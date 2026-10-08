@@ -305,17 +305,38 @@ Differences:
 
 ### Differences
 
-- No zlib version is reported. zlib-rs 0.6.8, the backend, exposes no version
-  string, so `archive_zlib_version()` returns NULL and
-  `archive_version_details()` has no `zlib/` entry, where upstream reports
-  `zlib/<ZLIB_VERSION>`. Open question: what version string to report.
-- Decompression is flate2 over zlib-rs in raw mode. Corrupt input fails with
-  "gzip decompression failed" as upstream does. zlib-rs is a port of zlib, but
-  equality of accepted streams is checked only through the upstream fixtures
-  and the tests in the module.
+- No zlib version is reported. miniz_oxide exposes no version string here, so
+  `archive_zlib_version()` returns NULL and `archive_version_details()` has no
+  `zlib/` entry, where upstream reports `zlib/<ZLIB_VERSION>`. Handled
+  centrally later.
+- Decompression is flate2's `rust_backend`, miniz_oxide, in raw mode. It
+  replaces zlib-rs, which has internal `unsafe`; miniz_oxide's crate root has
+  `#![forbid(unsafe_code)]`. On valid input the output is byte-identical:
+  `diff-cat '*.gz*' '*tgz*'` shows 12 same, 0 differ, and the one timeout
+  (`test_read_filter_gzip_recursive.gz`) is the oracle's timeout too.
+- On corrupt deflate data the two backends can disagree. Differential run
+  over 969 inputs (639 truncations, 330 files with 1-3 random byte changes),
+  comparing oracle and port `bsdcat` stdout, stderr and status:
+  - Truncations: 639 of 639 identical.
+  - Mutations: 270 of 330 identical. The other 60 are all corrupt input the
+    oracle rejects:
+    - 58: upstream fails with "gzip decompression failed" and no output
+      (status 1); the port exits 0 with bytes. 50 of these are zlib's
+      "invalid distance too far back". miniz_oxide checks a back-reference's
+      distance against its 32 KiB window, not against the bytes output so
+      far, so a reference before the start of the stream is accepted.
+      Example: a one-member gzip file of 300 bytes at level 1 with a few
+      bytes of its deflate data changed gives 324 bytes here and "gzip
+      decompression failed" upstream. The other 8 are rejected by zlib for a
+      reason not isolated.
+    - 2: both fail with status 1. Upstream says "gzip decompression failed";
+      the port fails with no message.
+  - No case where the port fails and upstream succeeds.
+  The accepted streams are checked only through these runs and the tests in
+  the module.
 - The `inflateInit2` and `inflateEnd` failures upstream reports ("Internal
   error initializing compression library", "Failed to clean up gzip
-  decompressor") cannot happen with zlib-rs, so they are not ported.
+  decompressor") cannot happen with miniz_oxide, so they are not ported.
 
 ## xz, lzma and lzip filters (`src/read/filter/xz.rs`)
 

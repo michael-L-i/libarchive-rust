@@ -26,8 +26,8 @@
 // Ported from libarchive/archive_read_support_filter_gzip.c.
 
 //! `archive_read_support_filter_gzip`: the gzip filter. The header and trailer
-//! are parsed here; the deflate data is inflated by zlib-rs (`flate2`), in
-//! raw mode.
+//! are parsed here; the deflate data is inflated by miniz_oxide (`flate2`'s
+//! `rust_backend`), in raw mode.
 
 use crate::archive::{ARCHIVE_ERRNO_MISC, ARCHIVE_FATAL, Base};
 use crate::entry::Entry;
@@ -164,7 +164,7 @@ impl Gzip {
     }
 
     /// Inflates the input into the rest of the output block, consuming what
-    /// zlib used. Returns whether the member ended.
+    /// the decoder used. Returns whether the member ended.
     fn inflate(&mut self, stream: &mut Decompress, up: &mut Reader<'_>) -> Result<bool, Error> {
         let input = up
             .read_ahead(1)
