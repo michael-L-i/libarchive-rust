@@ -47,7 +47,7 @@ impl Format for Empty {
 
     fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> c_int {
         // No data (or none readable) is the only thing this format takes.
-        if best_bid < 1 && r.read_ahead(1).map_or(true, <[u8]>::is_empty) {
+        if best_bid < 1 && !matches!(r.read_ahead(1), Ok(Some(_))) {
             return 1;
         }
         -1

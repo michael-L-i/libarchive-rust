@@ -64,7 +64,7 @@ impl Format for Raw {
     /// if there are bid errors or minor file damage, so we don't include
     /// "raw" as part of support_format_all().
     fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> c_int {
-        if best_bid < 1 && r.read_ahead(1).is_ok_and(|d| !d.is_empty()) {
+        if best_bid < 1 && matches!(r.read_ahead(1), Ok(Some(_))) {
             return 1;
         }
         -1
@@ -97,12 +97,11 @@ impl Format for Raw {
         }
 
         // Get whatever bytes are immediately available.
-        let data = r.read_ahead(1)?;
-        if data.is_empty() {
+        let Some(data) = r.read_ahead(1)? else {
             // Record and return end-of-file.
             self.end_of_file = true;
             return Ok(Data::Eof { offset: self.offset });
-        }
+        };
         // Return the bytes we just read.
         let offset = self.offset;
         let mut avail = i64::try_from(data.len()).unwrap_or(i64::MAX);

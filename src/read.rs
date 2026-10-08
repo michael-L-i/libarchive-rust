@@ -861,29 +861,32 @@ impl Reader<'_> {
     /// `__archive_read_ahead`: looks ahead in the input stream without
     /// moving the file pointer.
     ///
-    /// - The slice is at least `min` bytes long, but it may be much longer:
-    ///   it is whatever is available in the current block. If you just want
-    ///   "some data", ask for 1 byte and look at the length, then `consume`
-    ///   whatever you used.
-    /// - A slice shorter than `min` means the stream ends before `min` bytes
-    ///   are available, and holds what there is. Empty is end of file. (With
-    ///   `min == 0`, the same as 1.)
+    /// - `Some(slice)` is everything currently buffered: at least `min`
+    ///   bytes, often much more (the rest of the current block). If you just
+    ///   want "some data", ask for 1 byte and look at the length, then
+    ///   `consume` whatever you used. With `min == 0` it is `Some` even at
+    ///   the end of the input, and may be empty.
+    /// - `None` means the input ends before `min` bytes are available. Use
+    ///   `peek_available` to see what there is.
     /// - An error is a failed read, or the stream having failed before.
     ///
     /// The slice stays valid until the next call on this reader or the
     /// stages below it.
-    pub fn read_ahead(&mut self, min: usize) -> Result<&[u8], Error> {
+    pub fn read_ahead(&mut self, min: usize) -> Result<Option<&[u8]>, Error> {
+        let data = self.peek_available(min)?;
+        Ok((data.len() >= min).then_some(data))
+    }
+
+    /// Like `read_ahead`, but a short slice is returned as it is instead of
+    /// `None`: whatever is available when the input ends before `min` bytes
+    /// (empty at the end of input). Check the length before indexing it:
+    /// `peek_available(512)?[..512]` panics on a short archive.
+    pub fn peek_available(&mut self, min: usize) -> Result<&[u8], Error> {
         let Some((top, mut up)) = self.split() else {
             return Ok(&[]);
         };
         let loc = top.fill(&mut up, min)?;
         Ok(top.data(loc))
-    }
-
-    /// `read_ahead`, for a reader that needs exactly `n` bytes: the first `n`
-    /// bytes, or `None` if the stream ends before that.
-    pub fn read_ahead_exact(&mut self, n: usize) -> Result<Option<&[u8]>, Error> {
-        Ok(self.read_ahead(n)?.get(..n))
     }
 
     /// `__archive_read_consume`: moves the file pointer forward by `n`, which
@@ -1314,7 +1317,7 @@ impl Read {
             let Some(best) = best else {
                 // If no bidder, we're done. Verify the filter by asking it
                 // for some data.
-                if rd.read_ahead(1).is_err() {
+                if rd.peek_available(1).is_err() {
                     self.free_filters(a);
                     return ARCHIVE_FATAL;
                 }
@@ -1909,7 +1912,7 @@ mod tests {
 
         fn read(&mut self, up: &mut Reader<'_>) -> Result<(), Error> {
             let n = {
-                let data = up.read_ahead(1)?;
+                let data = up.peek_available(1)?;
                 self.out.clear();
                 self.out.extend(data.iter().map(u8::to_ascii_uppercase));
                 data.len()
@@ -1949,13 +1952,13 @@ mod tests {
         let (mut r, a) = setup(mem);
         let mut rd = r.reader(&a);
         // "I just want some data": the whole block comes back.
-        assert_eq!(rd.read_ahead(1).unwrap(), &data[..4]);
-        assert_eq!(rd.read_ahead(0).unwrap(), &data[..4]);
-        assert_eq!(rd.read_ahead(4).unwrap(), &data[..4]);
+        assert_eq!(rd.peek_available(1).unwrap(), &data[..4]);
+        assert_eq!(rd.peek_available(0).unwrap(), &data[..4]);
+        assert_eq!(rd.peek_available(4).unwrap(), &data[..4]);
         assert_eq!(rd.position(), 0);
         rd.consume(3).unwrap();
         assert_eq!(rd.position(), 3);
-        assert_eq!(rd.read_ahead(1).unwrap(), &data[3..4]);
+        assert_eq!(rd.peek_available(1).unwrap(), &data[3..4]);
     }
 
     #[test]
@@ -1966,13 +1969,13 @@ mod tests {
         let mut rd = r.reader(&a);
         // A request spanning blocks is served from the copy buffer, which
         // holds only what was needed.
-        assert_eq!(rd.read_ahead(6).unwrap(), &data[..6]);
-        assert_eq!(rd.read_ahead(1).unwrap(), &data[..6]);
+        assert_eq!(rd.peek_available(6).unwrap(), &data[..6]);
+        assert_eq!(rd.peek_available(1).unwrap(), &data[..6]);
         rd.consume(5).unwrap();
         // The rest of the second block is back to being served directly.
-        assert_eq!(rd.read_ahead(1).unwrap(), &data[5..8]);
+        assert_eq!(rd.peek_available(1).unwrap(), &data[5..8]);
         rd.consume(3).unwrap();
-        assert_eq!(rd.read_ahead(1).unwrap(), &data[8..10]);
+        assert_eq!(rd.peek_available(1).unwrap(), &data[8..10]);
         assert_eq!(rd.position(), 8);
     }
 
@@ -1983,13 +1986,13 @@ mod tests {
         let (mut r, a) = setup(mem);
         let mut rd = r.reader(&a);
         for want in [1, 10, 11, 100, 101, 700, 1000] {
-            assert_eq!(rd.read_ahead(want).unwrap().get(..want), Some(&data[..want]));
+            assert_eq!(rd.peek_available(want).unwrap().get(..want), Some(&data[..want]));
         }
         // Data stays contiguous when the buffer has to move it forward.
         rd.consume(995).unwrap();
-        assert_eq!(rd.read_ahead(5).unwrap(), &data[995..]);
+        assert_eq!(rd.peek_available(5).unwrap(), &data[995..]);
         rd.consume(5).unwrap();
-        assert_eq!(rd.read_ahead(1).unwrap(), b"");
+        assert_eq!(rd.peek_available(1).unwrap(), b"");
     }
 
     #[test]
@@ -1999,14 +2002,19 @@ mod tests {
         let (mut r, a) = setup(mem);
         let mut rd = r.reader(&a);
         // Asking for more than there is returns what there is.
-        assert_eq!(rd.read_ahead(10).unwrap(), &data[..]);
-        assert_eq!(rd.read_ahead_exact(10).unwrap(), None);
-        assert_eq!(rd.read_ahead_exact(6).unwrap(), Some(&data[..]));
-        assert_eq!(rd.read_ahead_exact(2).unwrap(), Some(&data[..2]));
+        assert_eq!(rd.peek_available(10).unwrap(), &data[..]);
+        assert_eq!(rd.read_ahead(10).unwrap(), None);
+        assert_eq!(rd.read_ahead(6).unwrap(), Some(&data[..]));
+        // Everything buffered comes back, not just what was asked for.
+        assert_eq!(rd.read_ahead(2).unwrap(), Some(&data[..]));
+        assert_eq!(rd.read_ahead(0).unwrap(), Some(&data[..]));
         rd.consume(6).unwrap();
-        assert_eq!(rd.read_ahead(1).unwrap(), b"");
-        assert_eq!(rd.read_ahead(0).unwrap(), b"");
-        assert_eq!(rd.read_ahead(5).unwrap(), b"");
+        assert_eq!(rd.peek_available(1).unwrap(), b"");
+        assert_eq!(rd.peek_available(0).unwrap(), b"");
+        assert_eq!(rd.peek_available(5).unwrap(), b"");
+        // The end of input is None, except when nothing was asked for.
+        assert_eq!(rd.read_ahead(1).unwrap(), None);
+        assert_eq!(rd.read_ahead(0).unwrap(), Some(&b""[..]));
         assert!(error(&a).is_empty());
     }
 
@@ -2036,7 +2044,7 @@ mod tests {
         let (mut r, a) = setup(mem);
         let mut rd = r.reader(&a);
         assert_eq!(rd.skip(5).unwrap(), 5);
-        assert_eq!(rd.read_ahead(1).unwrap(), &data[5..8]);
+        assert_eq!(rd.peek_available(1).unwrap(), &data[5..8]);
         assert_eq!(rd.skip(100).unwrap(), 15);
         assert_eq!((rd.position(), rd.skip(1).unwrap()), (20, 0));
         assert!(error(&a).is_empty());
@@ -2049,13 +2057,13 @@ mod tests {
         mem.skippable = true;
         let (mut r, a) = setup(mem);
         let mut rd = r.reader(&a);
-        assert_eq!(rd.read_ahead(1).unwrap(), &data[..8]);
+        assert_eq!(rd.peek_available(1).unwrap(), &data[..8]);
         // 3 bytes left in the block... no: all 8 are buffered and used first,
         // then the skipper rounds down to blocks (82 -> 80) and a read
         // finishes the job.
         rd.consume(90).unwrap();
         assert_eq!(rd.position(), 90);
-        assert_eq!(rd.read_ahead(1).unwrap(), &data[90..96]);
+        assert_eq!(rd.peek_available(1).unwrap(), &data[90..96]);
         assert!(log.borrow().events.contains(&"skip 82 -> 80".to_string()));
     }
 
@@ -2068,7 +2076,7 @@ mod tests {
         let mut rd = r.reader(&a);
         // Less than a block: the skipper returns 0 and reads take over.
         rd.consume(30).unwrap();
-        assert_eq!(rd.read_ahead(1).unwrap(), &data[30..]);
+        assert_eq!(rd.peek_available(1).unwrap(), &data[30..]);
         assert!(log.borrow().events.iter().any(|e| e == "skip 30 -> 0"));
     }
 
@@ -2083,7 +2091,7 @@ mod tests {
         // Over 64k: a relative seek, not reads.
         rd.consume(200_000).unwrap();
         assert_eq!(rd.position(), 200_100);
-        assert_eq!(rd.read_ahead(1).unwrap().first(), Some(&data[200_100]));
+        assert_eq!(rd.peek_available(1).unwrap().first(), Some(&data[200_100]));
         let seeks: Vec<_> = log
             .borrow()
             .events
@@ -2109,19 +2117,19 @@ mod tests {
         let (mut r, a) = setup(mem);
         let mut rd = r.reader(&a);
         assert!(rd.can_seek());
-        assert_eq!(rd.read_ahead(20).unwrap(), &data[..20]);
+        assert_eq!(rd.peek_available(20).unwrap(), &data[..20]);
         rd.consume(5).unwrap();
         assert_eq!(rd.seek(50, Whence::Set).unwrap(), 50);
-        assert_eq!((rd.position(), rd.read_ahead(1).unwrap()), (50, &data[50..58]));
+        assert_eq!((rd.position(), rd.peek_available(1).unwrap()), (50, &data[50..58]));
         assert_eq!(rd.seek(-10, Whence::Cur).unwrap(), 40);
-        assert_eq!(rd.read_ahead(1).unwrap(), &data[40..48]);
+        assert_eq!(rd.peek_available(1).unwrap(), &data[40..48]);
         assert_eq!(rd.seek(-4, Whence::End).unwrap(), 96);
-        assert_eq!(rd.read_ahead(10).unwrap(), &data[96..]);
+        assert_eq!(rd.peek_available(10).unwrap(), &data[96..]);
         // Seeking back out of the end of file works, too.
         rd.consume(4).unwrap();
-        assert_eq!(rd.read_ahead(1).unwrap(), b"");
+        assert_eq!(rd.peek_available(1).unwrap(), b"");
         assert_eq!(rd.seek(0, Whence::Set).unwrap(), 0);
-        assert_eq!(rd.read_ahead(1).unwrap(), &data[..8]);
+        assert_eq!(rd.peek_available(1).unwrap(), &data[..8]);
     }
 
     #[test]
@@ -2132,7 +2140,7 @@ mod tests {
         let (mut r, a) = setup(mem);
         let mut rd = r.reader(&a);
         assert_eq!(rd.seek(11, Whence::Set).unwrap_err().code, ARCHIVE_FATAL);
-        assert_eq!(rd.read_ahead(1).unwrap_err().code, ARCHIVE_FATAL);
+        assert_eq!(rd.peek_available(1).unwrap_err().code, ARCHIVE_FATAL);
         assert_eq!(rd.seek(0, Whence::Set).unwrap_err().code, ARCHIVE_FATAL);
     }
 
@@ -2144,7 +2152,7 @@ mod tests {
         let mut rd = r.reader(&a);
         assert!(!rd.can_seek());
         assert_eq!(rd.seek(0, Whence::Set).unwrap_err().code, ARCHIVE_FAILED);
-        assert_eq!(rd.read_ahead(1).unwrap(), &data[..8]);
+        assert_eq!(rd.peek_available(1).unwrap(), &data[..8]);
     }
 
     #[test]
@@ -2154,14 +2162,14 @@ mod tests {
         mem.fail_read_at = Some(2);
         let (mut r, a) = setup(mem);
         let mut rd = r.reader(&a);
-        assert_eq!(rd.read_ahead(8).unwrap(), &data[..8]);
+        assert_eq!(rd.peek_available(8).unwrap(), &data[..8]);
         rd.consume(8).unwrap();
-        let e = rd.read_ahead(1).unwrap_err();
+        let e = rd.peek_available(1).unwrap_err();
         assert!(e.recorded && e.code == ARCHIVE_FATAL);
         assert_eq!((error(&a), a.errno.get()), ("Error reading test input".into(), libc::EIO));
         a.clear_error();
         // Once a stream has failed, so does everything after it.
-        assert_eq!(rd.read_ahead(1).unwrap_err().code, ARCHIVE_FATAL);
+        assert_eq!(rd.peek_available(1).unwrap_err().code, ARCHIVE_FATAL);
         assert_eq!(rd.skip(1).unwrap_err().code, ARCHIVE_FATAL);
         // A consume on a failed stream says it was truncated.
         assert!(rd.consume(1).is_err());
@@ -2186,13 +2194,13 @@ mod tests {
         assert_eq!(r.filter_code(-2), -1);
         {
             let mut rd = r.reader(&a);
-            assert_eq!(rd.read_ahead(7).unwrap(), b"HELLO, ");
+            assert_eq!(rd.peek_available(7).unwrap(), b"HELLO, ");
             rd.consume(7).unwrap();
-            assert_eq!(rd.read_ahead(1).unwrap(), b"WOR");
+            assert_eq!(rd.peek_available(1).unwrap(), b"WOR");
             rd.consume(3).unwrap();
-            assert_eq!(rd.read_ahead(1).unwrap(), b"LD");
+            assert_eq!(rd.peek_available(1).unwrap(), b"LD");
             rd.consume(2).unwrap();
-            assert_eq!(rd.read_ahead(1).unwrap(), b"");
+            assert_eq!(rd.peek_available(1).unwrap(), b"");
         }
         // The client position is the compressed position.
         assert_eq!((r.filter_bytes(0), r.filter_bytes(-1)), (12, 12));
@@ -2211,10 +2219,10 @@ mod tests {
         let (mut r, a) = setup(mem);
         let mut rd = r.reader(&a);
         // Nodes are switched at the end of each; a request can span them.
-        assert_eq!(rd.read_ahead(17).unwrap(), b"0123456abcdefgXYZ");
-        assert_eq!(rd.read_ahead(18).unwrap(), b"0123456abcdefgXYZ");
+        assert_eq!(rd.peek_available(17).unwrap(), b"0123456abcdefgXYZ");
+        assert_eq!(rd.peek_available(18).unwrap(), b"0123456abcdefgXYZ");
         rd.consume(17).unwrap();
-        assert_eq!(rd.read_ahead(1).unwrap(), b"");
+        assert_eq!(rd.peek_available(1).unwrap(), b"");
         // The default switch closes the old node and opens the new one.
         let events = log.borrow().events.clone();
         assert_eq!(
@@ -2230,13 +2238,13 @@ mod tests {
         let (mut r, a) = setup(mem);
         let mut rd = r.reader(&a);
         assert_eq!(rd.seek(9, Whence::Set).unwrap(), 9);
-        assert_eq!(rd.read_ahead(1).unwrap(), b"cdef");
+        assert_eq!(rd.peek_available(1).unwrap(), b"cdef");
         assert_eq!(rd.seek(3, Whence::Set).unwrap(), 3);
-        assert_eq!(rd.read_ahead(1).unwrap(), b"3456");
+        assert_eq!(rd.peek_available(1).unwrap(), b"3456");
         assert_eq!(rd.seek(-2, Whence::End).unwrap(), 15);
-        assert_eq!(rd.read_ahead(1).unwrap(), b"YZ");
+        assert_eq!(rd.peek_available(1).unwrap(), b"YZ");
         assert_eq!(rd.seek(1, Whence::Cur).unwrap(), 16);
-        assert_eq!(rd.read_ahead(1).unwrap(), b"Z");
+        assert_eq!(rd.peek_available(1).unwrap(), b"Z");
         // Past the end is an error.
         assert_eq!(rd.seek(18, Whence::Set).unwrap_err().code, ARCHIVE_FATAL);
     }
@@ -2267,7 +2275,7 @@ mod tests {
         let mut r = Read::default();
         let a = Base::new(READ_MAGIC);
         let mut rd = r.reader(&a);
-        assert_eq!(rd.read_ahead(4).unwrap(), b"");
+        assert_eq!(rd.peek_available(4).unwrap(), b"");
         assert_eq!(rd.skip(3).unwrap(), 0);
         assert!(rd.consume(1).is_err());
         assert_eq!(rd.seek(0, Whence::Set).unwrap_err().code, ARCHIVE_FATAL);
@@ -2321,7 +2329,7 @@ mod tests {
         fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> c_int {
             self.bids.borrow_mut().push((N, best_bid));
             if self.peek > 0 {
-                let _ = r.read_ahead(self.peek);
+                let _ = r.peek_available(self.peek);
             }
             if self.eat {
                 let _ = r.consume(self.peek);
@@ -2353,7 +2361,7 @@ mod tests {
 
     impl FilterBidder for UpperBidder {
         fn bid(&mut self, up: &mut Reader<'_>) -> c_int {
-            match up.read_ahead(1) {
+            match up.peek_available(1) {
                 Ok(d) if d.first().is_some_and(u8::is_ascii_lowercase) => self.0,
                 _ => 0,
             }
@@ -2428,7 +2436,7 @@ mod tests {
         mem.seekable = true;
         assert_eq!(r.open(&a, Box::new(mem)), ARCHIVE_OK);
         assert_eq!(r.reader(&a).position(), 0);
-        assert_eq!(r.reader(&a).read_ahead(1).unwrap(), b"abcd");
+        assert_eq!(r.reader(&a).peek_available(1).unwrap(), b"abcd");
 
         // Without a seeker, that is fatal.
         let mut r = Read::default();
@@ -2464,7 +2472,7 @@ mod tests {
         assert_eq!(open_with(&mut r, &a, b"abc"), ARCHIVE_OK);
         // One filter: after upper-casing nobody bids.
         assert_eq!((r.filter_count(), r.filter_code(0)), (2, 99));
-        assert_eq!(r.reader(&a).read_ahead(3).unwrap(), b"ABC");
+        assert_eq!(r.reader(&a).peek_available(3).unwrap(), b"ABC");
     }
 
     #[test]
@@ -2495,7 +2503,7 @@ mod tests {
         r.register_format(fake::<0>(1, &Rc::default())).unwrap();
         assert_eq!(open_with(&mut r, &a, b"xyz"), ARCHIVE_OK);
         assert_eq!((r.filter_count(), r.filter_code(0), r.filter_code(1)), (2, 99, 0));
-        assert_eq!(r.reader(&a).read_ahead(3).unwrap(), b"XYZ");
+        assert_eq!(r.reader(&a).peek_available(3).unwrap(), b"XYZ");
         // Appending with no bidder is a programmer error.
         let mut none = Read::default();
         assert_eq!(none.append_last_bidder(&a), ARCHIVE_FATAL);

@@ -761,7 +761,7 @@ pub(super) mod tests {
                 let mut rd = r.reader(&h.base);
                 loop {
                     let n = {
-                        let block = rd.read_ahead(1).unwrap();
+                        let block = rd.peek_available(1).unwrap();
                         out.extend_from_slice(block);
                         block.len()
                     };
