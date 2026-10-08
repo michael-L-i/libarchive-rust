@@ -33,37 +33,54 @@ use crate::archive::*;
 use crate::read::{Filter, FilterBidder, Read, Reader, Status, filter_code};
 use crate::util::Error;
 use std::ffi::{CStr, c_int};
-use std::ops::Range;
 use xz::stream::{self, Action, Filters, Stream};
 
-/// Registers the bidder of filter `code`.
-fn support(r: &mut Read, code: c_int) -> Result<Status, Error> {
-    r.register_bidder(Box::new(Bidder(code)))
+/// The three formats this decoder handles.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Xz,
+    Lzma,
+    Lzip,
+}
+
+impl Kind {
+    fn code(self) -> c_int {
+        match self {
+            Kind::Xz => filter_code::XZ,
+            Kind::Lzma => filter_code::LZMA,
+            Kind::Lzip => filter_code::LZIP,
+        }
+    }
+
+    fn name(self) -> &'static CStr {
+        match self {
+            Kind::Xz => c"xz",
+            Kind::Lzma => c"lzma",
+            Kind::Lzip => c"lzip",
+        }
+    }
+}
+
+fn support(r: &mut Read, kind: Kind) -> Result<Status, Error> {
+    r.register_bidder(Box::new(Bidder(kind)))
 }
 
 /// `archive_read_support_filter_xz`.
 pub fn support_xz(r: &mut Read) -> Result<Status, Error> {
-    support(r, filter_code::XZ)
+    support(r, Kind::Xz)
 }
 
 /// `archive_read_support_filter_lzma`.
 pub fn support_lzma(r: &mut Read) -> Result<Status, Error> {
-    support(r, filter_code::LZMA)
+    support(r, Kind::Lzma)
 }
 
 /// `archive_read_support_filter_lzip`.
 pub fn support_lzip(r: &mut Read) -> Result<Status, Error> {
-    support(r, filter_code::LZIP)
+    support(r, Kind::Lzip)
 }
 
-/// The size of the output block.
 const OUT_BLOCK_SIZE: usize = 64 * 1024;
-
-/// The value of the little-endian integer in `p[range]`.
-fn le(p: &[u8], range: Range<usize>) -> u64 {
-    let bytes = p.get(range).unwrap_or_default();
-    bytes.iter().rev().fold(0, |n, &b| n << 8 | u64::from(b))
-}
 
 fn misc(msg: &str) -> Error {
     Error::fatal(ARCHIVE_ERRNO_MISC, msg)
@@ -83,15 +100,14 @@ fn failure(e: stream::Error) -> Error {
     }
 }
 
-/// The bidder of one of the filters, by code.
-struct Bidder(c_int);
+struct Bidder(Kind);
 
 impl FilterBidder for Bidder {
     fn bid(&mut self, up: &mut Reader<'_>) -> Result<c_int, Error> {
         match self.0 {
-            filter_code::XZ => xz_bid(up),
-            filter_code::LZMA => lzma_bid(up),
-            _ => lzip_has_member(up),
+            Kind::Xz => xz_bid(up),
+            Kind::Lzma => lzma_bid(up),
+            Kind::Lzip => lzip_has_member(up),
         }
     }
 
@@ -119,7 +135,9 @@ fn xz_bid(up: &mut Reader<'_>) -> Result<c_int, Error> {
 /// LZMA checking instead of (or in addition to) compression_all() when
 /// they have other evidence (file name, command-line option) to go on.
 fn lzma_bid(up: &mut Reader<'_>) -> Result<c_int, Error> {
-    let Some(h) = up.read_ahead(14)? else {
+    let Some(&[props, d0, d1, d2, d3, s0, s1, s2, s3, s4, s5, s6, s7, _]) =
+        up.read_ahead(14)?.and_then(|h| h.first_chunk())
+    else {
         return Ok(0);
     };
 
@@ -139,7 +157,6 @@ fn lzma_bid(up: &mut Reader<'_>) -> Result<c_int, Error> {
     // NOTE: If this checking of the first byte increases false
     // recognition, we should allow only 0x5d and 0x5e for the first
     // byte of LZMA stream.
-    let props = le(h, 0..1);
     if props > (4 * 5 + 4) * 9 + 8 {
         return Ok(0);
     }
@@ -153,7 +170,7 @@ fn lzma_bid(up: &mut Reader<'_>) -> Result<c_int, Error> {
     // stored in little-endian order. `-1' means uncompressed
     // size is unknown and lzma of XZ Utils always records `-1'
     // in this field.
-    if le(h, 5..13) == u64::MAX {
+    if u64::from_le_bytes([s0, s1, s2, s3, s4, s5, s6, s7]) == u64::MAX {
         bits_checked += 64;
     }
 
@@ -163,7 +180,7 @@ fn lzma_bid(up: &mut Reader<'_>) -> Result<c_int, Error> {
     // -d12 and the maximum dictionary size is 1 << 27(128MiB)
     // which the one uses with option -d27. (XZ Utils uses 1 << 16
     // to 1 << 26 for its options -0 to -9.)
-    let dicsize = le(h, 1..5);
+    let dicsize = u32::from_le_bytes([d0, d1, d2, d3]);
     if dicsize.is_power_of_two() && (12..=27).contains(&dicsize.trailing_zeros()) {
         bits_checked += 32;
     } else if (0x0030_0000..=0x03F0_0000).contains(&dicsize)
@@ -205,7 +222,7 @@ fn lzip_has_member(up: &mut Reader<'_>) -> Result<c_int, Error> {
 
 /// The decoder of all three filters.
 struct Xz {
-    code: c_int,
+    kind: Kind,
     /// `None` between lzip members: the library is initialized from the
     /// header of each.
     stream: Option<Stream>,
@@ -224,14 +241,14 @@ struct Xz {
 
 impl Xz {
     /// Sets up the library. xz and lzma are decoded with no memory limit.
-    fn new(code: c_int) -> Result<Self, Error> {
-        let stream = match code {
-            filter_code::XZ => Some(Stream::new_stream_decoder(u64::MAX, stream::CONCATENATED)),
-            filter_code::LZMA => Some(Stream::new_lzma_decoder(u64::MAX)),
-            _ => None,
+    fn new(kind: Kind) -> Result<Self, Error> {
+        let stream = match kind {
+            Kind::Xz => Some(Stream::new_stream_decoder(u64::MAX, stream::CONCATENATED)),
+            Kind::Lzma => Some(Stream::new_lzma_decoder(u64::MAX)),
+            Kind::Lzip => None,
         };
         Ok(Xz {
-            code,
+            kind,
             stream: stream.transpose().map_err(failure)?,
             out: vec![0; OUT_BLOCK_SIZE],
             block: 0,
@@ -245,14 +262,13 @@ impl Xz {
 
     /// Initializes the library from the header of a lzip member.
     fn lzip_init(&mut self, up: &mut Reader<'_>) -> Result<Stream, Error> {
-        // The bid checked the header, so it is all there.
-        let Some(h) = up.read_ahead(6)? else {
+        let Some(&[.., ver, log2dic]) = up.read_ahead(6)?.and_then(|h| h.first_chunk::<6>()) else {
+            // Unreachable: a bid has already seen the whole header.
             return Err(misc("truncated input"));
         };
-        self.lzip_ver = h.get(4).copied().unwrap_or_default();
+        self.lzip_ver = ver;
 
         // Setup lzma property.
-        let log2dic = h.get(5).copied().unwrap_or_default();
         let mut dicsize = 1u32 << (log2dic & 0x1f);
         if log2dic & 0x1f > 12 {
             dicsize -= (dicsize / 16) * u32::from(log2dic >> 5);
@@ -274,23 +290,29 @@ impl Xz {
     fn lzip_tail(&mut self, up: &mut Reader<'_>) -> Result<(), Error> {
         let tail = if self.lzip_ver == 0 { 12 } else { 20 };
         let failed = |msg: &str| Error::new(ARCHIVE_FAILED, ARCHIVE_ERRNO_MISC, msg);
-        let Some(p) = up.read_ahead(tail)? else {
+        let trailer = up.read_ahead(tail)?.and_then(|p| {
+            let (crc, p) = p.split_first_chunk::<4>()?;
+            let (size, p) = p.split_first_chunk::<8>()?;
+            let member = p.first_chunk().copied().map(u64::from_le_bytes);
+            Some((u32::from_le_bytes(*crc), u64::from_le_bytes(*size), member))
+        });
+        let Some((crc, size, member)) = trailer else {
             return Err(failed("Lzip: Remaining data is less bytes"));
         };
 
         // Check the crc32 value of the uncompressed data of the current
         // member
-        if u64::from(self.crc32) != le(p, 0..4) {
+        if self.crc32 != crc {
             return Err(failed("Lzip: CRC32 error"));
         }
 
         // Check the uncompressed size of the current member
-        if self.member_out != le(p, 4..12) {
+        if self.member_out != size {
             return Err(failed("Lzip: Uncompressed size error"));
         }
 
         // Check the total size of the current member
-        if self.lzip_ver == 1 && self.member_in.checked_add(20) != Some(le(p, 12..20)) {
+        if self.lzip_ver == 1 && self.member_in.checked_add(20) != member {
             return Err(failed("Lzip: Member size error"));
         }
         up.consume(tail)?;
@@ -310,15 +332,11 @@ impl Xz {
 
 impl Filter for Xz {
     fn name(&self) -> &CStr {
-        match self.code {
-            filter_code::XZ => c"xz",
-            filter_code::LZMA => c"lzma",
-            _ => c"lzip",
-        }
+        self.kind.name()
     }
 
     fn code(&self) -> c_int {
-        self.code
+        self.kind.code()
     }
 
     /// Return the next block of decompressed data.
@@ -366,7 +384,7 @@ impl Filter for Xz {
 
             self.block = filled;
             self.member_out += filled as u64;
-            if self.code != filter_code::LZIP {
+            if self.kind != Kind::Lzip {
                 return Ok(());
             }
             if filled == 0 {
