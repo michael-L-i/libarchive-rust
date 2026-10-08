@@ -51,7 +51,7 @@ pub const FORMATS: &[(c_int, Option<Support>)] = &[
     // running any of the more expensive bidders below.
     (code::AR, None),
     (code::CPIO, None),
-    (code::EMPTY, None), // TODO(part B): format::empty::support
+    (code::EMPTY, Some(super::empty::support)),
     (code::LHA, None),
     (code::MTREE, None),
     (code::TAR, None),
@@ -71,7 +71,7 @@ pub const FORMATS: &[(c_int, Option<Support>)] = &[
     // buffered data.
     (code::ZIP, None),
     // Not enabled by `all`, only by name.
-    (code::RAW, None), // TODO(part B): format::raw::support
+    (code::RAW, Some(super::raw::support)),
 ];
 
 /// `archive_read_support_format_all`.

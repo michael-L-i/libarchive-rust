@@ -149,6 +149,13 @@ pub trait Filter {
     /// The block `read` produced; it stays put until the next `read`.
     fn block(&self) -> &[u8];
 
+    /// Fills in the entry with what the filter's header says (the gzip
+    /// file name and time, say), for formats that make an entry from a
+    /// stream with no structure. The default has nothing to add.
+    fn read_header(&mut self, _up: &mut Reader<'_>, _entry: &mut Entry) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Closes just this filter; the stage below is closed separately. A
     /// failure is reported by `archive_read_close`, but every filter is
     /// closed regardless.
@@ -832,6 +839,14 @@ impl Reader<'_> {
             passphrases: &mut *self.passphrases,
         };
         Some((top, up))
+    }
+
+    /// `__archive_read_header`: lets the top filter fill in `entry`.
+    pub fn read_filter_header(&mut self, entry: &mut Entry) -> Result<(), Error> {
+        match self.split() {
+            Some((top, mut up)) => top.imp.filter_mut().read_header(&mut up, entry),
+            None => Ok(()),
+        }
     }
 
     /// `__archive_read_ahead`: looks ahead in the input stream without

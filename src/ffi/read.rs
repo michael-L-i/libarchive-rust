@@ -9,7 +9,7 @@ use super::{
 };
 use crate::archive::{Handle, Kind, READ_MAGIC, state};
 use crate::read::filter::{all as filter_all, by_code as filter_by_code, none as filter_none};
-use crate::read::format::{all as format_all, by_code as format_by_code};
+use crate::read::format::{all as format_all, by_code as format_by_code, empty, raw};
 use crate::read::{self, Read};
 use super::ArchiveEntry;
 use super::sys::Fd;
@@ -645,6 +645,34 @@ pub extern "C" fn archive_read_next_header(a: *mut Archive, entryp: *mut *mut Ar
     )
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_raw(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_raw,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            raw::support(r).map_or_else(|e| h.base.raise(e), |()| ARCHIVE_OK)
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_empty(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_empty,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            empty::support(r).map_or_else(|e| h.base.raise(e), |()| ARCHIVE_OK)
+        })
+    )
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -1011,6 +1039,41 @@ pub(super) mod tests {
         assert_eq!(archive_read_next_header2(a, own), crate::archive::ARCHIVE_EOF);
         assert_eq!(archive_read_next_header2(a, std::ptr::null_mut()), ARCHIVE_FATAL);
         crate::ffi::entry::archive_entry_free(own);
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+    }
+
+    #[test]
+    fn raw_makes_one_entry_of_any_input() {
+        let a = archive_read_new();
+        assert_eq!(archive_read_support_format_raw(a), ARCHIVE_OK);
+        let data = b"some raw bytes".repeat(10);
+        assert_eq!(
+            crate::ffi::read_open::archive_read_open_memory2(a, data.as_ptr().cast(), data.len(), 7),
+            ARCHIVE_OK
+        );
+        let mut e: *mut ArchiveEntry = std::ptr::null_mut();
+        assert_eq!(archive_read_next_header(a, &mut e), ARCHIVE_OK);
+        let name = crate::ffi::entry::archive_entry_pathname(e);
+        // SAFETY: the library returns a NUL-terminated string.
+        assert_eq!(unsafe { CStr::from_ptr(name) }, c"data");
+        assert_eq!(crate::ffi::entry::archive_entry_perm(e), 0o644);
+        let mut buf = vec![0u8; 200];
+        assert_eq!(archive_read_data(a, buf.as_mut_ptr().cast(), buf.len()), data.len() as isize);
+        assert_eq!(&buf[..data.len()], &data[..]);
+        assert_eq!(archive_read_next_header(a, &mut e), crate::archive::ARCHIVE_EOF);
+        assert_eq!(crate::ffi::archive::archive_format(a), 0x90000);
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+    }
+
+    #[test]
+    fn empty_input_has_no_entries() {
+        let a = archive_read_new();
+        assert_eq!(archive_read_support_format_all(a), ARCHIVE_OK);
+        assert_eq!(archive_read_support_format_raw(a), ARCHIVE_OK);
+        assert_eq!(crate::ffi::read_open::archive_read_open_memory(a, std::ptr::null(), 0), ARCHIVE_OK);
+        let mut e: *mut ArchiveEntry = std::ptr::null_mut();
+        assert_eq!(archive_read_next_header(a, &mut e), crate::archive::ARCHIVE_EOF);
+        assert_eq!(crate::ffi::archive::archive_format(a), 0x60000);
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 }
