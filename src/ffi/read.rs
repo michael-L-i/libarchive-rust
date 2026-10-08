@@ -1076,4 +1076,20 @@ pub(super) mod tests {
         assert_eq!(crate::ffi::archive::archive_format(a), 0x60000);
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
+
+    unsafe extern "C" fn null_buffer(_: *mut Archive, _: *mut c_void, _: *mut *const c_void) -> isize {
+        3
+    }
+
+    #[test]
+    fn a_reader_returning_bytes_without_a_buffer_is_fatal() {
+        let a = archive_read_new();
+        register_anything(a);
+        assert_eq!(
+            archive_read_open(a, std::ptr::null_mut(), None, Some(null_buffer), None),
+            ARCHIVE_FATAL
+        );
+        assert_eq!(error(a).as_deref(), Some("Read callback returned a NULL buffer"));
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+    }
 }

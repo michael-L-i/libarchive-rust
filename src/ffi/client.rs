@@ -103,8 +103,12 @@ impl Client for CClient {
         // SAFETY: `new`'s contract.
         let n = unsafe { reader(self.archive, self.data(node), &mut buff) };
         match usize::try_from(n) {
+            Ok(n) if n > 0 && buff.is_null() => {
+                self.block = (std::ptr::null(), 0);
+                Err(Error::fatal(libc::EINVAL, "Read callback returned a NULL buffer"))
+            }
             Ok(n) => {
-                self.block = if buff.is_null() { (buff.cast(), 0) } else { (buff.cast(), n) };
+                self.block = (buff.cast(), n);
                 Ok(())
             }
             Err(_) => {
@@ -155,6 +159,8 @@ impl Client for CClient {
     }
 
     fn close(&mut self, node: usize) -> Result<(), Error> {
+        // The closer may free the buffer the reader handed out.
+        self.block = (std::ptr::null(), 0);
         let Some(closer) = self.callbacks.closer else {
             return Ok(());
         };
