@@ -17,16 +17,6 @@ pub struct Ar {
     size: i64,
     remaining: i64,
     padding: i64,
-    /// Data returned in place by the last `read_data`, consumed by the next
-    /// call (the slice has to stay valid until then).
-    unconsumed: usize,
-}
-
-impl Ar {
-    /// Every entry point flushes the deferred consume first.
-    fn flush(&mut self, r: &mut Reader<'_>) -> Result<(), Error> {
-        r.consume(std::mem::take(&mut self.unconsumed))
-    }
 }
 
 impl Format for Ar {
@@ -43,7 +33,6 @@ impl Format for Ar {
     }
 
     fn read_header(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Result<Status, Error> {
-        self.flush(r)?;
         // Skip what the caller didn't read of the last entry.
         r.consume(std::mem::take(&mut self.remaining) + std::mem::take(&mut self.padding))?;
         if !self.started {
@@ -93,17 +82,19 @@ impl Format for Ar {
     }
 
     fn read_data<'x>(&'x mut self, r: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
-        self.flush(r)?;
         if self.remaining == 0 {
             return Ok(Data::Eof { offset: self.size });
         }
+        // The handle does not borrow the reader, so the slice can be returned
+        // and still consumed: the core does it before the next call.
+        let later = r.consume_later();
         let Some(data) = r.read_ahead(1)? else {
             return Err(Error::fatal(EILSEQ, "Truncated ar archive"));
         };
         let n = usize::try_from(self.remaining).map_or(data.len(), |left| left.min(data.len()));
         let offset = self.size - self.remaining;
         self.remaining -= i64::try_from(n).unwrap_or(0);
-        self.unconsumed = n;
+        later.consume(n);
         Ok(Data::Block {
             data: data.get(..n).unwrap_or_default(),
             offset,
@@ -111,7 +102,6 @@ impl Format for Ar {
     }
 
     fn read_data_skip(&mut self, r: &mut Reader<'_>) -> Result<Status, Error> {
-        self.flush(r)?;
         r.consume(std::mem::take(&mut self.remaining))?;
         Ok(Status::Ok)
     }

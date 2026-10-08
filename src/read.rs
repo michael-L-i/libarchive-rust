@@ -49,8 +49,9 @@ use crate::entry::Entry;
 use crate::read_add_passphrase::Passphrases;
 use crate::util::Error;
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, c_int};
+use std::rc::Rc;
 
 /// `ARCHIVE_ERRNO_FILE_FORMAT`: unrecognized or invalid file format.
 pub const ARCHIVE_ERRNO_FILE_FORMAT: c_int = libc::EILSEQ;
@@ -514,6 +515,9 @@ struct Stage {
     imp: Imp,
     /// Bytes consumed from this stage so far.
     position: i64,
+    /// Bytes `consume_later` promised to consume; taken by the next call
+    /// that reads or moves the position (`Reader::flush`).
+    later: Rc<Cell<usize>>,
     /// Set for the client stage when it can skip or seek.
     can_skip: bool,
     can_seek: bool,
@@ -553,6 +557,7 @@ impl Stage {
         Stage {
             imp,
             position: 0,
+            later: Rc::default(),
             can_skip,
             can_seek,
             buffer: Vec::new(),
@@ -945,6 +950,7 @@ impl<'a> Reader<'a> {
     /// (empty at the end of input). Check the length before indexing it:
     /// `peek_available(512)?[..512]` panics on a short archive.
     pub fn peek_available(&mut self, min: usize) -> Result<&[u8], Error> {
+        self.flush()?;
         let Some((top, mut up)) = self.split() else {
             return Ok(&[]);
         };
@@ -968,6 +974,7 @@ impl<'a> Reader<'a> {
     /// showed were there: `consume`, but running out is a bug in the caller,
     /// which debug builds assert on, rather than a truncated input.
     pub fn consume_ahead(&mut self, n: usize) -> Result<(), Error> {
+        self.flush()?;
         debug_assert!(
             self.chain
                 .last()
@@ -981,6 +988,12 @@ impl<'a> Reader<'a> {
     /// the reader should have looked at (or not) first. It is a fatal error
     /// for the stream to end first, or for `n` to be negative.
     pub fn consume(&mut self, n: impl TryInto<i64>) -> Result<(), Error> {
+        self.flush()?;
+        self.consume_now(n)
+    }
+
+    /// `consume` without the flush.
+    fn consume_now(&mut self, n: impl TryInto<i64>) -> Result<(), Error> {
         let a = self.a;
         let request = match n.try_into() {
             Ok(n) if n >= 0 => n,
@@ -1005,11 +1018,27 @@ impl<'a> Reader<'a> {
         Err(Error::recorded(ARCHIVE_FATAL))
     }
 
+    /// A handle for `consume_later`. Like `base()` it does not borrow the
+    /// reader, so it can be taken before `read_ahead` and used while the
+    /// slice is held.
+    pub fn consume_later(&self) -> ConsumeLater {
+        ConsumeLater(self.chain.last().map(|s| Rc::clone(&s.later)).unwrap_or_default())
+    }
+
+    /// Consumes what `consume_later` promised. Runs first in every method
+    /// that reads or moves the position, and before the core calls the
+    /// format. A failure is exactly the one an explicit `consume` would give.
+    pub(crate) fn flush(&mut self) -> Result<(), Error> {
+        let n = self.chain.last().map_or(0, |s| s.later.take());
+        self.consume_now(n)
+    }
+
     /// Moves the file pointer forward by up to `n` bytes, using the client's
     /// skip where it has one, and returns how far it moved: less than `n`
     /// only at the end of the stream. `consume` is this with the end of the
     /// stream being an error.
     pub fn skip(&mut self, n: i64) -> Result<i64, Error> {
+        self.flush()?;
         if n < 0 {
             return Err(Error::recorded(ARCHIVE_FATAL));
         }
@@ -1023,6 +1052,7 @@ impl<'a> Reader<'a> {
     /// buffered. `ARCHIVE_FAILED` if the input can't seek. Returns the new
     /// position.
     pub fn seek(&mut self, offset: i64, whence: Whence) -> Result<i64, Error> {
+        self.flush()?;
         match self.split() {
             Some((top, mut up)) => top.seek(&mut up, offset, whence),
             None => Err(Error::recorded(ARCHIVE_FATAL)),
@@ -1030,7 +1060,10 @@ impl<'a> Reader<'a> {
     }
 
     /// The number of bytes consumed from the stream: the offset in the
-    /// uncompressed data, where the next `read_ahead` looks.
+    /// uncompressed data, where the next `read_ahead` looks. Bytes promised
+    /// to `consume_later` are not counted until the next call that moves the
+    /// position, as in upstream, where the format consumes them at the top
+    /// of its next call.
     ///
     /// A `read_ahead` slice borrows the stage this number lives in, so the
     /// position can't be read while one is held; read it first. (It doesn't
@@ -1066,6 +1099,20 @@ impl<'a> Reader<'a> {
     /// when the candidates and the client's callback have run out.
     pub fn next_passphrase(&mut self) -> Option<Vec<u8>> {
         self.passphrases.next()
+    }
+}
+
+/// Consumes bytes at the start of the reader's next call: the way for a
+/// format to return a `read_ahead` slice from `read_data` and still move
+/// the position past it, since the slice must stay valid until then. See
+/// `Reader::consume_later`.
+pub struct ConsumeLater(Rc<Cell<usize>>);
+
+impl ConsumeLater {
+    /// Consumes `n` more bytes before the reader's next call that reads or
+    /// moves the position. Only bytes that `read_ahead` showed were there.
+    pub fn consume(&self, n: usize) {
+        self.0.set(self.0.get().saturating_add(n));
     }
 }
 
@@ -1252,10 +1299,14 @@ pub enum Data<'r> {
 /// # Deferred consume
 ///
 /// A format that returns data in place from `read_data` can't consume it
-/// first: the slice must stay valid until the next call. So it remembers how
-/// much is pending and consumes it at the top of its next `read_header`,
-/// `read_data_skip` or `read_data` call. All three must do this, or the
-/// stream is left in the wrong place.
+/// first: the slice must stay valid until the next call. So it returns a
+/// slice from `read_ahead`, then calls `consume_later(n)` (take the handle
+/// first, `let later = r.consume_later();`, as with `base()`). The core
+/// consumes the `n` bytes before the next call into the format
+/// (`read_header`, `read_data`, `read_data_skip`) and before the next
+/// `Reader` call that reads or moves the position, so the format has no
+/// bookkeeping of its own. `position()` counts them only from then on, as
+/// `archive_read_header_position` and `archive_filter_bytes` do in upstream.
 ///
 /// # Example
 ///
@@ -1291,8 +1342,7 @@ pub trait Format: Any {
     fn read_header(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Result<Status, Error>;
 
     /// The next block of the entry's data. A format that returns the data in
-    /// place (the usual zero-copy case) consumes it on its next call, since
-    /// the slice must stay valid until then.
+    /// place (the usual zero-copy case) calls `consume_later` for it.
     fn read_data<'x>(&'x mut self, r: &'x mut Reader<'_>) -> Result<Data<'x>, Error>;
 
     /// Skips the rest of the entry's data. The default reads and discards it.
@@ -1642,6 +1692,26 @@ fn copy_out(
 }
 
 impl Read {
+    /// Consumes what the format promised with `consume_later`, before the
+    /// core calls into it.
+    fn flush(&mut self, a: &Base) -> Result<(), Error> {
+        Reader {
+            chain: &mut self.chain,
+            a,
+            passphrases: &mut self.passphrases,
+        }
+        .flush()
+    }
+
+    /// Records `e` and gives its code; a fatal one makes the handle fatal.
+    fn fail(a: &Base, e: Error) -> c_int {
+        let code = a.raise(e);
+        if code == ARCHIVE_FATAL {
+            a.state.set(state::FATAL);
+        }
+        code
+    }
+
     /// The active format and a `Reader` over the chain, as separate borrows.
     fn active<'a>(&'a mut self, a: &'a Base) -> Option<(&'a mut dyn Format, Reader<'a>)> {
         let format = self.formats.get_mut(self.format?)?;
@@ -1662,6 +1732,9 @@ impl Read {
         a: &Base,
         f: impl FnOnce(Data<'_>) -> R,
     ) -> Result<R, c_int> {
+        if let Err(e) = self.flush(a) {
+            return Err(Self::fail(a, e));
+        }
         let Some((format, mut rd)) = self.active(a) else {
             a.state.set(state::FATAL);
             return Err(a.raise(Error::fatal(
@@ -1671,23 +1744,17 @@ impl Read {
         };
         match format.read_data(&mut rd) {
             Ok(data) => Ok(f(data)),
-            Err(e) => {
-                let code = a.raise(e);
-                if code == ARCHIVE_FATAL {
-                    a.state.set(state::FATAL);
-                }
-                Err(code)
-            }
+            Err(e) => Err(Self::fail(a, e)),
         }
     }
 
     /// `archive_read_data_skip`, after the caller has checked the state:
     /// skips over all remaining data in this entry.
     pub fn read_data_skip(&mut self, a: &Base) -> c_int {
-        let r = match self.active(a) {
+        let r = self.flush(a).and_then(|()| match self.active(a) {
             Some((format, mut rd)) => format.read_data_skip(&mut rd),
             None => Ok(Status::Ok),
-        };
+        });
         let code = match r {
             Ok(Status::Warn) => ARCHIVE_WARN,
             Ok(_) => ARCHIVE_OK,
@@ -1703,6 +1770,9 @@ impl Read {
 
     /// `archive_seek_data`, after the caller has checked the state.
     pub fn seek_data(&mut self, a: &Base, offset: i64, whence: c_int) -> i64 {
+        if let Err(e) = self.flush(a) {
+            return Self::fail(a, e).into();
+        }
         let Some((format, mut rd)) = self.active(a) else {
             return a.raise(Error::fatal(
                 ARCHIVE_ERRNO_PROGRAMMER,
@@ -1712,13 +1782,7 @@ impl Read {
         };
         match format.seek_data(&mut rd, offset, whence) {
             Ok(r) => r,
-            Err(e) => {
-                let code = a.raise(e);
-                if code == ARCHIVE_FATAL {
-                    a.state.set(state::FATAL);
-                }
-                code.into()
-            }
+            Err(e) => Self::fail(a, e).into(),
         }
     }
 
@@ -1866,16 +1930,21 @@ impl Read {
             }
         }
 
+        // Whatever the format's last read_data left to consume comes first,
+        // so that the header starts where the data ended.
+        let flushed = self.flush(a);
+
         // Record start-of-header offset in uncompressed stream.
         self.header_position = self.chain.last().map_or(0, |s| s.position);
 
         a.file_count.set(a.file_count.get() + 1);
-        let r2 = match self.active(a) {
-            Some((format, mut rd)) => match format.read_header(&mut rd, entry) {
+        let r2 = match flushed.map(|()| self.active(a)) {
+            Ok(Some((format, mut rd))) => match format.read_header(&mut rd, entry) {
                 Ok(status) => status.code(),
                 Err(e) => a.raise(e),
             },
-            None => ARCHIVE_FATAL,
+            Ok(None) => ARCHIVE_FATAL,
+            Err(e) => a.raise(e),
         };
 
         // EOF and FATAL are persistent at this layer. By modifying the
@@ -3036,6 +3105,123 @@ mod tests {
         assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_WARN);
         assert_eq!((a.state.get(), error(&a)), (state::DATA, "ar member without a name".into()));
         assert_eq!(ar_data(&mut r, &a), b"data");
+    }
+
+    /// Collects the blocks of the current entry: (offset, bytes), and the
+    /// stream position seen from outside after each one.
+    fn blocks(r: &mut Read, a: &Base) -> (Vec<(i64, Vec<u8>)>, Vec<i64>) {
+        let (mut blocks, mut positions) = (Vec::new(), Vec::new());
+        while let Ok(Some(block)) = r.read_data_block(a, |d| match d {
+            Data::Block { data, offset } => Some((offset, data.to_vec())),
+            _ => None,
+        }) {
+            blocks.push(block);
+            positions.push(r.filter_bytes(0));
+        }
+        (blocks, positions)
+    }
+
+    #[test]
+    fn raw_reads_many_blocks_and_consumes_each_on_the_next_call() {
+        let data = text(1000);
+        let mut r = Read::default();
+        assert_eq!(crate::read::format::raw::support(&mut r).unwrap(), Status::Ok);
+        let a = Base::new(READ_MAGIC);
+        let (mem, _) = Mem::new(&data, 7);
+        assert_eq!(r.open(&a, Box::new(mem)), ARCHIVE_OK);
+        let mut e = Entry::new(None);
+        assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_OK);
+
+        let (blocks, positions) = blocks(&mut r, &a);
+        // The data comes back in place, one client block at a time.
+        assert!(blocks.len() > 100);
+        let mut expect = 0;
+        for (i, (offset, bytes)) in blocks.iter().enumerate() {
+            assert_eq!(*offset, expect as i64);
+            assert_eq!(bytes[..], data[expect..expect + bytes.len()]);
+            // A block is not consumed until the next call: the position
+            // lags by one block, as it does in upstream.
+            assert_eq!(positions[i], expect as i64);
+            expect += bytes.len();
+        }
+        assert_eq!(expect, data.len());
+        // The call that found the end consumed the last block.
+        assert_eq!(r.filter_bytes(0), data.len() as i64);
+        // So did the one that skips, for a reader that stopped early.
+        let (mem, _) = Mem::new(&data, 7);
+        let mut r2 = Read::default();
+        assert_eq!(crate::read::format::raw::support(&mut r2).unwrap(), Status::Ok);
+        assert_eq!(r2.open(&a, Box::new(mem)), ARCHIVE_OK);
+        assert_eq!(r2.next_header2(&a, &mut e), ARCHIVE_OK);
+        assert!(r2.read_data_block(&a, |_| ()).is_ok());
+        assert_eq!(r2.filter_bytes(0), 0);
+        assert_eq!(r2.read_data_skip(&a), ARCHIVE_OK);
+        assert_eq!(r2.filter_bytes(0), 7);
+        assert_eq!(r2.next_header2(&a, &mut e), ARCHIVE_EOF);
+        assert_eq!(r2.header_position(), 7);
+    }
+
+    /// Promises to consume more than there is, to make the flush fail.
+    struct Over;
+
+    impl Format for Over {
+        fn name(&self) -> &'static str {
+            "over"
+        }
+
+        fn bid(&mut self, _: &mut Reader<'_>, _: c_int) -> Result<c_int, Error> {
+            Ok(1)
+        }
+
+        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<Status, Error> {
+            Ok(Status::Ok)
+        }
+
+        fn read_data<'x>(&'x mut self, r: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
+            let later = r.consume_later();
+            let data = r.peek_available(1)?;
+            later.consume(100);
+            Ok(Data::Block { data, offset: 0 })
+        }
+    }
+
+    fn over() -> (Read, Base, Entry) {
+        let mut r = Read::default();
+        assert_eq!(r.register_format(Box::new(Over)).unwrap(), Status::Ok);
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"12345"), ARCHIVE_OK);
+        let mut e = Entry::new(None);
+        assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_OK);
+        (r, a, e)
+    }
+
+    #[test]
+    fn a_failed_deferred_consume_fails_like_an_explicit_one() {
+        let truncated = "Truncated input file (needed 100 bytes, only 5 available)";
+        // The next read_data.
+        let (mut r, a, _) = over();
+        assert_eq!(r.read_data_block(&a, |d| matches!(d, Data::Block { data, .. } if data == b"1234")), Ok(true));
+        assert_eq!(r.read_data_block(&a, |_| ()), Err(ARCHIVE_FATAL));
+        assert_eq!((a.state.get(), error(&a)), (state::FATAL, truncated.to_string()));
+
+        // The skip that the next header does.
+        let (mut r, a, mut e) = over();
+        assert!(r.read_data_block(&a, |_| ()).is_ok());
+        assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_FATAL);
+        assert_eq!((a.state.get(), error(&a)), (state::FATAL, truncated.to_string()));
+
+        // An explicit read_data_skip.
+        let (mut r, a, _) = over();
+        assert!(r.read_data_block(&a, |_| ()).is_ok());
+        assert_eq!(r.read_data_skip(&a), ARCHIVE_FATAL);
+        assert_eq!(error(&a), truncated);
+
+        // The reader's own calls report it as consume does.
+        let (mut r, a, _) = over();
+        assert!(r.read_data_block(&a, |_| ()).is_ok());
+        let mut rd = r.reader(&a);
+        assert_eq!(rd.read_ahead(1).unwrap_err(), Error::recorded(ARCHIVE_FATAL));
+        assert_eq!(error(&a), truncated);
     }
 
     #[test]

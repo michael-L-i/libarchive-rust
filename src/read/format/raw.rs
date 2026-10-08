@@ -37,20 +37,12 @@ use std::ffi::c_int;
 struct Raw {
     /// Current position in the file.
     offset: i64,
-    unconsumed: usize,
     end_of_file: bool,
 }
 
 /// `archive_read_support_format_raw`.
 pub fn support(r: &mut Read) -> Result<Status, Error> {
     r.register_format(Box::new(Raw::default()))
-}
-
-impl Raw {
-    /// Consume the bytes we read last time.
-    fn consume_last(&mut self, r: &mut Reader<'_>) -> Result<(), Error> {
-        r.consume(std::mem::take(&mut self.unconsumed))
-    }
 }
 
 impl Format for Raw {
@@ -87,8 +79,6 @@ impl Format for Raw {
     }
 
     fn read_data<'x>(&'x mut self, r: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
-        self.consume_last(r)?;
-
         if self.end_of_file {
             // Keep reporting the end of the entry, so that a caller that
             // asks once more after end-of-file still gets a position it can
@@ -97,6 +87,7 @@ impl Format for Raw {
         }
 
         // Get whatever bytes are immediately available.
+        let later = r.consume_later();
         let Some(data) = r.read_ahead(1)? else {
             // Record and return end-of-file.
             self.end_of_file = true;
@@ -116,15 +107,14 @@ impl Format for Raw {
             }
         }
         let avail = usize::try_from(avail).unwrap_or(0);
-        self.unconsumed = avail;
+        later.consume(avail);
         Ok(Data::Block {
             data: data.get(..avail).unwrap_or_default(),
             offset,
         })
     }
 
-    fn read_data_skip(&mut self, r: &mut Reader<'_>) -> Result<Status, Error> {
-        self.consume_last(r)?;
+    fn read_data_skip(&mut self, _r: &mut Reader<'_>) -> Result<Status, Error> {
         self.end_of_file = true;
         Ok(Status::Ok)
     }
