@@ -157,9 +157,9 @@ enum Stage {
     Eof,
 }
 
+/// What a block decodes into.
 #[derive(Default)]
-struct Lz4 {
-    stage: Stage,
+struct Output {
     /// Where decoded blocks go: sized for the frame's block maximum, or 8 MiB
     /// for a legacy block.
     buf: Vec<u8>,
@@ -168,6 +168,12 @@ struct Lz4 {
     window: Vec<u8>,
     /// Length of the block the last `read` produced, at the start of `buf`.
     len: usize,
+}
+
+#[derive(Default)]
+struct Lz4 {
+    stage: Stage,
+    out: Output,
 }
 
 impl Lz4 {
@@ -233,19 +239,20 @@ impl Lz4 {
         };
         up.consume(size)?;
 
-        self.buf.resize(block_max, 0);
+        self.out.buf.resize(block_max, 0);
         if linked {
-            self.window.clear();
-            self.window.resize(WINDOW, 0);
+            self.out.window.clear();
+            self.out.window.resize(WINDOW, 0);
         }
         Ok(frame)
     }
 
     /// The next block of the LZ4 frame, or `None` at its end mark.
-    fn lz4_block(&mut self, up: &mut Reader<'_>) -> Result<Option<usize>, Error> {
-        let Stage::Lz4(frame) = &mut self.stage else {
-            return Ok(None);
-        };
+    fn lz4_block(
+        frame: &mut Frame,
+        out: &mut Output,
+        up: &mut Reader<'_>,
+    ) -> Result<Option<usize>, Error> {
         let head = up.read_ahead(4)?.map(le32).ok_or_else(truncated)?;
         // The high bit marks a stored block; a size over the maximum is
         // malformed.
@@ -273,45 +280,49 @@ impl Lz4 {
         let body = up.read_ahead(total)?.ok_or_else(truncated)?;
         let data = body.get(4..4 + size).unwrap_or_default();
         if frame.block_checksum {
-            let stored = body
-                .get(4 + size..total)
-                .map(le32)
-                .ok_or_else(truncated)?;
+            let stored = body.get(4 + size..total).map(le32).ok_or_else(truncated)?;
             if xxh32(data, 0) != stored {
                 return Err(malformed());
             }
         }
 
         if frame.linked {
-            slide(&mut self.window, self.buf.get(..frame.decoded).unwrap_or_default());
+            slide(
+                &mut out.window,
+                out.buf.get(..frame.decoded).unwrap_or_default(),
+            );
         }
         // A stored block of size zero is decoded as a compressed one, which
         // fails, as upstream's does.
         let n = if head & 0x8000_0000 != 0 && size > 0 {
-            self.buf
+            out.buf
                 .get_mut(..size)
                 .ok_or_else(malformed)?
                 .copy_from_slice(data);
             size
         } else if frame.linked {
-            decompress_into_with_dict(data, &mut self.buf, &self.window)
+            decompress_into_with_dict(data, &mut out.buf, &out.window)
                 .map_err(|_| decompression_failed())?
         } else {
-            decompress_into(data, &mut self.buf).map_err(|_| decompression_failed())?
+            decompress_into(data, &mut out.buf).map_err(|_| decompression_failed())?
         };
         frame.decoded = n;
         if let Some(hash) = &mut frame.content {
-            hash.update(self.buf.get(..n).unwrap_or_default());
+            hash.update(out.buf.get(..n).unwrap_or_default());
         }
-        self.len = n;
+        out.len = n;
         up.consume(total)?;
         Ok(Some(n))
     }
 
     /// The next block of a legacy frame, or `None` where the frame ends. A
     /// frame with no block at all (`first`) is truncated.
-    fn legacy_block(&mut self, up: &mut Reader<'_>, first: bool) -> Result<Option<usize>, Error> {
-        self.buf.resize(LEGACY_BLOCK, 0);
+    fn legacy_block(
+        out: &mut Output,
+        up: &mut Reader<'_>,
+        first: bool,
+    ) -> Result<Option<usize>, Error> {
+        out.buf.resize(LEGACY_BLOCK, 0);
         let Some(size) = up.read_ahead(4)?.map(le32) else {
             return if first { Err(truncated()) } else { Ok(None) };
         };
@@ -321,8 +332,8 @@ impl Lz4 {
         let total = 4 + usize::try_from(size).unwrap_or(usize::MAX);
         let body = up.read_ahead(total)?.ok_or_else(truncated)?;
         let data = body.get(4..total).unwrap_or_default();
-        let n = decompress_into(data, &mut self.buf).map_err(|_| decompression_failed())?;
-        self.len = n;
+        let n = decompress_into(data, &mut out.buf).map_err(|_| decompression_failed())?;
+        out.len = n;
         up.consume(total)?;
         Ok(Some(n))
     }
@@ -338,7 +349,7 @@ impl Filter for Lz4 {
     }
 
     fn read(&mut self, up: &mut Reader<'_>) -> Result<(), Error> {
-        self.len = 0;
+        self.out.len = 0;
         loop {
             // A frame that has just been opened gives its first block to the
             // caller directly. Upstream's end of input is decided there, so a
@@ -347,9 +358,9 @@ impl Filter for Lz4 {
             if fresh {
                 self.stage = self.open(up)?;
             }
-            let block = match self.stage {
-                Stage::Lz4(_) => self.lz4_block(up)?,
-                Stage::Legacy => self.legacy_block(up, fresh)?,
+            let block = match &mut self.stage {
+                Stage::Lz4(frame) => Self::lz4_block(frame, &mut self.out, up)?,
+                Stage::Legacy => Self::legacy_block(&mut self.out, up, fresh)?,
                 Stage::Magic | Stage::Eof => return Ok(()),
             };
             match block {
@@ -365,7 +376,7 @@ impl Filter for Lz4 {
     }
 
     fn block(&self) -> &[u8] {
-        self.buf.get(..self.len).unwrap_or_default()
+        self.out.buf.get(..self.out.len).unwrap_or_default()
     }
 }
 
@@ -400,16 +411,64 @@ mod tests {
     const A_TEXT: &[u8] = b"AAAAAAAAAAAAAAAA first frame\n";
     const B_TEXT: &[u8] = b"BBBBBBBBBBBBBBBB second frame\n";
 
+    /// 70000 bytes of a 36-byte period: `lz4 -BD -BX -B4`, two linked blocks with block checksums.
+    const LINKED: &[u8] = &[
+        0x04, 0x22, 0x4d, 0x18, 0x54, 0x40, 0xae, 0x2f, 0x01, 0x00, 0x00, 0xff, 0x15, 0x30, 0x31,
+        0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
+        0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76,
+        0x77, 0x78, 0x79, 0x7a, 0x24, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc4, 0x50, 0x62, 0x63, 0x64, 0x65, 0x66, 0xee,
+        0xfa, 0xc4, 0x06, 0x1b, 0x00, 0x00, 0x00, 0x0f, 0xf0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x69, 0x50, 0x62,
+        0x63, 0x64, 0x65, 0x66, 0x74, 0xd0, 0x7b, 0x33, 0x00, 0x00, 0x00, 0x00, 0xa7, 0x45, 0xd3,
+        0x1c,
+    ];
+    /// 100 random bytes: `lz4 -BX -B4`, one stored block with a block checksum.
+    const STORED: &[u8] = &[
+        0x04, 0x22, 0x4d, 0x18, 0x74, 0x40, 0xbd, 0x64, 0x00, 0x00, 0x80, 0xa5, 0x4d, 0xca, 0x18,
+        0x25, 0x30, 0xbb, 0x1d, 0x6d, 0x13, 0x2c, 0xde, 0xd6, 0x23, 0x7b, 0x2e, 0xd9, 0x1e, 0x3f,
+        0x72, 0x1f, 0xcb, 0x19, 0x71, 0x17, 0x44, 0x94, 0xd6, 0x49, 0x3c, 0x9d, 0x5c, 0x34, 0x60,
+        0xbe, 0x31, 0x20, 0x1e, 0x69, 0xfe, 0xda, 0xa0, 0xee, 0xe8, 0xb9, 0x99, 0x7f, 0x5c, 0x7c,
+        0x29, 0x99, 0xfd, 0xaf, 0xe5, 0x93, 0x25, 0x3c, 0xd6, 0x54, 0xaf, 0x4d, 0xfa, 0xd7, 0x14,
+        0x27, 0xa0, 0xae, 0xb3, 0xfe, 0xe9, 0x23, 0x2f, 0x8a, 0xf2, 0x21, 0x1f, 0x9e, 0xe4, 0x91,
+        0xc5, 0xb1, 0x0b, 0xec, 0xb5, 0x56, 0x3b, 0xfc, 0x1e, 0x6f, 0x93, 0x42, 0x7e, 0xcb, 0xc8,
+        0xfe, 0x29, 0x55, 0xe5, 0xcd, 0x8e, 0x1d, 0xf9, 0x2c, 0xbd, 0x00, 0x00, 0x00, 0x00, 0x1d,
+        0xf9, 0x2c, 0xbd,
+    ];
+
     #[test]
     fn a_frame_decodes_at_any_read_size() {
         for size in [1, 2, 3, 7, 4096] {
-            assert_eq!(decode(support, A, size), Ok(A_TEXT.to_vec()), "read size {size}");
+            assert_eq!(
+                decode(support, A, size),
+                Ok(A_TEXT.to_vec()),
+                "read size {size}"
+            );
         }
     }
 
     #[test]
     fn frames_concatenate_and_legacy_frames_decode() {
-        assert_eq!(decode(support, &[A, B].concat(), 5), Ok([A_TEXT, B_TEXT].concat()));
+        assert_eq!(
+            decode(support, &[A, B].concat(), 5),
+            Ok([A_TEXT, B_TEXT].concat())
+        );
         assert_eq!(decode(support, LEGACY, 3), Ok(A_TEXT.to_vec()));
     }
 
@@ -417,12 +476,18 @@ mod tests {
     fn an_empty_frame_ends_the_stream() {
         // Upstream stops at a frame with no data, so the frame after it is
         // never read.
-        assert_eq!(decode(support, &[A, EMPTY, B].concat(), 9), Ok(A_TEXT.to_vec()));
+        assert_eq!(
+            decode(support, &[A, EMPTY, B].concat(), 9),
+            Ok(A_TEXT.to_vec())
+        );
     }
 
     #[test]
     fn a_stream_cut_short_is_truncated() {
-        assert_eq!(decode(support, &A[..A.len() - 1], 3), Err("truncated lz4 input".into()));
+        assert_eq!(
+            decode(support, &A[..A.len() - 1], 3),
+            Err("truncated lz4 input".into())
+        );
     }
 
     #[test]
@@ -445,6 +510,48 @@ mod tests {
             }
             let _ = decode(support, &m, 7);
         }
+    }
+    #[test]
+    fn linked_blocks_refer_back_to_the_previous_block() {
+        let mut expected = b"0123456789abcdefghijklmnopqrstuvwxyz".repeat(2100);
+        expected.truncate(70000);
+        assert_eq!(decode(support, LINKED, 9), Ok(expected));
+    }
+
+    #[test]
+    fn a_stored_block_is_copied() {
+        // The stored data sits after the 7-byte header and the 4-byte size.
+        let data = STORED.get(11..111).unwrap_or_default().to_vec();
+        assert_eq!(decode(support, STORED, 13), Ok(data));
+    }
+
+    #[test]
+    fn a_block_checksum_failure_is_malformed() {
+        // The first block's checksum starts after its 303 bytes of data.
+        let mut bad = LINKED.to_vec();
+        bad[7 + 4 + 303] ^= 0xff;
+        assert_eq!(
+            decode(support, &bad, 4096),
+            Err("malformed lz4 data".into())
+        );
+    }
+
+    #[test]
+    fn a_content_checksum_failure_is_a_stream_error() {
+        let mut bad = LINKED.to_vec();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        assert_eq!(
+            decode(support, &bad, 4096),
+            Err("lz4 stream checksum error".into())
+        );
+    }
+
+    #[test]
+    fn a_skippable_frame_between_frames_is_skipped() {
+        let skip = [0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0];
+        let data = [A, &skip[..], &b"xyz"[..], B].concat();
+        assert_eq!(decode(support, &data, 5), Ok([A_TEXT, B_TEXT].concat()));
     }
 
     #[test]
