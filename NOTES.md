@@ -113,8 +113,9 @@ Suspected upstream bugs, ported as-is:
   `archive_read_next_header`. Ours forgets the cache the same way.
 - `archive_entry_xattr_add_entry` prepends, so `archive_entry_clone`, which
   adds the attributes in list order, reverses them. Ours does too.
-- `archive_entry_clone` does not copy `mset_digest`, and nothing in upstream
-  reads it, so it is not stored here at all.
+- `archive_entry_clone` does not copy `mset_digest` (the bitmap of digests
+  set, which the mtree writer reads), so a clone has digest bytes but no
+  record that they are set. Ours does the same.
 - `isint`/`isint_w` reject `INT_MAX` itself: the overflow test uses
   `digit >= INT_MAX % 10` where `>` would be exact, so a numeric ACL id of
   2147483647 makes the entry invalid.
@@ -137,6 +138,9 @@ Suspected upstream bugs, ported as-is:
 
 Differences:
 
+- `archive_entry_pathname` falls back to the UTF-8 form on any conversion
+  error, where upstream does so only for `EILSEQ`; the other error it can
+  see is `ENOMEM`, which aborts there.
 - A NULL entry: upstream dereferences it (except `archive_entry_free(NULL)`
   and `archive_entry_clear(NULL)`, which return). Ours return 0 or NULL.
   `archive_entry_xattr_add_entry` with a NULL name or value, and

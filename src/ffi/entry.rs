@@ -72,6 +72,31 @@ fn malloc_copy<T: Copy>(v: &[T], nul: T) -> *mut T {
     }
 }
 
+/// Calls `$set` with the string at `$p`, or `$clear` for NULL. An update
+/// returns 1 or 0 for success or failure; the form with a result says what
+/// clearing returns.
+macro_rules! or_clear {
+    ($e:ident, $p:expr, $get:ident, $set:ident, $clear:ident) => {
+        match $get($p) {
+            Some(v) => {
+                $e.$set(v);
+            }
+            None => {
+                $e.$clear();
+            }
+        }
+    };
+    ($e:ident, $p:expr, $get:ident, $update:ident, $clear:ident, $ok:expr) => {
+        match $get($p) {
+            Some(v) => c_int::from($e.$update(v)),
+            None => {
+                $e.$clear();
+                $ok
+            }
+        }
+    };
+}
+
 /// Defines exported functions that run a body on the entry. A function with
 /// a result names its type and the value for a NULL entry.
 macro_rules! entry_fns {
@@ -129,19 +154,19 @@ entry_fns! {
     // Functions for reading fields from an archive_entry.
     archive_entry_atime() -> libc::time_t = 0 => |e| e.atime();
     archive_entry_atime_nsec() -> c_long = 0 => |e| e.atime_nsec();
-    archive_entry_atime_is_set() -> c_int = 0 => |e| c_int::from(e.atime_is_set());
+    archive_entry_atime_is_set() -> c_int = 0 => |e| e.atime_is_set();
     archive_entry_birthtime() -> libc::time_t = 0 => |e| e.birthtime();
     archive_entry_birthtime_nsec() -> c_long = 0 => |e| e.birthtime_nsec();
-    archive_entry_birthtime_is_set() -> c_int = 0 => |e| c_int::from(e.birthtime_is_set());
+    archive_entry_birthtime_is_set() -> c_int = 0 => |e| e.birthtime_is_set();
     archive_entry_ctime() -> libc::time_t = 0 => |e| e.ctime();
     archive_entry_ctime_nsec() -> c_long = 0 => |e| e.ctime_nsec();
-    archive_entry_ctime_is_set() -> c_int = 0 => |e| c_int::from(e.ctime_is_set());
+    archive_entry_ctime_is_set() -> c_int = 0 => |e| e.ctime_is_set();
     archive_entry_dev() -> Dev = 0 => |e| e.dev();
-    archive_entry_dev_is_set() -> c_int = 0 => |e| c_int::from(e.dev_is_set());
+    archive_entry_dev_is_set() -> c_int = 0 => |e| e.dev_is_set();
     archive_entry_devmajor() -> Dev = 0 => |e| e.devmajor();
     archive_entry_devminor() -> Dev = 0 => |e| e.devminor();
     archive_entry_filetype() -> Mode = 0 => |e| e.filetype();
-    archive_entry_filetype_is_set() -> c_int = 0 => |e| c_int::from(e.filetype_is_set());
+    archive_entry_filetype_is_set() -> c_int = 0 => |e| e.filetype_is_set();
     archive_entry_fflags(set: *mut c_ulong, clear: *mut c_ulong) => |e| {
         let (s, c) = e.fflags();
         put(set, s);
@@ -149,7 +174,7 @@ entry_fns! {
     };
     archive_entry_fflags_text() -> *const c_char = std::ptr::null() => |e| cptr(e.fflags_text());
     archive_entry_gid() -> i64 = 0 => |e| e.gid();
-    archive_entry_gid_is_set() -> c_int = 0 => |e| c_int::from(e.gid_is_set());
+    archive_entry_gid_is_set() -> c_int = 0 => |e| e.gid_is_set();
     archive_entry_gname() -> *const c_char = std::ptr::null() => |e| cptr(e.gname());
     archive_entry_gname_utf8() -> *const c_char = std::ptr::null() => |e| cptr(e.gname_utf8());
     archive_entry_gname_w() -> *const wchar_t = std::ptr::null() => |e| wptr(e.gname_w());
@@ -157,26 +182,26 @@ entry_fns! {
     archive_entry_hardlink() -> *const c_char = std::ptr::null() => |e| cptr(e.hardlink());
     archive_entry_hardlink_utf8() -> *const c_char = std::ptr::null() => |e| cptr(e.hardlink_utf8());
     archive_entry_hardlink_w() -> *const wchar_t = std::ptr::null() => |e| wptr(e.hardlink_w());
-    archive_entry_hardlink_is_set() -> c_int = 0 => |e| c_int::from(e.hardlink_is_set());
+    archive_entry_hardlink_is_set() -> c_int = 0 => |e| e.hardlink_is_set();
     archive_entry_ino() -> i64 = 0 => |e| e.ino();
     archive_entry_ino64() -> i64 = 0 => |e| e.ino();
-    archive_entry_ino_is_set() -> c_int = 0 => |e| c_int::from(e.ino_is_set());
+    archive_entry_ino_is_set() -> c_int = 0 => |e| e.ino_is_set();
     archive_entry_mode() -> Mode = 0 => |e| e.mode();
     archive_entry_mtime() -> libc::time_t = 0 => |e| e.mtime();
     archive_entry_mtime_nsec() -> c_long = 0 => |e| e.mtime_nsec();
-    archive_entry_mtime_is_set() -> c_int = 0 => |e| c_int::from(e.mtime_is_set());
+    archive_entry_mtime_is_set() -> c_int = 0 => |e| e.mtime_is_set();
     archive_entry_nlink() -> c_uint = 0 => |e| e.nlink();
     archive_entry_pathname() -> *const c_char = std::ptr::null() => |e| cptr(e.pathname());
     archive_entry_pathname_utf8() -> *const c_char = std::ptr::null() => |e| cptr(e.pathname_utf8());
     archive_entry_pathname_w() -> *const wchar_t = std::ptr::null() => |e| wptr(e.pathname_w());
     archive_entry_perm() -> Mode = 0 => |e| e.perm();
-    archive_entry_perm_is_set() -> c_int = 0 => |e| c_int::from(e.perm_is_set());
-    archive_entry_rdev_is_set() -> c_int = 0 => |e| c_int::from(e.rdev_is_set());
+    archive_entry_perm_is_set() -> c_int = 0 => |e| e.perm_is_set();
+    archive_entry_rdev_is_set() -> c_int = 0 => |e| e.rdev_is_set();
     archive_entry_rdev() -> Dev = 0 => |e| e.rdev();
     archive_entry_rdevmajor() -> Dev = 0 => |e| e.rdevmajor();
     archive_entry_rdevminor() -> Dev = 0 => |e| e.rdevminor();
     archive_entry_size() -> i64 = 0 => |e| e.size();
-    archive_entry_size_is_set() -> c_int = 0 => |e| c_int::from(e.size_is_set());
+    archive_entry_size_is_set() -> c_int = 0 => |e| e.size_is_set();
     archive_entry_sourcepath() -> *const c_char = std::ptr::null() => |e| cptr(e.sourcepath());
     archive_entry_sourcepath_w() -> *const wchar_t = std::ptr::null() => |e| wptr(e.sourcepath_w());
     archive_entry_strmode() -> *const c_char = std::ptr::null() => |e| e.strmode().as_ptr();
@@ -186,14 +211,14 @@ entry_fns! {
     archive_entry_symlink_type() -> c_int = 0 => |e| e.symlink_type();
     archive_entry_symlink_w() -> *const wchar_t = std::ptr::null() => |e| wptr(e.symlink_w());
     archive_entry_uid() -> i64 = 0 => |e| e.uid();
-    archive_entry_uid_is_set() -> c_int = 0 => |e| c_int::from(e.uid_is_set());
+    archive_entry_uid_is_set() -> c_int = 0 => |e| e.uid_is_set();
     archive_entry_uname() -> *const c_char = std::ptr::null() => |e| cptr(e.uname());
     archive_entry_uname_utf8() -> *const c_char = std::ptr::null() => |e| cptr(e.uname_utf8());
     archive_entry_uname_w() -> *const wchar_t = std::ptr::null() => |e| wptr(e.uname_w());
     archive_entry_is_data_encrypted() -> c_int = 0 => |e| c_int::from(e.is_data_encrypted());
     archive_entry_is_metadata_encrypted() -> c_int = 0
         => |e| c_int::from(e.is_metadata_encrypted());
-    archive_entry_is_encrypted() -> c_int = 0 => |e| c_int::from(e.is_encrypted());
+    archive_entry_is_encrypted() -> c_int = 0 => |e| e.is_encrypted();
 
     // Functions to set archive_entry properties.
     archive_entry_set_atime(t: libc::time_t, ns: c_long) => |e| e.set_atime(t, ns);
@@ -227,51 +252,78 @@ entry_fns! {
     archive_entry_set_is_metadata_encrypted(is_encrypted: c_char)
         => |e| e.set_is_metadata_encrypted(is_encrypted != 0);
 
-    // The text fields. `copy` and `set` are the same operation.
-    archive_entry_set_gname(name: *const c_char) => |e| e.set_gname(cstr(name));
-    archive_entry_copy_gname(name: *const c_char) => |e| e.set_gname(cstr(name));
-    archive_entry_set_gname_utf8(name: *const c_char) => |e| e.set_gname_utf8(cstr(name));
-    archive_entry_copy_gname_w(name: *const wchar_t) => |e| e.copy_gname_w(wstr(name));
-    archive_entry_update_gname_utf8(name: *const c_char) -> c_int = 0
-        => |e| c_int::from(e.update_gname_utf8(cstr(name)));
-    archive_entry_set_uname(name: *const c_char) => |e| e.set_uname(cstr(name));
-    archive_entry_copy_uname(name: *const c_char) => |e| e.set_uname(cstr(name));
-    archive_entry_set_uname_utf8(name: *const c_char) => |e| e.set_uname_utf8(cstr(name));
-    archive_entry_copy_uname_w(name: *const wchar_t) => |e| e.copy_uname_w(wstr(name));
-    archive_entry_update_uname_utf8(name: *const c_char) -> c_int = 0
-        => |e| c_int::from(e.update_uname_utf8(cstr(name)));
-    archive_entry_set_pathname(name: *const c_char) => |e| e.set_pathname(cstr(name));
-    archive_entry_copy_pathname(name: *const c_char) => |e| e.set_pathname(cstr(name));
-    archive_entry_set_pathname_utf8(name: *const c_char) => |e| e.set_pathname_utf8(cstr(name));
-    archive_entry_copy_pathname_w(name: *const wchar_t) => |e| e.copy_pathname_w(wstr(name));
-    archive_entry_update_pathname_utf8(name: *const c_char) -> c_int = 0
-        => |e| c_int::from(e.update_pathname_utf8(cstr(name)));
-    archive_entry_copy_sourcepath(path: *const c_char) => |e| e.set_sourcepath(cstr(path));
-    archive_entry_copy_sourcepath_w(path: *const wchar_t) => |e| e.copy_sourcepath_w(wstr(path));
+    // The text fields. `copy` and `set` are the same operation. C's NULL
+    // unsets the field.
+    archive_entry_set_gname(v: *const c_char) => |e| or_clear!(e, v, cstr, set_gname, clear_gname);
+    archive_entry_copy_gname(v: *const c_char) => |e| or_clear!(e, v, cstr, set_gname, clear_gname);
+    archive_entry_set_gname_utf8(v: *const c_char)
+        => |e| or_clear!(e, v, cstr, set_gname_utf8, clear_gname);
+    archive_entry_copy_gname_w(v: *const wchar_t)
+        => |e| or_clear!(e, v, wstr, copy_gname_w, clear_gname);
+    archive_entry_update_gname_utf8(v: *const c_char) -> c_int = 0
+        => |e| or_clear!(e, v, cstr, update_gname_utf8, clear_gname, 1);
+    archive_entry_set_uname(v: *const c_char) => |e| or_clear!(e, v, cstr, set_uname, clear_uname);
+    archive_entry_copy_uname(v: *const c_char) => |e| or_clear!(e, v, cstr, set_uname, clear_uname);
+    archive_entry_set_uname_utf8(v: *const c_char)
+        => |e| or_clear!(e, v, cstr, set_uname_utf8, clear_uname);
+    archive_entry_copy_uname_w(v: *const wchar_t)
+        => |e| or_clear!(e, v, wstr, copy_uname_w, clear_uname);
+    archive_entry_update_uname_utf8(v: *const c_char) -> c_int = 0
+        => |e| or_clear!(e, v, cstr, update_uname_utf8, clear_uname, 1);
+    archive_entry_set_pathname(v: *const c_char) => |e| or_clear!(e, v, cstr, set_pathname, clear_pathname);
+    archive_entry_copy_pathname(v: *const c_char) => |e| or_clear!(e, v, cstr, set_pathname, clear_pathname);
+    archive_entry_set_pathname_utf8(v: *const c_char)
+        => |e| or_clear!(e, v, cstr, set_pathname_utf8, clear_pathname);
+    archive_entry_copy_pathname_w(v: *const wchar_t)
+        => |e| or_clear!(e, v, wstr, copy_pathname_w, clear_pathname);
+    archive_entry_update_pathname_utf8(v: *const c_char) -> c_int = 0
+        => |e| or_clear!(e, v, cstr, update_pathname_utf8, clear_pathname, 1);
+    archive_entry_copy_sourcepath(v: *const c_char)
+        => |e| or_clear!(e, v, cstr, set_sourcepath, clear_sourcepath);
+    archive_entry_copy_sourcepath_w(v: *const wchar_t)
+        => |e| or_clear!(e, v, wstr, copy_sourcepath_w, clear_sourcepath);
 
     // The link target.
-    archive_entry_set_hardlink(target: *const c_char) => |e| e.set_hardlink(cstr(target));
-    archive_entry_set_hardlink_utf8(target: *const c_char)
-        => |e| e.set_hardlink_utf8(cstr(target));
-    archive_entry_copy_hardlink(target: *const c_char) => |e| e.copy_hardlink(cstr(target));
-    archive_entry_copy_hardlink_w(target: *const wchar_t)
-        => |e| e.copy_hardlink_w(wstr(target));
-    archive_entry_update_hardlink_utf8(target: *const c_char) -> c_int = 0
-        => |e| c_int::from(e.update_hardlink_utf8(cstr(target)));
-    archive_entry_set_link(target: *const c_char) => |e| e.set_link(cstr(target));
-    archive_entry_copy_link(target: *const c_char) => |e| e.set_link(cstr(target));
-    archive_entry_set_link_utf8(target: *const c_char) => |e| e.set_link_utf8(cstr(target));
-    archive_entry_copy_link_w(target: *const wchar_t) => |e| e.copy_link_w(wstr(target));
-    archive_entry_update_link_utf8(target: *const c_char) -> c_int = 0
-        => |e| c_int::from(e.update_link_utf8(cstr(target)));
-    archive_entry_set_symlink(linkname: *const c_char) => |e| e.set_symlink(cstr(linkname));
-    archive_entry_copy_symlink(linkname: *const c_char) => |e| e.set_symlink(cstr(linkname));
-    archive_entry_set_symlink_utf8(linkname: *const c_char)
-        => |e| e.set_symlink_utf8(cstr(linkname));
-    archive_entry_copy_symlink_w(linkname: *const wchar_t)
-        => |e| e.copy_symlink_w(wstr(linkname));
-    archive_entry_update_symlink_utf8(linkname: *const c_char) -> c_int = 0
-        => |e| c_int::from(e.update_symlink_utf8(cstr(linkname)));
+    archive_entry_set_hardlink(v: *const c_char) => |e| {
+        or_clear!(e, v, cstr, set_hardlink, unset_hardlink);
+    };
+    archive_entry_copy_hardlink(v: *const c_char) => |e| {
+        or_clear!(e, v, cstr, copy_hardlink, unset_hardlink);
+    };
+    archive_entry_set_hardlink_utf8(v: *const c_char) => |e| {
+        or_clear!(e, v, cstr, set_hardlink_utf8, unset_hardlink);
+    };
+    archive_entry_copy_hardlink_w(v: *const wchar_t) => |e| {
+        or_clear!(e, v, wstr, copy_hardlink_w, unset_hardlink);
+    };
+    archive_entry_set_symlink(v: *const c_char) => |e| {
+        or_clear!(e, v, cstr, set_symlink, unset_symlink);
+    };
+    archive_entry_copy_symlink(v: *const c_char) => |e| {
+        or_clear!(e, v, cstr, set_symlink, unset_symlink);
+    };
+    archive_entry_set_symlink_utf8(v: *const c_char) => |e| {
+        or_clear!(e, v, cstr, set_symlink_utf8, unset_symlink);
+    };
+    archive_entry_copy_symlink_w(v: *const wchar_t) => |e| {
+        or_clear!(e, v, wstr, copy_symlink_w, unset_symlink);
+    };
+    archive_entry_set_link(v: *const c_char) => |e| or_clear!(e, v, cstr, set_link, unset_link);
+    archive_entry_copy_link(v: *const c_char) => |e| or_clear!(e, v, cstr, set_link, unset_link);
+    archive_entry_set_link_utf8(v: *const c_char) => |e| or_clear!(e, v, cstr, set_link_utf8, unset_link);
+    archive_entry_copy_link_w(v: *const wchar_t) => |e| or_clear!(e, v, wstr, copy_link_w, unset_link);
+    archive_entry_update_hardlink_utf8(v: *const c_char) -> c_int = 0
+        => |e| match cstr(v) {
+            Some(v) => c_int::from(e.update_hardlink_utf8(v)),
+            None => c_int::from(e.unset_hardlink()),
+        };
+    archive_entry_update_symlink_utf8(v: *const c_char) -> c_int = 0
+        => |e| match cstr(v) {
+            Some(v) => c_int::from(e.update_symlink_utf8(v)),
+            None => c_int::from(e.unset_symlink()),
+        };
+    archive_entry_update_link_utf8(v: *const c_char) -> c_int = 0
+        => |e| or_clear!(e, v, cstr, update_link_utf8, unset_link, 1);
 
     archive_entry_copy_fflags_text(flags: *const c_char) -> *const c_char = std::ptr::null()
         => |e| cstr(flags).map_or(std::ptr::null(), |f| {
@@ -301,7 +353,7 @@ entry_fns! {
         m.map_or(std::ptr::null(), |m| m.as_ptr().cast())
     };
     archive_entry_copy_mac_metadata(p: *const c_void, s: usize) => |e| {
-        e.copy_mac_metadata(if p.is_null() { None } else { bytes(p, s) });
+        e.copy_mac_metadata(if p.is_null() { &[] } else { bytes(p, s).unwrap_or_default() });
     };
 
     archive_entry_digest(ty: c_int) -> *const u8 = std::ptr::null()

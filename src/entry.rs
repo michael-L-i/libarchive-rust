@@ -168,6 +168,9 @@ pub struct Entry {
 
     encryption: u8,
     mac_metadata: Vec<u8>,
+    /// Bitmap of the digests that are set, by `1 << (type - 1)`.
+    #[allow(dead_code)] // read by the mtree writer (phase 5)
+    mset_digest: u32,
     digest: [[u8; 64]; 6],
 
     pub acl: Acl,
@@ -195,48 +198,25 @@ fn lock(cache: &Option<Cache>) -> Option<MutexGuard<'_, ConvCache>> {
         .map(|c| c.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
-fn set_mbs(s: &mut MString, v: Option<&[u8]>) {
-    match v {
-        Some(v) => s.copy_mbs(v),
-        None => s.clear(),
-    }
+/// A text to store in a field: multibyte, UTF-8 or wide.
+enum Text<'a> {
+    Mbs(&'a [u8]),
+    Utf8(&'a [u8]),
+    Wcs(&'a [wchar_t]),
 }
 
-fn set_utf8(s: &mut MString, v: Option<&[u8]>) {
-    match v {
-        Some(v) => {
+fn store(s: &mut MString, t: Text) {
+    match t {
+        Text::Mbs(v) => s.copy_mbs(v),
+        Text::Utf8(v) => {
             s.copy_utf8(v);
         }
-        None => s.clear(),
+        Text::Wcs(v) => s.copy_wcs(v),
     }
 }
 
-fn set_wcs(s: &mut MString, v: Option<&[wchar_t]>) {
-    match v {
-        Some(v) => s.copy_wcs(v),
-        None => s.clear(),
-    }
-}
-
-fn set_mbs_l(s: &mut MString, v: Option<&[u8]>, sc: Option<&StringConv>) -> Result<(), ConvFailed> {
-    match v {
-        Some(v) => s.copy_mbs_len_l(v, sc),
-        None => {
-            s.clear();
-            Ok(())
-        }
-    }
-}
-
-fn update_utf8(s: &mut MString, cache: &Option<Cache>, v: Option<&[u8]>) -> Result<(), ConvFailed> {
-    match v {
-        Some(v) => s.update_utf8(lock(cache).as_deref_mut(), v),
-        None => {
-            // Succeeded in clearing everything.
-            s.clear();
-            Ok(())
-        }
-    }
+fn update_utf8(s: &mut MString, cache: &Option<Cache>, v: &[u8]) -> bool {
+    s.update_utf8(lock(cache).as_deref_mut(), v).is_ok()
 }
 
 /// `makedev`, `major` and `minor` as the platform's `<sys/types.h>` defines
@@ -258,10 +238,13 @@ fn dev_minor(dev: Dev) -> Dev {
 
 /// Getters and setters of one text field. The `_l` variants convert from or
 /// to the charset of a string conversion, for the format readers and
-/// writers.
+/// writers. A getter returns the partial text of a failed conversion along
+/// with false; a setter that fails leaves the field unset, so it only
+/// reports the failure.
 macro_rules! text_field {
     ($field:ident: $get_utf8:ident, $get_w:ident, $get_l:ident,
-     $set:ident, $set_utf8:ident, $copy_w:ident, $update_utf8:ident, $copy_l:ident) => {
+     $set:ident, $set_utf8:ident, $copy_w:ident, $update_utf8:ident, $clear:ident,
+     $copy_l:ident) => {
         pub fn $get_utf8(&mut self) -> Option<&CStr> {
             let mut g = lock(&self.cache);
             self.$field.get_utf8_c(g.as_deref_mut()).ok().flatten()
@@ -274,35 +257,36 @@ macro_rules! text_field {
 
         /// The string in the charset of `sc`; false if it did not convert
         /// completely.
-        #[allow(dead_code)] // for the format readers and writers
+        #[allow(dead_code)] // used by the format readers and writers (phases 3-4)
         pub fn $get_l(&mut self, sc: Option<&StringConv>) -> (Option<&[u8]>, bool) {
             let mut g = lock(&self.cache);
             self.$field.get_mbs_l(g.as_deref_mut(), sc)
         }
 
-        pub fn $set(&mut self, v: Option<&[u8]>) {
-            set_mbs(&mut self.$field, v);
+        pub fn $set(&mut self, v: &[u8]) {
+            store(&mut self.$field, Text::Mbs(v));
         }
 
-        pub fn $set_utf8(&mut self, v: Option<&[u8]>) {
-            set_utf8(&mut self.$field, v);
+        pub fn $set_utf8(&mut self, v: &[u8]) {
+            store(&mut self.$field, Text::Utf8(v));
         }
 
-        pub fn $copy_w(&mut self, v: Option<&[wchar_t]>) {
-            set_wcs(&mut self.$field, v);
+        pub fn $copy_w(&mut self, v: &[wchar_t]) {
+            store(&mut self.$field, Text::Wcs(v));
         }
 
-        pub fn $update_utf8(&mut self, v: Option<&[u8]>) -> bool {
-            update_utf8(&mut self.$field, &self.cache, v).is_ok()
+        pub fn $update_utf8(&mut self, v: &[u8]) -> bool {
+            update_utf8(&mut self.$field, &self.cache, v)
         }
 
-        #[allow(dead_code)] // for the format readers
-        pub fn $copy_l(
-            &mut self,
-            v: Option<&[u8]>,
-            sc: Option<&StringConv>,
-        ) -> Result<(), ConvFailed> {
-            set_mbs_l(&mut self.$field, v, sc)
+        /// Unsets the field, as C does when it passes NULL.
+        pub fn $clear(&mut self) {
+            self.$field.clear();
+        }
+
+        #[allow(dead_code)] // used by the format readers (phases 3-4)
+        pub fn $copy_l(&mut self, v: &[u8], sc: Option<&StringConv>) -> Result<(), ConvFailed> {
+            self.$field.copy_mbs_len_l(v, sc)
         }
     };
 }
@@ -318,8 +302,8 @@ macro_rules! time_field {
             i64::from(self.ae.$field.nsec)
         }
 
-        pub fn $is_set(&self) -> bool {
-            self.set & $bit != 0
+        pub fn $is_set(&self) -> c_int {
+            (self.set & $bit) as c_int
         }
 
         pub fn $set(&mut self, t: i64, ns: i64) {
@@ -374,6 +358,7 @@ impl Entry {
             sourcepath: MString::default(),
             encryption: 0,
             mac_metadata: Vec::new(),
+            mset_digest: 0,
             digest: [[0; 64]; 6],
             acl: Acl::default(),
             xattrs: Vec::new(),
@@ -439,8 +424,8 @@ impl Entry {
         }
     }
 
-    pub fn dev_is_set(&self) -> bool {
-        self.set & AE_SET_DEV != 0
+    pub fn dev_is_set(&self) -> c_int {
+        (self.set & AE_SET_DEV) as c_int
     }
 
     pub fn devmajor(&self) -> Dev {
@@ -463,8 +448,8 @@ impl Entry {
         AE_IFMT & self.acl.mode
     }
 
-    pub fn filetype_is_set(&self) -> bool {
-        self.set & AE_SET_FILETYPE != 0
+    pub fn filetype_is_set(&self) -> c_int {
+        (self.set & AE_SET_FILETYPE) as c_int
     }
 
     pub fn fflags(&self) -> (c_ulong, c_ulong) {
@@ -480,14 +465,14 @@ impl Entry {
     /// conversions are platform-specific (see below).
     pub fn fflags_text(&mut self) -> Option<&CStr> {
         let mut g = lock(&self.cache);
-        if matches!(self.fflags_text.get_mbs_c(g.as_deref_mut()), Ok(Some(_))) {
-            return self.fflags_text.get_mbs_c(g.as_deref_mut()).ok().flatten();
+        let has_text = matches!(self.fflags_text.get_mbs_c(g.as_deref_mut()), Ok(Some(_)));
+        if !has_text {
+            if self.fflags_set == 0 && self.fflags_clear == 0 {
+                return None;
+            }
+            let p = fflags_to_str(self.fflags_set, self.fflags_clear)?;
+            self.fflags_text.copy_mbs(&p);
         }
-        if self.fflags_set == 0 && self.fflags_clear == 0 {
-            return None;
-        }
-        let p = fflags_to_str(self.fflags_set, self.fflags_clear)?;
-        self.fflags_text.copy_mbs(&p);
         self.fflags_text.get_mbs_c(g.as_deref_mut()).ok().flatten()
     }
 
@@ -495,16 +480,16 @@ impl Entry {
         self.ae.gid
     }
 
-    pub fn gid_is_set(&self) -> bool {
-        self.set & AE_SET_GID != 0
+    pub fn gid_is_set(&self) -> c_int {
+        (self.set & AE_SET_GID) as c_int
     }
 
     pub fn ino(&self) -> i64 {
         self.ae.ino
     }
 
-    pub fn ino_is_set(&self) -> bool {
-        self.set & AE_SET_INO != 0
+    pub fn ino_is_set(&self) -> c_int {
+        (self.set & AE_SET_INO) as c_int
     }
 
     pub fn mode(&self) -> Mode {
@@ -519,16 +504,16 @@ impl Entry {
         !AE_IFMT & self.acl.mode
     }
 
-    pub fn perm_is_set(&self) -> bool {
-        self.set & AE_SET_PERM != 0
+    pub fn perm_is_set(&self) -> c_int {
+        (self.set & AE_SET_PERM) as c_int
     }
 
-    pub fn rdev_is_set(&self) -> bool {
-        self.set & AE_SET_RDEV != 0
+    pub fn rdev_is_set(&self) -> c_int {
+        (self.set & AE_SET_RDEV) as c_int
     }
 
     pub fn rdev(&self) -> Dev {
-        if !self.rdev_is_set() {
+        if self.rdev_is_set() == 0 {
             0
         } else if self.ae.rdev_is_broken_down {
             make_dev(self.ae.rdevmajor, self.ae.rdevminor)
@@ -538,7 +523,7 @@ impl Entry {
     }
 
     pub fn rdevmajor(&self) -> Dev {
-        if !self.rdev_is_set() {
+        if self.rdev_is_set() == 0 {
             0
         } else if self.ae.rdev_is_broken_down {
             self.ae.rdevmajor
@@ -548,7 +533,7 @@ impl Entry {
     }
 
     pub fn rdevminor(&self) -> Dev {
-        if !self.rdev_is_set() {
+        if self.rdev_is_set() == 0 {
             0
         } else if self.ae.rdev_is_broken_down {
             self.ae.rdevminor
@@ -561,8 +546,8 @@ impl Entry {
         self.ae.size as i64
     }
 
-    pub fn size_is_set(&self) -> bool {
-        self.set & AE_SET_SIZE != 0
+    pub fn size_is_set(&self) -> c_int {
+        (self.set & AE_SET_SIZE) as c_int
     }
 
     pub fn symlink_type(&self) -> c_int {
@@ -573,8 +558,8 @@ impl Entry {
         self.ae.uid
     }
 
-    pub fn uid_is_set(&self) -> bool {
-        self.set & AE_SET_UID != 0
+    pub fn uid_is_set(&self) -> c_int {
+        (self.set & AE_SET_UID) as c_int
     }
 
     pub fn is_data_encrypted(&self) -> bool {
@@ -585,8 +570,8 @@ impl Entry {
         self.encryption & AE_ENCRYPTION_METADATA == AE_ENCRYPTION_METADATA
     }
 
-    pub fn is_encrypted(&self) -> bool {
-        self.encryption & (AE_ENCRYPTION_DATA | AE_ENCRYPTION_METADATA) != 0
+    pub fn is_encrypted(&self) -> c_int {
+        c_int::from(self.encryption & (AE_ENCRYPTION_DATA | AE_ENCRYPTION_METADATA))
     }
 
     // Functions to set archive_entry properties.
@@ -742,11 +727,12 @@ impl Entry {
     }
 
     text_field!(gname: gname_utf8, gname_w, gname_l,
-        set_gname, set_gname_utf8, copy_gname_w, update_gname_utf8, copy_gname_l);
+        set_gname, set_gname_utf8, copy_gname_w, update_gname_utf8, clear_gname, copy_gname_l);
     text_field!(uname: uname_utf8, uname_w, uname_l,
-        set_uname, set_uname_utf8, copy_uname_w, update_uname_utf8, copy_uname_l);
+        set_uname, set_uname_utf8, copy_uname_w, update_uname_utf8, clear_uname, copy_uname_l);
     text_field!(pathname: pathname_utf8, pathname_w, pathname_l,
-        set_pathname, set_pathname_utf8, copy_pathname_w, update_pathname_utf8, copy_pathname_l);
+        set_pathname, set_pathname_utf8, copy_pathname_w, update_pathname_utf8, clear_pathname,
+        copy_pathname_l);
 
     pub fn gname(&mut self) -> Option<&CStr> {
         let mut g = lock(&self.cache);
@@ -782,12 +768,16 @@ impl Entry {
         self.sourcepath.get_wcs_z(g.as_deref_mut()).ok().flatten()
     }
 
-    pub fn set_sourcepath(&mut self, path: Option<&[u8]>) {
-        set_mbs(&mut self.sourcepath, path);
+    pub fn set_sourcepath(&mut self, path: &[u8]) {
+        store(&mut self.sourcepath, Text::Mbs(path));
     }
 
-    pub fn copy_sourcepath_w(&mut self, path: Option<&[wchar_t]>) {
-        set_wcs(&mut self.sourcepath, path);
+    pub fn copy_sourcepath_w(&mut self, path: &[wchar_t]) {
+        store(&mut self.sourcepath, Text::Wcs(path));
+    }
+
+    pub fn clear_sourcepath(&mut self) {
+        self.sourcepath.clear();
     }
 
     // The link target is one string for both kinds of link.
@@ -802,8 +792,8 @@ impl Entry {
         self.set |= AE_SET_SYMLINK;
     }
 
-    pub fn hardlink_is_set(&self) -> bool {
-        self.set & AE_SET_HARDLINK != 0
+    pub fn hardlink_is_set(&self) -> c_int {
+        (self.set & AE_SET_HARDLINK) as c_int
     }
 
     pub fn hardlink(&mut self) -> Option<&CStr> {
@@ -872,171 +862,149 @@ impl Entry {
         self.linkname.get_mbs_l(g.as_deref_mut(), sc)
     }
 
-    pub fn set_hardlink(&mut self, target: Option<&[u8]>) {
-        if target.is_none() {
-            self.set &= !AE_SET_HARDLINK;
-            if self.set & AE_SET_SYMLINK != 0 {
-                return;
-            }
-        } else {
-            self.set |= AE_SET_HARDLINK;
-        }
+    // The setters of the link target. A NULL target of C has its own
+    // `unset_*` method, which leaves the other kind of link alone and
+    // returns false if it had to.
+
+    /// Stores a hardlink target. Unlike the other setters, `set_hardlink`
+    /// also unsets a symlink.
+    fn put_hardlink(&mut self, t: Text) {
+        store(&mut self.linkname, t);
+        self.set |= AE_SET_HARDLINK;
+    }
+
+    pub fn set_hardlink(&mut self, target: &[u8]) {
         self.set &= !AE_SET_SYMLINK;
-        set_mbs(&mut self.linkname, target);
+        self.put_hardlink(Text::Mbs(target));
     }
 
-    /// Whether a link setter that would clear the other kind of link leaves
-    /// the entry alone: it does when it unsets the link but the other kind
-    /// is set.
-    fn keeps_other_link(&self, target_is_none: bool, other: u32) -> bool {
-        target_is_none && self.set & other != 0
+    pub fn set_hardlink_utf8(&mut self, target: &[u8]) {
+        self.put_hardlink(Text::Utf8(target));
     }
 
-    pub fn set_hardlink_utf8(&mut self, target: Option<&[u8]>) {
-        if self.keeps_other_link(target.is_none(), AE_SET_SYMLINK) {
-            return;
-        }
-        set_utf8(&mut self.linkname, target);
-        self.mark_hardlink(target.is_some());
+    pub fn copy_hardlink(&mut self, target: &[u8]) {
+        self.put_hardlink(Text::Mbs(target));
     }
 
-    pub fn copy_hardlink(&mut self, target: Option<&[u8]>) {
-        if self.keeps_other_link(target.is_none(), AE_SET_SYMLINK) {
-            return;
-        }
-        set_mbs(&mut self.linkname, target);
-        self.mark_hardlink(target.is_some());
+    pub fn copy_hardlink_w(&mut self, target: &[wchar_t]) {
+        self.put_hardlink(Text::Wcs(target));
     }
 
-    pub fn copy_hardlink_w(&mut self, target: Option<&[wchar_t]>) {
-        if self.keeps_other_link(target.is_none(), AE_SET_SYMLINK) {
-            return;
-        }
-        set_wcs(&mut self.linkname, target);
-        self.mark_hardlink(target.is_some());
+    pub fn update_hardlink_utf8(&mut self, target: &[u8]) -> bool {
+        self.set |= AE_SET_HARDLINK;
+        update_utf8(&mut self.linkname, &self.cache, target)
     }
 
-    fn mark_hardlink(&mut self, is_set: bool) {
-        if is_set {
-            self.set |= AE_SET_HARDLINK;
-        } else {
-            self.set &= !AE_SET_HARDLINK;
-        }
-    }
-
-    pub fn update_hardlink_utf8(&mut self, target: Option<&[u8]>) -> bool {
-        if self.keeps_other_link(target.is_none(), AE_SET_SYMLINK) {
-            return false;
-        }
-        self.mark_hardlink(target.is_some());
-        update_utf8(&mut self.linkname, &self.cache, target).is_ok()
-    }
-
-    #[allow(dead_code)] // for the format readers
+    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn copy_hardlink_l(
         &mut self,
-        target: Option<&[u8]>,
+        target: &[u8],
         sc: Option<&StringConv>,
     ) -> Result<(), ConvFailed> {
-        if self.keeps_other_link(target.is_none(), AE_SET_SYMLINK) {
-            return Ok(());
-        }
-        let r = set_mbs_l(&mut self.linkname, target, sc);
-        self.mark_hardlink(target.is_some() && r.is_ok());
+        let r = self.linkname.copy_mbs_len_l(target, sc);
+        self.set = (self.set & !AE_SET_HARDLINK) | if r.is_ok() { AE_SET_HARDLINK } else { 0 };
         r
     }
 
+    pub fn unset_hardlink(&mut self) -> bool {
+        if self.set & AE_SET_SYMLINK != 0 {
+            return false;
+        }
+        self.set &= !AE_SET_HARDLINK;
+        self.linkname.clear();
+        true
+    }
+
+    fn put_symlink(&mut self, t: Text) {
+        self.set &= !AE_SET_HARDLINK;
+        store(&mut self.linkname, t);
+        self.set |= AE_SET_SYMLINK;
+    }
+
+    pub fn set_symlink(&mut self, linkname: &[u8]) {
+        self.put_symlink(Text::Mbs(linkname));
+    }
+
+    pub fn set_symlink_utf8(&mut self, linkname: &[u8]) {
+        self.put_symlink(Text::Utf8(linkname));
+    }
+
+    pub fn copy_symlink_w(&mut self, linkname: &[wchar_t]) {
+        self.put_symlink(Text::Wcs(linkname));
+    }
+
+    pub fn update_symlink_utf8(&mut self, linkname: &[u8]) -> bool {
+        self.set = (self.set & !AE_SET_HARDLINK) | AE_SET_SYMLINK;
+        update_utf8(&mut self.linkname, &self.cache, linkname)
+    }
+
+    #[allow(dead_code)] // used by the format readers (phases 3-4)
+    pub fn copy_symlink_l(
+        &mut self,
+        linkname: &[u8],
+        sc: Option<&StringConv>,
+    ) -> Result<(), ConvFailed> {
+        self.set &= !AE_SET_HARDLINK;
+        let r = self.linkname.copy_mbs_len_l(linkname, sc);
+        self.set = (self.set & !AE_SET_SYMLINK) | if r.is_ok() { AE_SET_SYMLINK } else { 0 };
+        r
+    }
+
+    pub fn unset_symlink(&mut self) -> bool {
+        if self.set & AE_SET_HARDLINK != 0 {
+            return false;
+        }
+        self.set &= !(AE_SET_HARDLINK | AE_SET_SYMLINK);
+        self.linkname.clear();
+        true
+    }
+
     /// Set symlink if symlink is already set, else set hardlink.
-    fn mark_link(&mut self) {
+    fn put_link(&mut self, t: Option<Text>) {
+        match t {
+            Some(t) => store(&mut self.linkname, t),
+            None => self.linkname.clear(),
+        }
+        self.put_link_flag();
+    }
+
+    fn put_link_flag(&mut self) {
         if self.set & AE_SET_SYMLINK == 0 {
             self.set |= AE_SET_HARDLINK;
         }
     }
 
-    pub fn set_link(&mut self, target: Option<&[u8]>) {
-        set_mbs(&mut self.linkname, target);
-        self.mark_link();
+    pub fn set_link(&mut self, target: &[u8]) {
+        self.put_link(Some(Text::Mbs(target)));
     }
 
-    pub fn set_link_utf8(&mut self, target: Option<&[u8]>) {
-        set_utf8(&mut self.linkname, target);
-        self.mark_link();
+    pub fn set_link_utf8(&mut self, target: &[u8]) {
+        self.put_link(Some(Text::Utf8(target)));
     }
 
-    pub fn copy_link_w(&mut self, target: Option<&[wchar_t]>) {
-        set_wcs(&mut self.linkname, target);
-        self.mark_link();
+    pub fn copy_link_w(&mut self, target: &[wchar_t]) {
+        self.put_link(Some(Text::Wcs(target)));
     }
 
-    pub fn update_link_utf8(&mut self, target: Option<&[u8]>) -> bool {
+    pub fn update_link_utf8(&mut self, target: &[u8]) -> bool {
         let r = update_utf8(&mut self.linkname, &self.cache, target);
-        self.mark_link();
-        r.is_ok()
-    }
-
-    #[allow(dead_code)] // for the format readers
-    pub fn copy_link_l(
-        &mut self,
-        target: Option<&[u8]>,
-        sc: Option<&StringConv>,
-    ) -> Result<(), ConvFailed> {
-        let r = set_mbs_l(&mut self.linkname, target, sc);
-        self.mark_link();
+        self.put_link_flag();
         r
     }
 
-    fn mark_symlink(&mut self, is_set: bool) {
-        self.set &= !AE_SET_HARDLINK;
-        if is_set {
-            self.set |= AE_SET_SYMLINK;
-        } else {
-            self.set &= !AE_SET_SYMLINK;
-        }
+    /// C's NULL target: the link is emptied but still counts as a link.
+    pub fn unset_link(&mut self) {
+        self.put_link(None);
     }
 
-    pub fn set_symlink(&mut self, linkname: Option<&[u8]>) {
-        if self.keeps_other_link(linkname.is_none(), AE_SET_HARDLINK) {
-            return;
-        }
-        set_mbs(&mut self.linkname, linkname);
-        self.mark_symlink(linkname.is_some());
-    }
-
-    pub fn set_symlink_utf8(&mut self, linkname: Option<&[u8]>) {
-        if self.keeps_other_link(linkname.is_none(), AE_SET_HARDLINK) {
-            return;
-        }
-        set_utf8(&mut self.linkname, linkname);
-        self.mark_symlink(linkname.is_some());
-    }
-
-    pub fn copy_symlink_w(&mut self, linkname: Option<&[wchar_t]>) {
-        if self.keeps_other_link(linkname.is_none(), AE_SET_HARDLINK) {
-            return;
-        }
-        set_wcs(&mut self.linkname, linkname);
-        self.mark_symlink(linkname.is_some());
-    }
-
-    pub fn update_symlink_utf8(&mut self, linkname: Option<&[u8]>) -> bool {
-        if self.keeps_other_link(linkname.is_none(), AE_SET_HARDLINK) {
-            return false;
-        }
-        self.mark_symlink(linkname.is_some());
-        update_utf8(&mut self.linkname, &self.cache, linkname).is_ok()
-    }
-
-    #[allow(dead_code)] // for the format readers
-    pub fn copy_symlink_l(
+    #[allow(dead_code)] // used by the format readers (phases 3-4)
+    pub fn copy_link_l(
         &mut self,
-        linkname: Option<&[u8]>,
+        target: &[u8],
         sc: Option<&StringConv>,
     ) -> Result<(), ConvFailed> {
-        if self.keeps_other_link(linkname.is_none(), AE_SET_HARDLINK) {
-            return Ok(());
-        }
-        let r = set_mbs_l(&mut self.linkname, linkname, sc);
-        self.mark_symlink(linkname.is_some() && r.is_ok());
+        let r = self.linkname.copy_mbs_len_l(target, sc);
+        self.put_link_flag();
         r
     }
 
@@ -1045,8 +1013,9 @@ impl Entry {
         (!self.mac_metadata.is_empty()).then_some(self.mac_metadata.as_slice())
     }
 
-    pub fn copy_mac_metadata(&mut self, p: Option<&[u8]>) {
-        self.mac_metadata = p.unwrap_or_default().to_vec();
+    /// Sets the metadata; empty metadata is none.
+    pub fn copy_mac_metadata(&mut self, p: &[u8]) {
+        self.mac_metadata = p.to_vec();
     }
 
     /// Digest handling.
@@ -1063,6 +1032,7 @@ impl Entry {
         match slot {
             Some((slot, digest)) => {
                 slot.copy_from_slice(digest);
+                self.mset_digest |= 1 << (ty - DIGEST_MD5);
                 ARCHIVE_OK
             }
             None => ARCHIVE_WARN,
@@ -1264,6 +1234,7 @@ const FILEFLAGS: &[Flag] = &[
     flag!(libc::SF_APPEND, 0; "nosappnd", "nosappend"),
     flag!(libc::SF_ARCHIVED, 0; "noarch", "noarchived"),
     flag!(libc::SF_IMMUTABLE, 0; "noschg", "noschange", "nosimmutable"),
+    flag!(0x0010_0000, 0; "nosunlnk", "nosunlink"), // SF_NOUNLINK
     flag!(libc::UF_APPEND, 0; "nouappnd", "nouappend"),
     flag!(libc::UF_IMMUTABLE, 0; "nouchg", "nouchange", "nouimmutable"),
     flag!(0, libc::UF_NODUMP; "nodump"),
@@ -1389,24 +1360,24 @@ mod tests {
         e.set_mtime(5, 2_500_000_000);
         assert_eq!((e.atime(), e.atime_nsec()), (0, 999_999_999));
         assert_eq!((e.mtime(), e.mtime_nsec()), (7, 500_000_000));
-        assert!(e.atime_is_set());
+        assert_eq!(e.atime_is_set(), 4);
         e.unset_atime();
-        assert_eq!((e.atime(), e.atime_nsec(), e.atime_is_set()), (0, 0, false));
+        assert_eq!((e.atime(), e.atime_nsec(), e.atime_is_set()), (0, 0, 0));
     }
 
     #[test]
     fn links_share_one_target() {
         let mut e = Entry::new(None);
-        e.set_symlink(Some(b"target"));
+        e.set_symlink(b"target");
         assert_eq!(e.symlink().map(CStr::to_bytes), Some(&b"target"[..]));
         assert!(e.hardlink().is_none());
         // Unsetting a hardlink leaves a symlink alone.
-        e.set_hardlink(None);
+        assert!(!e.unset_hardlink());
         assert!(e.symlink().is_some());
-        e.set_hardlink(Some(b"other"));
+        e.set_hardlink(b"other");
         assert!(e.symlink().is_none());
         assert_eq!(e.hardlink().map(CStr::to_bytes), Some(&b"other"[..]));
-        assert!(!e.update_symlink_utf8(None));
+        assert!(!e.unset_symlink());
     }
 
     #[test]
@@ -1437,7 +1408,7 @@ mod tests {
     fn clone_copies_fields_and_shares_the_cache() {
         let cache = Cache::default();
         let mut e = Entry::new(Some(cache.clone()));
-        e.set_pathname(Some(b"file"));
+        e.set_pathname(b"file");
         e.set_size(100);
         e.xattr_add(c"a", b"1");
         e.xattr_add(c"b", b"2");
@@ -1481,9 +1452,27 @@ mod tests {
     }
 
     #[test]
+    fn is_set_reports_bits_and_encryption_is_masked() {
+        let mut e = Entry::new(None);
+        e.set_size(1);
+        e.set_ctime(1, 0);
+        e.set_uid(1);
+        assert_eq!(
+            (e.size_is_set(), e.ctime_is_set(), e.uid_is_set()),
+            (64, 8, 2048)
+        );
+        e.set_is_metadata_encrypted(true);
+        assert_eq!((e.is_encrypted(), e.is_data_encrypted()), (2, false));
+        e.set_is_data_encrypted(true);
+        assert_eq!(e.is_encrypted(), 3);
+    }
+
+    #[test]
     fn digests_have_fixed_sizes() {
         let mut e = Entry::new(None);
         assert_eq!(e.set_digest(1, &[7; 16]), ARCHIVE_OK);
+        assert_eq!(e.set_digest(3, &[7; 20]), ARCHIVE_OK);
+        assert_eq!(e.mset_digest, 0b101);
         assert_eq!(e.digest(1), Some(&[7; 16][..]));
         assert_eq!(e.digest(4).map(<[u8]>::len), Some(32));
         assert_eq!(e.set_digest(7, &[0; 64]), ARCHIVE_WARN);
