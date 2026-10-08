@@ -165,6 +165,7 @@ impl Base {
     /// Records a warning, as `archive_set_error` before `return
     /// ARCHIVE_WARN`, and gives the status to return.
     #[must_use = "return the status so the warning reaches the caller"]
+    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn warn(&self, errno: c_int, msg: impl AsRef<[u8]>) -> Status {
         self.set_error(errno, Some(msg.as_ref()));
         Status::Warn
@@ -897,12 +898,11 @@ pub struct Reader<'a> {
     passphrases: &'a mut Passphrases,
 }
 
-// What the format readers and filters (phases 2-4) call; the tests use all of it.
-#[allow(dead_code)]
 impl<'a> Reader<'a> {
     /// The handle, to record warnings and set the format. The reference does
     /// not borrow the reader, so it can be used while a `read_ahead` slice is
     /// held: take it first, `let a = r.base();`.
+    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn base(&self) -> &'a Base {
         self.a
     }
@@ -961,6 +961,7 @@ impl<'a> Reader<'a> {
     /// Reads the next `n` bytes into a `Vec` and consumes them, or `None`
     /// (nothing consumed) if the input ends first. For fixed-size fields a
     /// format keeps, where a `read_ahead` slice would be in the way.
+    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn read_exact_vec(&mut self, n: usize) -> Result<Option<Vec<u8>>, Error> {
         let Some(data) = self.read_ahead(n)? else {
             return Ok(None);
@@ -973,6 +974,7 @@ impl<'a> Reader<'a> {
     /// Consumes `n` bytes that a `read_ahead` (or `peek_available`) just
     /// showed were there: `consume`, but running out is a bug in the caller,
     /// which debug builds assert on, rather than a truncated input.
+    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn consume_ahead(&mut self, n: usize) -> Result<(), Error> {
         self.flush()?;
         debug_assert!(
@@ -987,6 +989,7 @@ impl<'a> Reader<'a> {
     /// `__archive_read_consume`: moves the file pointer forward by `n`, which
     /// the reader should have looked at (or not) first. It is a fatal error
     /// for the stream to end first, or for `n` to be negative.
+    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn consume(&mut self, n: impl TryInto<i64>) -> Result<(), Error> {
         self.flush()?;
         self.consume_now(n)
@@ -1037,6 +1040,7 @@ impl<'a> Reader<'a> {
     /// skip where it has one, and returns how far it moved: less than `n`
     /// only at the end of the stream. `consume` is this with the end of the
     /// stream being an error.
+    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn skip(&mut self, n: i64) -> Result<i64, Error> {
         self.flush()?;
         if n < 0 {
@@ -1074,6 +1078,7 @@ impl<'a> Reader<'a> {
 
     /// Whether `seek` can work. Seeking is only possible if the client seeks
     /// and no filter is in the way.
+    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn can_seek(&self) -> bool {
         self.chain.last().is_some_and(|s| s.can_seek)
     }
@@ -1085,18 +1090,21 @@ impl<'a> Reader<'a> {
 
     /// Records a warning; return the `Status` it gives to say so.
     #[must_use = "return the status so the warning reaches the caller"]
+    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn warn(&self, errno: c_int, msg: impl AsRef<[u8]>) -> Status {
         self.a.warn(errno, msg)
     }
 
     /// `__archive_read_reset_passphrase`: call when you start looking for a
     /// passphrase for an entry.
+    #[allow(dead_code)] // used by the zip, rar and 7zip readers (phase 4)
     pub fn reset_passphrase(&mut self) {
         self.passphrases.reset();
     }
 
     /// `__archive_read_next_passphrase`: the next passphrase to try, `None`
     /// when the candidates and the client's callback have run out.
+    #[allow(dead_code)] // used by the zip, rar and 7zip readers (phase 4)
     pub fn next_passphrase(&mut self) -> Option<Vec<u8>> {
         self.passphrases.next()
     }

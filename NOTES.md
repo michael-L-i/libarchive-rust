@@ -93,6 +93,9 @@ Divergences:
   holds: macOS and glibc. musl defines neither, so on musl upstream would
   enable it; musl is not a supported target for this option here.
 - `archive_string_sprintf` is not ported; callers use `format!`.
+- `archive_string_default_conversion_for_read` and `_for_write` are not
+  ported: only Windows has one, so the readers and writers pass no
+  conversion.
 - Output is not NUL-terminated and buffers are `Vec`s, so the buffer-extent
   assertions of `test_archive_string` have no equivalent.
 - A string conversion error is returned as `ConvError { errno, message }`

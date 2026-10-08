@@ -32,10 +32,6 @@
 // compatibility converter (its option is a no-op wherever `wchar_t` is
 // Unicode: macOS and glibc; musl is not supported for this).
 
-// The API is consumed by `archive_entry` and the format readers, which land
-// after this unit.
-#![allow(dead_code)]
-
 use crate::ffi::charset::{self, Iconv, IconvStatus};
 use crate::string_composition::{
     CCC_INDEX, CCC_VAL, CCC_VAL_INDEX, U_COMPOSITION_TABLE, U_DECOMPOSABLE_BLOCKS,
@@ -62,8 +58,11 @@ const SCONV_FROM_UTF16LE: u32 = 1 << 13;
 const SCONV_TO_UTF16: u32 = SCONV_TO_UTF16BE | SCONV_TO_UTF16LE;
 const SCONV_FROM_UTF16: u32 = SCONV_FROM_UTF16BE | SCONV_FROM_UTF16LE;
 
+#[allow(dead_code)] // for `set_opt`'s callers, the tar reader (phase 4)
 pub(crate) const SCONV_SET_OPT_UTF8_LIBARCHIVE2X: i32 = 1;
+#[allow(dead_code)] // for `set_opt`'s callers, the tar reader (phase 4)
 pub(crate) const SCONV_SET_OPT_NORMALIZATION_C: i32 = 2;
+#[allow(dead_code)] // for `set_opt`'s callers, the tar reader (phase 4)
 pub(crate) const SCONV_SET_OPT_NORMALIZATION_D: i32 = 4;
 
 const UNICODE_MAX: u32 = 0x10FFFF;
@@ -116,6 +115,7 @@ fn skip(s: &[u8], n: i32) -> &[u8] {
 }
 
 /// Equivalent to dirname(3).
+#[allow(dead_code)] // used by the mtree reader (phase 3) and the disk code (phase 5)
 pub(crate) fn string_dirname(s: &mut Vec<u8>) {
     // strip trailing separators
     while s.len() > 1 && s.last() == Some(&b'/') {
@@ -1176,6 +1176,7 @@ impl StringConv {
     }
 
     /// Change the behavior of a string conversion.
+    #[allow(dead_code)] // used by the tar reader (phase 4)
     pub(crate) fn set_opt(&self, opt: i32) {
         let mut st = self.state();
         match opt {
@@ -1210,6 +1211,7 @@ impl StringConv {
 }
 
 /// The name of the charset a conversion goes to or from, for messages.
+#[allow(dead_code)] // used by the format readers and writers (phases 3-5)
 pub(crate) fn conversion_charset_name(sc: Option<&StringConv>) -> &[u8] {
     match sc {
         None => b"current locale",
@@ -1407,16 +1409,6 @@ pub(crate) fn conversion_from_charset(
     get_sconv_object(a, charset, &current, flag)
 }
 
-/// The default conversions for reading and writing an archive. Only Windows
-/// has one (between the ANSI and OEM code pages); everywhere else no
-/// conversion is needed.
-pub(crate) fn default_conversion_for_read() -> Option<Arc<StringConv>> {
-    None
-}
-
-pub(crate) fn default_conversion_for_write() -> Option<Arc<StringConv>> {
-    None
-}
 
 /// Copy `src` to `out` (replacing its contents) in locale conversion.
 /// On failure `out` holds the partial output.
@@ -1742,30 +1734,12 @@ impl MString {
         Ok(self.get_utf8_z(a)?.map(as_cstr))
     }
 
-    /// `get_mbs_l_z` as a C string.
-    pub(crate) fn get_mbs_l_c(
-        &mut self,
-        a: Option<&mut ConvCache>,
-        sc: Option<&StringConv>,
-    ) -> (Option<&CStr>, bool) {
-        let (s, ok) = self.get_mbs_l_z(a, sc);
-        (s.map(as_cstr), ok)
-    }
-
     /// The locale multibyte form without the terminator.
     pub(crate) fn get_mbs(
         &mut self,
         a: Option<&mut ConvCache>,
     ) -> Result<Option<&[u8]>, ConvFailed> {
         Ok(self.get_mbs_z(a)?.map(unterminated))
-    }
-
-    /// The UTF-8 form without the terminator.
-    pub(crate) fn get_utf8(
-        &mut self,
-        a: Option<&mut ConvCache>,
-    ) -> Result<Option<&[u8]>, ConvFailed> {
-        Ok(self.get_utf8_z(a)?.map(unterminated))
     }
 
     /// The wide-character form without the terminator.
@@ -2167,7 +2141,7 @@ mod tests {
         let mut m = mstr.clone();
         assert_eq!(m.get_mbs(Some(a)).unwrap(), Some(exp.as_bytes()));
         let mut m = mstr.clone();
-        assert_eq!(m.get_utf8(Some(a)).unwrap(), Some(exp.as_bytes()));
+        assert_eq!(m.get_utf8_c(Some(a)).unwrap().map(CStr::to_bytes), Some(exp.as_bytes()));
         let mut m = mstr.clone();
         assert_eq!(m.get_wcs(Some(a)).unwrap(), Some(wexp));
         let mut m = mstr.clone();
@@ -2495,8 +2469,7 @@ mod tests {
         assert_eq!(m.get_utf8_c(None).unwrap().unwrap().to_bytes(), b"hi");
         assert_eq!(m.get_mbs_c(None).unwrap().unwrap().to_bytes(), b"hi");
         assert_eq!(m.get_wcs_z(None).unwrap(), Some(&[0x68, 0x69, 0][..]));
-        let (c, ok) = m.get_mbs_l_c(None, None);
-        assert!(ok && c.unwrap().to_bytes() == b"hi");
+        assert_eq!(m.get_mbs_l_z(None, None), (Some(&b"hi\0"[..]), true));
         // An already-set form is not rewritten by a getter.
         let before = m.get_utf8_z(None).unwrap().unwrap().as_ptr();
         let _ = m.get_wcs_z(None);
