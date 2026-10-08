@@ -14,5 +14,7 @@ module, and the oracle tests that must pass.
 3. Iterate until the named tests pass and `cargo clippy -- -D warnings` is
    clean.
 
-Don't commit. Report back: files changed, tests now passing, tests still
-failing, and any upstream behavior you suspect is a bug.
+Commit incrementally in upstream style (AGENTS.md, Commits). Every commit
+builds, is clippy clean and holds the ratchet. Report back: the commit range,
+tests now passing, tests still failing, and any upstream behavior you suspect
+is a bug.

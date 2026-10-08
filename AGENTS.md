@@ -61,6 +61,23 @@ Naming rule, so upstream diffs map to modules mechanically:
 The crate builds `libarchive.{so,dylib,a}`: `[lib] name = "archive"`,
 `crate-type = ["cdylib", "staticlib", "rlib"]`.
 
+## FFI conventions
+
+- A `struct archive *` is a leaked `Box<Handle>` (`src/archive.rs`): the state
+  every kind shares (magic, state, error, format) plus a `Kind` enum for read,
+  write, write-disk, read-disk and match. A `struct archive_entry *` is a
+  leaked `Box<Entry>`. The `*_free` functions reclaim them.
+- Exported functions are thin: check the handle with the port of
+  `__archive_check_magic` (same messages, same state machine), run the body
+  under `guard`, convert arguments, call safe Rust, convert the result back.
+- Archive strings are bytes (`Vec<u8>`, `&[u8]`), never `String`; pathnames
+  aren't UTF-8.
+- A returned `const char *` points into a `CString` owned by the handle or
+  entry, valid until that field changes or the object is freed, as upstream
+  promises.
+- libc (locale, iconv, file descriptors, stat) is reached only through safe
+  wrappers in `src/ffi/`.
+
 ## Oracle
 
 Upstream decides correctness, not tests we write.
@@ -119,7 +136,7 @@ library unchanged and serve as integration tests. Windows-only files come last.
 
 **Orchestrator: Sonnet 5.5** (`claude-sonnet-5-5`, set in
 `.claude/settings.json`). It picks units, dispatches subagents, runs the
-oracle, updates `STATUS.md` and commits. It does not write large ports itself.
+oracle, merges and updates `STATUS.md`. It does not write large ports itself.
 
 **Subagents: Haiku 5.5** (`claude-haiku-5-5`) by default. Use **Sonnet 5.5**
 when a unit is:
@@ -136,14 +153,16 @@ Pass `model: "sonnet"` on the Agent call to escalate.
 Per unit:
 
 1. `porter` ports one unit (one upstream file, or one function group of a large
-   file) until its oracle tests pass.
-2. `reviewer`, in a fresh context with only the diff and the upstream file,
-   checks memory safety, fidelity and concision. Use the porter's model or
-   higher. `STOP` blocks the commit.
-3. The orchestrator runs the oracle, updates `STATUS.md` and commits.
+   file) until its oracle tests pass, committing incrementally as it goes.
+2. `reviewer`, in a fresh context with only the unit's commit range and the
+   upstream file, checks memory safety, fidelity and concision. Use the
+   porter's model or higher. `STOP` means the porter fixes it in follow-up
+   commits before the unit is merged.
+3. The orchestrator runs the full oracle, merges and updates `STATUS.md`.
 
-Run units in parallel only when they touch different files. Phase 1 is serial;
-the readers in phases 3–4 parallelize well.
+Parallel units run in separate git worktrees, one branch per unit, and touch
+different files. Phase 1 is mostly serial; the readers in phases 3–4
+parallelize well.
 
 ## Commits
 
