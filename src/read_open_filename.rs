@@ -25,8 +25,6 @@
 
 // Ported from libarchive/archive_read_open_filename.c.
 
-#![allow(dead_code)] // exported by ffi next
-
 //! The client behind `archive_read_open_filename`: reads an archive from
 //! one file, or from several, one after another (a multi-volume archive).
 //! A missing name is the standard input.

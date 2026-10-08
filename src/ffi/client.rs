@@ -173,3 +173,42 @@ impl Client for CClient {
         status(unsafe { switcher(self.archive, self.data(from), self.data(to)) })
     }
 }
+
+/// A block of memory the C caller lent for the life of the archive, for
+/// `archive_read_open_memory`.
+pub struct UserMem {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl UserMem {
+    /// `None` if `ptr` and `len` can't describe a slice.
+    ///
+    /// # Safety
+    ///
+    /// If `ptr` is not NULL, `len` bytes at `ptr` must stay readable and
+    /// unchanged until the `UserMem` is dropped, which the C caller promises
+    /// by passing them to `archive_read_open_memory`.
+    pub unsafe fn new(ptr: *const c_void, len: usize) -> Option<UserMem> {
+        if len == 0 {
+            return Some(UserMem {
+                ptr: std::ptr::null(),
+                len: 0,
+            });
+        }
+        (!ptr.is_null() && len <= isize::MAX as usize).then_some(UserMem {
+            ptr: ptr.cast(),
+            len,
+        })
+    }
+}
+
+impl AsRef<[u8]> for UserMem {
+    fn as_ref(&self) -> &[u8] {
+        if self.ptr.is_null() {
+            return &[];
+        }
+        // SAFETY: `new`'s contract.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}

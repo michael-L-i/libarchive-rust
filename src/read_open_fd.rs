@@ -25,8 +25,6 @@
 
 // Ported from libarchive/archive_read_open_fd.c.
 
-#![allow(dead_code)] // exported by ffi next
-
 //! The client behind `archive_read_open_fd`: reads an archive from a file
 //! descriptor the caller owns.
 

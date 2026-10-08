@@ -18,7 +18,7 @@ use std::ffi::{c_int, c_uint, c_void};
 /// Runs `f` on the read state of a handle that has passed its magic check.
 /// A re-entrant call from a client callback finds the state in use and gets
 /// `fallback`.
-fn with_read<T>(h: &Handle, fallback: T, f: impl FnOnce(&mut Read) -> T) -> T {
+pub(super) fn with_read<T>(h: &Handle, fallback: T, f: impl FnOnce(&mut Read) -> T) -> T {
     match &h.kind {
         Kind::Read(r) => r.try_borrow_mut().map_or(fallback, |mut r| f(&mut r)),
     }
@@ -336,12 +336,12 @@ pub extern "C" fn archive_read_extract_set_skip_file(a: *mut Archive, dev: i64, 
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::ffi::archive::{archive_error_string, archive_free};
     use std::ffi::CStr;
 
-    fn error(a: *mut Archive) -> Option<String> {
+    pub(in crate::ffi) fn error(a: *mut Archive) -> Option<String> {
         let p = archive_error_string(a);
         // SAFETY: the library returns NULL or a NUL-terminated string.
         (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
@@ -401,14 +401,14 @@ mod tests {
         }
     }
 
-    fn register_anything(a: *mut Archive) {
+    pub(in crate::ffi) fn register_anything(a: *mut Archive) {
         with(a, (), |h| {
             with_read(h, (), |r| r.register_format(Box::new(Anything)).unwrap());
         });
     }
 
     /// Everything the chain will give, three bytes at a time at most.
-    fn drain(a: *mut Archive) -> Vec<u8> {
+    pub(in crate::ffi) fn drain(a: *mut Archive) -> Vec<u8> {
         let mut out = Vec::new();
         with(a, (), |h| {
             with_read(h, (), |r| {

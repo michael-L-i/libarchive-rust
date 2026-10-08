@@ -11,6 +11,7 @@ pub(crate) mod client;
 pub(crate) mod entry;
 mod entry_link_resolver;
 mod read;
+mod read_open;
 #[rustfmt::skip]
 mod stubs;
 pub(crate) mod charset;

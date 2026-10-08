@@ -25,8 +25,6 @@
 
 // Ported from libarchive/archive_read_open_file.c.
 
-#![allow(dead_code)] // exported by ffi next
-
 //! The client behind `archive_read_open_FILE`: reads an archive from a C
 //! `FILE *` the caller owns.
 

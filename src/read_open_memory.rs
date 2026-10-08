@@ -25,8 +25,6 @@
 
 // Ported from libarchive/archive_read_open_memory.c.
 
-#![allow(dead_code)] // exported by ffi next
-
 //! The client behind `archive_read_open_memory`: reads an archive from a
 //! block of memory. Mostly a huge help in building test harnesses; test
 //! programs can build archives in memory and read them back again without
