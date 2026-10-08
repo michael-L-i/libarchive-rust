@@ -28,7 +28,7 @@
 //! State shared by every kind of `struct archive` handle.
 
 use crate::util::Error;
-use std::ffi::{CStr, CString, c_int};
+use std::ffi::{CStr, c_int};
 
 pub const ARCHIVE_EOF: c_int = 1;
 pub const ARCHIVE_OK: c_int = 0;
@@ -83,8 +83,13 @@ pub struct Base {
     /// Number of file entries processed.
     pub file_count: c_int,
     pub errno: c_int,
-    /// The message `archive_error_string` returns a pointer into.
-    pub error: Option<CString>,
+    /// `archive_error_string`'s storage: the message and a NUL, rewritten in
+    /// place so a pointer to it stays valid until the buffer has to grow or
+    /// the handle is freed. Empty until the first message.
+    pub error: Vec<u8>,
+    /// Whether `archive_error_string` reports the buffer; `archive_set_error`
+    /// without a message hides it without clearing it.
+    pub error_shown: bool,
 }
 
 impl Base {
@@ -96,7 +101,8 @@ impl Base {
             format_name: None,
             file_count: 0,
             errno: 0,
-            error: None,
+            error: Vec::new(),
+            error_shown: false,
         }
     }
 }

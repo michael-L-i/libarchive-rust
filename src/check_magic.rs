@@ -108,7 +108,9 @@ mod tests {
     use super::*;
 
     fn error(a: &Base) -> &str {
-        a.error_string().and_then(|e| e.to_str().ok()).unwrap_or("")
+        a.error_string()
+            .and_then(|e| std::str::from_utf8(e).ok())
+            .unwrap_or("")
     }
 
     #[test]

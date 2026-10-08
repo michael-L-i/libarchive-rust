@@ -50,6 +50,7 @@ archive_set_error(struct archive *a, int error_number, const char *fmt, ...)
 	if (msg != NULL)
 		vsnprintf(msg, (size_t)n + 1, fmt, ap2);
 	va_end(ap2);
-	__archive_rs_set_error(a, error_number, msg);
+	/* Formatting failed (e.g. an unconvertible %ls): keep the raw format. */
+	__archive_rs_set_error(a, error_number, msg != NULL ? msg : fmt);
 	free(msg);
 }

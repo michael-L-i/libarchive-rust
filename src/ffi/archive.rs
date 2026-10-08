@@ -83,7 +83,11 @@ pub extern "C" fn archive_errno(a: *mut Archive) -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_error_string(a: *mut Archive) -> *const c_char {
-    with(a, std::ptr::null(), |h| cptr(h.base.error_string()))
+    with(a, std::ptr::null(), |h| {
+        h.base
+            .error_string()
+            .map_or(std::ptr::null(), |m| m.as_ptr().cast())
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -439,6 +443,22 @@ mod tests {
         );
         assert_eq!(archive_free(a), ARCHIVE_WARN);
         assert_eq!(archive_free(b), ARCHIVE_WARN);
+    }
+
+    #[test]
+    fn error_string_pointer_survives_clear_and_shorter_messages() {
+        let a = new_handle(READ_MAGIC);
+        // SAFETY: `a` is a live handle and the formats take no arguments.
+        unsafe { archive_set_error(a, 1, c"a long first message".as_ptr()) };
+        let p = archive_error_string(a);
+        archive_clear_error(a);
+        // Like upstream, the buffer is emptied in place, not freed.
+        assert_eq!(string(p).as_deref(), Some(""));
+        // SAFETY: as above.
+        unsafe { archive_set_error(a, 1, c"short".as_ptr()) };
+        assert_eq!(archive_error_string(a), p);
+        assert_eq!(string(p).as_deref(), Some("short"));
+        assert_eq!(archive_free(a), ARCHIVE_WARN);
     }
 
     #[test]

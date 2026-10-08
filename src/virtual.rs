@@ -140,7 +140,7 @@ mod tests {
         assert_eq!(h.base.state, state::FATAL);
         assert_eq!(
             h.base.error_string(),
-            Some(c"archive_write_data_block not supported")
+            Some(b"archive_write_data_block not supported".as_slice())
         );
     }
 

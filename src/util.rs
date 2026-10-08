@@ -28,8 +28,8 @@
 
 //! Errors, library version and the accessors common to all handles.
 
-use crate::archive::{ARCHIVE_FATAL, ARCHIVE_OK, Base};
-use std::ffi::{CStr, CString, c_int};
+use crate::archive::{ARCHIVE_FATAL, Base};
+use std::ffi::{CStr, c_int};
 
 pub const VERSION_NUMBER: c_int = 3009000;
 pub const VERSION_STRING: &CStr = c"libarchive 3.9.0dev";
@@ -66,14 +66,18 @@ impl Error {
 
 impl Base {
     /// `archive_set_error`. With no message, only the error number changes
-    /// and the message is cleared.
+    /// and the message is hidden.
     pub fn set_error(&mut self, errno: c_int, msg: Option<&[u8]>) {
         self.errno = errno;
-        self.error = msg.map(|m| {
+        self.error_shown = msg.is_some();
+        if let Some(m) = msg {
             // The C message is a NUL-terminated string.
             let end = m.iter().position(|&b| b == 0).unwrap_or(m.len());
-            CString::new(&m[..end]).unwrap_or_default()
-        });
+            self.error.clear();
+            self.error
+                .extend_from_slice(m.get(..end).unwrap_or_default());
+            self.error.push(0);
+        }
     }
 
     /// Records `e` and returns the code to hand back to the C caller.
@@ -82,24 +86,26 @@ impl Base {
         e.code
     }
 
-    /// `raise` for a function that returns `Result<()>`.
-    pub fn status(&mut self, r: Result<()>) -> c_int {
-        r.map_or_else(|e| self.raise(e), |()| ARCHIVE_OK)
-    }
-
     pub fn clear_error(&mut self) {
-        self.error = None;
+        self.error.clear();
+        self.error.push(0);
+        self.error_shown = false;
         self.errno = 0;
     }
 
     pub fn copy_error(&mut self, src: &Base) {
         self.errno = src.errno;
-        self.error = src.error.clone();
+        self.error.clear();
+        self.error.extend_from_slice(&src.error);
+        self.error_shown = true;
     }
 
-    /// `archive_error_string`: the message, or `None` if there is none.
-    pub fn error_string(&self) -> Option<&CStr> {
-        self.error.as_deref().filter(|e| !e.is_empty())
+    /// `archive_error_string`: the message without its NUL, or `None` if there
+    /// is none. Its `as_ptr()` is a C string that stays put until the message
+    /// outgrows the buffer.
+    pub fn error_string(&self) -> Option<&[u8]> {
+        let (_, msg) = self.error.split_last()?;
+        (self.error_shown && !msg.is_empty()).then_some(msg)
     }
 }
 
@@ -113,11 +119,14 @@ mod tests {
         let mut a = Base::new(READ_MAGIC);
         assert_eq!(a.error_string(), None);
         a.set_error(5, Some(b"bad thing"));
-        assert_eq!((a.errno, a.error_string()), (5, Some(c"bad thing")));
+        assert_eq!(
+            (a.errno, a.error_string()),
+            (5, Some(b"bad thing".as_slice()))
+        );
         a.set_error(7, None);
         assert_eq!((a.errno, a.error_string()), (7, None));
         a.set_error(1, Some(b"cut\0short"));
-        assert_eq!(a.error_string(), Some(c"cut"));
+        assert_eq!(a.error_string(), Some(b"cut".as_slice()));
         a.set_error(1, Some(b""));
         assert_eq!(a.error_string(), None);
         a.set_error(1, Some(b"x"));
@@ -129,9 +138,8 @@ mod tests {
     fn raise_records_and_returns_code() {
         let mut a = Base::new(READ_MAGIC);
         assert_eq!(a.raise(Error::new(ARCHIVE_WARN, 22, "odd")), ARCHIVE_WARN);
-        assert_eq!((a.errno, a.error_string()), (22, Some(c"odd")));
-        assert_eq!(a.status(Ok(())), 0);
-        assert_eq!(a.status(Err(Error::fatal(1, "no"))), ARCHIVE_FATAL);
+        assert_eq!((a.errno, a.error_string()), (22, Some(b"odd".as_slice())));
+        assert_eq!(a.raise(Error::fatal(1, "no")), ARCHIVE_FATAL);
     }
 
     #[test]
@@ -140,6 +148,6 @@ mod tests {
         let mut b = Base::new(READ_MAGIC);
         a.set_error(9, Some(b"from a"));
         b.copy_error(&a);
-        assert_eq!((b.errno, b.error_string()), (9, Some(c"from a")));
+        assert_eq!((b.errno, b.error_string()), (9, Some(b"from a".as_slice())));
     }
 }
