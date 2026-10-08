@@ -146,11 +146,15 @@ fn parse_option(item: &[u8]) -> Option<Item<'_>> {
 pub fn set_options(a: &Base, options: &[u8], use_option: &mut Handler<'_>) -> c_int {
     let (mut allok, mut anyok, mut ignore_mod_err) = (true, false, false);
 
-    // Upstream passes an empty item (",," or a trailing comma) to the
-    // handlers as an option with no name; skipping it is the same as the
-    // early OK `set_option` gives for one.
-    for item in options.split(|&b| b == b',').filter_map(parse_option) {
-        let (mod_, opt, val) = item;
+    for item in options.split(|&b| b == b',') {
+        let Some((mod_, opt, val)) = parse_option(item) else {
+            // An empty item (",," or a trailing comma) reaches the handler
+            // as an option with no name and no value, which
+            // `set_either_option` answers with OK: it counts as one that
+            // worked.
+            anyok = true;
+            continue;
+        };
         if mod_.is_none() && opt == b"__ignore_wrong_module_name__" {
             // Ignore module name error.
             if val.is_some() {
@@ -290,11 +294,15 @@ mod tests {
                 (some(""), "g".to_string(), some("1")),
             ]
         );
-        // Empty items are skipped.
+        // Empty items never reach the handler.
         calls.borrow_mut().clear();
         let mut h = recording(&calls, vec![]);
         assert_eq!(set_options(&a, b",a,,b,", &mut h), ARCHIVE_OK);
         assert_eq!(calls.borrow().len(), 2);
+        // But they count as an option that worked: "a," with a failing
+        // "a" is a warning, not a failure.
+        assert_eq!(set_options(&a, b"a,", &mut recording(&calls, vec![ARCHIVE_FAILED])), ARCHIVE_WARN);
+        assert_eq!(set_options(&a, b"a", &mut recording(&calls, vec![ARCHIVE_FAILED])), ARCHIVE_FAILED);
     }
 
     #[test]

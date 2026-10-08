@@ -215,8 +215,6 @@ Differences:
   one node with NULL data. `archive_read_open_memory` with a NULL buffer and a
   size, and `archive_read_open_FILE(NULL)`, fail with `ARCHIVE_FATAL` and
   EINVAL instead of crashing.
-- An empty item in an options string (`a,,b` or a trailing comma) is skipped;
-  upstream passes it to the handlers as an option with no name (archive_options.c).
 - A `FILE *` read that returns no bytes with the stream in error fails the
   read (fatal); upstream records the error and reports end of file
   (archive_read_open_file.c). The client trait returns errors rather than
