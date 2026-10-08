@@ -216,6 +216,10 @@ pub trait Filter {
 /// supply several `nodes` (the volumes of a multi-volume archive), which the
 /// core reads one after another, calling `switch` between them.
 ///
+/// Each call gets the handle `a`, to record a warning and carry on (a stream
+/// that fails to read but returns its bytes, say). A returned `Err` is a
+/// failure.
+///
 /// The C callbacks, `archive_read_open_memory`'s block of memory and the file
 /// readers all implement this; the C-callback implementation is the only one
 /// that needs `unsafe`, and lives in `ffi`.
@@ -227,13 +231,13 @@ pub trait Client {
 
     /// Opens node `node`. A failure aborts the open; the core then calls
     /// `close` for every node.
-    fn open(&mut self, _node: usize) -> Result<(), Error> {
+    fn open(&mut self, _a: &Base, _node: usize) -> Result<(), Error> {
         Ok(())
     }
 
     /// Reads the next block of node `node` into `block`; an empty block is
     /// the end of the node.
-    fn read(&mut self, node: usize) -> Result<(), Error>;
+    fn read(&mut self, _a: &Base, node: usize) -> Result<(), Error>;
 
     /// The block `read` produced; it stays put until the next `read`.
     fn block(&self) -> &[u8];
@@ -247,7 +251,7 @@ pub trait Client {
     /// Skips up to `request` bytes forward and returns how many were
     /// skipped; the client may skip less (to keep block alignment) or
     /// nothing (0 makes the core read and discard).
-    fn skip(&mut self, _node: usize, _request: i64) -> Result<i64, Error> {
+    fn skip(&mut self, _a: &Base, _node: usize, _request: i64) -> Result<i64, Error> {
         Ok(0)
     }
 
@@ -258,12 +262,12 @@ pub trait Client {
 
     /// Seeks within node `node` and returns the new offset in the node. A
     /// negative-code error means the node cannot seek.
-    fn seek(&mut self, _node: usize, _offset: i64, _whence: Whence) -> Result<i64, Error> {
+    fn seek(&mut self, _a: &Base, _node: usize, _offset: i64, _whence: Whence) -> Result<i64, Error> {
         Err(Error::recorded(ARCHIVE_FAILED))
     }
 
     /// Closes node `node`.
-    fn close(&mut self, _node: usize) -> Result<Status, Error> {
+    fn close(&mut self, _a: &Base, _node: usize) -> Result<Status, Error> {
         Ok(Status::Ok)
     }
 
@@ -275,9 +279,9 @@ pub trait Client {
 
     /// Moves from node `from` to node `to`. Without a dedicated switch, the
     /// old node is closed and the new one opened.
-    fn switch(&mut self, from: usize, to: usize) -> Result<(), Error> {
-        let closed = self.close(from);
-        let opened = self.open(to).map(|()| Status::Ok);
+    fn switch(&mut self, a: &Base, from: usize, to: usize) -> Result<(), Error> {
+        let closed = self.close(a, from);
+        let opened = self.open(a, to).map(|()| Status::Ok);
         worse(closed, opened).map(|_| ())
     }
 }
@@ -324,20 +328,20 @@ impl ClientFilter {
     }
 
     /// `client_switch_proxy`: makes node `index` the current one.
-    fn switch_to(&mut self, index: usize) -> Result<(), Error> {
+    fn switch_to(&mut self, a: &Base, index: usize) -> Result<(), Error> {
         // Don't do anything if already in the specified data node.
         if self.cursor == index {
             return Ok(());
         }
         let from = std::mem::replace(&mut self.cursor, index);
-        self.client.switch(from, index)
+        self.client.switch(a, from, index)
     }
 
     /// `client_close_proxy`: closes every node, returning the worst failure.
-    fn close_all(&mut self) -> Result<Status, Error> {
+    fn close_all(&mut self, a: &Base) -> Result<Status, Error> {
         let mut r = Ok(Status::Ok);
         for i in 0..self.nodes.len() {
-            r = worse(r, self.client.close(i));
+            r = worse(r, self.client.close(a, i));
         }
         r
     }
@@ -345,7 +349,7 @@ impl ClientFilter {
     /// The seek of `__archive_read_filter_seek`, across nodes. `position` is
     /// the stage's position in the concatenated stream. Returns the new
     /// position.
-    fn seek(&mut self, position: i64, offset: i64, whence: Whence) -> Result<i64, Error> {
+    fn seek(&mut self, a: &Base, position: i64, offset: i64, whence: Whence) -> Result<i64, Error> {
         let mut offset = offset;
         let mut cursor = 0;
         let mut r;
@@ -359,8 +363,8 @@ impl ClientFilter {
                     cursor = next;
                 }
                 loop {
-                    self.switch_to(cursor)?;
-                    r = self.client.seek(cursor, 0, Whence::End)?;
+                    self.switch_to(a, cursor)?;
+                    r = self.client.seek(a, cursor, 0, Whence::End)?;
                     self.nodes[cursor].total_size = r;
                     if self.node_end(cursor).saturating_sub(1) > offset
                         || cursor + 1 >= self.nodes.len()
@@ -374,7 +378,7 @@ impl ClientFilter {
                 if offset < 0 || offset > self.nodes[cursor].total_size {
                     return Err(Error::recorded(ARCHIVE_FATAL));
                 }
-                r = self.client.seek(cursor, offset, Whence::Set)?;
+                r = self.client.seek(a, cursor, offset, Whence::Set)?;
             }
             Whence::End => {
                 while self.nodes[cursor].begin_position >= 0
@@ -385,8 +389,8 @@ impl ClientFilter {
                     self.nodes[cursor].begin_position = self.node_end(cursor - 1);
                 }
                 loop {
-                    self.switch_to(cursor)?;
-                    self.nodes[cursor].total_size = self.client.seek(cursor, 0, Whence::End)?;
+                    self.switch_to(a, cursor)?;
+                    self.nodes[cursor].total_size = self.client.seek(a, cursor, 0, Whence::End)?;
                     r = self.node_end(cursor);
                     if cursor + 1 >= self.nodes.len() {
                         break;
@@ -405,8 +409,8 @@ impl ClientFilter {
                 offset = r
                     .saturating_add(offset)
                     .saturating_sub(self.nodes[cursor].begin_position);
-                self.switch_to(cursor)?;
-                r = self.client.seek(cursor, offset, Whence::Set)?;
+                self.switch_to(a, cursor)?;
+                r = self.client.seek(a, cursor, offset, Whence::Set)?;
             }
         }
         Ok(r.saturating_add(self.nodes[cursor].begin_position))
@@ -449,10 +453,10 @@ impl Filter for ClientFilter {
     /// handling of multi volume archives for readers.
     fn read(&mut self, up: &mut Reader<'_>) -> Result<(), Error> {
         loop {
-            self.client.read(self.cursor)?;
+            self.client.read(up.a, self.cursor)?;
             if self.client.block().is_empty() && self.cursor + 1 < self.nodes.len() {
                 // Continue with next client object if available.
-                match self.switch_to(self.cursor + 1) {
+                match self.switch_to(up.a, self.cursor + 1) {
                     Ok(()) => continue,
                     Err(e) => {
                         up.a.raise(e);
@@ -467,8 +471,8 @@ impl Filter for ClientFilter {
         self.client.block()
     }
 
-    fn close(&mut self, _a: &Base) -> Result<Status, Error> {
-        self.close_all()
+    fn close(&mut self, a: &Base) -> Result<Status, Error> {
+        self.close_all(a)
     }
 }
 
@@ -769,7 +773,7 @@ impl Stage {
         let Imp::Client(c) = &mut self.imp else {
             return Ok(0);
         };
-        c.client.skip(c.cursor, request).map_err(|e| {
+        c.client.skip(up.a, c.cursor, request).map_err(|e| {
             self.fatal = true;
             Error::recorded(up.a.raise(e))
         })
@@ -789,7 +793,7 @@ impl Stage {
         let Imp::Client(c) = &mut self.imp else {
             return Err(Error::recorded(ARCHIVE_FAILED));
         };
-        c.client.seek(c.cursor, offset, whence).map_err(|e| {
+        c.client.seek(up.a, c.cursor, offset, whence).map_err(|e| {
             self.fatal = true;
             Error::recorded(up.a.raise(e))
         })
@@ -807,7 +811,7 @@ impl Stage {
         if !self.can_seek {
             return Err(Error::recorded(ARCHIVE_FAILED));
         }
-        let r = c.seek(self.position, offset, whence);
+        let r = c.seek(up.a, self.position, offset, whence);
 
         // Ouch. Clearing the buffer like this hurts, especially at bid time.
         // A lot of our efficiency at bid time comes from having bidders
@@ -1087,11 +1091,11 @@ impl Read {
     /// Opens `client`'s first node and installs it as the bottom of the
     /// chain, below any filters appended before. On failure every node is
     /// closed; the caller records the error.
-    fn open_client(&mut self, client: Box<dyn Client>) -> Result<(), Error> {
+    fn open_client(&mut self, a: &Base, client: Box<dyn Client>) -> Result<(), Error> {
         let mut client = ClientFilter::new(client);
-        if let Err(e) = client.client.open(0) {
+        if let Err(e) = client.client.open(a, 0) {
             // If the open failed, call the closer to clean up.
-            let _ = client.close_all();
+            let _ = client.close_all(a);
             return Err(e);
         }
         client.nodes[0].begin_position = 0;
@@ -1471,7 +1475,7 @@ impl Read {
         a.state.set(state::OPEN);
 
         // Open data source.
-        if let Err(e) = self.open_client(client) {
+        if let Err(e) = self.open_client(a, client) {
             a.state.set(state::FATAL);
             return a.raise(e);
         }
@@ -1512,7 +1516,7 @@ impl Read {
             && let Imp::Client(c) = &mut stage.imp
             && c.cursor != 0
         {
-            if let Err(e) = c.switch_to(0) {
+            if let Err(e) = c.switch_to(a, 0) {
                 a.raise(e);
             }
             stage.client_total = 0;
@@ -1912,13 +1916,13 @@ mod tests {
             self.nodes.len()
         }
 
-        fn open(&mut self, node: usize) -> Result<(), Error> {
+        fn open(&mut self, _a: &Base, node: usize) -> Result<(), Error> {
             self.pos = 0;
             self.note(format!("open {node}"));
             Ok(())
         }
 
-        fn read(&mut self, node: usize) -> Result<(), Error> {
+        fn read(&mut self, _a: &Base, node: usize) -> Result<(), Error> {
             self.reads += 1;
             if self.fail_read_at == Some(self.reads) {
                 self.block.clear();
@@ -1939,7 +1943,7 @@ mod tests {
             self.skippable
         }
 
-        fn skip(&mut self, node: usize, request: i64) -> Result<i64, Error> {
+        fn skip(&mut self, _a: &Base, node: usize, request: i64) -> Result<i64, Error> {
             let left = (self.nodes[node].len() - self.pos) as i64;
             // Round down to the block size, as upstream's memory client does.
             let n = request.min(left) / self.block_size as i64 * self.block_size as i64;
@@ -1952,7 +1956,7 @@ mod tests {
             self.seekable
         }
 
-        fn seek(&mut self, node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
+        fn seek(&mut self, _a: &Base, node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
             let len = self.nodes[node].len() as i64;
             let to = match whence {
                 Whence::Set => offset,
@@ -1967,7 +1971,7 @@ mod tests {
             Ok(to)
         }
 
-        fn close(&mut self, node: usize) -> Result<Status, Error> {
+        fn close(&mut self, _a: &Base, node: usize) -> Result<Status, Error> {
             self.note(format!("close {node}"));
             Ok(Status::Ok)
         }
@@ -2010,8 +2014,9 @@ mod tests {
 
     fn setup(mem: Mem) -> (Read, Base) {
         let mut r = Read::default();
-        r.open_client(Box::new(mem)).unwrap();
-        (r, Base::new(READ_MAGIC))
+        let a = Base::new(READ_MAGIC);
+        r.open_client(&a, Box::new(mem)).unwrap();
+        (r, a)
     }
 
     fn text(n: usize) -> Vec<u8> {
@@ -2368,23 +2373,23 @@ mod tests {
             fn nodes(&self) -> usize {
                 2
             }
-            fn open(&mut self, _: usize) -> Result<(), Error> {
+            fn open(&mut self, _a: &Base, _: usize) -> Result<(), Error> {
                 Err(Error::fatal(libc::ENOENT, "nope"))
             }
-            fn read(&mut self, _: usize) -> Result<(), Error> {
+            fn read(&mut self, _a: &Base, _: usize) -> Result<(), Error> {
                 Ok(())
             }
             fn block(&self) -> &[u8] {
                 &[]
             }
-            fn close(&mut self, node: usize) -> Result<Status, Error> {
+            fn close(&mut self, _a: &Base, node: usize) -> Result<Status, Error> {
                 self.0.borrow_mut().push(format!("close {node}"));
                 Ok(Status::Ok)
             }
         }
         let closed = Rc::new(Cell_::new(Vec::new()));
         let mut r = Read::default();
-        let e = r.open_client(Box::new(Failing(Rc::clone(&closed)))).unwrap_err();
+        let e = r.open_client(&Base::new(READ_MAGIC), Box::new(Failing(Rc::clone(&closed)))).unwrap_err();
         assert_eq!((e.code, e.errno, e.msg.as_slice()), (ARCHIVE_FATAL, libc::ENOENT, b"nope".as_slice()));
         assert_eq!(*closed.borrow(), ["close 0", "close 1"]);
         assert_eq!(r.filter_count(), 0);

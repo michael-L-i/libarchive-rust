@@ -31,6 +31,7 @@
 
 use crate::read_open_fd::buffer;
 use crate::ffi::sys::Fd;
+use crate::archive::Base;
 use crate::read::{Client, Status, Whence};
 use crate::util::Error;
 use std::ffi::OsStr;
@@ -215,11 +216,11 @@ impl Client for Filenames {
         self.nodes.len()
     }
 
-    fn open(&mut self, node: usize) -> Result<(), Error> {
+    fn open(&mut self, _a: &Base, node: usize) -> Result<(), Error> {
         self.nodes.get_mut(node).map_or(Ok(()), FileNode::open)
     }
 
-    fn read(&mut self, node: usize) -> Result<(), Error> {
+    fn read(&mut self, _a: &Base, node: usize) -> Result<(), Error> {
         self.len = 0;
         let Some(mine) = self.nodes.get_mut(node) else {
             return Ok(());
@@ -257,7 +258,7 @@ impl Client for Filenames {
     /// TODO: This can leave future reads mis-aligned. Since we know the
     /// offset here, we should store it and use it in the read to determine
     /// whether we should perform a short read to get back into alignment.
-    fn skip(&mut self, node: usize, request: i64) -> Result<i64, Error> {
+    fn skip(&mut self, _a: &Base, node: usize, request: i64) -> Result<i64, Error> {
         let Some(mine) = self.nodes.get_mut(node) else {
             return Ok(0);
         };
@@ -293,7 +294,7 @@ impl Client for Filenames {
         true
     }
 
-    fn seek(&mut self, node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
+    fn seek(&mut self, _a: &Base, node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
         let Some(mine) = self.nodes.get(node) else {
             return Ok(0);
         };
@@ -305,7 +306,7 @@ impl Client for Filenames {
         r.map_err(|errno| Error::fatal(errno, about(&mine.name, b"Error seeking in")))
     }
 
-    fn close(&mut self, node: usize) -> Result<Status, Error> {
+    fn close(&mut self, _a: &Base, node: usize) -> Result<Status, Error> {
         if let Some(mine) = self.nodes.get_mut(node) {
             mine.close();
         }
@@ -320,6 +321,11 @@ impl Client for Filenames {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::READ_MAGIC;
+
+    fn base() -> Base {
+        Base::new(READ_MAGIC)
+    }
     use std::path::PathBuf;
 
     /// Files named `tag-N` in the temp dir, removed on drop.
@@ -360,21 +366,21 @@ mod tests {
         let files = Files::new("multi", &[b"AAAA", b"BBBBBB"]);
         let mut c = files.client(4);
         assert_eq!(c.nodes(), 2);
-        c.open(0).unwrap();
-        c.read(0).unwrap();
+        c.open(&base(), 0).unwrap();
+        c.read(&base(), 0).unwrap();
         // Disk-like inputs get a block size of at least 64k, so the whole
         // file arrives at once.
         assert_eq!(c.block(), b"AAAA");
         assert!(c.skip_file().is_some());
-        c.read(0).unwrap();
+        c.read(&base(), 0).unwrap();
         assert!(c.block().is_empty());
-        c.switch(0, 1).unwrap();
-        c.read(1).unwrap();
+        c.switch(&base(), 0, 1).unwrap();
+        c.read(&base(), 1).unwrap();
         assert_eq!(c.block(), b"BBBBBB");
-        c.close(0).unwrap();
-        c.close(1).unwrap();
+        c.close(&base(), 0).unwrap();
+        c.close(&base(), 1).unwrap();
         // Closing twice is harmless.
-        c.close(1).unwrap();
+        c.close(&base(), 1).unwrap();
     }
 
     #[test]
@@ -382,16 +388,16 @@ mod tests {
         let data: Vec<u8> = (0..200).collect();
         let files = Files::new("skip", &[&data]);
         let mut c = files.client(16);
-        c.open(0).unwrap();
-        assert_eq!(c.skip(0, 50).unwrap(), 50);
-        assert_eq!(c.seek(0, 0, Whence::Cur).unwrap(), 50);
+        c.open(&base(), 0).unwrap();
+        assert_eq!(c.skip(&base(), 0, 50).unwrap(), 50);
+        assert_eq!(c.seek(&base(), 0, 0, Whence::Cur).unwrap(), 50);
         // Past the end: nothing skipped, and no more tries.
-        assert_eq!(c.skip(0, 1000).unwrap(), 0);
-        assert_eq!(c.skip(0, 10).unwrap(), 0);
-        assert_eq!(c.seek(0, 190, Whence::Set).unwrap(), 190);
-        c.read(0).unwrap();
+        assert_eq!(c.skip(&base(), 0, 1000).unwrap(), 0);
+        assert_eq!(c.skip(&base(), 0, 10).unwrap(), 0);
+        assert_eq!(c.seek(&base(), 0, 190, Whence::Set).unwrap(), 190);
+        c.read(&base(), 0).unwrap();
         assert_eq!(c.block(), &data[190..]);
-        let e = c.seek(0, -1, Whence::Set).unwrap_err();
+        let e = c.seek(&base(), 0, -1, Whence::Set).unwrap_err();
         assert_eq!(e.errno, libc::EINVAL);
         assert!(e.msg.starts_with(b"Error seeking in '"));
     }
@@ -399,11 +405,11 @@ mod tests {
     #[test]
     fn open_errors_name_the_file() {
         let mut c = Filenames::new(vec![Some(b"/nonexistent/archive-test".to_vec())], 4);
-        let e = c.open(0).unwrap_err();
+        let e = c.open(&base(), 0).unwrap_err();
         assert_eq!(e.errno, libc::ENOENT);
         assert_eq!(e.msg, b"Failed to open '/nonexistent/archive-test'");
         // Closing a node that never opened is harmless.
-        c.close(0).unwrap();
+        c.close(&base(), 0).unwrap();
         assert!(c.block().is_empty());
     }
 
@@ -411,8 +417,8 @@ mod tests {
     fn read_errors_name_the_file() {
         let dir = std::env::temp_dir();
         let mut c = Filenames::new(vec![Some(dir.as_os_str().as_bytes().to_vec())], 4);
-        c.open(0).unwrap();
-        let e = c.read(0).unwrap_err();
+        c.open(&base(), 0).unwrap();
+        let e = c.read(&base(), 0).unwrap_err();
         assert_eq!(e.errno, libc::EISDIR);
         assert!(e.msg.starts_with(b"Error reading '"));
     }

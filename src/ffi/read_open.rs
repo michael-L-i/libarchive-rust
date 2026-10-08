@@ -361,4 +361,22 @@ mod tests {
         assert_eq!(archive_free(a), ARCHIVE_OK);
         std::fs::remove_file(p).unwrap();
     }
+
+    #[test]
+    fn a_stream_in_error_records_it_and_ends() {
+        let p = temp("filerr", 0, b"x");
+        let path = c(&p);
+        // Reading a stream opened for writing fails.
+        // SAFETY: both arguments are valid C strings.
+        let file = unsafe { libc::fopen(path.as_ptr(), c"w".as_ptr()) };
+        assert!(!file.is_null());
+        let a = new();
+        assert_eq!(archive_read_open_FILE(a, file), ARCHIVE_OK);
+        assert_eq!(drain(a), b"");
+        assert_eq!(error(a).as_deref(), Some("Error reading file"));
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+        // SAFETY: the stream is open and no longer used.
+        unsafe { libc::fclose(file) };
+        std::fs::remove_file(p).unwrap();
+    }
 }

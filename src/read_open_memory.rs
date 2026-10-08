@@ -31,6 +31,7 @@
 //! having to mess with files on disk.
 
 use crate::archive::ARCHIVE_FATAL;
+use crate::archive::Base;
 use crate::read::{Client, Whence};
 use crate::util::Error;
 use std::ops::Range;
@@ -62,7 +63,7 @@ impl<D: AsRef<[u8]>> Memory<D> {
 
 impl<D: AsRef<[u8]>> Client for Memory<D> {
     /// This is scary simple: just advance a pointer.
-    fn read(&mut self, _node: usize) -> Result<(), Error> {
+    fn read(&mut self, _a: &Base, _node: usize) -> Result<(), Error> {
         let len = self.data.as_ref().len();
         let end = len.min(self.pos.saturating_add(self.read_size));
         self.block = self.pos.min(end)..end;
@@ -81,7 +82,7 @@ impl<D: AsRef<[u8]>> Client for Memory<D> {
     /// Advancing is just as simple. Again, this is doing more than necessary
     /// in order to better exercise internal code when used as a test
     /// harness.
-    fn skip(&mut self, _node: usize, request: i64) -> Result<i64, Error> {
+    fn skip(&mut self, _a: &Base, _node: usize, request: i64) -> Result<i64, Error> {
         let left = self.data.as_ref().len().saturating_sub(self.pos);
         let skip = usize::try_from(request).unwrap_or(0).min(left);
         // Round down to block size.
@@ -94,7 +95,7 @@ impl<D: AsRef<[u8]>> Client for Memory<D> {
         true
     }
 
-    fn seek(&mut self, _node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
+    fn seek(&mut self, _a: &Base, _node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
         let len = i64::try_from(self.data.as_ref().len()).unwrap_or(i64::MAX);
         let base = match whence {
             Whence::Set => 0,
@@ -114,11 +115,16 @@ impl<D: AsRef<[u8]>> Client for Memory<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::READ_MAGIC;
+
+    fn base() -> Base {
+        Base::new(READ_MAGIC)
+    }
 
     fn collect(m: &mut Memory<Vec<u8>>) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         loop {
-            m.read(0).unwrap();
+            m.read(&base(), 0).unwrap();
             if m.block().is_empty() {
                 return out;
             }
@@ -136,7 +142,7 @@ mod tests {
         // by zero when skipping.
         let mut m = Memory::new(b"abc".to_vec(), 0);
         assert!(collect(&mut m).is_empty());
-        assert_eq!(m.skip(0, 2).unwrap(), 0);
+        assert_eq!(m.skip(&base(), 0, 2).unwrap(), 0);
         let mut m = Memory::new(Vec::new(), 4);
         assert!(collect(&mut m).is_empty());
     }
@@ -144,27 +150,27 @@ mod tests {
     #[test]
     fn skip_rounds_down_to_whole_blocks() {
         let mut m = Memory::new(b"0123456789".to_vec(), 4);
-        assert_eq!(m.skip(0, 3).unwrap(), 0);
-        assert_eq!(m.skip(0, 9).unwrap(), 8);
-        m.read(0).unwrap();
+        assert_eq!(m.skip(&base(), 0, 3).unwrap(), 0);
+        assert_eq!(m.skip(&base(), 0, 9).unwrap(), 8);
+        m.read(&base(), 0).unwrap();
         assert_eq!(m.block(), b"89");
-        assert_eq!(m.skip(0, -5).unwrap(), 0);
-        assert_eq!(m.skip(0, i64::MAX).unwrap(), 0);
+        assert_eq!(m.skip(&base(), 0, -5).unwrap(), 0);
+        assert_eq!(m.skip(&base(), 0, i64::MAX).unwrap(), 0);
     }
 
     #[test]
     fn seek_stays_inside_the_memory() {
         let mut m = Memory::new(b"0123456789".to_vec(), 4);
-        assert_eq!(m.seek(0, 3, Whence::Set).unwrap(), 3);
-        m.read(0).unwrap();
+        assert_eq!(m.seek(&base(), 0, 3, Whence::Set).unwrap(), 3);
+        m.read(&base(), 0).unwrap();
         assert_eq!(m.block(), b"3456");
-        assert_eq!(m.seek(0, -2, Whence::Cur).unwrap(), 5);
-        assert_eq!(m.seek(0, 0, Whence::End).unwrap(), 10);
-        assert_eq!(m.seek(0, -10, Whence::End).unwrap(), 0);
+        assert_eq!(m.seek(&base(), 0, -2, Whence::Cur).unwrap(), 5);
+        assert_eq!(m.seek(&base(), 0, 0, Whence::End).unwrap(), 10);
+        assert_eq!(m.seek(&base(), 0, -10, Whence::End).unwrap(), 0);
         for (off, whence) in [(-1, Whence::Set), (11, Whence::Set), (1, Whence::End), (i64::MAX, Whence::Cur), (i64::MIN, Whence::End)] {
-            assert_eq!(m.seek(0, off, whence).unwrap_err().code, ARCHIVE_FATAL);
+            assert_eq!(m.seek(&base(), 0, off, whence).unwrap_err().code, ARCHIVE_FATAL);
         }
         // A failed seek leaves the position alone.
-        assert_eq!(m.seek(0, 0, Whence::Cur).unwrap(), 0);
+        assert_eq!(m.seek(&base(), 0, 0, Whence::Cur).unwrap(), 0);
     }
 }

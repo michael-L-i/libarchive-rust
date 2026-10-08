@@ -82,7 +82,7 @@ impl Client for CClient {
         self.callbacks.data.len().max(1)
     }
 
-    fn open(&mut self, node: usize) -> Result<(), Error> {
+    fn open(&mut self, _a: &Base, node: usize) -> Result<(), Error> {
         let Some(opener) = self.callbacks.opener else {
             return Ok(());
         };
@@ -90,7 +90,7 @@ impl Client for CClient {
         status(unsafe { opener(self.archive, self.data(node)) })
     }
 
-    fn read(&mut self, node: usize) -> Result<(), Error> {
+    fn read(&mut self, _a: &Base, node: usize) -> Result<(), Error> {
         let Some(reader) = self.callbacks.reader else {
             return Err(Error::recorded(ARCHIVE_FATAL));
         };
@@ -128,7 +128,7 @@ impl Client for CClient {
         self.callbacks.skipper.is_some()
     }
 
-    fn skip(&mut self, node: usize, request: i64) -> Result<i64, Error> {
+    fn skip(&mut self, _a: &Base, node: usize, request: i64) -> Result<i64, Error> {
         let Some(skipper) = self.callbacks.skipper else {
             return Ok(0);
         };
@@ -144,7 +144,7 @@ impl Client for CClient {
         self.callbacks.seeker.is_some()
     }
 
-    fn seek(&mut self, node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
+    fn seek(&mut self, _a: &Base, node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
         let Some(seeker) = self.callbacks.seeker else {
             return Err(Error::recorded(ARCHIVE_FAILED));
         };
@@ -153,7 +153,7 @@ impl Client for CClient {
         if r < 0 { Err(failure(r)) } else { Ok(r) }
     }
 
-    fn close(&mut self, node: usize) -> Result<Status, Error> {
+    fn close(&mut self, _a: &Base, node: usize) -> Result<Status, Error> {
         // The closer may free the buffer the reader handed out.
         self.block = (std::ptr::null(), 0);
         let Some(closer) = self.callbacks.closer else {
@@ -167,11 +167,11 @@ impl Client for CClient {
         }
     }
 
-    fn switch(&mut self, from: usize, to: usize) -> Result<(), Error> {
+    fn switch(&mut self, a: &Base, from: usize, to: usize) -> Result<(), Error> {
         let Some(switcher) = self.callbacks.switcher else {
             // Attempt to call close and open instead.
-            let closed = self.close(from);
-            let opened = self.open(to).map(|()| Status::Ok);
+            let closed = self.close(a, from);
+            let opened = self.open(a, to).map(|()| Status::Ok);
             return worse(closed, opened).map(|_| ());
         };
         // SAFETY: `new`'s contract.

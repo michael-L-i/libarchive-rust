@@ -29,6 +29,7 @@
 //! `FILE *` the caller owns.
 
 use crate::ffi::sys::CFile;
+use crate::archive::Base;
 use crate::read::{Client, Whence};
 use crate::read_open_fd::buffer;
 use crate::util::Error;
@@ -68,15 +69,15 @@ impl ReadFile {
 }
 
 impl Client for ReadFile {
-    /// A stream in error that produced nothing fails the read. (Upstream
-    /// records the error and reports end of file; see NOTES.md.)
-    fn read(&mut self, _node: usize) -> Result<(), Error> {
+    /// A stream in error records the error and still returns the bytes it
+    /// read, which may be none: that is end of file.
+    fn read(&mut self, a: &Base, _node: usize) -> Result<(), Error> {
         let (n, failed) = self.file.read(&mut self.buffer);
         self.len = n;
-        match failed {
-            Some(errno) if n == 0 => Err(Error::fatal(errno, "Error reading file")),
-            _ => Ok(()),
+        if let Some(errno) = failed {
+            a.set_error(errno, Some(b"Error reading file"));
         }
+        Ok(())
     }
 
     fn block(&self) -> &[u8] {
@@ -87,7 +88,7 @@ impl Client for ReadFile {
         true
     }
 
-    fn skip(&mut self, _node: usize, request: i64) -> Result<i64, Error> {
+    fn skip(&mut self, _a: &Base, _node: usize, request: i64) -> Result<i64, Error> {
         // If we can't skip, return 0 as the amount we did step and the
         // caller will work around by reading and discarding.
         if !self.can_skip || request == 0 {
@@ -109,7 +110,7 @@ impl Client for ReadFile {
         true
     }
 
-    fn seek(&mut self, _node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
+    fn seek(&mut self, _a: &Base, _node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
         // If we arrive here, the input is corrupted or truncated so fail.
         let fail = |errno| Error::fatal(errno, "Error seeking in FILE* pointer");
         self.file.seek(offset, whence.to_c()).map_err(fail)?;

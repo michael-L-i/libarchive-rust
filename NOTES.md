@@ -215,10 +215,6 @@ Differences:
   one node with NULL data. `archive_read_open_memory` with a NULL buffer and a
   size, and `archive_read_open_FILE(NULL)`, fail with `ARCHIVE_FATAL` and
   EINVAL instead of crashing.
-- A `FILE *` read that returns no bytes with the stream in error fails the
-  read (fatal); upstream records the error and reports end of file
-  (archive_read_open_file.c). The client trait returns errors rather than
-  setting them and continuing.
 - `archive_read_extract_set_skip_file`'s device and inode are also provided by
   the filename client for its current file (`Client::skip_file`), where
   upstream's open callback sets them as a side effect.

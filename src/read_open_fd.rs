@@ -30,6 +30,7 @@
 
 use crate::archive::ARCHIVE_FAILED;
 use crate::ffi::sys::Fd;
+use crate::archive::Base;
 use crate::read::{Client, Whence};
 use crate::util::Error;
 
@@ -77,7 +78,7 @@ impl ReadFd {
 }
 
 impl Client for ReadFd {
-    fn read(&mut self, _node: usize) -> Result<(), Error> {
+    fn read(&mut self, _a: &Base, _node: usize) -> Result<(), Error> {
         self.len = 0;
         loop {
             match self.fd.read(&mut self.buffer) {
@@ -104,7 +105,7 @@ impl Client for ReadFd {
         true
     }
 
-    fn skip(&mut self, _node: usize, request: i64) -> Result<i64, Error> {
+    fn skip(&mut self, _a: &Base, _node: usize, request: i64) -> Result<i64, Error> {
         if !self.use_lseek {
             return Ok(0);
         }
@@ -145,7 +146,7 @@ impl Client for ReadFd {
         true
     }
 
-    fn seek(&mut self, _node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
+    fn seek(&mut self, _a: &Base, _node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
         self.fd.lseek(offset, whence.to_c()).map_err(|errno| {
             if errno == libc::ESPIPE {
                 Error::new(
@@ -167,6 +168,11 @@ impl Client for ReadFd {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::READ_MAGIC;
+
+    fn base() -> Base {
+        Base::new(READ_MAGIC)
+    }
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
@@ -188,20 +194,20 @@ mod tests {
         let f = file(&data);
         let (mut c, skip_file) = ReadFd::new(Fd(f.as_raw_fd()), 8).unwrap();
         assert!(skip_file.is_some());
-        c.read(0).unwrap();
+        c.read(&base(), 0).unwrap();
         assert_eq!(c.block(), &data[..8]);
         // Skips whole blocks only, and never past the end.
-        assert_eq!(c.skip(0, 20).unwrap(), 16);
-        c.read(0).unwrap();
+        assert_eq!(c.skip(&base(), 0, 20).unwrap(), 16);
+        c.read(&base(), 0).unwrap();
         assert_eq!(c.block(), &data[24..32]);
-        assert_eq!(c.skip(0, 7).unwrap(), 0);
-        assert_eq!(c.skip(0, 1000).unwrap(), 0);
-        assert_eq!(c.seek(0, -4, Whence::End).unwrap(), 96);
-        c.read(0).unwrap();
+        assert_eq!(c.skip(&base(), 0, 7).unwrap(), 0);
+        assert_eq!(c.skip(&base(), 0, 1000).unwrap(), 0);
+        assert_eq!(c.seek(&base(), 0, -4, Whence::End).unwrap(), 96);
+        c.read(&base(), 0).unwrap();
         assert_eq!(c.block(), &data[96..]);
-        c.read(0).unwrap();
+        c.read(&base(), 0).unwrap();
         assert!(c.block().is_empty());
-        let e = c.seek(0, -1, Whence::Set).unwrap_err();
+        let e = c.seek(&base(), 0, -1, Whence::Set).unwrap_err();
         assert_eq!((e.code, e.errno), (crate::archive::ARCHIVE_FATAL, libc::EINVAL));
         assert_eq!(e.msg, format!("Error seeking in a file descriptor({})", f.as_raw_fd()).into_bytes());
     }
@@ -221,10 +227,10 @@ mod tests {
         let r = Fd(reader.as_raw_fd());
         let (mut c, skip_file) = ReadFd::new(r, 4).unwrap();
         assert!(skip_file.is_none());
-        c.read(0).unwrap();
+        c.read(&base(), 0).unwrap();
         assert_eq!(c.block(), b"pipe");
-        assert_eq!(c.skip(0, 100).unwrap(), 0);
-        let e = c.seek(0, 0, Whence::Set).unwrap_err();
+        assert_eq!(c.skip(&base(), 0, 100).unwrap(), 0);
+        let e = c.seek(&base(), 0, 0, Whence::Set).unwrap_err();
         assert_eq!((e.code, e.errno), (ARCHIVE_FAILED, libc::ESPIPE));
         assert_eq!(e.msg, format!("A file descriptor({}) is not seekable(PIPE)", r.0).into_bytes());
     }
@@ -235,7 +241,7 @@ mod tests {
         let fd = Fd(f.as_raw_fd());
         let (mut c, _) = ReadFd::new(fd, 4).unwrap();
         c.fd = Fd(-1);
-        let e = c.read(0).unwrap_err();
+        let e = c.read(&base(), 0).unwrap_err();
         assert_eq!((e.errno, e.msg.as_slice()), (libc::EBADF, b"Error reading fd -1".as_slice()));
     }
 }
