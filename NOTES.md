@@ -283,3 +283,31 @@ Differences:
   upstream finds within its buffer is found the same way, and a line it
   would only find by reading out of bounds is not found. A line starting
   exactly at the window's end gets an empty window, as upstream.
+## Read filters: compress (.Z) and rpm (`src/read/filter/compress.rs`, `rpm.rs`)
+
+Ported as-is:
+
+- The first code is decoded in `compress_filter_init` and its result is
+  dropped, so an invalid first code is skipped silently and the second code
+  decodes from the stream (archive_read_support_filter_compress.c).
+- A reset clears only `bits_avail`, so the bits left in `bit_buffer` are
+  ORed under the next byte. This matters only when the padding count is zero.
+- Truncated compress input is the end of the input, not an error: the output
+  so far is returned. A cut inside a code or inside the reset padding ends
+  the stream the same way.
+- An rpm whose payload is shorter than 16 bytes after the last header fails
+  with `ARCHIVE_FATAL` and no message (`(null)` from bsdcat), because upstream
+  reads 16 bytes to look for another header before it reaches the payload.
+  `skip_padding` at end of input fails the same way.
+
+Differences:
+
+- The compress stack is a `Vec` rather than a fixed 65300-byte array. Its
+  length is bounded by the 65536-entry dictionary (at most 65282 bytes), so
+  it cannot grow past upstream's bound.
+- The rpm filter copies each payload block into its own block, the one copy
+  the `Filter` API needs for a pass-through. Upstream returns the stage's
+  bytes in place.
+- The bidders propagate a read error with `?`, so the open fails with the
+  client's message. Upstream's bid returns 0 there, the same divergence the
+  read core records for format bids above.
