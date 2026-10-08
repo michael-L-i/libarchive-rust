@@ -374,10 +374,10 @@ mod tests {
         c.switch(&base(), 0, 1).unwrap();
         c.read(&base(), 1).unwrap();
         assert_eq!(c.block(), b"BBBBBB");
-        c.close(&base(), 0).unwrap();
-        c.close(&base(), 1).unwrap();
+        assert_eq!(c.close(&base(), 0).unwrap(), Status::Ok);
+        assert_eq!(c.close(&base(), 1).unwrap(), Status::Ok);
         // Closing twice is harmless.
-        c.close(&base(), 1).unwrap();
+        assert_eq!(c.close(&base(), 1).unwrap(), Status::Ok);
     }
 
     #[test]
@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(e.errno, libc::ENOENT);
         assert_eq!(e.msg, b"Failed to open '/nonexistent/archive-test'");
         // Closing a node that never opened is harmless.
-        c.close(&base(), 0).unwrap();
+        assert_eq!(c.close(&base(), 0).unwrap(), Status::Ok);
         assert!(c.block().is_empty());
     }
 

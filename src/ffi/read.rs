@@ -747,7 +747,7 @@ pub(super) mod tests {
     pub(in crate::ffi) fn register_anything(a: *mut Archive) {
         with(a, (), |h| {
             with_read(h, (), |r| {
-                r.register_format(Box::new(Anything)).unwrap();
+                assert_eq!(r.register_format(Box::new(Anything)).unwrap(), Status::Ok);
             });
         });
     }

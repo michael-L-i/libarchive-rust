@@ -167,12 +167,12 @@ mod tests {
 
     fn handle() -> (Read, Base) {
         let mut r = Read::default();
-        r.register_format(Box::new(Plain)).unwrap();
-        r.register_format(Box::new(Opt {
+        assert_eq!(r.register_format(Box::new(Plain)).unwrap(), Status::Ok);
+        let opt = Opt {
             name: "opt",
             seen: Vec::new(),
-        }))
-        .unwrap();
+        };
+        assert_eq!(r.register_format(Box::new(opt)).unwrap(), Status::Ok);
         (r, Base::new(READ_MAGIC))
     }
 

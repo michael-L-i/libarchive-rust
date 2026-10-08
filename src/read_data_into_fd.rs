@@ -274,7 +274,7 @@ mod tests {
         let mut r = Read::default();
         let blocks = blocks.iter().map(|(o, d)| (*o, d.to_vec())).collect();
         let format = Blocks { blocks, end, next: 0, declared };
-        r.register_format(Box::new(format)).unwrap();
+        assert_eq!(r.register_format(Box::new(format)).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(r.open(&a, Box::new(Memory::new(b"x".to_vec(), 1))), ARCHIVE_OK);
         // The declared size comes from the header, as it does for a caller.

@@ -136,6 +136,7 @@ impl Whence {
 }
 
 /// How a call that can warn went: the failures are `Err`.
+#[must_use = "a warning has to reach the return value"]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     /// `ARCHIVE_OK`.
@@ -160,9 +161,9 @@ impl Status {
 }
 
 impl Base {
-    #[allow(dead_code)] // for the format readers (phases 3-4)
     /// Records a warning, as `archive_set_error` before `return
     /// ARCHIVE_WARN`, and gives the status to return.
+    #[must_use = "return the status so the warning reaches the caller"]
     pub fn warn(&self, errno: c_int, msg: impl AsRef<[u8]>) -> Status {
         self.set_error(errno, Some(msg.as_ref()));
         Status::Warn
@@ -1050,6 +1051,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Records a warning; return the `Status` it gives to say so.
+    #[must_use = "return the status so the warning reaches the caller"]
     pub fn warn(&self, errno: c_int, msg: impl AsRef<[u8]>) -> Status {
         self.a.warn(errno, msg)
     }
@@ -2525,10 +2527,10 @@ mod tests {
     fn the_highest_bid_wins_and_the_first_wins_ties() {
         let log = Rc::default();
         let mut r = Read::default();
-        r.register_format(fake::<0>(0, &log)).unwrap();
-        r.register_format(fake::<1>(5, &log)).unwrap();
-        r.register_format(fake::<2>(5, &log)).unwrap();
-        r.register_format(fake::<3>(3, &log)).unwrap();
+        assert_eq!(r.register_format(fake::<0>(0, &log)).unwrap(), Status::Ok);
+        assert_eq!(r.register_format(fake::<1>(5, &log)).unwrap(), Status::Ok);
+        assert_eq!(r.register_format(fake::<2>(5, &log)).unwrap(), Status::Ok);
+        assert_eq!(r.register_format(fake::<3>(3, &log)).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_OK);
         assert_eq!(r.format, Some(1));
@@ -2547,7 +2549,7 @@ mod tests {
         assert_eq!((a.errno.get(), a.state.get()), (ARCHIVE_ERRNO_FILE_FORMAT, state::FATAL));
 
         let mut r = Read::default();
-        r.register_format(fake::<0>(0, &log)).unwrap();
+        assert_eq!(r.register_format(fake::<0>(0, &log)).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_FATAL);
         assert_eq!(error(&a), "Unrecognized archive format");
@@ -2558,8 +2560,8 @@ mod tests {
     fn a_fatal_bid_aborts_the_open() {
         let log = Rc::default();
         let mut r = Read::default();
-        r.register_format(fake::<0>(ARCHIVE_FATAL, &log)).unwrap();
-        r.register_format(fake::<1>(9, &log)).unwrap();
+        assert_eq!(r.register_format(fake::<0>(ARCHIVE_FATAL, &log)).unwrap(), Status::Ok);
+        assert_eq!(r.register_format(fake::<1>(9, &log)).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_FATAL);
         assert_eq!(log.borrow().len(), 1);
@@ -2571,7 +2573,7 @@ mod tests {
         let mut r = Read::default();
         let mut f = fake::<0>(7, &log);
         (f.peek, f.eat) = (3, true);
-        r.register_format(f).unwrap();
+        assert_eq!(r.register_format(f).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         let (mut mem, _) = Mem::new(b"abcdefgh", 4);
         mem.seekable = true;
@@ -2583,7 +2585,7 @@ mod tests {
         let mut r = Read::default();
         let mut f = fake::<0>(7, &log);
         (f.peek, f.eat) = (3, true);
-        r.register_format(f).unwrap();
+        assert_eq!(r.register_format(f).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"abcdefgh"), ARCHIVE_FATAL);
     }
@@ -2592,11 +2594,11 @@ mod tests {
     fn duplicate_and_excess_registrations() {
         let log = Rc::default();
         let mut r = Read::default();
-        r.register_format(fake::<0>(1, &log)).unwrap();
+        assert_eq!(r.register_format(fake::<0>(1, &log)).unwrap(), Status::Ok);
         assert_eq!(r.register_format(fake::<0>(1, &log)).unwrap(), Status::Warn);
         assert_eq!(r.formats.len(), 1);
         for _ in 0..16 {
-            r.register_bidder(Box::new(UpperBidder(1))).unwrap();
+            assert_eq!(r.register_bidder(Box::new(UpperBidder(1))).unwrap(), Status::Ok);
         }
         let e = r.register_bidder(Box::new(UpperBidder(1))).unwrap_err();
         assert_eq!((e.code, e.errno), (ARCHIVE_FATAL, libc::ENOMEM));
@@ -2606,9 +2608,9 @@ mod tests {
     #[test]
     fn the_best_bidding_filter_is_stacked_until_nobody_bids() {
         let mut r = Read::default();
-        r.register_bidder(Box::new(UpperBidder(1))).unwrap();
-        r.register_bidder(Box::new(UpperBidder(3))).unwrap();
-        r.register_format(fake::<0>(1, &Rc::default())).unwrap();
+        assert_eq!(r.register_bidder(Box::new(UpperBidder(1))).unwrap(), Status::Ok);
+        assert_eq!(r.register_bidder(Box::new(UpperBidder(3))).unwrap(), Status::Ok);
+        assert_eq!(r.register_format(fake::<0>(1, &Rc::default())).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"abc"), ARCHIVE_OK);
         // One filter: after upper-casing nobody bids.
@@ -2628,8 +2630,8 @@ mod tests {
             }
         }
         let mut r = Read::default();
-        r.register_bidder(Box::new(Always)).unwrap();
-        r.register_format(fake::<0>(1, &Rc::default())).unwrap();
+        assert_eq!(r.register_bidder(Box::new(Always)).unwrap(), Status::Ok);
+        assert_eq!(r.register_format(fake::<0>(1, &Rc::default())).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"abc"), ARCHIVE_FATAL);
         assert_eq!(error(&a), "Input requires too many filters for decoding");
@@ -2638,10 +2640,10 @@ mod tests {
     #[test]
     fn appended_filters_skip_bidding_and_sit_on_the_client() {
         let mut r = Read::default();
-        r.register_bidder(Box::new(UpperBidder(1))).unwrap();
+        assert_eq!(r.register_bidder(Box::new(UpperBidder(1))).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(r.append_last_bidder(&a), ARCHIVE_OK);
-        r.register_format(fake::<0>(1, &Rc::default())).unwrap();
+        assert_eq!(r.register_format(fake::<0>(1, &Rc::default())).unwrap(), Status::Ok);
         assert_eq!(open_with(&mut r, &a, b"xyz"), ARCHIVE_OK);
         assert_eq!((r.filter_count(), r.filter_code(0), r.filter_code(1)), (2, 99, 0));
         assert_eq!(r.reader(&a).peek_available(3).unwrap(), b"XYZ");
@@ -2655,8 +2657,8 @@ mod tests {
         let log = Rc::default();
         let mut r = Read::default();
         let a = Base::new(READ_MAGIC);
-        r.register_format(fake::<1>(0, &log)).unwrap();
-        r.register_format(fake::<2>(9, &log)).unwrap();
+        assert_eq!(r.register_format(fake::<1>(0, &log)).unwrap(), Status::Ok);
+        assert_eq!(r.register_format(fake::<2>(9, &log)).unwrap(), Status::Ok);
         assert_eq!(r.select_format(&a, "nope"), ARCHIVE_FATAL);
         assert_eq!(error(&a), "Internal error: Unable to set format");
         assert_eq!(r.select_format(&a, "one"), ARCHIVE_OK);
@@ -2667,7 +2669,7 @@ mod tests {
         assert_eq!(*log.borrow(), [(2, -1)]);
 
         let mut r = Read::default();
-        r.register_format(fake::<1>(-1, &log)).unwrap();
+        assert_eq!(r.register_format(fake::<1>(-1, &log)).unwrap(), Status::Ok);
         r.select_format(&a, "one");
         assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_FATAL);
         assert_eq!(error(&a), "Registered format does not match");
@@ -2728,7 +2730,7 @@ mod tests {
 
     fn opened(script: Script) -> (Read, Base) {
         let mut r = Read::default();
-        r.register_format(Box::new(script)).unwrap();
+        assert_eq!(r.register_format(Box::new(script)).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"x"), ARCHIVE_OK);
         a.state.set(state::DATA);
@@ -2795,7 +2797,7 @@ mod tests {
         // Popped from the back: OK, WARN, FAILED, then EOF.
         script.headers = vec![ARCHIVE_EOF, ARCHIVE_FAILED, ARCHIVE_WARN, ARCHIVE_OK];
         let mut r = Read::default();
-        r.register_format(Box::new(script)).unwrap();
+        assert_eq!(r.register_format(Box::new(script)).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"abcdef"), ARCHIVE_OK);
         let mut e = Entry::new(None);
@@ -2815,7 +2817,7 @@ mod tests {
         let mut script = Script::new(&[], 0);
         script.headers = vec![ARCHIVE_OK, ARCHIVE_OK];
         let mut r = Read::default();
-        r.register_format(Box::new(script)).unwrap();
+        assert_eq!(r.register_format(Box::new(script)).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"abcdef"), ARCHIVE_OK);
         r.reader(&a).consume(2).unwrap();
@@ -2830,7 +2832,7 @@ mod tests {
         assert_eq!(r.has_encrypted_entries(), ENCRYPTION_UNSUPPORTED);
         let mut s = Script::new(&[], 0);
         s.caps = 1;
-        r.register_format(Box::new(s)).unwrap();
+        assert_eq!(r.register_format(Box::new(s)).unwrap(), Status::Ok);
         r.format = Some(0);
         assert_eq!(r.format_capabilities(), 1);
         assert_eq!(r.has_encrypted_entries(), ENCRYPTION_DONT_KNOW);
@@ -2848,8 +2850,8 @@ mod tests {
             }
         }
         let mut r = Read::default();
-        r.register_bidder(Box::new(Failing)).unwrap();
-        r.register_format(fake::<0>(1, &Rc::default())).unwrap();
+        assert_eq!(r.register_bidder(Box::new(Failing)).unwrap(), Status::Ok);
+        assert_eq!(r.register_format(fake::<0>(1, &Rc::default())).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"abc"), ARCHIVE_FATAL);
         assert_eq!((error(&a), a.state.get()), ("bidder failed".into(), state::FATAL));
@@ -2878,7 +2880,8 @@ mod tests {
             if std::mem::replace(&mut self.0, true) {
                 return Ok(Data::Eof { offset: 0 });
             }
-            r.warn(libc::EILSEQ, "bad checksum");
+            // `Data::Warn` is what carries the warning back.
+            let _ = r.warn(libc::EILSEQ, "bad checksum");
             Ok(Data::Warn)
         }
     }
@@ -2886,7 +2889,7 @@ mod tests {
     #[test]
     fn warnings_continue_and_are_not_errors() {
         let mut r = Read::default();
-        r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap();
+        assert_eq!(r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"x"), ARCHIVE_OK);
         let mut e = Entry::new(None);
@@ -2901,7 +2904,7 @@ mod tests {
         // A skip stops at a warning and reports it, but the handle is fine.
         let (mut r, a) = {
             let mut r = Read::default();
-            r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap();
+            assert_eq!(r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap(), Status::Ok);
             let a = Base::new(READ_MAGIC);
             open_with(&mut r, &a, b"x");
             (r, a)
@@ -2912,7 +2915,7 @@ mod tests {
         // read_data hands the status on, as upstream's archive_read_data does.
         let (mut r, a) = {
             let mut r = Read::default();
-            r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap();
+            assert_eq!(r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap(), Status::Ok);
             let a = Base::new(READ_MAGIC);
             open_with(&mut r, &a, b"x");
             (r, a)
@@ -2932,7 +2935,7 @@ mod tests {
         let position = rd.position();
         let data = rd.read_ahead(5).unwrap().unwrap();
         base.set_format(5, c"five");
-        base.warn(libc::EILSEQ, "noted");
+        assert_eq!(base.warn(libc::EILSEQ, "noted"), Status::Warn);
         assert_eq!((data, position), (&b"hello"[..], 0));
         assert_eq!((a.format.get(), error(&a)), (5, "noted".to_string()));
     }
@@ -2958,7 +2961,7 @@ mod tests {
 
     fn ar_open(bytes: &[u8], read_size: usize) -> (Read, Base) {
         let mut r = Read::default();
-        r.register_format(Box::new(ar_example::Ar::default())).unwrap();
+        assert_eq!(r.register_format(Box::new(ar_example::Ar::default())).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         let mem = crate::read_open_memory::Memory::new(bytes.to_vec(), read_size);
         assert_eq!(r.open(&a, Box::new(mem)), ARCHIVE_OK);
