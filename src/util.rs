@@ -47,6 +47,9 @@ pub struct Error {
     pub code: c_int,
     pub errno: c_int,
     pub msg: Vec<u8>,
+    /// The error is already on the handle (a client callback called
+    /// `archive_set_error`, say), so `raise` only reports its code.
+    pub recorded: bool,
 }
 
 impl Error {
@@ -55,11 +58,21 @@ impl Error {
             code,
             errno,
             msg: msg.into(),
+            recorded: false,
         }
     }
 
     pub fn fatal(errno: c_int, msg: impl Into<Vec<u8>>) -> Self {
         Self::new(ARCHIVE_FATAL, errno, msg)
+    }
+
+    /// An error of this `code` whose message was already recorded where it
+    /// happened: `raise` leaves the handle's error alone.
+    pub fn recorded(code: c_int) -> Self {
+        Error {
+            recorded: true,
+            ..Self::new(code, 0, Vec::new())
+        }
     }
 }
 
@@ -79,9 +92,12 @@ impl Base {
         }
     }
 
-    /// Records `e` and returns the code to hand back to the C caller.
+    /// Records `e` (unless it is `recorded` already) and returns the code to
+    /// hand back to the C caller.
     pub fn raise(&self, e: Error) -> c_int {
-        self.set_error(e.errno, Some(&e.msg));
+        if !e.recorded {
+            self.set_error(e.errno, Some(&e.msg));
+        }
         e.code
     }
 
@@ -121,7 +137,7 @@ impl Base {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{ARCHIVE_WARN, READ_MAGIC};
+    use crate::archive::{ARCHIVE_FAILED, ARCHIVE_WARN, READ_MAGIC};
 
     #[test]
     fn set_and_clear_error() {
@@ -152,6 +168,20 @@ mod tests {
             (22, Some(b"odd".as_slice()))
         );
         assert_eq!(a.raise(Error::fatal(1, "no")), ARCHIVE_FATAL);
+    }
+
+    #[test]
+    fn raising_a_recorded_error_keeps_the_recorded_error() {
+        let a = Base::new(READ_MAGIC);
+        a.set_error(9, Some(b"earlier"));
+        assert_eq!(a.raise(Error::recorded(ARCHIVE_FATAL)), ARCHIVE_FATAL);
+        assert_eq!(
+            (a.errno.get(), a.error_string().as_deref()),
+            (9, Some(b"earlier".as_slice()))
+        );
+        // An empty message with no errno is still a message to record.
+        assert_eq!(a.raise(Error::new(ARCHIVE_FAILED, 0, "")), ARCHIVE_FAILED);
+        assert_eq!((a.errno.get(), a.error_string().as_deref()), (0, None));
     }
 
     #[test]

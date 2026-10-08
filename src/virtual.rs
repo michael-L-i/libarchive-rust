@@ -29,35 +29,77 @@
 //! its own implementation: a `match` on `Kind`, where later units add arms.
 
 use crate::archive::*;
+use crate::entry::Entry;
 use crate::util::Error;
 use std::ffi::{c_char, c_int};
 
 impl Handle {
+    // The filter getters can be called by a client callback on its own
+    // handle, while the read state is borrowed for the call into it. Upstream
+    // allows that; here the getters answer with their error value.
+
     pub fn filter_code(&self, n: c_int) -> c_int {
         match &self.kind {
-            Kind::Read(r) => r.borrow().filter_code(n),
+            Kind::Read(r) => r.try_borrow().map_or(ARCHIVE_FATAL, |r| r.filter_code(n)),
         }
     }
 
     pub fn filter_count(&self) -> c_int {
         match &self.kind {
-            Kind::Read(r) => r.borrow().filter_count(),
+            Kind::Read(r) => r.try_borrow().map_or(ARCHIVE_FATAL, |r| r.filter_count()),
         }
     }
 
     /// The filter's name, or NULL. The pointer lives as long as the filter.
     pub fn filter_name(&self, n: c_int) -> *const c_char {
         match &self.kind {
-            Kind::Read(r) => r
-                .borrow()
-                .filter_name(n)
-                .map_or(std::ptr::null(), |s| s.as_ptr()),
+            Kind::Read(r) => r.try_borrow().map_or(std::ptr::null(), |r| {
+                r.filter_name(n).map_or(std::ptr::null(), |s| s.as_ptr())
+            }),
         }
     }
 
     pub fn filter_bytes(&self, n: c_int) -> i64 {
         match &self.kind {
-            Kind::Read(r) => r.borrow().filter_bytes(n),
+            Kind::Read(r) => r
+                .try_borrow()
+                .map_or(i64::from(ARCHIVE_FATAL), |r| r.filter_bytes(n)),
+        }
+    }
+
+    /// `archive_read_next_header2` and the read half of `next_header`:
+    /// reads the next header into `entry`.
+    pub fn read_next_header2(&self, entry: &mut Entry) -> c_int {
+        match &self.kind {
+            Kind::Read(r) => r
+                .try_borrow_mut()
+                .map_or(ARCHIVE_FATAL, |mut r| r.next_header2(&self.base, entry)),
+        }
+    }
+
+    /// The entry a read handle reads headers into, or NULL.
+    pub fn read_entry(&self) -> *mut Entry {
+        match &self.kind {
+            Kind::Read(r) => r
+                .try_borrow()
+                .map_or(std::ptr::null_mut(), |r| r.entry()),
+        }
+    }
+
+    /// Takes the read handle's entry for `archive_free` to free.
+    pub fn take_read_entry(&self) -> *mut Entry {
+        match &self.kind {
+            Kind::Read(r) => r
+                .try_borrow_mut()
+                .map_or(std::ptr::null_mut(), |mut r| r.take_entry()),
+        }
+    }
+
+    pub fn header_position(&self) -> i64 {
+        match &self.kind {
+            Kind::Read(r) => r
+                .try_borrow()
+                .map_or(i64::from(ARCHIVE_FATAL), |r| r.header_position()),
         }
     }
 
@@ -67,10 +109,12 @@ impl Handle {
         }
     }
 
-    /// `archive_free`: the handle is gone afterwards.
-    pub fn free(self) -> c_int {
-        match self.kind {
-            Kind::Read(r) => r.into_inner().free(&self.base),
+    /// `archive_free`, up to dropping the handle: closes it and releases
+    /// what client callbacks may still see. The caller drops the handle
+    /// afterwards, so the callbacks run on a live one.
+    pub fn free(&self) -> c_int {
+        match &self.kind {
+            Kind::Read(r) => r.borrow_mut().free(&self.base),
         }
     }
 
