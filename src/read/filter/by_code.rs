@@ -30,12 +30,12 @@
 use super::all::FILTERS;
 use super::none;
 use crate::archive::*;
-use crate::read::{Read, filter_code};
+use crate::read::{Read, Status, filter_code};
 use std::ffi::c_int;
 
 /// Registers the filter for `code`. A filter that is not ported yet fails
 /// with `ARCHIVE_FATAL`, as does an unknown code.
-pub fn support(r: &mut Read, code: c_int) -> c_int {
+pub fn support(r: &mut Read, a: &Base, code: c_int) -> c_int {
     if code == filter_code::NONE {
         return none::support();
     }
@@ -43,8 +43,7 @@ pub fn support(r: &mut Read, code: c_int) -> c_int {
         .iter()
         .find(|(c, _)| *c == code)
         .and_then(|(_, register)| *register)
-        .map_or(ARCHIVE_FATAL, |register| match register(r) {
-            Ok(status) => status.code(),
-            Err(e) => e.code,
+        .map_or(ARCHIVE_FATAL, |register| {
+            register(r, a).map_or_else(|e| a.raise(e), Status::code)
         })
 }

@@ -33,8 +33,9 @@ use crate::read::{Read, Status, filter_code as code};
 use crate::util::Error;
 use std::ffi::c_int;
 
-/// Registers a filter's bidder with the handle.
-pub type Support = fn(&mut Read) -> Result<Status, Error>;
+/// Registers a filter's bidder with the handle. A filter that needs an
+/// external program warns of it through the handle.
+pub type Support = fn(&mut Read, &Base) -> Result<Status, Error>;
 
 /// Every filter code (but `NONE` and `PROGRAM`, which are special), with its
 /// registration function once it is ported.
@@ -66,7 +67,7 @@ pub fn support(r: &mut Read, a: &Base) -> c_int {
             // much as possible." Clients who need specific compression
             // should enable those individually so they can verify the level
             // of support.
-            let _ = register(r);
+            let _ = register(r, a);
         }
     }
     // Clear any warning messages set by the above functions.

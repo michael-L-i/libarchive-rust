@@ -1,16 +1,18 @@
 //! The exported functions of archive_read.c and the files around it.
 
-use super::archive::with;
+use super::archive::{bytes, with};
 use super::client::CClient;
 use super::{
     ARCHIVE_FATAL, ARCHIVE_OK, Archive, archive_close_callback, archive_open_callback,
     archive_passphrase_callback, archive_read_callback, archive_seek_callback, archive_skip_callback, archive_switch_callback,
     guard,
 };
-use crate::archive::{Handle, Kind, READ_MAGIC, state};
-use crate::read::filter::{all as filter_all, by_code as filter_by_code, none as filter_none};
+use crate::archive::{Base, Handle, Kind, READ_MAGIC, state};
+use crate::read::filter::{
+    all as filter_all, by_code as filter_by_code, none as filter_none, program,
+};
 use crate::read::format::{all as format_all, by_code as format_by_code, empty, raw};
-use crate::read::{self, Read};
+use crate::read::{self, Read, Status};
 use super::ArchiveEntry;
 use super::sys::Fd;
 use crate::entry::Entry;
@@ -79,7 +81,7 @@ pub extern "C" fn archive_read_support_filter_by_code(a: *mut Archive, code: c_i
         READ_MAGIC,
         state::NEW,
         ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| filter_by_code::support(r, code))
+        |h| with_read(h, ARCHIVE_FATAL, |r| filter_by_code::support(r, &h.base, code))
     )
 }
 
@@ -130,6 +132,87 @@ pub extern "C" fn archive_read_append_filter(a: *mut Archive, code: c_int) -> c_
         ARCHIVE_FATAL,
         |h| with_read(h, ARCHIVE_FATAL, |r| read_append_filter::append_filter(r, &h.base, code))
     )
+}
+
+/// The code a registration function reports: its status, or the failure
+/// recorded on the handle.
+fn code(a: &Base, result: Result<Status, Error>) -> c_int {
+    result.map_or_else(|e| a.raise(e), Status::code)
+}
+
+/// Runs `f` on a read handle in the state to register a bidder, with the
+/// command and signature the program functions take: no signature if it is
+/// NULL. Upstream names `__archive_read_register_bidder` in the magic check
+/// error, because that is the first function to check. A NULL command
+/// crashes upstream; it fails here.
+fn with_program(
+    a: *mut Archive,
+    cmd: *const c_char,
+    signature: *const c_void,
+    len: usize,
+    f: impl FnOnce(&mut Read, &Base, &[u8], &[u8]) -> c_int,
+) -> c_int {
+    checked!(
+        __archive_read_register_bidder,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| {
+            let Some(cmd) = cstr(cmd) else {
+                return ARCHIVE_FATAL;
+            };
+            let signature = bytes(signature, len).unwrap_or_default();
+            with_read(h, ARCHIVE_FATAL, |r| f(r, &h.base, cmd, signature))
+        }
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_filter_program(a: *mut Archive, cmd: *const c_char) -> c_int {
+    archive_read_support_filter_program_signature(a, cmd, std::ptr::null(), 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_compression_program(a: *mut Archive, cmd: *const c_char) -> c_int {
+    archive_read_support_filter_program(a, cmd)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_filter_program_signature(
+    a: *mut Archive,
+    cmd: *const c_char,
+    signature: *const c_void,
+    signature_len: usize,
+) -> c_int {
+    with_program(a, cmd, signature, signature_len, |r, a, cmd, signature| {
+        code(a, program::support(r, cmd, signature))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_compression_program_signature(
+    a: *mut Archive,
+    cmd: *const c_char,
+    signature: *const c_void,
+    signature_len: usize,
+) -> c_int {
+    archive_read_support_filter_program_signature(a, cmd, signature, signature_len)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_append_filter_program(a: *mut Archive, cmd: *const c_char) -> c_int {
+    archive_read_append_filter_program_signature(a, cmd, std::ptr::null(), 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_append_filter_program_signature(
+    a: *mut Archive,
+    cmd: *const c_char,
+    signature: *const c_void,
+    signature_len: usize,
+) -> c_int {
+    with_program(a, cmd, signature, signature_len, read_append_filter::append_filter_program)
 }
 
 #[unsafe(no_mangle)]
