@@ -28,6 +28,7 @@
 //! The filters `archive_read_support_filter_all` enables, and the table
 //! `archive_read_support_filter_by_code` looks filters up in.
 
+use super::gzip;
 use crate::archive::*;
 use crate::read::{Read, Status, filter_code as code};
 use crate::util::Error;
@@ -41,7 +42,7 @@ pub type Support = fn(&mut Read) -> Result<Status, Error>;
 pub const FILTERS: &[(c_int, Option<Support>)] = &[
     (code::BZIP2, None),
     (code::COMPRESS, None),
-    (code::GZIP, None),
+    (code::GZIP, Some(gzip::support)),
     (code::LZIP, None),
     // The LZMA file format has a very weak signature, so it may not be
     // feasible to keep this here, but we'll try. This will come back out if

@@ -283,3 +283,36 @@ Differences:
   upstream finds within its buffer is found the same way, and a line it
   would only find by reading out of bounds is not found. A line starting
   exactly at the window's end gets an empty window, as upstream.
+
+## Gzip filter (`src/read/filter/gzip.rs`)
+
+### Ported as-is
+
+- The trailer's CRC32 and ISIZE are read and not checked (upstream's
+  `XXX TODO: Verify`), and so is the optional header CRC. A member with a bad
+  checksum decodes without error (archive_read_support_filter_gzip.c).
+- Each header sets the mtime, but only a header with a file name sets the
+  name. A later member without FNAME leaves the earlier name, which
+  `read_header` then reports (`gzip_read_header` after `peek_at_header`).
+- A truncated trailer fails with `ARCHIVE_FATAL` and no message, because
+  upstream's `__archive_read_filter_ahead` sets none at end of input.
+- A read error met while reading a header is a missing header, so the stream
+  ends cleanly there, as upstream's NULL from `__archive_read_filter_ahead`
+  does. A read error met in the deflate data reports "truncated gzip input".
+- The 1 MiB limit on a file name or comment is checked against the bytes
+  buffered so far, as upstream checks its buffer. Where a too-long field is
+  rejected therefore depends on the read block size, in upstream too.
+
+### Differences
+
+- No zlib version is reported. zlib-rs 0.6.8, the backend, exposes no version
+  string, so `archive_zlib_version()` returns NULL and
+  `archive_version_details()` has no `zlib/` entry, where upstream reports
+  `zlib/<ZLIB_VERSION>`. Open question: what version string to report.
+- Decompression is flate2 over zlib-rs in raw mode. Corrupt input fails with
+  "gzip decompression failed" as upstream does. zlib-rs is a port of zlib, but
+  equality of accepted streams is checked only through the upstream fixtures
+  and the tests in the module.
+- The `inflateInit2` and `inflateEnd` failures upstream reports ("Internal
+  error initializing compression library", "Failed to clean up gzip
+  decompressor") cannot happen with zlib-rs, so they are not ported.
