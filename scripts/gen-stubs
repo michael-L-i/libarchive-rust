@@ -177,7 +177,10 @@ def defined_elsewhere():
     found = set()
     for f in FFI.glob("**/*.rs"):
         if f.name not in ("stubs.rs", "mod.rs"):
-            found |= set(re.findall(r"\bfn\s+(archive_\w+)\s*\(", f.read_text()))
+            text = f.read_text()
+            found |= set(re.findall(r"\bfn\s+(archive_\w+)\s*\(", text))
+            if "entry_fns!" in text:  # functions defined by the macro, one per line
+                found |= set(re.findall(r"(?m)^    (archive_\w+)\(", text))
     return found
 
 
