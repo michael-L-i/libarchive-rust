@@ -9,6 +9,7 @@ name = "archive"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 libc = "0.2"
 
 [build-dependencies]
