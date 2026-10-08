@@ -103,6 +103,7 @@ scripts/build-oracle            once: CMake build of upstream into build/oracle
 scripts/build-port              cargo build, relink upstream's tests against ours
 scripts/run-tests [PATTERN...]  one process per test, parallel; checks the ratchet
 scripts/run-tests --update      add newly passing tests to tests/passing.txt
+scripts/run-tests --suite cat [PATTERN...]  front-end suite: cat, tar, cpio, unzip, or all
 ```
 
 1. **Upstream test suite.** `libarchive/test/` holds 934 tests and 491 `.uu`

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Run upstream's libarchive_test one test per process and enforce the ratchet.
+"""Run upstream's test programs one test per process and enforce the ratchet.
 
+Suites: libarchive (upstream's libarchive_test) and the front-end suites cat, tar,
+cpio and unzip, whose bsd<name>_test drives build/<mode>/bin/bsd<name> given with -p.
 Port mode (default) runs build/port; --oracle runs build/oracle (upstream).
+Front-end test names are prefixed with the suite: cat/test_expand_gz.
 See AGENTS.md, "Oracle".
 """
 
@@ -32,6 +35,7 @@ FORMAT_ALIAS = {
     "zip64": "zip",
 }
 PREFIX_AREAS = ("read_filter", "write_filter", "entry", "acl", "archive", "compat", "fuzz")
+SUITES = ("libarchive", "cat", "tar", "cpio", "unzip")
 
 
 def die(msg, code=2):
@@ -62,7 +66,32 @@ def list_tests(binary):
     return names
 
 
+def suite_of(name):
+    return name.split("/")[0] if "/" in name else "libarchive"
+
+
+def short(name):
+    return name.rsplit("/", 1)[-1]
+
+
+def log_path(out_dir, name):
+    return os.path.join(out_dir, "logs", name.replace("/", ".") + ".log")
+
+
+def suite_cmd(suite, label, bin_override=None):
+    """Argv that runs one test of a suite (name appended), and the executables it needs."""
+    if suite == "libarchive":
+        binary = bin_override or os.path.join(ROOT, "build", label, "bin", "libarchive_test")
+        return [binary, "-s", "-r", TESTDIR], [binary]
+    binary = os.path.join(ROOT, "build", "oracle", "bin", f"bsd{suite}_test")
+    prog = os.path.join(ROOT, "build", label, "bin", f"bsd{suite}")
+    fixtures = os.path.join(ROOT, "upstream/libarchive", suite, "test")
+    return [binary, "-s", "-p", prog, "-r", fixtures], [binary, prog]
+
+
 def area(name):
+    if "/" in name:
+        return suite_of(name)
     n = name[len("test_"):] if name.startswith("test_") else name
     for kind in ("read_format_", "write_format_"):
         if n.startswith(kind):
@@ -83,18 +112,18 @@ def classify(rc):
     return {0: "pass", 2: "skip"}.get(rc, "fail")
 
 
-def run_one(binary, name, out_dir, timeout):
-    work = os.path.join(out_dir, "work", name)
+def run_one(cmd, name, out_dir, timeout):
+    work = os.path.join(out_dir, "work", name.replace("/", "."))
     shutil.rmtree(work, ignore_errors=True)
     cwd = os.path.join(work, "cwd")
     tmp = os.path.join(work, "tmp")
     os.makedirs(cwd)
     os.makedirs(tmp)
-    log = os.path.join(out_dir, "logs", name + ".log")
+    log = log_path(out_dir, name)
     env = dict(os.environ, TMPDIR=tmp)
     start = time.monotonic()
     with open(log, "w") as out:
-        proc = subprocess.Popen([binary, "-s", "-r", TESTDIR, name], cwd=cwd, env=env,
+        proc = subprocess.Popen(cmd + [short(name)], cwd=cwd, env=env,
                                 stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             status = classify(proc.wait(timeout=timeout))
@@ -147,10 +176,12 @@ def write_status(label, tests, status, upstream):
         r[0] += n in ours
         r[1] += upstream is not None and n in upstream
         r[2] += 1
+    # The headline is libarchive's; the front-end suites appear as rows only.
+    lib = {n for n in tests if suite_of(n) == "libarchive"}
     if upstream is None:
-        head = f"**Passing {len(ours)} / {len(tests)} total** (no tests/upstream.txt yet)"
+        head = f"**Passing {len(ours & lib)} / {len(lib)} total** (no tests/upstream.txt yet)"
     else:
-        head = f"**Passing {len(ours)} / upstream {len(upstream)} / {len(tests)} total**"
+        head = f"**Passing {len(ours & lib)} / upstream {len(lib & upstream)} / {len(lib)} total**"
     lines = [
         "# libarchive-rust status",
         "",
@@ -177,18 +208,23 @@ def write_status(label, tests, status, upstream):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Run upstream libarchive_test per test, in parallel, and enforce the ratchet.")
+        description="Run upstream's test programs per test, in parallel, and enforce the ratchet.")
+    ap.add_argument("--suite", choices=SUITES + ("all",), default="libarchive",
+                    help="libarchive (default), a front-end (cat, tar, cpio, unzip), or all")
     ap.add_argument("--oracle", action="store_true", help="run upstream (build/oracle) instead of the port")
-    ap.add_argument("--bin", metavar="PATH", help="test binary to run (overrides --oracle's default)")
+    ap.add_argument("--bin", metavar="PATH", help="libarchive test binary to run (overrides --oracle's default)")
     ap.add_argument("--update", action="store_true", help="add new passes to tests/passing.txt")
-    ap.add_argument("--baseline", action="store_true", help="with --oracle, write tests/upstream.txt (full run)")
-    ap.add_argument("--status", action="store_true", help="rewrite STATUS.md (full run)")
+    ap.add_argument("--baseline", action="store_true",
+                    help="with --oracle, record the passes of the selected suites in tests/upstream.txt (full run)")
+    ap.add_argument("--status", action="store_true", help="rewrite STATUS.md (full run, --suite all)")
     ap.add_argument("-j", type=int, default=os.cpu_count() or 1, help="parallel jobs (default: CPU count)")
     # Upstream's slowest test takes ~5s; stubbed reads can loop until killed.
     ap.add_argument("--timeout", type=float, default=30, help="seconds per test (default: 30)")
     ap.add_argument("-v", "--verbose", action="store_true", help="list all non-passing and new tests")
-    ap.add_argument("patterns", nargs="*", metavar="PATTERN", help="fnmatch globs on test names")
+    ap.add_argument("patterns", nargs="*", metavar="PATTERN",
+                    help="fnmatch globs on test names, matched within the selected suite")
     a = ap.parse_args()
+    suites = list(SUITES) if a.suite == "all" else [a.suite]
 
     if a.oracle and a.update:
         die("--update applies to the port ratchet, not --oracle")
@@ -196,42 +232,42 @@ def main():
         die("--baseline requires --oracle")
     if (a.baseline or a.status) and a.patterns:
         die("--baseline and --status require a full run (no patterns)")
+    if a.status and a.suite != "all":
+        die("--status requires --suite all")
+    if a.bin and suites != ["libarchive"]:
+        die("--bin applies to --suite libarchive only")
     if a.j < 1:
         die("-j must be at least 1")
 
-    if a.bin:
-        binary = os.path.abspath(a.bin)
-    else:
-        binary = os.path.join(ROOT, "build", "oracle" if a.oracle else "port", "bin", "libarchive_test")
-    if not os.access(binary, os.X_OK):
-        if a.bin:
-            die(f"not an executable: {binary}")
-        hint = "scripts/build-oracle" if a.oracle else "scripts/build-port"
-        die(f"missing {binary}; run {hint}")
+    label = "oracle" if a.oracle else "port"
+    cmds = {}
+    for s in suites:
+        cmd, needs = suite_cmd(s, label, os.path.abspath(a.bin) if a.bin else None)
+        missing = [p for p in needs if not os.access(p, os.X_OK)]
+        if missing:
+            die(f"missing {' '.join(missing)}; run scripts/build-oracle and scripts/build-port")
+        cmds[s] = cmd
 
-    if not a.bin:
-        label = "oracle" if a.oracle else "port"
-    elif a.oracle:
-        label = "oracle"
-    else:
-        label = next((n for n in ("oracle", "port")
-                      if binary.startswith(os.path.join(ROOT, "build", n) + os.sep)), "custom")
-    ratchet = not a.oracle
-
-    tests = list_tests(binary)
+    listed = {}  # qualified name -> suite
+    for s in suites:
+        for n in list_tests(cmds[s][0]):
+            listed[n if s == "libarchive" else f"{s}/{n}"] = s
+    tests = list(listed)
     if not tests:
-        die(f"{binary} lists no tests")
-    selected = [t for t in tests if not a.patterns or any(fnmatch.fnmatchcase(t, p) for p in a.patterns)]
+        die("no tests listed")
+    selected = [t for t in tests
+                if not a.patterns or any(fnmatch.fnmatchcase(short(t), p) for p in a.patterns)]
     if not selected:
         die("no tests match " + " ".join(a.patterns))
 
+    ratchet = not a.oracle
     passing = set()
     if ratchet:
         if not os.path.exists(PASSING):
             write_names(PASSING, [], PASS_HEADER)
         passing = set(read_names(PASSING))
         if not a.patterns:
-            unknown = sorted(passing - set(tests))
+            unknown = sorted(n for n in passing if suite_of(n) in suites and n not in listed)
             if unknown:
                 print(f"warning: {len(unknown)} names in passing.txt are not in the test list: "
                       + " ".join(unknown[:5]))
@@ -243,7 +279,7 @@ def main():
 
     start = time.monotonic()
     with ThreadPoolExecutor(max_workers=a.j) as ex:
-        results = list(ex.map(lambda n: run_one(binary, n, out_dir, a.timeout), selected))
+        results = list(ex.map(lambda n: run_one(cmds[listed[n]], n, out_dir, a.timeout), selected))
     wall = time.monotonic() - start
 
     status = {n: s for n, s, _ in results}
@@ -271,7 +307,7 @@ def main():
     if regressions:
         print("REGRESSIONS (in tests/passing.txt, not passing now):")
         for n in regressions:
-            log = "" if status[n] == "skip" else "  " + os.path.join(out_dir, "logs", n + ".log")
+            log = "" if status[n] == "skip" else "  " + log_path(out_dir, n)
             print(f"  {n}  {status[n]}{log}")
 
     nonpass = [(n, status[n]) for n in selected if status[n] != "pass"]
@@ -283,7 +319,7 @@ def main():
 
     first = next((n for n in selected if status[n] not in ("pass", "skip")), None)
     if first:
-        log = os.path.join(out_dir, "logs", first + ".log")
+        log = log_path(out_dir, first)
         print(f"first failure: {first} ({status[first]}) log: {log}")
         with open(log, errors="replace") as f:
             tail = f.read().splitlines()[-10:]
@@ -291,9 +327,10 @@ def main():
             print("    " + line)
 
     if a.baseline:
-        passes = [n for n in selected if status[n] == "pass"]
-        write_names(UPSTREAM, passes, UPSTREAM_HEADER)
-        print(f"wrote tests/upstream.txt ({len(passes)} tests)")
+        kept = {n for n in read_names(UPSTREAM) if suite_of(n) not in suites} if os.path.exists(UPSTREAM) else set()
+        passes = {n for n in selected if status[n] == "pass"}
+        write_names(UPSTREAM, kept | passes, UPSTREAM_HEADER)
+        print(f"wrote tests/upstream.txt ({len(kept | passes)} tests)")
 
     if a.status:
         upstream = set(read_names(UPSTREAM)) if os.path.exists(UPSTREAM) else None
