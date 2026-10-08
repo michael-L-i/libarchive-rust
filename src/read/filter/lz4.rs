@@ -285,7 +285,9 @@ impl Lz4 {
         if frame.linked {
             slide(&mut self.window, self.buf.get(..frame.decoded).unwrap_or_default());
         }
-        let n = if head & 0x8000_0000 != 0 {
+        // A stored block of size zero is decoded as a compressed one, which
+        // fails, as upstream's does.
+        let n = if head & 0x8000_0000 != 0 && size > 0 {
             self.buf
                 .get_mut(..size)
                 .ok_or_else(malformed)?
@@ -443,5 +445,15 @@ mod tests {
             }
             let _ = decode(support, &m, 7);
         }
+    }
+
+    #[test]
+    fn a_stored_block_of_size_zero_fails_to_decompress() {
+        // Upstream decodes the header 0x80000000 as a compressed block of 0 bytes.
+        let data = [&A[..7], &[0, 0, 0, 0x80][..], &EMPTY[7..]].concat();
+        assert_eq!(
+            decode(support, &data, 3),
+            Err("lz4 decompression failed".into())
+        );
     }
 }
