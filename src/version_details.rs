@@ -37,7 +37,8 @@ use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
 
 pub const ZLIB: Option<&CStr> = None;
-pub const LIBLZMA: Option<&CStr> = None;
+/// The liblzma version the `xz` crate is a port of.
+pub const LIBLZMA: Option<&CStr> = Some(c"5.8.3");
 /// Like `BZ2_bzlibVersion()`: "1.0.8, 13-Jul-2019".
 pub const BZLIB: Option<&CStr> = None;
 pub const LIBLZ4: Option<&CStr> = None;
@@ -90,8 +91,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_backends_yet() {
-        assert_eq!(details(), c"libarchive 3.9.0dev libb2/bundled");
+    fn only_the_ported_backends() {
+        assert_eq!(details(), c"libarchive 3.9.0dev liblzma/5.8.3 libb2/bundled");
     }
 
     #[test]
