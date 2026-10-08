@@ -1430,7 +1430,6 @@ impl Read {
     }
 
     /// `__archive_read_register_bidder`.
-    #[allow(dead_code)] // called by the filters' `support` functions (phase 2)
     pub fn register_bidder(&mut self, bidder: Box<dyn FilterBidder>) -> Result<Status, Error> {
         if self.bidders.len() >= MAX_REGISTERED {
             return Err(Error::fatal(

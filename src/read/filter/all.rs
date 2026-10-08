@@ -48,7 +48,7 @@ pub const FILTERS: &[(c_int, Option<Support>)] = &[
     // there are problems.
     (code::LZMA, None),
     (code::XZ, None),
-    (code::UU, None),
+    (code::UU, Some(super::uu::support)),
     (code::RPM, None),
     (code::LRZIP, None),
     (code::LZOP, None),
