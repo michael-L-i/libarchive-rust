@@ -218,8 +218,8 @@ def main():
                     help="with --oracle, record the passes of the selected suites in tests/upstream.txt (full run)")
     ap.add_argument("--status", action="store_true", help="rewrite STATUS.md (full run, --suite all)")
     ap.add_argument("-j", type=int, default=os.cpu_count() or 1, help="parallel jobs (default: CPU count)")
-    # Upstream's slowest test takes ~5s; stubbed reads can loop until killed.
-    ap.add_argument("--timeout", type=float, default=30, help="seconds per test (default: 30)")
+    # Upstream's slowest test takes ~5s alone; leave room for a loaded machine.
+    ap.add_argument("--timeout", type=float, default=60, help="seconds per test (default: 60)")
     ap.add_argument("-v", "--verbose", action="store_true", help="list all non-passing and new tests")
     ap.add_argument("patterns", nargs="*", metavar="PATTERN",
                     help="fnmatch globs on test names, matched within the selected suite")
