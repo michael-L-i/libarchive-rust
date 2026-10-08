@@ -63,7 +63,46 @@ pub mod filter_code {
     use std::ffi::c_int;
 
     pub const NONE: c_int = 0;
+    pub const GZIP: c_int = 1;
+    pub const BZIP2: c_int = 2;
+    pub const COMPRESS: c_int = 3;
+    pub const PROGRAM: c_int = 4;
+    pub const LZMA: c_int = 5;
+    pub const XZ: c_int = 6;
+    pub const UU: c_int = 7;
+    pub const RPM: c_int = 8;
+    pub const LZIP: c_int = 9;
+    pub const LRZIP: c_int = 10;
+    pub const LZOP: c_int = 11;
+    pub const GRZIP: c_int = 12;
+    pub const LZ4: c_int = 13;
+    pub const ZSTD: c_int = 14;
 }
+
+/// The `ARCHIVE_FORMAT_*` base codes.
+pub mod format_code {
+    use std::ffi::c_int;
+
+    pub const BASE_MASK: c_int = 0xff0000;
+    pub const CPIO: c_int = 0x10000;
+    pub const TAR: c_int = 0x30000;
+    pub const ISO9660: c_int = 0x40000;
+    pub const ZIP: c_int = 0x50000;
+    pub const EMPTY: c_int = 0x60000;
+    pub const AR: c_int = 0x70000;
+    pub const MTREE: c_int = 0x80000;
+    pub const RAW: c_int = 0x90000;
+    pub const XAR: c_int = 0xA0000;
+    pub const LHA: c_int = 0xB0000;
+    pub const CAB: c_int = 0xC0000;
+    pub const RAR: c_int = 0xD0000;
+    pub const SEVENZIP: c_int = 0xE0000;
+    pub const WARC: c_int = 0xF0000;
+    pub const RAR_V5: c_int = 0x100000;
+}
+
+pub mod filter;
+pub mod format;
 
 /// A seek origin, as `lseek` and the client seek callback take it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,7 +214,7 @@ pub trait Client {
 }
 
 /// Of two results, the failing one with the lower code (the worse error).
-fn worse(a: Result<(), Error>, b: Result<(), Error>) -> Result<(), Error> {
+pub(crate) fn worse(a: Result<(), Error>, b: Result<(), Error>) -> Result<(), Error> {
     match (a, b) {
         (Err(a), Err(b)) => Err(if b.code < a.code { b } else { a }),
         (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
@@ -918,6 +957,9 @@ pub struct Read {
     /// The device and inode extraction must not overwrite, as the client or
     /// `archive_read_extract_set_skip_file` set it.
     pub(crate) skip_file: Option<(i64, i64)>,
+    /// The client callbacks `archive_read_set_*_callback` have collected,
+    /// until the archive is opened.
+    pub(crate) callbacks: crate::ffi::client::Callbacks,
 }
 
 /// `archive_read_new`.

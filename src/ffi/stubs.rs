@@ -10,18 +10,9 @@ use super::{
     archive_free_callback,
     archive_open_callback,
     archive_passphrase_callback,
-    archive_read_callback,
-    archive_seek_callback,
-    archive_skip_callback,
-    archive_switch_callback,
     archive_write_callback,
 };
 use std::ffi::{c_char, c_int, c_long, c_uint, c_void};
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_compression_all(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_compression_bzip2(_a0: *mut Archive) -> c_int {
@@ -45,11 +36,6 @@ pub extern "C" fn archive_read_support_compression_lzip(_a0: *mut Archive) -> c_
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_compression_lzma(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_compression_none(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
 
@@ -83,16 +69,6 @@ pub extern "C" fn archive_read_support_compression_uu(_a0: *mut Archive) -> c_in
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_compression_xz(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_all(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_by_code(_a0: *mut Archive, _a1: c_int) -> c_int {
     ARCHIVE_FATAL
 }
 
@@ -142,11 +118,6 @@ pub extern "C" fn archive_read_support_filter_lzop(_a0: *mut Archive) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_none(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_program(
     _a0: *mut Archive,
     _command: *const c_char,
@@ -190,17 +161,7 @@ pub extern "C" fn archive_read_support_format_7zip(_a0: *mut Archive) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_format_all(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_ar(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_format_by_code(_a0: *mut Archive, _a1: c_int) -> c_int {
     ARCHIVE_FATAL
 }
 
@@ -285,16 +246,6 @@ pub extern "C" fn archive_read_support_format_zip_seekable(_a0: *mut Archive) ->
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_format(_a0: *mut Archive, _a1: c_int) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_append_filter(_a0: *mut Archive, _a1: c_int) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_append_filter_program(
     _a0: *mut Archive,
     _a1: *const c_char,
@@ -308,115 +259,6 @@ pub extern "C" fn archive_read_append_filter_program_signature(
     _a1: *const c_char,
     _a2: *const c_void,
     _a3: usize,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_open_callback(
-    _a0: *mut Archive,
-    _a1: archive_open_callback,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_read_callback(
-    _a0: *mut Archive,
-    _a1: archive_read_callback,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_seek_callback(
-    _a0: *mut Archive,
-    _a1: archive_seek_callback,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_skip_callback(
-    _a0: *mut Archive,
-    _a1: archive_skip_callback,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_close_callback(
-    _a0: *mut Archive,
-    _a1: archive_close_callback,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_switch_callback(
-    _a0: *mut Archive,
-    _a1: archive_switch_callback,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_callback_data(_a0: *mut Archive, _a1: *mut c_void) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_callback_data2(
-    _a0: *mut Archive,
-    _a1: *mut c_void,
-    _a2: c_uint,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_add_callback_data(
-    _a0: *mut Archive,
-    _a1: *mut c_void,
-    _a2: c_uint,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_append_callback_data(_a0: *mut Archive, _a1: *mut c_void) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_prepend_callback_data(_a0: *mut Archive, _a1: *mut c_void) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_open1(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_open(
-    _a0: *mut Archive,
-    _client_data: *mut c_void,
-    _a2: archive_open_callback,
-    _a3: archive_read_callback,
-    _a4: archive_close_callback,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_open2(
-    _a0: *mut Archive,
-    _client_data: *mut c_void,
-    _a2: archive_open_callback,
-    _a3: archive_read_callback,
-    _a4: archive_skip_callback,
-    _a5: archive_close_callback,
 ) -> c_int {
     ARCHIVE_FATAL
 }
@@ -617,9 +459,6 @@ pub extern "C" fn archive_read_extract_set_progress_callback(
     _progress_func: Option<unsafe extern "C" fn(*mut c_void)>,
     _user_data: *mut c_void,
 ) {}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_extract_set_skip_file(_a0: *mut Archive, _a1: i64, _a2: i64) {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_new() -> *mut Archive {

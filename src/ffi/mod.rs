@@ -5,7 +5,9 @@ use std::ffi::{c_char, c_int, c_void};
 use std::marker::{PhantomData, PhantomPinned};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+#[macro_use]
 mod archive;
+pub(crate) mod client;
 pub(crate) mod entry;
 mod entry_link_resolver;
 mod read;
