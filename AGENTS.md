@@ -24,11 +24,15 @@ C programs (bsdtar, package managers) link it in place of `libarchive.so`.
   error strings, entry metadata and output bytes. Port behavior that looks wrong
   as-is and record it in `NOTES.md`. The one intended difference: input that
   makes upstream read or write out of bounds fails cleanly here.
-- **Pure Rust.** No C dependencies. Compression comes from existing crates
-  (zlib-rs via flate2, libbz2-rs-sys, xz, ruzstd, lz4_flex; quick-xml for xar). A
-  new dependency needs one line in the commit body saying why. The one C file
-  is `src/ffi/variadic.c`, which formats `archive_set_error`'s varargs and calls
-  into Rust, because stable Rust can't define C variadic functions.
+- **Safe Rust dependencies.** No C, and prefer crates with no or minimal
+  `unsafe`. When a backend can't be both memory-safe and byte-identical to
+  upstream, safe wins: use the safe crate and record how its behavior differs
+  (usually only on corrupt input) in `NOTES.md`. A machine-translated (c2rust)
+  backend is allowed only when no safe option exists, and is tracked for
+  replacement. A new dependency needs one line in the commit body saying why.
+  The one C file is `src/ffi/variadic.c`, which formats `archive_set_error`'s
+  varargs and calls into Rust, because stable Rust can't define C variadic
+  functions.
 
 ## Layout
 
