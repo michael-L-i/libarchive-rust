@@ -101,3 +101,58 @@ Divergences:
   check (0xE1 does not decode to U+0410), so upstream's
   `test_archive_string_update_utf8_koi8` skips there; a variant that checks
   only the multibyte forms runs instead.
+
+## archive_entry and archive_acl (`src/entry*.rs`, `src/acl.rs`)
+
+Suspected upstream bugs, ported as-is:
+
+- `archive_entry_clear` ends in `memset(entry, 0, ...)`, which also zeroes
+  `entry->archive`. The reader clears the entry before every header, so an
+  entry made by `archive_entry_new2(a)` loses its conversion cache (and with
+  it the place where conversion errors would be reported) after the first
+  `archive_read_next_header`. Ours forgets the cache the same way.
+- `archive_entry_xattr_add_entry` prepends, so `archive_entry_clone`, which
+  adds the attributes in list order, reverses them. Ours does too.
+- `archive_entry_clone` does not copy `mset_digest`, and nothing in upstream
+  reads it, so it is not stored here at all.
+- `isint`/`isint_w` reject `INT_MAX` itself: the overflow test uses
+  `digit >= INT_MAX % 10` where `>` would be exact, so a numeric ACL id of
+  2147483647 makes the entry invalid.
+- `ismode`, `is_nfs4_perms` and `is_nfs4_flags` leave the bits they found so
+  far in `permset` when they fail. For a Solaris-style `other:rw?` entry the
+  failed `ismode` leaves a non-zero `permset`, which makes the later
+  `permset == 0` test skip the mode check, so the entry is accepted with the
+  partial permissions.
+- The narrow (`archive_acl_from_text_nl`) and wide (`archive_acl_from_text_w`)
+  parsers differ: the narrow `next_field` ends a field at the first
+  whitespace (`user:big bob:r-x` names `big`), the wide one keeps internal
+  whitespace in the name. Both are ported as they are.
+- NFSv4 text `user:100:...` passes `100` on as the entry's name as well as
+  its id.
+- `archive_acl_next` leaves `*type`, `*permset` and `*tag` untouched when it
+  returns `ARCHIVE_WARN`; ours does too.
+- `archive_acl_to_text_w` leaves out an entry whose name does not convert to
+  wide characters, but `archive_acl_to_text_l` fails as a whole.
+- `FIX_NS` overflows (undefined behavior in C) for a huge `t`; ours wraps.
+
+Differences:
+
+- A NULL entry: upstream dereferences it (except `archive_entry_free(NULL)`
+  and `archive_entry_clear(NULL)`, which return). Ours return 0 or NULL.
+  `archive_entry_xattr_add_entry` with a NULL name or value, and
+  `archive_entry_set_digest` with a NULL digest, do nothing (the latter
+  returns `ARCHIVE_WARN`) instead of crashing.
+- `archive_entry_acl_to_text` and `archive_entry_acl_to_text_w` return
+  `malloc`ed memory that the caller frees, as upstream does; only the
+  deprecated `archive_entry_acl_text` and `archive_entry_acl_text_w` keep
+  their text in the ACL until the next call or change.
+- The file flag tables cover macOS (`SF_*`, `UF_*`) and Linux (`FS_*_FL`,
+  with the `linux/fs.h` values); other platforms have no flags, where
+  upstream would use the BSD or Windows lists.
+- `archive_entry_copy_bhfi` (Windows) and the deprecated, unexported
+  `archive_entry_acl_text_l` are not ported. The `_l` locale variants of the
+  setters and getters are methods on `Entry` for the readers and writers, not
+  exports, as in upstream.
+- `st_birthtime` is filled and read only where `struct stat` has it (macOS);
+  elsewhere `archive_entry_copy_stat` unsets the birth time as upstream's
+  fallback does.
