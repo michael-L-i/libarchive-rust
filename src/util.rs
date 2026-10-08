@@ -61,6 +61,20 @@ impl Error {
     pub fn fatal(errno: c_int, msg: impl Into<Vec<u8>>) -> Self {
         Self::new(ARCHIVE_FATAL, errno, msg)
     }
+
+    /// A bare status code with nothing to record: `ARCHIVE_EOF`, or an error
+    /// whose message was already recorded where it happened (a client
+    /// callback called `archive_set_error`, say). `raise` leaves the handle's
+    /// error alone for these.
+    #[allow(dead_code)] // used by the read core's chain (next commits)
+    pub fn status(code: c_int) -> Self {
+        Self::new(code, 0, Vec::new())
+    }
+
+    /// Whether this is a `status`: no errno and no message.
+    pub fn is_status(&self) -> bool {
+        self.errno == 0 && self.msg.is_empty()
+    }
 }
 
 impl Base {
@@ -79,9 +93,12 @@ impl Base {
         }
     }
 
-    /// Records `e` and returns the code to hand back to the C caller.
+    /// Records `e` (unless it is a bare `Error::status`) and returns the code
+    /// to hand back to the C caller.
     pub fn raise(&self, e: Error) -> c_int {
-        self.set_error(e.errno, Some(&e.msg));
+        if !e.is_status() {
+            self.set_error(e.errno, Some(&e.msg));
+        }
         e.code
     }
 
@@ -152,6 +169,19 @@ mod tests {
             (22, Some(b"odd".as_slice()))
         );
         assert_eq!(a.raise(Error::fatal(1, "no")), ARCHIVE_FATAL);
+    }
+
+    #[test]
+    fn raising_a_status_keeps_the_recorded_error() {
+        let a = Base::new(READ_MAGIC);
+        a.set_error(9, Some(b"earlier"));
+        assert_eq!(a.raise(Error::status(ARCHIVE_FATAL)), ARCHIVE_FATAL);
+        assert_eq!(
+            (a.errno.get(), a.error_string().as_deref()),
+            (9, Some(b"earlier".as_slice()))
+        );
+        assert!(!Error::new(ARCHIVE_WARN, 0, "x").is_status());
+        assert!(!Error::new(ARCHIVE_WARN, 5, "").is_status());
     }
 
     #[test]

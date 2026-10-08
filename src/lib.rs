@@ -12,6 +12,7 @@ mod entry_strmode;
 mod entry_xattr;
 mod ffi;
 mod read;
+mod read_add_passphrase;
 mod string;
 mod string_composition;
 mod util;
