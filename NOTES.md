@@ -316,3 +316,26 @@ Differences:
 - The `inflateInit2` and `inflateEnd` failures upstream reports ("Internal
   error initializing compression library", "Failed to clean up gzip
   decompressor") cannot happen with zlib-rs, so they are not ported.
+
+## xz, lzma and lzip filters (`src/read/filter/xz.rs`)
+
+### Differences
+
+- liblzma is replaced by the pure Rust `xz` crate (a port of liblzma
+  5.8.3, which `archive_liblzma_version` and `archive_version_details`
+  report; the oracle links 5.8.4). The crate has the same stream API, so
+  the error messages and which input is rejected match; a bug fix between
+  5.8.3 and 5.8.4 could differ on unusual damaged input. `LZMA_MEMLIMIT` is
+  disabled as upstream does for liblzma 5.
+- The "Using external xz program" fallback is not ported: the decoder is
+  always built in.
+- A read error while a filter bids is passed up as a failure where
+  upstream's bid returns 0 (see the read core notes). The same goes for the
+  `lzip_has_member` call in `lzip_tail`: a read error right after a lzip
+  trailer is fatal here, but upstream reads it as a clean end of input.
+- The `xz` crate's `xz-core` is a c2rust translation of liblzma with about
+  1,000 `unsafe` blocks. It is pure Rust but not safe Rust, so this path
+  does not yet meet the project's memory-safety goal. A safe Rust decoder
+  with liblzma's stream semantics is a tracked follow-up.
+- `lzip_init` does not re-check the dictionary size: `lzip_has_member` has
+  already validated every header it reads.

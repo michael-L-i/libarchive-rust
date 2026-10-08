@@ -25,16 +25,6 @@ pub extern "C" fn archive_read_support_compression_compress(_a0: *mut Archive) -
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_compression_lzip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_compression_lzma(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_compression_program(
     _a0: *mut Archive,
     _command: *const c_char,
@@ -54,11 +44,6 @@ pub extern "C" fn archive_read_support_compression_program_signature(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_compression_rpm(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_compression_xz(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
 
@@ -88,16 +73,6 @@ pub extern "C" fn archive_read_support_filter_lz4(_a0: *mut Archive) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_lzip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_lzma(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_lzop(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
@@ -122,11 +97,6 @@ pub extern "C" fn archive_read_support_filter_program_signature(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_rpm(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_xz(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
 

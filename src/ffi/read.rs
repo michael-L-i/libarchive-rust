@@ -10,6 +10,7 @@ use super::{
 use crate::archive::{Handle, Kind, READ_MAGIC, state};
 use crate::read::filter::{
     all as filter_all, by_code as filter_by_code, gzip, none as filter_none, uu as filter_uu,
+    xz as filter_xz,
 };
 use crate::read::format::{all as format_all, by_code as format_by_code, empty, raw};
 use crate::read::{self, Read};
@@ -121,6 +122,63 @@ pub extern "C" fn archive_read_support_filter_by_code(a: *mut Archive, code: c_i
         ARCHIVE_FATAL,
         |h| with_read(h, ARCHIVE_FATAL, |r| filter_by_code::support(r, code))
     )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_filter_xz(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_filter_xz,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            filter_xz::support_xz(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_compression_xz(a: *mut Archive) -> c_int {
+    archive_read_support_filter_xz(a)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_filter_lzma(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_filter_lzma,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            filter_xz::support_lzma(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_compression_lzma(a: *mut Archive) -> c_int {
+    archive_read_support_filter_lzma(a)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_filter_lzip(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_filter_lzip,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            filter_xz::support_lzip(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_compression_lzip(a: *mut Archive) -> c_int {
+    archive_read_support_filter_lzip(a)
 }
 
 #[unsafe(no_mangle)]
