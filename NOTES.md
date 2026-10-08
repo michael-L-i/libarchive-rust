@@ -297,6 +297,12 @@ Differences:
 - The "Using external xz program" fallback is not ported: the decoder is
   always built in.
 - A read error while a filter bids is passed up as a failure where
-  upstream's bid returns 0 (see the read core notes).
+  upstream's bid returns 0 (see the read core notes). The same goes for the
+  `lzip_has_member` call in `lzip_tail`: a read error right after a lzip
+  trailer is fatal here, but upstream reads it as a clean end of input.
+- The `xz` crate's `xz-core` is a c2rust translation of liblzma with about
+  1,000 `unsafe` blocks. It is pure Rust but not safe Rust, so this path
+  does not yet meet the project's memory-safety goal. A safe Rust decoder
+  with liblzma's stream semantics is a tracked follow-up.
 - `lzip_init` does not re-check the dictionary size: `lzip_has_member` has
   already validated every header it reads.
