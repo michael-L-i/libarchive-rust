@@ -1149,7 +1149,7 @@ pub trait Format: Any {
     /// `read_ahead`; the core rewinds a seekable stream afterwards.
     /// `best_bid` is the best bid so far, so an expensive check can be
     /// skipped. `ARCHIVE_FATAL` aborts the open.
-    fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> c_int;
+    fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> Result<c_int, Error>;
 
     /// Handles a format option. `None` if the format has no options at all;
     /// otherwise `Ok` if it took the option and `Err` with `ARCHIVE_WARN`
@@ -1216,7 +1216,7 @@ pub const CAPS_ENCRYPT: c_int = 1 | 2;
 pub trait FilterBidder {
     /// Taste the stream (`read_ahead` on `up`) to see if this filter handles
     /// it: 0 for not at all, higher for a surer match.
-    fn bid(&mut self, up: &mut Reader<'_>) -> c_int;
+    fn bid(&mut self, up: &mut Reader<'_>) -> Result<c_int, Error>;
 
     /// Creates the filter. `up` is the stream the filter will sit on.
     fn init(&mut self, up: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error>;
@@ -1303,7 +1303,14 @@ impl Read {
                     a,
                     passphrases: &mut self.passphrases,
                 };
-                let bid = bidder.bid(&mut rd);
+                let bid = match bidder.bid(&mut rd) {
+                    Ok(bid) => bid,
+                    Err(e) => {
+                        a.raise(e);
+                        self.free_filters(a);
+                        return ARCHIVE_FATAL;
+                    }
+                };
                 if bid > best_bid {
                     best_bid = bid;
                     best = Some(i);
@@ -1349,7 +1356,10 @@ impl Read {
             a,
             passphrases: &mut self.passphrases,
         };
-        let bid = format.bid(&mut rd, best_bid);
+        // An error from a bidder, say a failed read, is fatal.
+        let Ok(bid) = format.bid(&mut rd, best_bid).map_err(|e| a.raise(e)) else {
+            return ARCHIVE_FATAL;
+        };
         if bid == ARCHIVE_FATAL || (rd.position() != 0 && rd.seek(0, Whence::Set).is_err()) {
             return ARCHIVE_FATAL;
         }
@@ -2326,15 +2336,15 @@ mod tests {
             ["zero", "one", "two", "three"][N % 4]
         }
 
-        fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> c_int {
+        fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> Result<c_int, Error> {
             self.bids.borrow_mut().push((N, best_bid));
             if self.peek > 0 {
-                let _ = r.peek_available(self.peek);
+                r.peek_available(self.peek)?;
             }
             if self.eat {
-                let _ = r.consume(self.peek);
+                r.consume(self.peek)?;
             }
-            self.bid
+            Ok(self.bid)
         }
 
         fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {
@@ -2360,11 +2370,9 @@ mod tests {
     struct UpperBidder(c_int);
 
     impl FilterBidder for UpperBidder {
-        fn bid(&mut self, up: &mut Reader<'_>) -> c_int {
-            match up.peek_available(1) {
-                Ok(d) if d.first().is_some_and(u8::is_ascii_lowercase) => self.0,
-                _ => 0,
-            }
+        fn bid(&mut self, up: &mut Reader<'_>) -> Result<c_int, Error> {
+            let lowercase = up.peek_available(1)?.first().is_some_and(u8::is_ascii_lowercase);
+            Ok(if lowercase { self.0 } else { 0 })
         }
 
         fn init(&mut self, _up: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error> {
@@ -2479,8 +2487,8 @@ mod tests {
     fn too_many_filters_is_fatal() {
         struct Always;
         impl FilterBidder for Always {
-            fn bid(&mut self, _: &mut Reader<'_>) -> c_int {
-                1
+            fn bid(&mut self, _: &mut Reader<'_>) -> Result<c_int, Error> {
+                Ok(1)
             }
             fn init(&mut self, _: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error> {
                 Ok(Box::new(Upper { out: Vec::new(), closed: Rc::default() }))
@@ -2558,8 +2566,8 @@ mod tests {
             "script"
         }
 
-        fn bid(&mut self, _: &mut Reader<'_>, _: c_int) -> c_int {
-            1
+        fn bid(&mut self, _: &mut Reader<'_>, _: c_int) -> Result<c_int, Error> {
+            Ok(1)
         }
 
         fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {
@@ -2691,5 +2699,24 @@ mod tests {
         r.format = Some(0);
         assert_eq!(r.format_capabilities(), 1);
         assert_eq!(r.has_encrypted_entries(), ENCRYPTION_DONT_KNOW);
+    }
+
+    #[test]
+    fn a_bid_that_fails_aborts_the_open_with_its_error() {
+        struct Failing;
+        impl FilterBidder for Failing {
+            fn bid(&mut self, _: &mut Reader<'_>) -> Result<c_int, Error> {
+                Err(Error::fatal(libc::EIO, "bidder failed"))
+            }
+            fn init(&mut self, _: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error> {
+                Err(Error::fatal(libc::EIO, "never"))
+            }
+        }
+        let mut r = Read::default();
+        r.register_bidder(Box::new(Failing)).unwrap();
+        r.register_format(fake::<0>(1, &Rc::default())).unwrap();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"abc"), ARCHIVE_FATAL);
+        assert_eq!((error(&a), a.state.get()), ("bidder failed".into(), state::FATAL));
     }
 }

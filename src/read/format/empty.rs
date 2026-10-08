@@ -45,12 +45,12 @@ impl Format for Empty {
         "empty"
     }
 
-    fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> c_int {
+    fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> Result<c_int, Error> {
         // No data (or none readable) is the only thing this format takes.
         if best_bid < 1 && !matches!(r.read_ahead(1), Ok(Some(_))) {
-            return 1;
+            return Ok(1);
         }
-        -1
+        Ok(-1)
     }
 
     fn read_header(&mut self, r: &mut Reader<'_>, _entry: &mut Entry) -> Result<(), Error> {

@@ -249,8 +249,8 @@ mod tests {
             "blocks"
         }
 
-        fn bid(&mut self, _: &mut Reader<'_>, _: c_int) -> c_int {
-            1
+        fn bid(&mut self, _: &mut Reader<'_>, _: c_int) -> Result<c_int, Error> {
+            Ok(1)
         }
 
         fn read_header(&mut self, _: &mut Reader<'_>, entry: &mut Entry) -> Result<(), Error> {

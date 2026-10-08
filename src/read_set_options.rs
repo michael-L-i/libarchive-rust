@@ -118,8 +118,8 @@ mod tests {
             self.name
         }
 
-        fn bid(&mut self, _: &mut Reader<'_>, _: c_int) -> c_int {
-            0
+        fn bid(&mut self, _: &mut Reader<'_>, _: c_int) -> Result<c_int, Error> {
+            Ok(0)
         }
 
         fn options(&mut self, _: &Base, key: &[u8], value: Option<&[u8]>) -> Option<Result<(), Error>> {
@@ -150,8 +150,8 @@ mod tests {
             "plain"
         }
 
-        fn bid(&mut self, _: &mut Reader<'_>, _: c_int) -> c_int {
-            0
+        fn bid(&mut self, _: &mut Reader<'_>, _: c_int) -> Result<c_int, Error> {
+            Ok(0)
         }
 
         fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {

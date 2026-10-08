@@ -63,11 +63,11 @@ impl Format for Raw {
     /// conjunction with other formats. But, this could really confuse folks
     /// if there are bid errors or minor file damage, so we don't include
     /// "raw" as part of support_format_all().
-    fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> c_int {
-        if best_bid < 1 && matches!(r.read_ahead(1), Ok(Some(_))) {
-            return 1;
+    fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> Result<c_int, Error> {
+        if best_bid < 1 && r.read_ahead(1)?.is_some() {
+            return Ok(1);
         }
-        -1
+        Ok(-1)
     }
 
     /// Mock up a fake header.
