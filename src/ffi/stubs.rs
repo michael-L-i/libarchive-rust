@@ -21,16 +21,6 @@ use super::{
 use std::ffi::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_version_number() -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_version_string() -> *const c_char {
-    std::ptr::null()
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_version_details() -> *const c_char {
     std::ptr::null()
 }
@@ -1473,59 +1463,8 @@ pub extern "C" fn archive_filter_name(_a0: *mut Archive, _a1: c_int) -> *const c
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_position_compressed(_a0: *mut Archive) -> i64 {
-    ARCHIVE_FATAL as i64
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_position_uncompressed(_a0: *mut Archive) -> i64 {
-    ARCHIVE_FATAL as i64
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_compression_name(_a0: *mut Archive) -> *const c_char {
-    std::ptr::null()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_compression(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_parse_date(_now: libc::time_t, _datestr: *const c_char) -> libc::time_t {
     ARCHIVE_FATAL as libc::time_t
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_errno(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_error_string(_a0: *mut Archive) -> *const c_char {
-    std::ptr::null()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_format_name(_a0: *mut Archive) -> *const c_char {
-    std::ptr::null()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_format(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_clear_error(_a0: *mut Archive) {}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_copy_error(_dest: *mut Archive, _src: *mut Archive) {}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_file_count(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
 }
 
 #[unsafe(no_mangle)]
@@ -1734,11 +1673,6 @@ pub extern "C" fn archive_match_include_gname_w(
     _a0: *mut Archive,
     _a1: *const libc::wchar_t,
 ) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_utility_string_sort(_a0: *mut *mut c_char) -> c_int {
     ARCHIVE_FATAL
 }
 

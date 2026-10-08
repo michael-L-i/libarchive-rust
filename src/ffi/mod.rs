@@ -5,6 +5,7 @@ use std::ffi::{c_char, c_int, c_void};
 use std::marker::{PhantomData, PhantomPinned};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+mod archive;
 #[rustfmt::skip]
 mod stubs;
 
@@ -36,24 +37,11 @@ pub type archive_switch_callback =
 pub type archive_passphrase_callback =
     Option<unsafe extern "C" fn(*mut Archive, *mut c_void) -> *const c_char>;
 
-pub const ARCHIVE_EOF: c_int = 1;
-pub const ARCHIVE_OK: c_int = 0;
-pub const ARCHIVE_RETRY: c_int = -10;
-pub const ARCHIVE_WARN: c_int = -20;
-pub const ARCHIVE_FAILED: c_int = -25;
-pub const ARCHIVE_FATAL: c_int = -30;
-
-/// Called by `archive_set_error` in variadic.c with the formatted message.
-#[unsafe(no_mangle)]
-pub extern "C" fn __archive_rs_set_error(
-    _a: *mut Archive,
-    _error_number: c_int,
-    _msg: *const c_char,
-) {
-}
+pub use crate::archive::{
+    ARCHIVE_EOF, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_RETRY, ARCHIVE_WARN,
+};
 
 /// Runs `f`, returning `fallback` if it panics so panics never cross the C ABI.
-#[allow(dead_code)]
 pub fn guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(fallback)
 }
