@@ -28,21 +28,21 @@ fn with_entry<T: Copy>(e: *mut ArchiveEntry, fallback: T, f: impl FnOnce(&mut En
     })
 }
 
-/// The string at `p`, without its NUL, if `p` is not NULL.
-fn cstr<'a>(p: *const c_char) -> Option<&'a [u8]> {
+/// Copies input before a setter can overwrite an entry-owned buffer.
+fn cstr(p: *const c_char) -> Option<Vec<u8>> {
     // SAFETY: the caller passes NULL or a NUL-terminated string.
-    (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_bytes())
+    (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_bytes().to_vec())
 }
 
 /// The wide string at `p`, without its NUL, if `p` is not NULL.
-fn wstr<'a>(p: *const wchar_t) -> Option<&'a [wchar_t]> {
+fn wstr(p: *const wchar_t) -> Option<Vec<wchar_t>> {
     if p.is_null() {
         return None;
     }
     // SAFETY: the caller passes a NUL-terminated wide string.
     let len = (0..).take_while(|&i| unsafe { *p.add(i) } != 0).count();
     // SAFETY: the `len` characters before the terminator are valid.
-    Some(unsafe { std::slice::from_raw_parts(p, len) })
+    Some(unsafe { std::slice::from_raw_parts(p, len) }.to_vec())
 }
 
 fn wptr(s: Option<&[wchar_t]>) -> *const wchar_t {
@@ -79,7 +79,7 @@ macro_rules! or_clear {
     ($e:ident, $p:expr, $get:ident, $set:ident, $clear:ident) => {
         match $get($p) {
             Some(v) => {
-                $e.$set(v);
+                $e.$set(&v);
             }
             None => {
                 $e.$clear();
@@ -88,7 +88,7 @@ macro_rules! or_clear {
     };
     ($e:ident, $p:expr, $get:ident, $update:ident, $clear:ident, $ok:expr) => {
         match $get($p) {
-            Some(v) => c_int::from($e.$update(v)),
+            Some(v) => c_int::from($e.$update(&v)),
             None => {
                 $e.$clear();
                 $ok
@@ -148,6 +148,40 @@ pub extern "C" fn archive_entry_free(entry: *mut ArchiveEntry) {
         // SAFETY: `entry` is a live entry and the caller gives up ownership.
         guard((), || drop(unsafe { Box::from_raw(entry.cast::<Entry>()) }));
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_entry_copy_stat(entry: *mut ArchiveEntry, st: *const libc::stat) {
+    guard((), || {
+        if entry.is_null() {
+            return;
+        }
+        // SAFETY: the caller passes NULL or a readable stat, possibly owned by entry.
+        let st = unsafe { st.as_ref() }.copied();
+        if let Some(st) = st {
+            with_entry(entry, (), |e| e.copy_stat(&st));
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_entry_set_digest(
+    entry: *mut ArchiveEntry,
+    ty: c_int,
+    digest: *const u8,
+) -> c_int {
+    guard(ARCHIVE_WARN, || {
+        if entry.is_null() {
+            return ARCHIVE_WARN;
+        }
+        let Some(input) = digest_len(ty).and_then(|len| bytes(digest.cast(), len)) else {
+            return ARCHIVE_WARN;
+        };
+        // Snapshot before borrowing the entry: input may point into its digest array.
+        let mut copy = [0; 64];
+        copy[..input.len()].copy_from_slice(input);
+        with_entry(entry, ARCHIVE_WARN, |e| e.set_digest(ty, &copy))
+    })
 }
 
 entry_fns! {
@@ -314,12 +348,12 @@ entry_fns! {
     archive_entry_copy_link_w(v: *const wchar_t) => |e| or_clear!(e, v, wstr, copy_link_w, unset_link);
     archive_entry_update_hardlink_utf8(v: *const c_char) -> c_int = 0
         => |e| match cstr(v) {
-            Some(v) => c_int::from(e.update_hardlink_utf8(v)),
+            Some(v) => c_int::from(e.update_hardlink_utf8(&v)),
             None => c_int::from(e.unset_hardlink()),
         };
     archive_entry_update_symlink_utf8(v: *const c_char) -> c_int = 0
         => |e| match cstr(v) {
-            Some(v) => c_int::from(e.update_symlink_utf8(v)),
+            Some(v) => c_int::from(e.update_symlink_utf8(&v)),
             None => c_int::from(e.unset_symlink()),
         };
     archive_entry_update_link_utf8(v: *const c_char) -> c_int = 0
@@ -327,25 +361,20 @@ entry_fns! {
 
     archive_entry_copy_fflags_text(flags: *const c_char) -> *const c_char = std::ptr::null()
         => |e| cstr(flags).map_or(std::ptr::null(), |f| {
-            e.copy_fflags_text(f).map_or(std::ptr::null(), |i| flags.wrapping_add(i))
+            e.copy_fflags_text(&f).map_or(std::ptr::null(), |i| flags.wrapping_add(i))
         });
     archive_entry_copy_fflags_text_len(flags: *const c_char, len: usize) -> *const c_char
         = std::ptr::null()
-        => |e| bytes(flags.cast(), len).map_or(std::ptr::null(), |f| {
-            e.copy_fflags_text(f).map_or(std::ptr::null(), |i| flags.wrapping_add(i))
+        => |e| bytes(flags.cast(), len).map(<[u8]>::to_vec).map_or(std::ptr::null(), |f| {
+            e.copy_fflags_text(&f).map_or(std::ptr::null(), |i| flags.wrapping_add(i))
         });
     archive_entry_copy_fflags_text_w(flags: *const wchar_t) -> *const wchar_t = std::ptr::null()
         => |e| wstr(flags).map_or(std::ptr::null(), |f| {
-            e.copy_fflags_text_w(f).map_or(std::ptr::null(), |i| flags.wrapping_add(i))
+            e.copy_fflags_text_w(&f).map_or(std::ptr::null(), |i| flags.wrapping_add(i))
         });
 
     archive_entry_stat() -> *const libc::stat = std::ptr::null() => |e| std::ptr::from_ref(e.stat());
-    archive_entry_copy_stat(st: *const libc::stat) => |e| {
-        // SAFETY: the caller passes NULL or a valid `struct stat`.
-        if let Some(st) = unsafe { st.as_ref() } {
-            e.copy_stat(st);
-        }
-    };
+
 
     archive_entry_mac_metadata(size: *mut usize) -> *const c_void = std::ptr::null() => |e| {
         let m = e.mac_metadata();
@@ -358,12 +387,7 @@ entry_fns! {
 
     archive_entry_digest(ty: c_int) -> *const u8 = std::ptr::null()
         => |e| e.digest(ty).map_or(std::ptr::null(), <[u8]>::as_ptr);
-    archive_entry_set_digest(ty: c_int, digest: *const u8) -> c_int = ARCHIVE_WARN => |e| {
-        match digest_len(ty).and_then(|len| bytes(digest.cast(), len)) {
-            Some(d) if !digest.is_null() => e.set_digest(ty, d),
-            _ => ARCHIVE_WARN,
-        }
-    };
+
 
     // ACL management.
     archive_entry_acl() -> *mut ArchiveAcl = std::ptr::null_mut()
@@ -371,10 +395,10 @@ entry_fns! {
     archive_entry_acl_clear() => |e| e.acl.clear();
     archive_entry_acl_add_entry(ty: c_int, permset: c_int, tag: c_int, id: c_int, name: *const c_char)
         -> c_int = ARCHIVE_FATAL
-        => |e| e.acl.add_entry(ty, permset, tag, id, cstr(name));
+        => |e| e.acl.add_entry(ty, permset, tag, id, cstr(name).as_deref());
     archive_entry_acl_add_entry_w(ty: c_int, permset: c_int, tag: c_int, id: c_int, name: *const wchar_t)
         -> c_int = ARCHIVE_FATAL
-        => |e| e.acl.add_entry_w(ty, permset, tag, id, wstr(name));
+        => |e| e.acl.add_entry_w(ty, permset, tag, id, wstr(name).as_deref());
     archive_entry_acl_types() -> c_int = 0 => |e| e.acl.types();
     archive_entry_acl_count(want_type: c_int) -> c_int = 0 => |e| e.acl.count(want_type);
     archive_entry_acl_reset(want_type: c_int) -> c_int = 0 => |e| e.acl.reset(want_type);
@@ -409,9 +433,9 @@ entry_fns! {
             malloc_copy(&t, 0).cast()
         });
     archive_entry_acl_from_text_w(wtext: *const wchar_t, ty: c_int) -> c_int = ARCHIVE_FATAL
-        => |e| e.acl_from_text_w(wstr(wtext).unwrap_or_default(), ty);
+        => |e| e.acl_from_text_w(wstr(wtext).as_deref().unwrap_or_default(), ty);
     archive_entry_acl_from_text(text: *const c_char, ty: c_int) -> c_int = ARCHIVE_FATAL
-        => |e| e.acl_from_text(cstr(text).unwrap_or_default(), ty);
+        => |e| e.acl_from_text(cstr(text).as_deref().unwrap_or_default(), ty);
     archive_entry_acl_text_w(flags: c_int) -> *const wchar_t = std::ptr::null()
         => |e| wptr(e.acl_text_w(flags));
     archive_entry_acl_text(flags: c_int) -> *const c_char = std::ptr::null()
@@ -449,4 +473,110 @@ entry_fns! {
         put(length, l);
         r
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_setters_accept_entry_owned_input() {
+        let e = archive_entry_new();
+        let fields = [
+            (
+                archive_entry_copy_pathname as extern "C" fn(_, _),
+                archive_entry_pathname as extern "C" fn(_) -> _,
+            ),
+            (archive_entry_copy_uname, archive_entry_uname),
+            (archive_entry_copy_gname, archive_entry_gname),
+            (archive_entry_copy_hardlink, archive_entry_hardlink),
+            (archive_entry_copy_symlink, archive_entry_symlink),
+            (archive_entry_copy_sourcepath, archive_entry_sourcepath),
+        ];
+        for (set, get) in fields {
+            set(e, c"abcdefghij".as_ptr());
+            set(e, get(e));
+            assert_eq!(cstr(get(e)).as_deref(), Some(b"abcdefghij".as_slice()));
+            set(e, get(e).wrapping_add(2));
+            assert_eq!(cstr(get(e)).as_deref(), Some(b"cdefghij".as_slice()));
+        }
+        archive_entry_free(e);
+    }
+
+    #[test]
+    fn digests_and_stat_accept_entry_owned_input() {
+        let e = archive_entry_new();
+        for ty in 1..=6 {
+            assert_eq!(archive_entry_set_digest(e, ty, [7; 64].as_ptr()), 0);
+            assert_eq!(
+                archive_entry_set_digest(e, ty, archive_entry_digest(e, ty)),
+                0
+            );
+            let len = digest_len(ty).unwrap();
+            assert_eq!(
+                bytes(archive_entry_digest(e, ty).cast(), len),
+                Some(&[7; 64][..len])
+            );
+        }
+        archive_entry_set_size(e, 123);
+        archive_entry_set_mtime(e, 45, 678);
+        archive_entry_set_perm(e, 0o640);
+        archive_entry_copy_stat(e, archive_entry_stat(e));
+        assert_eq!(archive_entry_size(e), 123);
+        assert_eq!(archive_entry_mtime(e), 45);
+        assert_eq!(archive_entry_mtime_nsec(e), 678);
+        assert_eq!(archive_entry_perm(e), 0o640);
+        archive_entry_free(e);
+    }
+
+    #[test]
+    fn flag_setters_accept_entry_owned_input() {
+        let e = archive_entry_new();
+        archive_entry_copy_fflags_text(e, c"nodump bogus".as_ptr());
+        let p = archive_entry_fflags_text(e);
+        assert_eq!(
+            archive_entry_copy_fflags_text_len(e, p, 12),
+            p.wrapping_add(7)
+        );
+        assert_eq!(
+            cstr(archive_entry_fflags_text(e)).as_deref(),
+            Some(b"nodump bogus".as_slice())
+        );
+        archive_entry_free(e);
+    }
+
+    #[test]
+    fn wide_and_utf8_setters_accept_entry_owned_input() {
+        let e = archive_entry_new();
+        let wide: Vec<wchar_t> = "abcdefghij"
+            .chars()
+            .map(|c| c as wchar_t)
+            .chain([0])
+            .collect();
+        archive_entry_copy_pathname_w(e, wide.as_ptr());
+        archive_entry_copy_pathname_w(e, archive_entry_pathname_w(e).wrapping_add(2));
+        assert_eq!(
+            wstr(archive_entry_pathname_w(e)).as_deref(),
+            Some(&wide[2..wide.len() - 1])
+        );
+        // The getter fills a converted buffer, then the setter copies it back.
+        archive_entry_copy_pathname(e, archive_entry_pathname(e));
+        assert_eq!(
+            cstr(archive_entry_pathname(e)).as_deref(),
+            Some(b"cdefghij".as_slice())
+        );
+        archive_entry_set_pathname_utf8(e, c"abcdefghij".as_ptr());
+        archive_entry_set_pathname_utf8(e, archive_entry_pathname_utf8(e).wrapping_add(2));
+        assert_eq!(
+            cstr(archive_entry_pathname_utf8(e)).as_deref(),
+            Some(b"cdefghij".as_slice())
+        );
+        // Changing representation must copy before clearing the source form.
+        archive_entry_copy_pathname(e, archive_entry_pathname_utf8(e));
+        assert_eq!(
+            cstr(archive_entry_pathname(e)).as_deref(),
+            Some(b"cdefghij".as_slice())
+        );
+        archive_entry_free(e);
+    }
 }
