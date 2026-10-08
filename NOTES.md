@@ -249,3 +249,37 @@ Differences:
   message. Upstream's `__archive_read_ahead` returns NULL there, so the bid
   returns 0 and "Unrecognized archive format" overwrites the message. The
   final code is `ARCHIVE_FATAL` either way (archive_read.c).
+
+## Read filter uu (`src/read/filter/uu.rs`)
+
+### Ported as-is
+
+- The base64 bid accepts any first line made only of base64 characters,
+  `=` included, and an empty line too. Upstream's `====` score after that
+  test can never be reached, because the loop has already consumed the line,
+  so it is not ported (archive_read_support_filter_uu.c).
+- A body line that would take one `read` past 64k (`total + 2 * len`, so a
+  line over 32k when it is the first of the block) ends that `read`. When
+  nothing was decoded before it, the `read` returns nothing, which the core
+  takes as end of stream, so the rest of the input is dropped without an
+  error.
+- Lines end at the first LF in the window, and a CR is a line end only when
+  no LF is found in the window: `a\rb\nc` is the line `a\rb`. A lone CR that
+  is the last byte in the window waits for one more byte (CR LF), and at the
+  end of the input it ends the line.
+- A final line without a newline is never a line, so `end` with no newline
+  at the end of the input is "Insufficient compressed data".
+- A header name of one byte is dropped (`namelen > 1`), and a name ends at
+  a NUL.
+
+### Differences
+
+- The bidder's MINIX padding test (`if (len == 1 && ...) ++p; --len;`) is a
+  no-op upstream: the next line read overwrites both `p` and `len`. It is not
+  ported.
+- Upstream's `read_line_ahead` computes `avail - offset` as a `size_t` for a
+  line that starts past the 128k window, and its `memchr` then reads on past
+  the buffered data. We search only the bytes buffered, so a line that
+  upstream finds within its buffer is found the same way, and a line it
+  would only find by reading out of bounds is not found. A line starting
+  exactly at the window's end gets an empty window, as upstream.

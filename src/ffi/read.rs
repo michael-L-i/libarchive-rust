@@ -8,7 +8,9 @@ use super::{
     guard,
 };
 use crate::archive::{Handle, Kind, READ_MAGIC, state};
-use crate::read::filter::{all as filter_all, by_code as filter_by_code, none as filter_none};
+use crate::read::filter::{
+    all as filter_all, by_code as filter_by_code, none as filter_none, uu as filter_uu,
+};
 use crate::read::format::{all as format_all, by_code as format_by_code, empty, raw};
 use crate::read::{self, Read};
 use super::ArchiveEntry;
@@ -69,6 +71,25 @@ pub extern "C" fn archive_read_support_filter_all(a: *mut Archive) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_compression_all(a: *mut Archive) -> c_int {
     archive_read_support_filter_all(a)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_filter_uu(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_filter_uu,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            filter_uu::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_compression_uu(a: *mut Archive) -> c_int {
+    archive_read_support_filter_uu(a)
 }
 
 #[unsafe(no_mangle)]
