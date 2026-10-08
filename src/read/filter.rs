@@ -3,5 +3,6 @@
 
 pub mod all;
 pub mod by_code;
+pub mod gzip;
 pub mod none;
 pub mod uu;
