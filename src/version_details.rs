@@ -40,7 +40,9 @@ pub const ZLIB: Option<&CStr> = None;
 /// The liblzma version the `xz` crate is a port of.
 pub const LIBLZMA: Option<&CStr> = Some(c"5.8.3");
 /// Like `BZ2_bzlibVersion()`: "1.0.8, 13-Jul-2019".
-pub const BZLIB: Option<&CStr> = None;
+/// What `BZ2_bzlibVersion()` returns in libbz2-rs-sys 0.2.5, the backend
+/// (upstream reports "1.0.8, 13-Jul-2019"). Update with the crate.
+pub const BZLIB: Option<&CStr> = Some(c"1.1.0-libbz2-rs-sys-0.2.5");
 pub const LIBLZ4: Option<&CStr> = Some(c"lz4_flex 0.14.0");
 pub const LIBZSTD: Option<&CStr> = None;
 pub const LIBLZO2: Option<&CStr> = None;
@@ -92,7 +94,10 @@ mod tests {
 
     #[test]
     fn only_the_ported_backends() {
-        assert_eq!(details(), c"libarchive 3.9.0dev liblzma/5.8.3 liblz4/lz4_flex 0.14.0 libb2/bundled");
+        assert_eq!(
+            details(),
+            c"libarchive 3.9.0dev liblzma/5.8.3 bz2lib/1.1.0-libbz2-rs-sys-0.2.5 liblz4/lz4_flex 0.14.0 libb2/bundled"
+        );
     }
 
     #[test]

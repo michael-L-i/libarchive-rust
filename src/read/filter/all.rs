@@ -41,7 +41,7 @@ pub type Support = fn(&mut Read, &Base) -> Result<Status, Error>;
 /// Every filter code (but `NONE` and `PROGRAM`, which are special), with its
 /// registration function once it is ported.
 pub const FILTERS: &[(c_int, Option<Support>)] = &[
-    (code::BZIP2, None),
+    (code::BZIP2, Some(super::bzip2::support)),
     (code::COMPRESS, Some(compress::support)),
     (code::GZIP, Some(gzip::support)),
     (code::LZIP, Some(xz::support_lzip)),

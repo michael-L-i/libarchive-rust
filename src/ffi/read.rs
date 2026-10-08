@@ -9,8 +9,9 @@ use super::{
 };
 use crate::archive::{Base, Handle, Kind, READ_MAGIC, state};
 use crate::read::filter::{
-    all as filter_all, by_code as filter_by_code, compress, grzip, gzip, lrzip, lzop, none as filter_none,
-    lz4 as filter_lz4, program, rpm, uu as filter_uu, xz as filter_xz,
+    all as filter_all, bzip2 as filter_bzip2, by_code as filter_by_code, compress, grzip, gzip,
+    lrzip, lz4 as filter_lz4, lzop, none as filter_none, program, rpm, uu as filter_uu,
+    xz as filter_xz,
 };
 use crate::read::format::{all as format_all, by_code as format_by_code, empty, raw};
 use crate::read::{self, Read, Status};
@@ -158,6 +159,23 @@ pub extern "C" fn archive_read_support_filter_lz4(a: *mut Archive) -> c_int {
         ARCHIVE_FATAL,
         |h| support_filter(h, filter_lz4::support)
     )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_filter_bzip2(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_filter_bzip2,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| support_filter(h, filter_bzip2::support)
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_compression_bzip2(a: *mut Archive) -> c_int {
+    archive_read_support_filter_bzip2(a)
 }
 
 #[unsafe(no_mangle)]
