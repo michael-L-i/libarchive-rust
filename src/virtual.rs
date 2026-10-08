@@ -33,31 +33,44 @@ use crate::util::Error;
 use std::ffi::{c_char, c_int};
 
 impl Handle {
+    // The filter getters can be called by a client callback on its own
+    // handle, while the read state is borrowed for the call into it. Upstream
+    // allows that; here the getters answer with their error value.
+
     pub fn filter_code(&self, n: c_int) -> c_int {
         match &self.kind {
-            Kind::Read(r) => r.borrow().filter_code(n),
+            Kind::Read(r) => r.try_borrow().map_or(ARCHIVE_FATAL, |r| r.filter_code(n)),
         }
     }
 
     pub fn filter_count(&self) -> c_int {
         match &self.kind {
-            Kind::Read(r) => r.borrow().filter_count(),
+            Kind::Read(r) => r.try_borrow().map_or(ARCHIVE_FATAL, |r| r.filter_count()),
         }
     }
 
     /// The filter's name, or NULL. The pointer lives as long as the filter.
     pub fn filter_name(&self, n: c_int) -> *const c_char {
         match &self.kind {
-            Kind::Read(r) => r
-                .borrow()
-                .filter_name(n)
-                .map_or(std::ptr::null(), |s| s.as_ptr()),
+            Kind::Read(r) => r.try_borrow().map_or(std::ptr::null(), |r| {
+                r.filter_name(n).map_or(std::ptr::null(), |s| s.as_ptr())
+            }),
         }
     }
 
     pub fn filter_bytes(&self, n: c_int) -> i64 {
         match &self.kind {
-            Kind::Read(r) => r.borrow().filter_bytes(n),
+            Kind::Read(r) => r
+                .try_borrow()
+                .map_or(i64::from(ARCHIVE_FATAL), |r| r.filter_bytes(n)),
+        }
+    }
+
+    pub fn header_position(&self) -> i64 {
+        match &self.kind {
+            Kind::Read(r) => r
+                .try_borrow()
+                .map_or(i64::from(ARCHIVE_FATAL), |r| r.header_position()),
         }
     }
 
@@ -67,10 +80,12 @@ impl Handle {
         }
     }
 
-    /// `archive_free`: the handle is gone afterwards.
-    pub fn free(self) -> c_int {
-        match self.kind {
-            Kind::Read(r) => r.into_inner().free(&self.base),
+    /// `archive_free`, up to dropping the handle: closes it and releases
+    /// what client callbacks may still see. The caller drops the handle
+    /// afterwards, so the callbacks run on a live one.
+    pub fn free(&self) -> c_int {
+        match &self.kind {
+            Kind::Read(r) => r.borrow_mut().free(&self.base),
         }
     }
 

@@ -112,6 +112,18 @@ pub enum Whence {
     End,
 }
 
+impl Whence {
+    /// The origin for a C `whence`.
+    pub fn from_c(whence: c_int) -> Option<Whence> {
+        match whence {
+            libc::SEEK_SET => Some(Whence::Set),
+            libc::SEEK_CUR => Some(Whence::Cur),
+            libc::SEEK_END => Some(Whence::End),
+            _ => None,
+        }
+    }
+}
+
 /// What a decompression filter implements. A filter owns its output buffer
 /// and exposes it as the current block; the stage above it copies from the
 /// block only when a request spans blocks, so most reads are zero-copy.
@@ -938,7 +950,7 @@ pub struct Read {
     /// The client first, then each filter on top of the one before; the last
     /// stage is what formats read.
     chain: Vec<Stage>,
-    passphrases: Passphrases,
+    pub(crate) passphrases: Passphrases,
     /// Registered filter bidders, in registration order.
     bidders: Vec<Box<dyn FilterBidder>>,
     /// Whether filters were appended by hand, so bidding is skipped.
@@ -1027,7 +1039,8 @@ impl Read {
 
     /// `_archive_read_free`, after the caller has checked the handle: closes
     /// the archive if needed. The rest is released by `Drop`, once the
-    /// caller drops the handle; client callbacks still see it alive.
+    /// caller drops the handle; client callbacks still see it alive (the
+    /// caller's check of the handle is in `archive_free`).
     pub fn free(&mut self, a: &Base) -> c_int {
         let r = match a.state.get() {
             state::CLOSED | state::FATAL => ARCHIVE_OK,

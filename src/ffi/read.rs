@@ -4,16 +4,20 @@ use super::archive::with;
 use super::client::CClient;
 use super::{
     ARCHIVE_FATAL, ARCHIVE_OK, Archive, archive_close_callback, archive_open_callback,
-    archive_read_callback, archive_seek_callback, archive_skip_callback, archive_switch_callback,
+    archive_passphrase_callback, archive_read_callback, archive_seek_callback, archive_skip_callback, archive_switch_callback,
     guard,
 };
 use crate::archive::{Handle, Kind, READ_MAGIC, state};
 use crate::read::filter::{all as filter_all, by_code as filter_by_code, none as filter_none};
 use crate::read::format::{all as format_all, by_code as format_by_code};
 use crate::read::{self, Read};
-use crate::{read_append_filter, read_set_format};
+use super::sys::Fd;
+use crate::archive::ARCHIVE_EOF;
+use crate::read::{Data, Whence};
+use crate::read_add_passphrase::PassphraseCallback;
 use crate::util::Error;
-use std::ffi::{c_int, c_uint, c_void};
+use crate::{options, read_append_filter, read_data_into_fd, read_set_format, read_set_options};
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 
 /// Runs `f` on the read state of a handle that has passed its magic check.
 /// A re-entrant call from a client callback finds the state in use and gets
@@ -335,6 +339,266 @@ pub extern "C" fn archive_read_extract_set_skip_file(a: *mut Archive, dev: i64, 
     });
 }
 
+/// The bytes of a C string, `None` for NULL.
+fn cstr<'a>(p: *const c_char) -> Option<&'a [u8]> {
+    // SAFETY: the caller passes NULL or a NUL-terminated string.
+    (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_bytes())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_set_format_option(
+    a: *mut Archive,
+    m: *const c_char,
+    o: *const c_char,
+    v: *const c_char,
+) -> c_int {
+    checked!(
+        archive_read_set_format_option,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            options::set_option(&h.base, cstr(m), cstr(o), cstr(v), &mut |m, o, v| {
+                r.set_format_option(&h.base, m, o, v)
+            })
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_set_filter_option(
+    a: *mut Archive,
+    m: *const c_char,
+    o: *const c_char,
+    v: *const c_char,
+) -> c_int {
+    checked!(
+        archive_read_set_filter_option,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| options::set_option(&h.base, cstr(m), cstr(o), cstr(v), &mut |m, _, _| {
+            read_set_options::set_filter_option(m)
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_set_option(
+    a: *mut Archive,
+    m: *const c_char,
+    o: *const c_char,
+    v: *const c_char,
+) -> c_int {
+    checked!(
+        archive_read_set_option,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            options::set_option(&h.base, cstr(m), cstr(o), cstr(v), &mut |m, o, v| {
+                r.set_option(&h.base, m, o, v)
+            })
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_set_options(a: *mut Archive, opts: *const c_char) -> c_int {
+    checked!(
+        archive_read_set_options,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            let opts = cstr(opts).unwrap_or_default();
+            options::set_options(&h.base, opts, &mut |m, o, v| r.set_option(&h.base, m, o, v))
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_add_passphrase(a: *mut Archive, passphrase: *const c_char) -> c_int {
+    checked!(
+        archive_read_add_passphrase,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            match r.passphrases.add(cstr(passphrase).unwrap_or_default()) {
+                Ok(()) => ARCHIVE_OK,
+                Err(e) => h.base.raise(e),
+            }
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_set_passphrase_callback(
+    a: *mut Archive,
+    client_data: *mut c_void,
+    callback: archive_passphrase_callback,
+) -> c_int {
+    checked!(
+        archive_read_set_passphrase_callback,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            r.passphrases.set_callback(callback.map(|callback| -> PassphraseCallback {
+                Box::new(move || {
+                    // SAFETY: the caller registered the callback to be called
+                    // with this handle and data; the handle owns this
+                    // closure.
+                    let p = unsafe { callback(a, client_data) };
+                    cstr(p).map(<[u8]>::to_vec)
+                })
+            }));
+            ARCHIVE_OK
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_header_position(a: *mut Archive) -> i64 {
+    checked!(
+        archive_read_header_position,
+        a,
+        READ_MAGIC,
+        state::ANY,
+        i64::from(ARCHIVE_FATAL),
+        |h| h.header_position()
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_format_capabilities(a: *mut Archive) -> c_int {
+    with(a, 0, |h| match &h.kind {
+        Kind::Read(r) => r.try_borrow().map_or(0, |r| r.format_capabilities()),
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_has_encrypted_entries(a: *mut Archive) -> c_int {
+    with(a, read::ENCRYPTION_UNSUPPORTED, |h| match &h.kind {
+        Kind::Read(r) => r
+            .try_borrow()
+            .map_or(read::ENCRYPTION_UNSUPPORTED, |r| r.has_encrypted_entries()),
+    })
+}
+
+/// Writes through an out pointer the caller may have left NULL.
+fn put<T>(p: *mut T, value: T) {
+    // SAFETY: the caller passes NULL or a valid, writable `T`.
+    if let Some(out) = unsafe { p.as_mut() } {
+        *out = value;
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_data_block(
+    a: *mut Archive,
+    buff: *mut *const c_void,
+    size: *mut usize,
+    offset: *mut i64,
+) -> c_int {
+    checked!(
+        archive_read_data_block,
+        a,
+        READ_MAGIC,
+        state::DATA,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            let block = r.read_data_block(&h.base, |data| match data {
+                Data::Block { data, offset } => (data.as_ptr().cast(), data.len(), offset, ARCHIVE_OK),
+                Data::Eof { offset } => (std::ptr::null(), 0, offset, ARCHIVE_EOF),
+            });
+            match block {
+                Ok((p, n, o, code)) => {
+                    // The block stays valid until the next read.
+                    put(buff, p);
+                    put(size, n);
+                    put(offset, o);
+                    code
+                }
+                Err(code) => {
+                    put(buff, std::ptr::null());
+                    put(size, 0);
+                    code
+                }
+            }
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_data(a: *mut Archive, buff: *mut c_void, size: usize) -> isize {
+    let fatal = ARCHIVE_FATAL as isize;
+    with(a, fatal, |h| {
+        if size == 0 {
+            return 0;
+        }
+        // Upstream gets here by way of archive_read_data_block.
+        let name = "archive_read_data_block";
+        if h.base.check_magic(READ_MAGIC, state::DATA, name) == ARCHIVE_FATAL {
+            return fatal;
+        }
+        if buff.is_null() || size > isize::MAX as usize {
+            return fatal;
+        }
+        // SAFETY: the caller passes `size` writable bytes at `buff`.
+        let dest = unsafe { std::slice::from_raw_parts_mut(buff.cast::<u8>(), size) };
+        with_read(h, fatal, |r| r.read_data(&h.base, dest))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_data_skip(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_data_skip,
+        a,
+        READ_MAGIC,
+        state::DATA | state::DATA_RECOVERY,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| r.read_data_skip(&h.base))
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_seek_data(a: *mut Archive, offset: i64, whence: c_int) -> i64 {
+    checked!(
+        archive_seek_data_block,
+        a,
+        READ_MAGIC,
+        state::DATA,
+        i64::from(ARCHIVE_FATAL),
+        |h| {
+            let Some(whence) = Whence::from_c(whence) else {
+                return i64::from(h.base.raise(Error::fatal(libc::EINVAL, "Invalid whence")));
+            };
+            with_read(h, i64::from(ARCHIVE_FATAL), |r| r.seek_data(&h.base, offset, whence))
+        }
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_data_into_fd(a: *mut Archive, fd: c_int) -> c_int {
+    checked!(
+        archive_read_data_into_fd,
+        a,
+        READ_MAGIC,
+        state::DATA,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| read_data_into_fd::data_into_fd(r, &h.base, Fd(fd)))
+    )
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -390,6 +654,19 @@ pub(super) mod tests {
 
         fn bid(&mut self, _: &mut Reader<'_>, _: c_int) -> c_int {
             1
+        }
+
+        fn options(
+            &mut self,
+            _: &crate::archive::Base,
+            key: &[u8],
+            _: Option<&[u8]>,
+        ) -> Option<Result<(), Err_>> {
+            Some(if key == b"flag" {
+                Ok(())
+            } else {
+                Err(Err_::status(crate::archive::ARCHIVE_WARN))
+            })
         }
 
         fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Err_> {
@@ -530,5 +807,144 @@ pub(super) mod tests {
         assert_eq!(archive_free(a), ARCHIVE_OK);
         // Volumes are closed on moving on, and all of them on closing.
         assert_eq!([closed(first), closed(second), closed(third)], [2, 2, 1]);
+    }
+
+    static REENTRANT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    /// Asks the handle about itself from inside the close callback, which
+    /// runs with the read state borrowed.
+    unsafe extern "C" fn close_and_ask(a: *mut Archive, _: *mut c_void) -> c_int {
+        use crate::ffi::archive::*;
+        let answers = [
+            i64::from(archive_filter_count(a)),
+            i64::from(archive_filter_code(a, 0)),
+            archive_filter_bytes(a, 0),
+            archive_position_compressed(a),
+            archive_read_header_position(a),
+            i64::from(archive_filter_name(a, 0).is_null()),
+        ];
+        REENTRANT.store(
+            i64::from(answers.iter().all(|&r| r == i64::from(ARCHIVE_FATAL) || r == 1)),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        ARCHIVE_OK
+    }
+
+    #[test]
+    fn getters_called_from_callbacks_fall_back_instead_of_panicking() {
+        let a = archive_read_new();
+        register_anything(a);
+        assert_eq!(archive_read_set_read_callback(a, Some(read_volume)), ARCHIVE_OK);
+        assert_eq!(archive_read_set_close_callback(a, Some(close_and_ask)), ARCHIVE_OK);
+        assert_eq!(archive_read_set_callback_data(a, volume(b"data")), ARCHIVE_OK);
+        assert_eq!(archive_read_open1(a), ARCHIVE_OK);
+        // Outside a callback the getters work.
+        assert_eq!(crate::ffi::archive::archive_filter_count(a), 1);
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+        assert_eq!(REENTRANT.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn options_reach_formats_and_report_unknown_names() {
+        let a = new_with_format();
+        let opt = |m: &CStr, o: &CStr, v: Option<&CStr>| {
+            archive_read_set_option(a, m.as_ptr(), o.as_ptr(), v.map_or(std::ptr::null(), CStr::as_ptr))
+        };
+        assert_eq!(opt(c"anything", c"flag", Some(c"1")), ARCHIVE_OK);
+        assert_eq!(opt(c"", c"flag", None), ARCHIVE_OK);
+        assert_eq!(opt(c"nomod", c"flag", None), crate::archive::ARCHIVE_FAILED);
+        assert_eq!(error(a).as_deref(), Some("Unknown module name: `nomod'"));
+        assert_eq!(archive_read_set_options(a, c"anything:flag,!flag,flag=2".as_ptr()), ARCHIVE_OK);
+        assert_eq!(
+            archive_read_set_options(a, c"anything:bad".as_ptr()),
+            crate::archive::ARCHIVE_FAILED
+        );
+        assert_eq!(error(a).as_deref(), Some("Undefined option: `anything:bad'"));
+        assert_eq!(archive_read_set_options(a, std::ptr::null()), ARCHIVE_OK);
+        assert_eq!(
+            archive_read_set_filter_option(a, c"gzip".as_ptr(), c"x".as_ptr(), std::ptr::null()),
+            crate::archive::ARCHIVE_FAILED
+        );
+        assert_eq!(error(a).as_deref(), Some("Unknown module name: `gzip'"));
+        assert_eq!(
+            archive_read_set_format_option(a, std::ptr::null(), c"flag".as_ptr(), std::ptr::null()),
+            ARCHIVE_OK
+        );
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+    }
+
+    fn opened() -> *mut Archive {
+        let a = new_with_format();
+        assert_eq!(crate::ffi::read_open::archive_read_open_memory(a, b"x".as_ptr().cast(), 1), ARCHIVE_OK);
+        a
+    }
+
+    fn new_with_format() -> *mut Archive {
+        let a = archive_read_new();
+        register_anything(a);
+        a
+    }
+
+    unsafe extern "C" fn offer(_: *mut Archive, data: *mut c_void) -> *const c_char {
+        data.cast::<c_char>().cast_const()
+    }
+
+    #[test]
+    fn passphrases_are_listed_and_asked_for() {
+        let a = new_with_format();
+        assert_eq!(
+            archive_read_add_passphrase(a, c"".as_ptr()),
+            crate::archive::ARCHIVE_FAILED
+        );
+        assert_eq!(error(a).as_deref(), Some("Empty passphrase is unacceptable"));
+        assert_eq!(archive_read_add_passphrase(a, c"one".as_ptr()), ARCHIVE_OK);
+        assert_eq!(
+            archive_read_set_passphrase_callback(a, c"two".as_ptr().cast_mut().cast(), Some(offer)),
+            ARCHIVE_OK
+        );
+        let mut got = Vec::new();
+        with(a, (), |h| {
+            with_read(h, (), |r| {
+                r.passphrases.reset();
+                while let Some(p) = r.passphrases.next() {
+                    got.push(String::from_utf8_lossy(&p).into_owned());
+                    if got.len() > 5 {
+                        break;
+                    }
+                }
+            });
+        });
+        // The list first, then the callback's, once; then it is offered
+        // again from the list.
+        assert_eq!(got[..2], ["one", "two"]);
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+    }
+
+    #[test]
+    fn data_functions_check_the_state_and_dispatch_to_the_format() {
+        let a = new_with_format();
+        let mut buf = [0u8; 8];
+        let (mut p, mut n, mut off) = (std::ptr::null(), 1usize, 5i64);
+        // Not in the data state yet.
+        assert_eq!(archive_read_data_block(a, &mut p, &mut n, &mut off), ARCHIVE_FATAL);
+        assert!(error(a).is_some_and(|e| e.contains("archive_read_data_block")));
+        let a = opened();
+        with(a, (), |h| h.base.state.set(state::DATA));
+        assert_eq!(archive_read_data(a, buf.as_mut_ptr().cast(), 0), 0);
+        assert_eq!(archive_read_data(a, buf.as_mut_ptr().cast(), buf.len()), 0);
+        assert_eq!(
+            archive_read_data_block(a, &mut p, &mut n, &mut off),
+            crate::archive::ARCHIVE_EOF
+        );
+        assert_eq!((p.is_null(), n, off), (true, 0, 0));
+        assert_eq!(archive_seek_data(a, 0, 0), i64::from(crate::archive::ARCHIVE_FAILED));
+        assert_eq!(error(a).as_deref(), Some("Cannot seek data with this format"));
+        assert_eq!(archive_seek_data(a, 0, 77), i64::from(ARCHIVE_FATAL));
+        let a = opened();
+        with(a, (), |h| h.base.state.set(state::DATA));
+        assert_eq!(archive_read_data_skip(a), ARCHIVE_OK);
+        assert_eq!(with(a, 0, |h| h.base.state.get()), state::HEADER);
+        assert_eq!(archive_read_data_skip(a), ARCHIVE_FATAL);
+        assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 }

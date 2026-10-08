@@ -25,8 +25,6 @@
 
 // Ported from libarchive/archive_options.c.
 
-#![allow(dead_code)] // the write side joins in phase 5
-
 //! Parsing and dispatch of `module:option=value` option strings, shared by
 //! the read and write sides.
 //!

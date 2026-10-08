@@ -15,6 +15,7 @@ mod options;
 mod read;
 mod read_add_passphrase;
 mod read_append_filter;
+mod read_data_into_fd;
 mod read_open_fd;
 mod read_open_file;
 mod read_open_filename;

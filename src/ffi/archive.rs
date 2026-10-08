@@ -180,15 +180,27 @@ pub extern "C" fn archive_filter_bytes(a: *mut Archive, n: c_int) -> i64 {
     with(a, i64::from(ARCHIVE_FATAL), |h| h.filter_bytes(n))
 }
 
+/// `archive_free`: checks the handle as its kind's free function does, then
+/// closes it and drops it. The handle is borrowed, not owned, while it
+/// closes: client callbacks run on it and may use it.
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_free(a: *mut Archive) -> c_int {
     if a.is_null() {
         return ARCHIVE_OK;
     }
     guard(ARCHIVE_FATAL, || {
-        // SAFETY: `a` is a live handle and the caller gives up ownership.
-        let h = unsafe { Box::from_raw(a.cast::<Handle>()) };
-        (*h).free()
+        // SAFETY: `a` is a live handle, only ever borrowed shared.
+        let h = unsafe { &*a.cast::<Handle>() };
+        // Only read handles exist so far.
+        let states = state::ANY | state::FATAL;
+        if h.base.check_magic(READ_MAGIC, states, "archive_read_free") == ARCHIVE_FATAL {
+            return ARCHIVE_FATAL;
+        }
+        let r = h.free();
+        // SAFETY: the caller gives up ownership, and nothing refers to the
+        // handle any more.
+        drop(unsafe { Box::from_raw(a.cast::<Handle>()) });
+        r
     })
 }
 

@@ -25,8 +25,6 @@
 
 // Ported from libarchive/archive_read_set_options.c.
 
-#![allow(dead_code)] // exported by ffi next
-
 //! `archive_read_set_options` and friends: offering options to the
 //! registered formats. Filters have no options.
 
