@@ -74,12 +74,14 @@ scripts/run-tests --update      add newly passing tests to tests/passing.txt
 
 1. **Upstream test suite.** `libarchive/test/` holds 934 tests and 491 `.uu`
    fixtures, compiled unchanged and linked against our library. This is the
-   primary oracle; its pass count is the headline number in `STATUS.md`. A test
-   in `tests/passing.txt` that fails is a regression and blocks the commit.
-   Newly passing tests go into `passing.txt` in the same commit as the code
-   that fixed them. Eleven files (56 tests) call libarchive internals and can't
-   link against the public ABI; `build-port` turns them into skips, and their
-   checks are ported as Rust `#[test]`s next to the module they cover.
+   primary oracle; its pass count is the headline number in `STATUS.md`.
+   Upstream itself passes 829 here (the rest skip for platform reasons), so 829
+   is the target. A test in `tests/passing.txt` that fails is a regression and
+   blocks the commit. Newly passing tests go into `passing.txt` in the same
+   commit as the code that fixed them. 17 files (73 tests) call libarchive
+   internals and can't link against the public ABI; `build-port` detects them
+   with `nm` and turns them into skips, and their checks are ported as Rust
+   `#[test]`s next to the module they cover.
 2. **Differential runs.** Build upstream `bsdtar` against upstream libarchive
    and against ours. Diff `bsdtar -tvf` output, extracted trees and exit codes
    over the corpus: upstream's `*.uu` test archives plus oss-fuzz corpora.
@@ -96,7 +98,7 @@ lines; the read side (phases 1–4) is about 67k.
 
 | Phase | Units | Lines |
 |---|---|---|
-| 0 | Harness: oracle build, stubs for the 456 public functions, relinked test binary, runner, ratchet | — |
+| 0 | Harness: oracle build, stubs for the 454 public functions, relinked test binary, runner, ratchet | — |
 | 1 | Core read path: `archive_read`, `archive_entry`, `archive_string` (+ composition table), `archive_acl`, `archive_util`, `archive_rb`, `archive_read_open_*` | 12k |
 | 2 | Read filters: gzip, bzip2, xz, zstd, lz4, compress, uu, lzop, rpm, program | 4k |
 | 3 | Small readers: raw, empty, ar, cpio, warc, mtree | 4k |
