@@ -7,6 +7,7 @@ pub mod compress;
 pub mod grzip;
 pub mod gzip;
 pub mod lrzip;
+pub mod lz4;
 pub mod lzop;
 pub mod none;
 pub mod program;

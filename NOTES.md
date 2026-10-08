@@ -406,3 +406,60 @@ Differences:
   `lzop -d` and `archive_read_support_filter_lzop` returns `ARCHIVE_WARN`
   ("Using external lzop program for lzop decompression"). The liblzo2 path
   (`lzop_filter_read` and its block and checksum handling) is not ported.
+
+## lz4 filter (`src/read/filter/lz4.rs`)
+
+Upstream's frame parsing is ported. The block decoder is `lz4_flex` 0.14.0
+with `safe-decode` and `safe-encode`, and the frame header and block checksums
+use `xxhash-rust` 0.8.19 (`xxh32`). That build compiles four `unsafe` blocks
+inside `xxhash-rust` (three in `utils.rs`, one in `xxh32.rs`); none is in this
+crate.
+
+### Ported as-is
+
+- An empty frame, or a block that decodes to zero bytes, ends the stream: the
+  frames after it are never read. This holds for any frame, the first or a
+  later one.
+- A block header of `0x80000000` (stored flag, size zero) is decoded as a
+  compressed block of zero bytes, which fails with `lz4 decompression failed`.
+  The legacy format has no stored flag, and its zero-length block fails the
+  same way.
+- A zero-length legacy block is a decompression failure
+  (`lz4 decompression failed`), where a zero-length LZ4 block is the end of
+  the stream.
+- Bytes after the last frame that are not a frame are ignored silently; so is
+  a trailing 1 to 3 bytes.
+- A linked block refers back to the previous block only, not the output
+  before it. A previous block shorter than 64 KiB leaves the rest of the
+  window zero-filled, so the back-references see zeros, not the older output.
+- The preset dictionary flag is read and ignored; the frame is decoded with no
+  dictionary, as upstream does.
+- `Malformed lz4 data` (capital M) is upstream's message for a bad skippable
+  frame; the other malformed messages are lowercase.
+
+### Differences
+
+- `archive_liblz4_version` reports `lz4_flex 0.14.0`, not the LZ4 library
+  version: the oracle links Homebrew liblz4 1.10.0, and the backend here is a
+  Rust crate, so `archive_version_details` reads `liblz4/lz4_flex 0.14.0`.
+- `lz4_flex` is more lenient than liblz4 1.10 on hostile or non-conforming
+  blocks. For example, a block that breaks LZ4's end-of-block rule (fewer than
+  five final literal bytes) fails upstream with `lz4 decompression failed`, but
+  `lz4_flex` decodes it. Taking the reviewer's example, after a block of
+  `hello`, the block `10 'x' 05 00 | 20 'zz'` is decoded here and rejected
+  upstream. Such blocks are accepted where upstream rejects them; they never
+  cause unsafe access, because the decoder is `safe-decode`.
+- Frame and block parsing and every checksum follow upstream
+  (`DONT_FAIL_ON_CRC_ERROR` is not defined there, so checksum errors fail).
+
+Oracle notes:
+
+- All 5,838 generated truncations and mutations of the 17 upstream lz4 fixtures
+  match the oracle: stdout, exit status and stderr. An earlier run showed 553
+  stdout differences where the oracle emitted nothing. They came from the uu
+  bidder's search window (fixed on main by `0c8ecb6`), not from this filter.
+
+Phase 5 look-ahead: `lz4_flex` (feature `frame`) has a frame writer with
+linked or independent blocks and block and content checksums, which is the
+frame format `archive_write_filter_lz4` needs. It does not write the legacy
+format, so that part would need our own encoder.

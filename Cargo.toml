@@ -13,6 +13,8 @@ flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] 
 libc = "0.2"
 crc32fast = "1"
 xz = "=0.4.6-rc.0"
+lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "safe-encode"] }
+xxhash-rust = { version = "0.8.19", default-features = false, features = ["xxh32"] }
 
 [build-dependencies]
 cc = "1"

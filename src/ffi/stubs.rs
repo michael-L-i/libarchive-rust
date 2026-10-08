@@ -25,11 +25,6 @@ pub extern "C" fn archive_read_support_filter_bzip2(_a0: *mut Archive) -> c_int 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_lz4(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_zstd(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
