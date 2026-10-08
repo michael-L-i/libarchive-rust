@@ -66,6 +66,7 @@
 
 //! The compress (`.Z`) filter: the LZW decoder of the Unix `compress` tool.
 
+use crate::archive::Base;
 use crate::read::{Filter, FilterBidder, Read, Reader, Status, filter_code};
 use crate::util::Error;
 use std::cmp::Ordering;
@@ -79,7 +80,7 @@ const CODES: usize = 1 << 16;
 const RESET: usize = 256;
 
 /// `archive_read_support_filter_compress`.
-pub fn support(r: &mut Read) -> Result<Status, Error> {
+pub fn support(r: &mut Read, _: &Base) -> Result<Status, Error> {
     r.register_bidder(Box::new(Bidder))
 }
 

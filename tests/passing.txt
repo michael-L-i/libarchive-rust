@@ -30,6 +30,7 @@ test_acl_posix1e_text_solaris
 test_acl_to_text
 test_archive_api_feature
 test_archive_clear_error
+test_archive_read_append_filter
 test_archive_read_close_twice
 test_archive_read_close_twice_open_fd
 test_archive_read_close_twice_open_filename
@@ -38,6 +39,7 @@ test_archive_read_open2
 test_archive_read_set_filter_option
 test_archive_set_error
 test_bad_fd
+test_create_child_environment
 test_entry
 test_entry_mac_metadata_self_copy
 test_entry_strmode
@@ -52,6 +54,7 @@ test_fuzz_tar
 test_fuzz_zip
 test_link_resolver
 test_open_filename_wcs_oob
+test_read_append_filter_wrong_program
 test_read_append_wrong_filter
 test_read_file_nonexistent
 test_read_files_compressed

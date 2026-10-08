@@ -29,7 +29,7 @@
 //! are parsed here; the deflate data is inflated by zlib-rs (`flate2`), in
 //! raw mode.
 
-use crate::archive::{ARCHIVE_ERRNO_MISC, ARCHIVE_FATAL};
+use crate::archive::{ARCHIVE_ERRNO_MISC, ARCHIVE_FATAL, Base};
 use crate::entry::Entry;
 use crate::read::{Filter, FilterBidder, Read, Reader, Status, filter_code};
 use crate::util::Error;
@@ -71,7 +71,7 @@ struct Gzip {
 }
 
 /// `archive_read_support_filter_gzip`.
-pub fn support(r: &mut Read) -> Result<Status, Error> {
+pub fn support(r: &mut Read, _: &Base) -> Result<Status, Error> {
     r.register_bidder(Box::new(Bidder))
 }
 
@@ -316,7 +316,7 @@ mod tests {
     fn decode(data: &[u8], block: usize) -> (Vec<u8>, c_int, String) {
         let mut r = Read::default();
         let a = Base::new(READ_MAGIC);
-        assert_eq!(support(&mut r).unwrap(), Status::Ok);
+        assert_eq!(support(&mut r, &Base::new(READ_MAGIC)).unwrap(), Status::Ok);
         assert_eq!(raw::support(&mut r).unwrap(), Status::Ok);
         let mut status = r.open(&a, Blocks::new(data.to_vec(), block));
         let mut entry = Entry::new(None);
@@ -413,7 +413,7 @@ mod tests {
     fn header_supplies_the_name_and_mtime() {
         let mut r = Read::default();
         let a = Base::new(READ_MAGIC);
-        assert_eq!(support(&mut r).unwrap(), Status::Ok);
+        assert_eq!(support(&mut r, &Base::new(READ_MAGIC)).unwrap(), Status::Ok);
         assert_eq!(raw::support(&mut r).unwrap(), Status::Ok);
         let gz = member(b"x", Some("test-file-name.data"), 0x5cba_fd25);
         assert_eq!(r.open(&a, Blocks::new(gz, 64)), ARCHIVE_OK);
@@ -475,7 +475,7 @@ mod tests {
         let gz = member(b"x", None, 0);
         let mut r = Read::default();
         let a = Base::new(READ_MAGIC);
-        assert_eq!(support(&mut r).unwrap(), Status::Ok);
+        assert_eq!(support(&mut r, &Base::new(READ_MAGIC)).unwrap(), Status::Ok);
         assert_eq!(raw::support(&mut r).unwrap(), Status::Ok);
         let mut client = Blocks::new(gz, 10);
         client.fail_at = 10;

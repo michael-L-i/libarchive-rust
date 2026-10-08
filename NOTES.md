@@ -371,3 +371,38 @@ Differences:
 - The bidders propagate a read error with `?`, so the open fails with the
   client's message. Upstream's bid returns 0 there, the same divergence the
   read core records for format bids above.
+
+## External program filter (`archive_cmdline`, `filter_fork_posix`, `program`)
+
+### Ported as-is
+
+- A signature bidder does not inhibit itself: a program whose output still
+  starts with the signature is bid on again, until the filter limit.
+- A child that exits non-zero (or dies of a signal other than SIGPIPE) makes
+  the read fail with `ARCHIVE_FATAL` and loses the block being filled; the
+  same warning is reported again at close (archive_read_support_filter_program.c).
+- Writing to a child that has exited raises SIGPIPE in the caller unless the
+  application ignores it, as upstream does.
+
+### Differences
+
+- The child is started with `std::process::Command` (`posix_spawn` or
+  `fork`+`exec`, as std chooses). A program that cannot be found fails at
+  open with "unable to run program" on every platform; upstream's `fork`
+  path would start the child and see it exit with status 254 instead.
+  Descriptors the application left inheritable are not closed in the child
+  (upstream closes all above 2 on the `fork` path); std's own pipes are
+  close-on-exec.
+- A NULL command, which crashes upstream, fails with `ARCHIVE_FATAL`. A
+  signature of more than `isize::MAX` bytes is ignored instead of reported as
+  "Signature too large".
+
+## grzip, lrzip and lzop filters
+
+### Differences
+
+- lzop: upstream decodes with liblzo2 when it is compiled in. The oracle
+  build has none, so the port mirrors that configuration: it always runs
+  `lzop -d` and `archive_read_support_filter_lzop` returns `ARCHIVE_WARN`
+  ("Using external lzop program for lzop decompression"). The liblzo2 path
+  (`lzop_filter_read` and its block and checksum handling) is not ported.

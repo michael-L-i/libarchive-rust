@@ -15,6 +15,7 @@ mod read_open;
 #[rustfmt::skip]
 mod stubs;
 pub(crate) mod charset;
+pub(crate) mod filter_fork;
 pub(crate) mod sys;
 
 macro_rules! opaque {

@@ -38,7 +38,7 @@ fn message(a: &Base) -> String {
 /// delivering `block` bytes at a time; or the error message the handle
 /// reports.
 pub fn decode(
-    support: fn(&mut Read) -> Result<Status, Error>,
+    support: super::all::Support,
     data: &[u8],
     block: usize,
 ) -> Result<Vec<u8>, String> {
@@ -49,13 +49,13 @@ pub fn decode(
 /// keeps a message set while opening until the first header is read, which
 /// clears it.
 pub fn decode_with_message(
-    support: fn(&mut Read) -> Result<Status, Error>,
+    support: super::all::Support,
     data: &[u8],
     block: usize,
 ) -> (Result<Vec<u8>, String>, String) {
     let a = Base::new(READ_MAGIC);
     let mut r = Read::default();
-    assert_eq!(support(&mut r).expect("filter registers"), Status::Ok);
+    assert_eq!(support(&mut r, &a).expect("filter registers"), Status::Ok);
     assert_eq!(raw::support(&mut r).expect("raw format registers"), Status::Ok);
     let client = Blocks {
         data: data.to_vec(),

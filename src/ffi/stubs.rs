@@ -20,63 +20,12 @@ pub extern "C" fn archive_read_support_compression_bzip2(_a0: *mut Archive) -> c
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_compression_program(
-    _a0: *mut Archive,
-    _command: *const c_char,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_compression_program_signature(
-    _a0: *mut Archive,
-    _a1: *const c_char,
-    _a2: *const c_void,
-    _a3: usize,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_bzip2(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_grzip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_lrzip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_lz4(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_lzop(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_program(
-    _a0: *mut Archive,
-    _command: *const c_char,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_program_signature(
-    _a0: *mut Archive,
-    _a1: *const c_char,
-    _a2: *const c_void,
-    _a3: usize,
-) -> c_int {
     ARCHIVE_FATAL
 }
 
@@ -162,24 +111,6 @@ pub extern "C" fn archive_read_support_format_zip_streamable(_a0: *mut Archive) 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_zip_seekable(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_append_filter_program(
-    _a0: *mut Archive,
-    _a1: *const c_char,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_append_filter_program_signature(
-    _a0: *mut Archive,
-    _a1: *const c_char,
-    _a2: *const c_void,
-    _a3: usize,
-) -> c_int {
     ARCHIVE_FATAL
 }
 

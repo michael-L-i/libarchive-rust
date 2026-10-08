@@ -29,7 +29,7 @@
 //! of bidding.
 
 use crate::archive::*;
-use crate::read::filter::by_code;
+use crate::read::filter::{by_code, program};
 use crate::read::{ARCHIVE_ERRNO_PROGRAMMER, Read, filter_code as code};
 use crate::util::Error;
 use std::ffi::c_int;
@@ -61,7 +61,7 @@ pub fn append_filter(r: &mut Read, a: &Base, filter_code: c_int) -> c_int {
         | code::LZIP
         | code::LZOP
         | code::LRZIP
-        | code::GRZIP => by_code::support(r, filter_code),
+        | code::GRZIP => by_code::support(r, a, filter_code),
         _ => {
             return a.raise(Error::fatal(
                 ARCHIVE_ERRNO_PROGRAMMER,
@@ -78,8 +78,15 @@ pub fn append_filter(r: &mut Read, a: &Base, filter_code: c_int) -> c_int {
     r1.min(r2)
 }
 
-// TODO(phase 2): archive_read_append_filter_program and
-// archive_read_append_filter_program_signature, with the program filter.
+/// `archive_read_append_filter_program_signature`, and with no signature,
+/// `archive_read_append_filter_program`: puts the external program `cmd` on
+/// the chain.
+pub fn append_filter_program(r: &mut Read, a: &Base, cmd: &[u8], signature: &[u8]) -> c_int {
+    match program::support(r, cmd, signature) {
+        Ok(_) => r.append_last_bidder(a),
+        Err(e) => a.raise(e),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -98,5 +105,13 @@ mod tests {
         assert_eq!(a.error_string().as_deref(), Some(b"Invalid filter code specified".as_slice()));
         // A real filter that is not ported yet registers nothing.
         assert_eq!(append_filter(&mut r, &a, code::BZIP2), ARCHIVE_FATAL);
+    }
+
+    #[test]
+    fn appends_a_program() {
+        let (mut r, a) = (Read::default(), Base::new(READ_MAGIC));
+        assert_eq!(append_filter_program(&mut r, &a, b"cat", b""), ARCHIVE_OK);
+        assert_eq!(r.filter_code(0), code::PROGRAM);
+        assert_eq!(append_filter_program(&mut r, &a, b"nonexistent", b""), ARCHIVE_FATAL);
     }
 }

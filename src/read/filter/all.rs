@@ -28,14 +28,15 @@
 //! The filters `archive_read_support_filter_all` enables, and the table
 //! `archive_read_support_filter_by_code` looks filters up in.
 
-use super::{compress, gzip, rpm, xz};
+use super::{compress, grzip, gzip, lrzip, lzop, rpm, xz};
 use crate::archive::*;
 use crate::read::{Read, Status, filter_code as code};
 use crate::util::Error;
 use std::ffi::c_int;
 
-/// Registers a filter's bidder with the handle.
-pub type Support = fn(&mut Read) -> Result<Status, Error>;
+/// Registers a filter's bidder with the handle. A filter that needs an
+/// external program warns of it through the handle.
+pub type Support = fn(&mut Read, &Base) -> Result<Status, Error>;
 
 /// Every filter code (but `NONE` and `PROGRAM`, which are special), with its
 /// registration function once it is ported.
@@ -51,9 +52,9 @@ pub const FILTERS: &[(c_int, Option<Support>)] = &[
     (code::XZ, Some(xz::support_xz)),
     (code::UU, Some(super::uu::support)),
     (code::RPM, Some(rpm::support)),
-    (code::LRZIP, None),
-    (code::LZOP, None),
-    (code::GRZIP, None),
+    (code::LRZIP, Some(lrzip::support)),
+    (code::LZOP, Some(lzop::support)),
+    (code::GRZIP, Some(grzip::support)),
     (code::LZ4, None),
     (code::ZSTD, None),
 ];
@@ -67,7 +68,7 @@ pub fn support(r: &mut Read, a: &Base) -> c_int {
             // much as possible." Clients who need specific compression
             // should enable those individually so they can verify the level
             // of support.
-            let _ = register(r);
+            let _ = register(r, a);
         }
     }
     // Clear any warning messages set by the above functions.

@@ -66,17 +66,17 @@ fn support(r: &mut Read, kind: Kind) -> Result<Status, Error> {
 }
 
 /// `archive_read_support_filter_xz`.
-pub fn support_xz(r: &mut Read) -> Result<Status, Error> {
+pub fn support_xz(r: &mut Read, _: &Base) -> Result<Status, Error> {
     support(r, Kind::Xz)
 }
 
 /// `archive_read_support_filter_lzma`.
-pub fn support_lzma(r: &mut Read) -> Result<Status, Error> {
+pub fn support_lzma(r: &mut Read, _: &Base) -> Result<Status, Error> {
     support(r, Kind::Lzma)
 }
 
 /// `archive_read_support_filter_lzip`.
-pub fn support_lzip(r: &mut Read) -> Result<Status, Error> {
+pub fn support_lzip(r: &mut Read, _: &Base) -> Result<Status, Error> {
     support(r, Kind::Lzip)
 }
 
@@ -421,7 +421,7 @@ mod tests {
     use xz::stream::LzmaOptions;
     use xz::write::XzEncoder;
 
-    type Register = fn(&mut Read) -> Result<Status, Error>;
+    type Register = crate::read::filter::all::Support;
 
     /// A format that takes any stream, so that tests can read the filters'
     /// output directly.
@@ -462,12 +462,12 @@ mod tests {
         let mut r = Read::default();
         match register {
             Some(register) => {
-                assert_eq!(register(&mut r).unwrap(), Status::Ok);
+                assert_eq!(register(&mut r, &a).unwrap(), Status::Ok);
                 assert_eq!(r.append_last_bidder(&a), ARCHIVE_OK);
             }
             None => {
                 for register in [support_lzip, support_lzma, support_xz] {
-                    assert_eq!(register(&mut r).unwrap(), Status::Ok);
+                    assert_eq!(register(&mut r, &a).unwrap(), Status::Ok);
                 }
             }
         }
@@ -595,7 +595,7 @@ mod tests {
         ] {
             let a = Base::new(READ_MAGIC);
             let mut r = Read::default();
-            assert_eq!(register(&mut r).unwrap(), Status::Ok);
+            assert_eq!(register(&mut r, &a).unwrap(), Status::Ok);
             assert_eq!(r.register_format(Box::new(Any)).unwrap(), Status::Ok);
             let packed = encode(b"x");
             assert_eq!(r.open(&a, Box::new(Memory::new(packed, 100))), ARCHIVE_OK);

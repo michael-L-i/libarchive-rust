@@ -29,6 +29,7 @@
 //! passes the payload (usually compressed cpio) through to the filter above.
 
 use crate::archive::ARCHIVE_FATAL;
+use crate::archive::Base;
 use crate::read::{ARCHIVE_ERRNO_FILE_FORMAT, Filter, FilterBidder, Read, Reader, Status, filter_code};
 use crate::util::Error;
 use std::ffi::{CStr, c_int};
@@ -39,7 +40,7 @@ const LEAD_SIZE: usize = 96;
 const MIN_HEADER_SIZE: usize = 16;
 
 /// `archive_read_support_filter_rpm`.
-pub fn support(r: &mut Read) -> Result<Status, Error> {
+pub fn support(r: &mut Read, _: &Base) -> Result<Status, Error> {
     r.register_bidder(Box::new(Bidder))
 }
 

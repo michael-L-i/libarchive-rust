@@ -28,7 +28,7 @@
 //! `archive_read_support_filter_uu`: decodes a uuencoded or base64 body that
 //! follows a `begin` line.
 
-use crate::archive::ARCHIVE_ERRNO_MISC;
+use crate::archive::{ARCHIVE_ERRNO_MISC, Base};
 use crate::entry::{AE_IFREG, Entry, Mode};
 use crate::read::{
     ARCHIVE_ERRNO_FILE_FORMAT, Filter, FilterBidder, Read, Reader, Status, filter_code,
@@ -42,7 +42,7 @@ const MAX_LINE_LENGTH: usize = 128 * 1024;
 const OUT_BUFF_SIZE: usize = 64 * 1024;
 
 /// Registers the uudecode bidder with the handle.
-pub fn support(r: &mut Read) -> Result<Status, Error> {
+pub fn support(r: &mut Read, _: &Base) -> Result<Status, Error> {
     r.register_bidder(Box::new(Bidder))
 }
 
@@ -458,7 +458,7 @@ mod tests {
     /// message the failure left on the handle.
     fn decode(input: &[u8], block: usize) -> Result<Vec<u8>, String> {
         let mut r = Read::default();
-        assert_eq!(support(&mut r).unwrap(), Status::Ok);
+        assert_eq!(support(&mut r, &Base::new(READ_MAGIC)).unwrap(), Status::Ok);
         assert_eq!(raw::support(&mut r).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         let failed = |a: &Base| {
