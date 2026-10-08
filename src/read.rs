@@ -875,9 +875,11 @@ pub struct Reader<'a> {
     passphrases: &'a mut Passphrases,
 }
 
-impl Reader<'_> {
-    /// The handle, to record warnings and read its settings.
-    pub fn base(&self) -> &Base {
+impl<'a> Reader<'a> {
+    /// The handle, to record warnings and set the format. The reference does
+    /// not borrow the reader, so it can be used while a `read_ahead` slice is
+    /// held: take it first, `let a = r.base();`.
+    pub fn base(&self) -> &'a Base {
         self.a
     }
 
@@ -985,6 +987,10 @@ impl Reader<'_> {
 
     /// The number of bytes consumed from the stream: the offset in the
     /// uncompressed data, where the next `read_ahead` looks.
+    ///
+    /// A `read_ahead` slice borrows the stage this number lives in, so the
+    /// position can't be read while one is held; read it first. (It doesn't
+    /// change until `consume`, so nothing is lost.)
     pub fn position(&self) -> i64 {
         self.chain.last().map_or(0, |s| s.position)
     }
@@ -2848,5 +2854,21 @@ mod tests {
         };
         a.state.set(state::DATA);
         assert_eq!(r.read_data(&a, &mut [0; 4]), ARCHIVE_WARN as isize);
+    }
+
+    #[test]
+    fn the_handle_is_usable_while_a_read_ahead_slice_is_held() {
+        let (mem, _) = Mem::new(b"hello", 5);
+        let (mut r, a) = setup(mem);
+        let mut rd = r.reader(&a);
+        // This is the pattern formats use: take the handle (and the
+        // position) first, then keep the slice while recording things.
+        let base = rd.base();
+        let position = rd.position();
+        let data = rd.read_ahead(5).unwrap().unwrap();
+        base.set_format(5, c"five");
+        base.warn(libc::EILSEQ, "noted");
+        assert_eq!((data, position), (&b"hello"[..], 0));
+        assert_eq!((a.format.get(), error(&a)), (5, "noted".to_string()));
     }
 }
