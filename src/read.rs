@@ -49,6 +49,7 @@
 use crate::archive::*;
 use crate::read_add_passphrase::Passphrases;
 use crate::util::Error;
+use std::any::Any;
 use std::cell::RefCell;
 use std::ffi::{CStr, c_int};
 
@@ -893,6 +894,14 @@ pub struct Read {
     /// stage is what formats read.
     chain: Vec<Stage>,
     passphrases: Passphrases,
+    /// Registered filter bidders, in registration order.
+    bidders: Vec<Box<dyn FilterBidder>>,
+    /// Whether filters were appended by hand, so bidding is skipped.
+    bypass_filter_bidding: bool,
+    /// Registered formats, in registration order.
+    pub(crate) formats: Vec<Box<dyn Format>>,
+    /// The active format: an index into `formats`.
+    pub(crate) format: Option<usize>,
 }
 
 /// `archive_read_new`.
@@ -999,6 +1008,353 @@ impl Read {
     /// `_archive_filter_name`.
     pub fn filter_name(&self, n: c_int) -> Option<&CStr> {
         self.get_filter(n).map(|s| s.imp.filter().name())
+    }
+}
+
+/// Stands in for `crate::entry::Entry` until phase 1c lands.
+// TODO(part B): delete this and `use crate::entry::Entry`.
+pub struct Entry;
+
+/// What `Format::read_data` produces.
+pub enum Data<'r> {
+    /// The next block of the entry's data, which starts at `offset` in the
+    /// entry (sparse files have gaps between blocks).
+    Block { data: &'r [u8], offset: i64 },
+    /// The end of the entry's data, at `offset` (a sparse file may end in a
+    /// hole).
+    Eof { offset: i64 },
+}
+
+/// What a format reader implements. A format owns its own state in `self`;
+/// everything it reads comes through the `Reader` passed to each call, so a
+/// format's state, the stream and the entry are separate borrows.
+///
+/// Statuses follow `util::Error`: `Ok` is `ARCHIVE_OK`; `Err(e)` carries any
+/// other code. `ARCHIVE_WARN` and `ARCHIVE_FAILED` are `Err`, too: the core
+/// records the message and carries on as upstream does. A format that wants
+/// to warn but continue finishes its work first, then returns the warning.
+/// `Error::status(ARCHIVE_EOF)` is end of archive.
+pub trait Format: Any {
+    /// The name `archive_read_set_format` and the option modules use.
+    fn name(&self) -> &'static str;
+
+    /// How well the stream matches this format: 0 for not at all. Peek with
+    /// `read_ahead`; the core rewinds a seekable stream afterwards.
+    /// `best_bid` is the best bid so far, so an expensive check can be
+    /// skipped. `ARCHIVE_FATAL` aborts the open.
+    fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> c_int;
+
+    /// Handles a format option. `None` if the format has no options at all;
+    /// otherwise `Ok` if it took the option and `Err` with `ARCHIVE_WARN`
+    /// if it doesn't know it.
+    fn options(
+        &mut self,
+        _a: &Base,
+        _key: &[u8],
+        _value: Option<&[u8]>,
+    ) -> Option<Result<(), Error>> {
+        None
+    }
+
+    /// Reads the next entry's header into `entry`. At the end of the
+    /// archive, `Error::status(ARCHIVE_EOF)`.
+    fn read_header(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Result<(), Error>;
+
+    /// The next block of the entry's data. A format that returns the data in
+    /// place (the usual zero-copy case) consumes it on its next call, since
+    /// the slice must stay valid until then.
+    fn read_data<'r>(&mut self, r: &'r mut Reader<'_>) -> Result<Data<'r>, Error>;
+
+    /// Skips the rest of the entry's data. The default reads and discards it.
+    fn read_data_skip(&mut self, r: &mut Reader<'_>) -> Result<(), Error> {
+        loop {
+            if let Data::Eof { .. } = self.read_data(r)? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// `archive_seek_data`.
+    fn seek_data(&mut self, _r: &mut Reader<'_>, _offset: i64, _whence: Whence) -> Result<i64, Error> {
+        Err(Error::new(
+            ARCHIVE_FAILED,
+            ARCHIVE_ERRNO_MISC,
+            "Cannot seek data with this format",
+        ))
+    }
+
+    /// `ARCHIVE_READ_FORMAT_CAPS_*` bits.
+    fn capabilities(&self) -> c_int {
+        0
+    }
+
+    /// `archive_read_has_encrypted_entries` for a format that can tell.
+    fn has_encrypted_entries(&self) -> c_int {
+        ENCRYPTION_DONT_KNOW
+    }
+}
+
+/// `ARCHIVE_READ_FORMAT_ENCRYPTION_DONT_KNOW`.
+pub const ENCRYPTION_DONT_KNOW: c_int = -1;
+/// `ARCHIVE_READ_FORMAT_ENCRYPTION_UNSUPPORTED`.
+pub const ENCRYPTION_UNSUPPORTED: c_int = -2;
+/// `ARCHIVE_READ_FORMAT_CAPS_ENCRYPT_DATA` and `_METADATA`.
+pub const CAPS_ENCRYPT: c_int = 1 | 2;
+
+/// A decompression filter's bidder. Bidding works like this: the core asks
+/// each registered bidder, with the stream so far, how well it matches. The
+/// winner initializes a new filter that becomes the top of the chain, and
+/// the process repeats until no bidder bids above 0.
+pub trait FilterBidder {
+    /// Taste the stream (`read_ahead` on `up`) to see if this filter handles
+    /// it: 0 for not at all, higher for a surer match.
+    fn bid(&mut self, up: &mut Reader<'_>) -> c_int;
+
+    /// Creates the filter. `up` is the stream the filter will sit on.
+    fn init(&mut self, up: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error>;
+}
+
+/// At most this many formats or filter bidders can be registered.
+const MAX_REGISTERED: usize = 16;
+
+/// We won't build a filter pipeline with more stages than this.
+const MAX_NUMBER_FILTERS: usize = 25;
+
+impl Read {
+    /// `__archive_read_register_format`. A format of a type that is already
+    /// registered is a warning (and is dropped).
+    pub fn register_format(&mut self, format: Box<dyn Format>) -> Result<(), Error> {
+        let id = (*format).type_id();
+        if self.formats.iter().any(|f| (**f).type_id() == id) {
+            return Err(Error::status(ARCHIVE_WARN));
+        }
+        if self.formats.len() >= MAX_REGISTERED {
+            return Err(Error::fatal(
+                libc::ENOMEM,
+                "Not enough slots for format registration",
+            ));
+        }
+        self.formats.push(format);
+        Ok(())
+    }
+
+    /// `__archive_read_register_bidder`.
+    pub fn register_bidder(&mut self, bidder: Box<dyn FilterBidder>) -> Result<(), Error> {
+        if self.bidders.len() >= MAX_REGISTERED {
+            return Err(Error::fatal(
+                libc::ENOMEM,
+                "Not enough slots for filter registration",
+            ));
+        }
+        self.bidders.push(bidder);
+        Ok(())
+    }
+
+    /// `archive_read_append_filter_last_bidder`: puts the filter of the most
+    /// recently registered bidder on the chain without bidding.
+    pub fn append_last_bidder(&mut self, a: &Base) -> c_int {
+        let Self {
+            chain,
+            passphrases,
+            bidders,
+            ..
+        } = self;
+        let Some(bidder) = bidders.last_mut() else {
+            return a.raise(Error::fatal(
+                ARCHIVE_ERRNO_PROGRAMMER,
+                "Internal error: no bidder to append",
+            ));
+        };
+        let mut rd = Reader {
+            chain,
+            a,
+            passphrases,
+        };
+        match bidder.init(&mut rd) {
+            Ok(filter) => {
+                chain.push(Stage::new(Imp::Filter(filter)));
+                self.bypass_filter_bidding = true;
+                ARCHIVE_OK
+            }
+            Err(e) => {
+                a.raise(e);
+                self.free_filters(a);
+                ARCHIVE_FATAL
+            }
+        }
+    }
+
+    /// `choose_filters`: lets the bidders build the chain of filters.
+    fn choose_filters(&mut self, a: &Base) -> c_int {
+        for _ in 0..MAX_NUMBER_FILTERS {
+            let mut best_bid = 0;
+            let mut best = None;
+            for (i, bidder) in self.bidders.iter_mut().enumerate() {
+                let mut rd = Reader {
+                    chain: &mut self.chain,
+                    a,
+                    passphrases: &mut self.passphrases,
+                };
+                let bid = bidder.bid(&mut rd);
+                if bid > best_bid {
+                    best_bid = bid;
+                    best = Some(i);
+                }
+            }
+            let mut rd = Reader {
+                chain: &mut self.chain,
+                a,
+                passphrases: &mut self.passphrases,
+            };
+            let Some(best) = best else {
+                // If no bidder, we're done. Verify the filter by asking it
+                // for some data.
+                if rd.read_ahead(1).is_err() {
+                    self.free_filters(a);
+                    return ARCHIVE_FATAL;
+                }
+                return ARCHIVE_OK;
+            };
+            match self.bidders[best].init(&mut rd) {
+                Ok(filter) => self.chain.push(Stage::new(Imp::Filter(filter))),
+                Err(e) => {
+                    a.raise(e);
+                    self.free_filters(a);
+                    return ARCHIVE_FATAL;
+                }
+            }
+        }
+        a.raise(Error::fatal(
+            ARCHIVE_ERRNO_FILE_FORMAT,
+            "Input requires too many filters for decoding",
+        ))
+    }
+
+    /// `bid_format`: the bid of format `index`, rewinding the stream if the
+    /// bidder moved it.
+    fn bid_format(&mut self, a: &Base, index: usize, best_bid: c_int) -> c_int {
+        let Some(format) = self.formats.get_mut(index) else {
+            return ARCHIVE_FATAL;
+        };
+        let mut rd = Reader {
+            chain: &mut self.chain,
+            a,
+            passphrases: &mut self.passphrases,
+        };
+        let bid = format.bid(&mut rd, best_bid);
+        if bid == ARCHIVE_FATAL || (rd.position() != 0 && rd.seek(0, Whence::Set).is_err()) {
+            return ARCHIVE_FATAL;
+        }
+        bid
+    }
+
+    /// `choose_format`: lets each registered format bid on whether it wants
+    /// to handle the stream. Returns the winner's index, with an error
+    /// recorded if there is none.
+    fn choose_format(&mut self, a: &Base) -> Option<usize> {
+        let mut best_bid = -1;
+        let mut best_slot = None;
+        // Set up the active format for convenience of bidders.
+        for i in 0..self.formats.len() {
+            self.format = Some(i);
+            let bid = self.bid_format(a, i, best_bid);
+            if bid == ARCHIVE_FATAL {
+                return None;
+            }
+            if bid > best_bid || best_slot.is_none() {
+                best_bid = bid;
+                best_slot = Some(i);
+            }
+        }
+
+        // There were no bidders; this is a serious programmer error.
+        let Some(slot) = best_slot else {
+            a.raise(Error::fatal(ARCHIVE_ERRNO_FILE_FORMAT, "No formats registered"));
+            return None;
+        };
+        // There were bidders, but no non-zero bids; this means we can't
+        // support this stream.
+        if best_bid < 1 {
+            a.raise(Error::fatal(
+                ARCHIVE_ERRNO_FILE_FORMAT,
+                "Unrecognized archive format",
+            ));
+            return None;
+        }
+        Some(slot)
+    }
+
+    /// `archive_read_open1`, after the caller has checked the handle and
+    /// built `client`: opens the client, builds the filter chain, picks the
+    /// format.
+    pub fn open(&mut self, a: &Base, client: Box<dyn Client>) -> c_int {
+        a.clear_error();
+        a.state.set(state::OPEN);
+
+        // Open data source.
+        if let Err(e) = self.open_client(client) {
+            a.state.set(state::FATAL);
+            return a.raise(e);
+        }
+        if !self.bypass_filter_bidding {
+            // Build out the input pipeline.
+            if self.choose_filters(a) < ARCHIVE_WARN {
+                a.state.set(state::FATAL);
+                return ARCHIVE_FATAL;
+            }
+        }
+
+        match self.format {
+            None => match self.choose_format(a) {
+                Some(slot) => self.format = Some(slot),
+                None => {
+                    self.close_filters(a);
+                    a.state.set(state::FATAL);
+                    return ARCHIVE_FATAL;
+                }
+            },
+            Some(index) => {
+                if self.bid_format(a, index, -1) < 0 {
+                    a.raise(Error::fatal(
+                        ARCHIVE_ERRNO_FILE_FORMAT,
+                        "Registered format does not match",
+                    ));
+                    self.close_filters(a);
+                    a.state.set(state::FATAL);
+                    return ARCHIVE_FATAL;
+                }
+            }
+        }
+
+        a.state.set(state::HEADER);
+
+        // Ensure libarchive starts from the first node in a multivolume set.
+        if let Some(stage) = self.chain.first_mut()
+            && let Imp::Client(c) = &mut stage.imp
+            && c.cursor != 0
+        {
+            if let Err(e) = c.switch_to(0) {
+                a.raise(e);
+            }
+            stage.client_total = 0;
+            stage.client_avail = 0;
+        }
+        ARCHIVE_OK
+    }
+
+    /// The tail of `archive_read_set_format`, once the format for the code is
+    /// registered: makes the format named `name` the active one. A warning if
+    /// there already was one.
+    pub fn select_format(&mut self, a: &Base, name: &str) -> c_int {
+        let warn = self.format.is_some();
+        let Some(index) = self.formats.iter().position(|f| f.name() == name) else {
+            return a.raise(Error::fatal(
+                ARCHIVE_ERRNO_PROGRAMMER,
+                "Internal error: Unable to set format",
+            ));
+        };
+        self.format = Some(index);
+        if warn { ARCHIVE_WARN } else { ARCHIVE_OK }
     }
 }
 
@@ -1530,5 +1886,225 @@ mod tests {
         assert_eq!((e.code, e.errno, e.msg.as_slice()), (ARCHIVE_FATAL, libc::ENOENT, b"nope".as_slice()));
         assert_eq!(*closed.borrow(), ["close 0", "close 1"]);
         assert_eq!(r.filter_count(), 0);
+    }
+
+    /// A format whose bid is fixed, and that peeks `peek` bytes (consuming
+    /// them if `eat`) when asked.
+    struct Fake<const N: usize> {
+        bid: c_int,
+        peek: usize,
+        eat: bool,
+        bids: Rc<Cell_<Vec<(usize, c_int)>>>,
+    }
+
+    impl<const N: usize> Format for Fake<N> {
+        fn name(&self) -> &'static str {
+            ["zero", "one", "two", "three"][N % 4]
+        }
+
+        fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> c_int {
+            self.bids.borrow_mut().push((N, best_bid));
+            if self.peek > 0 {
+                let _ = r.read_ahead(self.peek);
+            }
+            if self.eat {
+                let _ = r.consume(self.peek);
+            }
+            self.bid
+        }
+
+        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {
+            Err(Error::status(ARCHIVE_EOF))
+        }
+
+        fn read_data<'r>(&mut self, _: &'r mut Reader<'_>) -> Result<Data<'r>, Error> {
+            Ok(Data::Eof { offset: 0 })
+        }
+    }
+
+    fn fake<const N: usize>(bid: c_int, log: &Rc<Cell_<Vec<(usize, c_int)>>>) -> Box<Fake<N>> {
+        Box::new(Fake::<N> {
+            bid,
+            peek: 0,
+            eat: false,
+            bids: Rc::clone(log),
+        })
+    }
+
+    /// Bids `bid` if the stream starts with a lowercase letter, then
+    /// upper-cases it.
+    struct UpperBidder(c_int);
+
+    impl FilterBidder for UpperBidder {
+        fn bid(&mut self, up: &mut Reader<'_>) -> c_int {
+            match up.read_ahead(1) {
+                Ok(d) if d.first().is_some_and(u8::is_ascii_lowercase) => self.0,
+                _ => 0,
+            }
+        }
+
+        fn init(&mut self, _up: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error> {
+            Ok(Box::new(Upper {
+                out: Vec::new(),
+                closed: Rc::default(),
+            }))
+        }
+    }
+
+    fn open_with(r: &mut Read, a: &Base, data: &[u8]) -> c_int {
+        let (mem, _) = Mem::new(data, 4);
+        r.open(a, Box::new(mem))
+    }
+
+    #[test]
+    fn the_highest_bid_wins_and_the_first_wins_ties() {
+        let log = Rc::default();
+        let mut r = Read::default();
+        r.register_format(fake::<0>(0, &log)).unwrap();
+        r.register_format(fake::<1>(5, &log)).unwrap();
+        r.register_format(fake::<2>(5, &log)).unwrap();
+        r.register_format(fake::<3>(3, &log)).unwrap();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_OK);
+        assert_eq!(r.format, Some(1));
+        assert_eq!(a.state.get(), state::HEADER);
+        // Each bidder is told the best bid so far, starting from -1.
+        assert_eq!(*log.borrow(), [(0, -1), (1, 0), (2, 5), (3, 5)]);
+    }
+
+    #[test]
+    fn a_stream_nobody_bids_on_is_unrecognized() {
+        let log = Rc::default();
+        let mut r = Read::default();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_FATAL);
+        assert_eq!(error(&a), "No formats registered");
+        assert_eq!((a.errno.get(), a.state.get()), (ARCHIVE_ERRNO_FILE_FORMAT, state::FATAL));
+
+        let mut r = Read::default();
+        r.register_format(fake::<0>(0, &log)).unwrap();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_FATAL);
+        assert_eq!(error(&a), "Unrecognized archive format");
+        assert_eq!(a.state.get(), state::FATAL);
+    }
+
+    #[test]
+    fn a_fatal_bid_aborts_the_open() {
+        let log = Rc::default();
+        let mut r = Read::default();
+        r.register_format(fake::<0>(ARCHIVE_FATAL, &log)).unwrap();
+        r.register_format(fake::<1>(9, &log)).unwrap();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_FATAL);
+        assert_eq!(log.borrow().len(), 1);
+    }
+
+    #[test]
+    fn bidders_that_consume_rewind_a_seekable_stream() {
+        let log = Rc::default();
+        let mut r = Read::default();
+        let mut f = fake::<0>(7, &log);
+        (f.peek, f.eat) = (3, true);
+        r.register_format(f).unwrap();
+        let a = Base::new(READ_MAGIC);
+        let (mut mem, _) = Mem::new(b"abcdefgh", 4);
+        mem.seekable = true;
+        assert_eq!(r.open(&a, Box::new(mem)), ARCHIVE_OK);
+        assert_eq!(r.reader(&a).position(), 0);
+        assert_eq!(r.reader(&a).read_ahead(1).unwrap(), b"abcd");
+
+        // Without a seeker, that is fatal.
+        let mut r = Read::default();
+        let mut f = fake::<0>(7, &log);
+        (f.peek, f.eat) = (3, true);
+        r.register_format(f).unwrap();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"abcdefgh"), ARCHIVE_FATAL);
+    }
+
+    #[test]
+    fn duplicate_and_excess_registrations() {
+        let log = Rc::default();
+        let mut r = Read::default();
+        r.register_format(fake::<0>(1, &log)).unwrap();
+        assert_eq!(r.register_format(fake::<0>(1, &log)).unwrap_err().code, ARCHIVE_WARN);
+        assert_eq!(r.formats.len(), 1);
+        for _ in 0..16 {
+            r.register_bidder(Box::new(UpperBidder(1))).unwrap();
+        }
+        let e = r.register_bidder(Box::new(UpperBidder(1))).unwrap_err();
+        assert_eq!((e.code, e.errno), (ARCHIVE_FATAL, libc::ENOMEM));
+        assert_eq!(e.msg, b"Not enough slots for filter registration");
+    }
+
+    #[test]
+    fn the_best_bidding_filter_is_stacked_until_nobody_bids() {
+        let mut r = Read::default();
+        r.register_bidder(Box::new(UpperBidder(1))).unwrap();
+        r.register_bidder(Box::new(UpperBidder(3))).unwrap();
+        r.register_format(fake::<0>(1, &Rc::default())).unwrap();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"abc"), ARCHIVE_OK);
+        // One filter: after upper-casing nobody bids.
+        assert_eq!((r.filter_count(), r.filter_code(0)), (2, 99));
+        assert_eq!(r.reader(&a).read_ahead(3).unwrap(), b"ABC");
+    }
+
+    #[test]
+    fn too_many_filters_is_fatal() {
+        struct Always;
+        impl FilterBidder for Always {
+            fn bid(&mut self, _: &mut Reader<'_>) -> c_int {
+                1
+            }
+            fn init(&mut self, _: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error> {
+                Ok(Box::new(Upper { out: Vec::new(), closed: Rc::default() }))
+            }
+        }
+        let mut r = Read::default();
+        r.register_bidder(Box::new(Always)).unwrap();
+        r.register_format(fake::<0>(1, &Rc::default())).unwrap();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"abc"), ARCHIVE_FATAL);
+        assert_eq!(error(&a), "Input requires too many filters for decoding");
+    }
+
+    #[test]
+    fn appended_filters_skip_bidding_and_sit_on_the_client() {
+        let mut r = Read::default();
+        r.register_bidder(Box::new(UpperBidder(1))).unwrap();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(r.append_last_bidder(&a), ARCHIVE_OK);
+        r.register_format(fake::<0>(1, &Rc::default())).unwrap();
+        assert_eq!(open_with(&mut r, &a, b"xyz"), ARCHIVE_OK);
+        assert_eq!((r.filter_count(), r.filter_code(0), r.filter_code(1)), (2, 99, 0));
+        assert_eq!(r.reader(&a).read_ahead(3).unwrap(), b"XYZ");
+        // Appending with no bidder is a programmer error.
+        let mut none = Read::default();
+        assert_eq!(none.append_last_bidder(&a), ARCHIVE_FATAL);
+    }
+
+    #[test]
+    fn set_format_names_an_active_format_and_open_checks_it() {
+        let log = Rc::default();
+        let mut r = Read::default();
+        let a = Base::new(READ_MAGIC);
+        r.register_format(fake::<1>(0, &log)).unwrap();
+        r.register_format(fake::<2>(9, &log)).unwrap();
+        assert_eq!(r.select_format(&a, "nope"), ARCHIVE_FATAL);
+        assert_eq!(error(&a), "Internal error: Unable to set format");
+        assert_eq!(r.select_format(&a, "one"), ARCHIVE_OK);
+        assert_eq!(r.select_format(&a, "two"), ARCHIVE_WARN);
+        // The chosen format is not bid against others, only checked.
+        assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_OK);
+        assert_eq!(r.format, Some(1));
+        assert_eq!(*log.borrow(), [(2, -1)]);
+
+        let mut r = Read::default();
+        r.register_format(fake::<1>(-1, &log)).unwrap();
+        r.select_format(&a, "one");
+        assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_FATAL);
+        assert_eq!(error(&a), "Registered format does not match");
     }
 }
