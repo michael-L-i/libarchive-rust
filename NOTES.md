@@ -283,3 +283,20 @@ Differences:
   upstream finds within its buffer is found the same way, and a line it
   would only find by reading out of bounds is not found. A line starting
   exactly at the window's end gets an empty window, as upstream.
+
+## xz, lzma and lzip filters (`src/read/filter/xz.rs`)
+
+### Differences
+
+- liblzma is replaced by the pure Rust `xz` crate (a port of liblzma
+  5.8.3, which `archive_liblzma_version` and `archive_version_details`
+  report; the oracle links 5.8.4). The crate has the same stream API, so
+  the error messages and which input is rejected match; a bug fix between
+  5.8.3 and 5.8.4 could differ on unusual damaged input. `LZMA_MEMLIMIT` is
+  disabled as upstream does for liblzma 5.
+- The "Using external xz program" fallback is not ported: the decoder is
+  always built in.
+- A read error while a filter bids is passed up as a failure where
+  upstream's bid returns 0 (see the read core notes).
+- `lzip_init` does not re-check the dictionary size: `lzip_has_member` has
+  already validated every header it reads.
