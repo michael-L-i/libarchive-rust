@@ -625,24 +625,24 @@ pub extern "C" fn archive_read_next_header2(a: *mut Archive, entry: *mut Archive
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_next_header(a: *mut Archive, entryp: *mut *mut ArchiveEntry) -> c_int {
     put(entryp, std::ptr::null_mut());
-    checked!(
+    let r = checked!(
         archive_read_next_header,
         a,
         READ_MAGIC,
         state::HEADER | state::DATA | state::DATA_RECOVERY,
         ARCHIVE_FATAL,
         |h| {
-            let entry = h.read_entry();
             // SAFETY: the handle's entry is a live `Box` leak, only used
             // through this pointer and the ones handed to the caller.
-            let r = match unsafe { entry.as_mut() } {
+            match unsafe { h.read_entry().as_mut() } {
                 Some(e) => h.read_next_header2(e),
                 None => ARCHIVE_FATAL,
-            };
-            put(entryp, entry.cast());
-            r
+            }
         }
-    )
+    );
+    // The entry comes back even when the header does not.
+    put(entryp, with(a, std::ptr::null_mut(), |h| h.read_entry().cast()));
+    r
 }
 
 #[unsafe(no_mangle)]
@@ -1031,7 +1031,7 @@ pub(super) mod tests {
         assert_eq!(with(a, 0, |h| h.base.state.get()), state::EOF);
         // Wrong state now.
         assert_eq!(archive_read_next_header(a, &mut e), ARCHIVE_FATAL);
-        assert!(e.is_null());
+        assert!(!e.is_null());
         assert_eq!(archive_free(a), ARCHIVE_OK);
 
         let a = opened();
