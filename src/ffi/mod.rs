@@ -9,6 +9,7 @@ mod archive;
 mod read;
 #[rustfmt::skip]
 mod stubs;
+pub(crate) mod charset;
 
 macro_rules! opaque {
     ($($name:ident),*) => {$(
