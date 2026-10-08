@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""Run upstream's libarchive_test one test per process and enforce the ratchet.
+
+Port mode (default) runs build/port; --oracle runs build/oracle (upstream).
+See AGENTS.md, "Oracle".
+"""
+
+import argparse
+import datetime
+import fnmatch
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TESTDIR = os.path.join(ROOT, "upstream/libarchive/libarchive/test")
+PASSING = os.path.join(ROOT, "tests/passing.txt")
+UPSTREAM = os.path.join(ROOT, "tests/upstream.txt")
+PASS_HEADER = "# Upstream tests that pass against libarchive-rust. Maintained by scripts/run-tests --update.\n"
+UPSTREAM_HEADER = "# Upstream tests that pass against upstream libarchive on this machine. Maintained by scripts/run-tests --oracle --baseline.\n"
+PASSING_STATES = ("pass",)
+FORMAT_ALIAS = {
+    **dict.fromkeys(["gtar", "gnutar", "ustar", "pax", "v7tar", "tbz", "tgz", "tlz", "txz", "tz"], "tar"),
+    **dict.fromkeys(["isorr", "isojoliet", "iso9660", "isozisofs"], "iso"),
+    **dict.fromkeys(["rar3", "rar4"], "rar"),
+    "zip64": "zip",
+}
+PREFIX_AREAS = ("read_filter", "write_filter", "entry", "acl", "archive", "compat", "fuzz")
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def read_names(path):
+    with open(path) as f:
+        return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
+
+def write_names(path, names, header):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(header)
+        for n in sorted(names):
+            f.write(n + "\n")
+
+
+def list_tests(binary):
+    out = subprocess.run([binary, "-l"], capture_output=True, text=True, check=True).stdout
+    names = []
+    for line in out.splitlines():
+        m = re.match(r"\s*\d+:\s+(\S+)\s*$", line)
+        if m:
+            names.append(m.group(1))
+    return names
+
+
+def area(name):
+    n = name[len("test_"):] if name.startswith("test_") else name
+    for kind in ("read_format_", "write_format_"):
+        if n.startswith(kind):
+            fmt = n[len(kind):].split("_")[0]
+            return kind + FORMAT_ALIAS.get(fmt, fmt)
+    for p in PREFIX_AREAS:
+        if n.startswith(p):
+            return p
+    return "other"
+
+
+def classify(rc):
+    if rc < 0:
+        try:
+            return "crash:" + signal.Signals(-rc).name
+        except ValueError:
+            return f"crash:signal{-rc}"
+    return {0: "pass", 2: "skip"}.get(rc, "fail")
+
+
+def run_one(binary, name, out_dir, timeout):
+    work = os.path.join(out_dir, "work", name)
+    shutil.rmtree(work, ignore_errors=True)
+    cwd = os.path.join(work, "cwd")
+    tmp = os.path.join(work, "tmp")
+    os.makedirs(cwd)
+    os.makedirs(tmp)
+    log = os.path.join(out_dir, "logs", name + ".log")
+    env = dict(os.environ, TMPDIR=tmp)
+    start = time.monotonic()
+    with open(log, "w") as out:
+        proc = subprocess.Popen([binary, "-s", "-r", TESTDIR, name], cwd=cwd, env=env,
+                                stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            status = classify(proc.wait(timeout=timeout))
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            status = "timeout"
+            out.write(f"\n[run-tests] timed out after {timeout:g}s, killed\n")
+        if status.startswith("crash:"):
+            out.write(f"\n[run-tests] killed by {status[6:]}\n")
+    if status in ("pass", "skip"):
+        os.remove(log)
+        shutil.rmtree(work, ignore_errors=True)
+    return name, status, time.monotonic() - start
+
+
+def count_unsafe():
+    pat = re.compile(r"\bunsafe\s*(\{|fn\b|impl\b|extern\b|trait\b)")
+    total = 0
+    for dirpath, _, files in os.walk(os.path.join(ROOT, "src")):
+        for f in files:
+            path = os.path.join(dirpath, f)
+            if not f.endswith(".rs") or path == os.path.join(ROOT, "src/ffi/stubs.rs"):
+                continue
+            with open(path, errors="replace") as fh:
+                total += sum(1 for line in fh if pat.search(line))
+    return total
+
+
+def count_stubs():
+    path = os.path.join(ROOT, "src/ffi/stubs.rs")
+    if not os.path.exists(path):
+        return 0
+    with open(path, errors="replace") as fh:
+        return sum(1 for line in fh if "#[unsafe(no_mangle)]" in line)
+
+
+def write_status(label, tests, status, upstream):
+    pin = "unknown"
+    try:
+        pin = subprocess.run(["git", "-C", os.path.join(ROOT, "upstream/libarchive"), "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        pass
+    ours = {n for n in tests if status[n] == "pass"}
+    rows = {}
+    for n in tests:
+        a = area(n)
+        r = rows.setdefault(a, [0, 0, 0])
+        r[0] += n in ours
+        r[1] += upstream is not None and n in upstream
+        r[2] += 1
+    if upstream is None:
+        head = f"**Passing {len(ours)} / {len(tests)} total** (no tests/upstream.txt yet)"
+    else:
+        head = f"**Passing {len(ours)} / upstream {len(upstream)} / {len(tests)} total**"
+    lines = [
+        "# libarchive-rust status",
+        "",
+        f"Date {datetime.date.today().isoformat()}. Upstream pin `{pin}`. Run: {label}.",
+        "",
+        head,
+        "",
+        "| Area | Ours | Upstream | Total |",
+        "|---|---:|---:|---:|",
+    ]
+    for a in sorted(rows, key=lambda a: (a == "other", a)):
+        ours_n, up_n, total = rows[a]
+        up_s = str(up_n) if upstream is not None else "-"
+        lines.append(f"| {a} | {ours_n} | {up_s} | {total} |")
+    lines += [
+        "",
+        f"Remaining stubs (`src/ffi/stubs.rs`): {count_stubs()}",
+        f"`unsafe` in `src/` (excluding stubs.rs): {count_unsafe()}",
+        "",
+    ]
+    with open(os.path.join(ROOT, "STATUS.md"), "w") as f:
+        f.write("\n".join(lines))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Run upstream libarchive_test per test, in parallel, and enforce the ratchet.")
+    ap.add_argument("--oracle", action="store_true", help="run upstream (build/oracle) instead of the port")
+    ap.add_argument("--bin", metavar="PATH", help="test binary to run (overrides --oracle's default)")
+    ap.add_argument("--update", action="store_true", help="add new passes to tests/passing.txt")
+    ap.add_argument("--baseline", action="store_true", help="with --oracle, write tests/upstream.txt (full run)")
+    ap.add_argument("--status", action="store_true", help="rewrite STATUS.md (full run)")
+    ap.add_argument("-j", type=int, default=os.cpu_count() or 1, help="parallel jobs (default: CPU count)")
+    # Upstream's slowest test takes ~5s; stubbed reads can loop until killed.
+    ap.add_argument("--timeout", type=float, default=30, help="seconds per test (default: 30)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="list all non-passing and new tests")
+    ap.add_argument("patterns", nargs="*", metavar="PATTERN", help="fnmatch globs on test names")
+    a = ap.parse_args()
+
+    if a.oracle and a.update:
+        die("--update applies to the port ratchet, not --oracle")
+    if a.baseline and not a.oracle:
+        die("--baseline requires --oracle")
+    if (a.baseline or a.status) and a.patterns:
+        die("--baseline and --status require a full run (no patterns)")
+    if a.j < 1:
+        die("-j must be at least 1")
+
+    if a.bin:
+        binary = os.path.abspath(a.bin)
+    else:
+        binary = os.path.join(ROOT, "build", "oracle" if a.oracle else "port", "bin", "libarchive_test")
+    if not os.access(binary, os.X_OK):
+        if a.bin:
+            die(f"not an executable: {binary}")
+        hint = "scripts/build-oracle" if a.oracle else "scripts/build-port"
+        die(f"missing {binary}; run {hint}")
+
+    if not a.bin:
+        label = "oracle" if a.oracle else "port"
+    elif a.oracle:
+        label = "oracle"
+    else:
+        label = next((n for n in ("oracle", "port")
+                      if binary.startswith(os.path.join(ROOT, "build", n) + os.sep)), "custom")
+    ratchet = not a.oracle
+
+    tests = list_tests(binary)
+    if not tests:
+        die(f"{binary} lists no tests")
+    selected = [t for t in tests if not a.patterns or any(fnmatch.fnmatchcase(t, p) for p in a.patterns)]
+    if not selected:
+        die("no tests match " + " ".join(a.patterns))
+
+    passing = set()
+    if ratchet:
+        if not os.path.exists(PASSING):
+            write_names(PASSING, [], PASS_HEADER)
+        passing = set(read_names(PASSING))
+        if not a.patterns:
+            unknown = sorted(passing - set(tests))
+            if unknown:
+                print(f"warning: {len(unknown)} names in passing.txt are not in the test list: "
+                      + " ".join(unknown[:5]))
+
+    out_dir = os.path.join(ROOT, "build", label)
+    shutil.rmtree(os.path.join(out_dir, "logs"), ignore_errors=True)
+    os.makedirs(os.path.join(out_dir, "logs"))
+    os.makedirs(os.path.join(out_dir, "work"), exist_ok=True)
+
+    start = time.monotonic()
+    with ThreadPoolExecutor(max_workers=a.j) as ex:
+        results = list(ex.map(lambda n: run_one(binary, n, out_dir, a.timeout), selected))
+    wall = time.monotonic() - start
+
+    status = {n: s for n, s, _ in results}
+    with open(os.path.join(out_dir, "results.tsv"), "w") as f:
+        f.write("name\tstatus\tseconds\n")
+        for n, s, t in results:
+            f.write(f"{n}\t{s}\t{t:.2f}\n")
+
+    counts = Counter("crash" if s.startswith("crash:") else s for s in status.values())
+    summary = (f"{label}: {counts['pass']} pass, {counts['fail']} fail, {counts['skip']} skip, "
+               f"{counts['crash']} crash, {counts['timeout']} timeout in {wall:.0f}s")
+
+    regressions, new = [], []
+    if ratchet:
+        regressions = [n for n in selected if n in passing and status[n] not in PASSING_STATES]
+        new = [n for n in selected if status[n] in PASSING_STATES and n not in passing]
+        summary += f" | ratchet: {len(regressions)} regressions, {len(new)} new"
+        if a.update and new:
+            with open(PASSING) as f:
+                header = "".join(l for l in f if l.startswith("#")) or PASS_HEADER
+            write_names(PASSING, passing | set(new), header)
+            summary += " (added to passing.txt)"
+    print(summary)
+
+    if regressions:
+        print("REGRESSIONS (in tests/passing.txt, not passing now):")
+        for n in regressions:
+            log = "" if status[n] == "skip" else "  " + os.path.join(out_dir, "logs", n + ".log")
+            print(f"  {n}  {status[n]}{log}")
+
+    nonpass = [(n, status[n]) for n in selected if status[n] != "pass"]
+    if a.oracle or a.verbose:
+        for n, s in nonpass:
+            print(f"  {n}  {s}")
+    if a.verbose and new:
+        print("new passes: " + " ".join(new))
+
+    first = next((n for n in selected if status[n] not in ("pass", "skip")), None)
+    if first:
+        log = os.path.join(out_dir, "logs", first + ".log")
+        print(f"first failure: {first} ({status[first]}) log: {log}")
+        with open(log, errors="replace") as f:
+            tail = f.read().splitlines()[-10:]
+        for line in tail:
+            print("    " + line)
+
+    if a.baseline:
+        passes = [n for n in selected if status[n] == "pass"]
+        write_names(UPSTREAM, passes, UPSTREAM_HEADER)
+        print(f"wrote tests/upstream.txt ({len(passes)} tests)")
+
+    if a.status:
+        upstream = set(read_names(UPSTREAM)) if os.path.exists(UPSTREAM) else None
+        write_status(label, tests, status, upstream)
+        print("wrote STATUS.md")
+
+    sys.exit(1 if regressions else 0)
+
+
+if __name__ == "__main__":
+    main()
