@@ -101,9 +101,8 @@ impl FilterBidder for Bidder {
             *s = code;
         }
         Ok(Box::new(Compress {
-            out: table(OUT_BLOCK, 0u8)?,
-            block_len: 0,
-            block_pos: 0,
+            out: alloc(OUT_BLOCK)?,
+            block_used: 0,
             bit_buffer: 0,
             bits_avail: 0,
             bytes_in_section: 0,
@@ -124,9 +123,9 @@ impl FilterBidder for Bidder {
     }
 }
 
-/// A table of `n` copies of `fill`. A failed allocation is ENOMEM, as
-/// upstream reports it.
-fn table<T: Clone>(n: usize, fill: T) -> Result<Vec<T>, Error> {
+/// An empty buffer with room for `n` elements. A failed allocation is ENOMEM,
+/// as upstream reports it.
+fn alloc<T>(n: usize) -> Result<Vec<T>, Error> {
     let mut v = Vec::new();
     v.try_reserve_exact(n).map_err(|_| {
         Error::fatal(
@@ -134,6 +133,12 @@ fn table<T: Clone>(n: usize, fill: T) -> Result<Vec<T>, Error> {
             "Can't allocate data for compress (.Z) decompression",
         )
     })?;
+    Ok(v)
+}
+
+/// A table of `n` copies of `fill`.
+fn table<T: Clone>(n: usize, fill: T) -> Result<Vec<T>, Error> {
+    let mut v = alloc(n)?;
     v.resize(n, fill);
     Ok(v)
 }
@@ -146,11 +151,10 @@ fn invalid() -> Error {
 struct Compress {
     /// The block `read` produced.
     out: Vec<u8>,
-    /// The input block the last fetch returned, and how much of it is used.
-    /// Upstream consumes a block only when it fetches the next one, so the
-    /// stage below keeps the used bytes until then.
-    block_len: usize,
-    block_pos: usize,
+    /// Bytes of the current input block that are used. Upstream consumes a
+    /// block only when it fetches the next one, so the stage below keeps the
+    /// used bytes until then.
+    block_used: usize,
     /// The bits read but not yet taken: the low `bits_avail` of `bit_buffer`.
     bit_buffer: usize,
     bits_avail: usize,
@@ -231,9 +235,12 @@ impl Compress {
         self.bits = 9;
         self.section_end_code = (1 << self.bits) - 1;
         self.oldcode = None;
-        // Upstream decodes the first code here and drops its result: an
-        // invalid first code is skipped, not reported.
-        let _ = self.next_code(up);
+        // Upstream decodes the first code here and ignores the result, but
+        // `next_code` has already set the error on the handle, and that stays
+        // there while decoding carries on.
+        if let Err(e) = self.next_code(up) {
+            up.base().raise(e);
+        }
         Ok(())
     }
 
@@ -268,9 +275,8 @@ impl Compress {
             self.free_ent = 257;
             self.oldcode = None;
         };
-        let newcode = code;
-
-        let mut code = match (code.cmp(&self.free_ent), self.oldcode) {
+        let previous = self.oldcode;
+        let mut string = match (code.cmp(&self.free_ent), previous) {
             (Ordering::Less, _) => code,
             // The KwKwK case: the code being defined is the previous string
             // followed by its own first byte.
@@ -280,20 +286,21 @@ impl Compress {
             }
             _ => return Err(invalid()),
         };
+        self.oldcode = Some(code);
 
         // Generate output characters in reverse order. Every code is below
         // `free_ent`, which is at most `CODES`, so the table lookups are in
         // range.
-        while code >= 256 {
-            self.stack.push(self.suffix[code]);
-            code = usize::from(self.prefix[code]);
+        while string >= 256 {
+            self.stack.push(self.suffix[string]);
+            string = usize::from(self.prefix[string]);
         }
-        self.finbyte = code as u8;
+        self.finbyte = string as u8;
         self.stack.push(self.finbyte);
 
         // Generate the new entry.
         if self.free_ent < self.maxcode
-            && let Some(old) = self.oldcode
+            && let Some(old) = previous
         {
             self.prefix[self.free_ent] = old as u16;
             self.suffix[self.free_ent] = self.finbyte;
@@ -308,8 +315,6 @@ impl Compress {
                 (1 << self.bits) - 1
             };
         }
-
-        self.oldcode = Some(newcode);
         Ok(true)
     }
 
@@ -317,18 +322,27 @@ impl Compress {
     /// `None` at the end of the input.
     fn getbits(&mut self, up: &mut Reader<'_>, n: usize) -> Result<Option<usize>, Error> {
         while self.bits_avail < n {
-            if self.block_pos == self.block_len {
-                up.consume(self.block_len)?;
-                self.block_len = up.peek_available(1)?.len();
-                self.block_pos = 0;
+            let block = up.peek_available(1)?;
+            let mut used = self.block_used;
+            while self.bits_avail < n {
+                let Some(&byte) = block.get(used) else {
+                    break;
+                };
+                used += 1;
+                self.bit_buffer |= usize::from(byte) << self.bits_avail;
+                self.bits_avail += 8;
+                self.bytes_in_section = self.bytes_in_section.saturating_add(1);
             }
-            let Some(&byte) = up.peek_available(1)?.get(self.block_pos) else {
+            self.block_used = used;
+            if self.bits_avail >= n {
+                break;
+            }
+            if block.is_empty() {
                 return Ok(None);
-            };
-            self.block_pos += 1;
-            self.bit_buffer |= usize::from(byte) << self.bits_avail;
-            self.bits_avail += 8;
-            self.bytes_in_section = self.bytes_in_section.saturating_add(1);
+            }
+            // The block is used up: consume it before the next one is fetched.
+            up.consume(used)?;
+            self.block_used = 0;
         }
         let code = self.bit_buffer & ((1 << n) - 1);
         self.bit_buffer >>= n;
@@ -340,7 +354,7 @@ impl Compress {
 #[cfg(test)]
 mod tests {
     use super::support;
-    use crate::read::filter::testing::decode;
+    use crate::read::filter::testing::{decode, decode_with_message};
 
     /// `test_read_format_raw.data.Z`, which holds "foo\n".
     const FOO: &[u8] = &[0x1f, 0x9d, 0x90, 0x66, 0xde, 0xbc, 0x51, 0x00];
@@ -388,6 +402,17 @@ mod tests {
             decode(support, &data, 4096),
             Err("Invalid compressed data".to_string())
         );
+    }
+
+    /// An invalid first code is dropped and decoding carries on, but the error
+    /// stays on the handle.
+    #[test]
+    fn invalid_first_code_is_kept_on_the_handle() {
+        // 300 (invalid as the first code), then 65.
+        let data = [0x1f, 0x9d, 0x90, 0x2c, 0x83, 0x00];
+        let (out, message) = decode_with_message(support, &data, 4096);
+        assert_eq!(out, Ok(b"A".to_vec()));
+        assert_eq!(message, "Invalid compressed data");
     }
 
     #[test]

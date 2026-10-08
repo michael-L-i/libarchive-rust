@@ -288,8 +288,11 @@ Differences:
 Ported as-is:
 
 - The first code is decoded in `compress_filter_init` and its result is
-  dropped, so an invalid first code is skipped silently and the second code
-  decodes from the stream (archive_read_support_filter_compress.c).
+  ignored, so an invalid first code does not stop decoding: the second code
+  decodes from the stream. The error it set ("Invalid compressed data",
+  errno -1) stays on the handle until the first header read clears it, so
+  the handle reports it after `archive_read_open` succeeds
+  (archive_read_support_filter_compress.c).
 - A reset clears only `bits_avail`, so the bits left in `bit_buffer` are
   ORed under the next byte. This matters only when the padding count is zero.
 - Truncated compress input is the end of the input, not an error: the output

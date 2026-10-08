@@ -28,6 +28,12 @@ impl Client for Blocks {
     }
 }
 
+/// The handle's error message, or the empty string.
+fn message(a: &Base) -> String {
+    a.error_string()
+        .map_or_else(String::new, |m| String::from_utf8_lossy(&m).into_owned())
+}
+
 /// What `data` decodes to through `support`'s filter, with the client
 /// delivering `block` bytes at a time; or the error message the handle
 /// reports.
@@ -36,6 +42,17 @@ pub fn decode(
     data: &[u8],
     block: usize,
 ) -> Result<Vec<u8>, String> {
+    decode_with_message(support, data, block).0
+}
+
+/// `decode`, and the message the handle holds once the stream is open. Upstream
+/// keeps a message set while opening until the first header is read, which
+/// clears it.
+pub fn decode_with_message(
+    support: fn(&mut Read) -> Result<Status, Error>,
+    data: &[u8],
+    block: usize,
+) -> (Result<Vec<u8>, String>, String) {
     let a = Base::new(READ_MAGIC);
     let mut r = Read::default();
     assert_eq!(support(&mut r).expect("filter registers"), Status::Ok);
@@ -46,23 +63,28 @@ pub fn decode(
         block,
         out: Vec::new(),
     };
-    let message = || {
-        a.error_string()
-            .map_or_else(String::new, |m| String::from_utf8_lossy(&m).into_owned())
+    let opened = r.open(&a, Box::new(client)) == ARCHIVE_OK;
+    let open_message = message(&a);
+    let result = if opened {
+        read_all(&mut r, &a)
+    } else {
+        Err(open_message.clone())
     };
-    if r.open(&a, Box::new(client)) != ARCHIVE_OK {
-        return Err(message());
-    }
+    (result, open_message)
+}
+
+/// Reads the one entry's data to the end.
+fn read_all(r: &mut Read, a: &Base) -> Result<Vec<u8>, String> {
     let mut entry = Entry::new(None);
-    if r.next_header2(&a, &mut entry) != ARCHIVE_OK {
-        return Err(message());
+    if r.next_header2(a, &mut entry) != ARCHIVE_OK {
+        return Err(message(a));
     }
     let mut out = Vec::new();
     let mut buf = vec![0; 1 << 16];
     loop {
-        match r.read_data(&a, &mut buf) {
+        match r.read_data(a, &mut buf) {
             0 => return Ok(out),
-            n if n < 0 => return Err(message()),
+            n if n < 0 => return Err(message(a)),
             n => out.extend_from_slice(buf.get(..n as usize).unwrap_or_default()),
         }
     }
