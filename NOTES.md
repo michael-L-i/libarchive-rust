@@ -39,8 +39,9 @@ Divergences:
 - Windows code (`_WIN32` paths, code pages, `cd_w`) is not ported.
 - The libarchive-2.x UTF-8 converter (`SCONV_UTF8_LIBARCHIVE_2`,
   `strncat_from_utf8_libarchive2`) is not ported: `set_opt` ignores that
-  option wherever `wchar_t` is Unicode (`__STDC_ISO_10646__`, `__APPLE__`),
-  which is every supported platform.
+  option wherever upstream's guard (`__STDC_ISO_10646__ || __APPLE__`)
+  holds: macOS and glibc. musl defines neither, so on musl upstream would
+  enable it; musl is not a supported target for this option here.
 - `archive_string_sprintf` is not ported; callers use `format!`.
 - Output is not NUL-terminated and buffers are `Vec`s, so the buffer-extent
   assertions of `test_archive_string` have no equivalent.

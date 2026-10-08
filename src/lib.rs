@@ -2,5 +2,5 @@
 
 pub mod ffi;
 
-mod archive_string;
-mod archive_string_composition;
+mod string;
+mod string_composition;

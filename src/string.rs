@@ -30,18 +30,19 @@
 // (`Vec<u8>` and `Vec<wchar_t>` here), `archive_string_sprintf` (callers use
 // `format!`), the Windows code-page paths, and the libarchive-2.x UTF-8
 // compatibility converter (its option is a no-op wherever `wchar_t` is
-// Unicode, which includes every supported platform).
+// Unicode: macOS and glibc; musl is not supported for this).
 
 // The API is consumed by `archive_entry` and the format readers, which land
 // after this unit.
 #![allow(dead_code)]
 
-use crate::archive_string_composition::{
+use crate::ffi::charset::{self, Iconv, IconvStatus};
+use crate::string_composition::{
     CCC_INDEX, CCC_VAL, CCC_VAL_INDEX, U_COMPOSITION_TABLE, U_DECOMPOSABLE_BLOCKS,
     U_DECOMPOSITION_TABLE,
 };
-use crate::ffi::charset::{self, Iconv, IconvStatus};
 use libc::wchar_t;
+use std::ffi::CStr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// `ARCHIVE_ERRNO_MISC`.
@@ -496,9 +497,9 @@ impl State {
             if has_cd {
                 self.add_converter(Iconv);
             } else if f & SCONV_BEST_EFFORT != 0 && f & SCONV_FROM_UTF16BE != 0 {
-                self.converters = vec![BestEffortFromUtf16Be];
+                self.add_converter(BestEffortFromUtf16Be);
             } else if f & SCONV_BEST_EFFORT != 0 && f & SCONV_FROM_UTF16LE != 0 {
-                self.converters = vec![BestEffortFromUtf16Le];
+                self.add_converter(BestEffortFromUtf16Le);
             } else {
                 // Make sure we have no converter.
                 self.converters.clear();
@@ -1475,6 +1476,11 @@ pub(crate) fn strncat_l(
 /// `set` says which forms are valid; the others are stale buffers. Setting
 /// one form clears the rest, and a conversion adds a form only when it
 /// succeeded.
+///
+/// Every stored form keeps a trailing NUL, so the `_z` and `_c` getters hand
+/// out C-string views. A view stays valid until the next `&mut` use of this
+/// `MString`: a getter never rewrites a form that is already set. Only
+/// `get_mbs_l` with a charset rewrites its scratch buffer.
 #[derive(Clone, Default)]
 pub(crate) struct MString {
     mbs: Vec<u8>,
@@ -1488,6 +1494,23 @@ pub(crate) const AES_SET_MBS: u8 = 1;
 pub(crate) const AES_SET_UTF8: u8 = 2;
 pub(crate) const AES_SET_WCS: u8 = 4;
 
+/// Empty `v`, let `f` fill it, and terminate it with a NUL.
+fn fill<T: Default, R>(v: &mut Vec<T>, f: impl FnOnce(&mut Vec<T>) -> R) -> R {
+    v.clear();
+    let r = f(v);
+    v.push(T::default());
+    r
+}
+
+/// A stored form without its terminator.
+fn unterminated<T>(z: &[T]) -> &[T] {
+    z.split_last().map_or(z, |(_, s)| s)
+}
+
+fn as_cstr(z: &[u8]) -> &CStr {
+    CStr::from_bytes_until_nul(z).unwrap_or_default()
+}
+
 impl MString {
     /// Mark the string as not set (upstream's copy of a NULL pointer).
     pub(crate) fn clear(&mut self) {
@@ -1497,8 +1520,7 @@ impl MString {
     /// Set from a locale multibyte string; only that form is set.
     pub(crate) fn copy_mbs(&mut self, mbs: &[u8]) {
         self.set = AES_SET_MBS;
-        self.mbs.clear();
-        self.mbs.extend_from_slice(until_nul(mbs));
+        fill(&mut self.mbs, |v| v.extend_from_slice(until_nul(mbs)));
         self.utf8.clear();
         self.wcs.clear();
     }
@@ -1508,9 +1530,8 @@ impl MString {
         self.set = AES_SET_UTF8;
         self.mbs.clear();
         self.wcs.clear();
-        self.utf8.clear();
-        self.utf8.extend_from_slice(until_nul(utf8));
-        self.utf8.len()
+        fill(&mut self.utf8, |v| v.extend_from_slice(until_nul(utf8)));
+        self.utf8.len() - 1
     }
 
     /// Set from a wide string; only that form is set.
@@ -1518,8 +1539,9 @@ impl MString {
         self.set = AES_SET_WCS;
         self.mbs.clear();
         self.utf8.clear();
-        self.wcs.clear();
-        self.wcs.extend(wcs.iter().copied().take_while(|&w| w != 0));
+        fill(&mut self.wcs, |v| {
+            v.extend(wcs.iter().copied().take_while(|&w| w != 0))
+        });
     }
 
     /// Set from a multibyte string in the charset of `sc`, converted to the
@@ -1529,10 +1551,9 @@ impl MString {
         mbs: &[u8],
         sc: Option<&StringConv>,
     ) -> Result<(), ConvFailed> {
-        self.mbs.clear();
         self.wcs.clear();
         self.utf8.clear();
-        let r = strncpy_l(&mut self.mbs, mbs, sc);
+        let r = fill(&mut self.mbs, |v| strncpy_l(v, mbs, sc));
         self.set = if r.is_ok() { AES_SET_MBS } else { 0 };
         r
     }
@@ -1551,8 +1572,7 @@ impl MString {
         utf8: &[u8],
     ) -> Result<(), ConvFailed> {
         // Save the UTF8 string.
-        self.utf8.clear();
-        self.utf8.extend_from_slice(until_nul(utf8));
+        fill(&mut self.utf8, |v| v.extend_from_slice(until_nul(utf8)));
         // Empty the mbs and wcs strings.
         self.mbs.clear();
         self.wcs.clear();
@@ -1561,11 +1581,11 @@ impl MString {
         let sc = conversion_from_charset(a, b"UTF-8", true).map_err(|_| ConvFailed)?;
 
         // Try converting UTF-8 to MBS, return false on failure.
-        strncpy_l(&mut self.mbs, &self.utf8, Some(&sc))?;
+        fill(&mut self.mbs, |v| strncpy_l(v, &self.utf8, Some(&sc)))?;
         self.set = AES_SET_UTF8 | AES_SET_MBS; // Both UTF8 and MBS set.
 
         // Try converting MBS to WCS, return false on failure.
-        if !charset::mb_to_wide(&self.mbs, &mut self.wcs) {
+        if !fill(&mut self.wcs, |v| charset::mb_to_wide(&self.mbs, v)) {
             return Err(ConvFailed);
         }
 
@@ -1584,8 +1604,7 @@ impl MString {
         let mut ok = true;
         // If there's a WCS form, try converting with the native locale.
         if self.set & AES_SET_WCS != 0 {
-            self.mbs.clear();
-            if charset::wide_to_mb(&self.wcs, &mut self.mbs) {
+            if fill(&mut self.mbs, |v| charset::wide_to_mb(&self.wcs, v)) {
                 self.set |= AES_SET_MBS;
                 return true;
             }
@@ -1598,7 +1617,7 @@ impl MString {
             let Ok(sc) = conversion_from_charset(a, b"UTF-8", true) else {
                 return false;
             };
-            ok = strncpy_l(&mut self.mbs, &self.utf8, Some(&sc)).is_ok();
+            ok = fill(&mut self.mbs, |v| strncpy_l(v, &self.utf8, Some(&sc))).is_ok();
             if ok {
                 self.set |= AES_SET_MBS;
             }
@@ -1606,13 +1625,13 @@ impl MString {
         ok
     }
 
-    /// The locale multibyte form. `Ok(None)` if the string is not set;
-    /// an error if the string could not be converted.
+    /// The locale multibyte form with its trailing NUL. `Ok(None)` if the
+    /// string is not set; an error if the string could not be converted.
     ///
-    /// Callers that fall back to `get_utf8` on failure, as
+    /// Callers that fall back to `get_utf8_z` on failure, as
     /// `archive_entry_pathname` does for EILSEQ, should do so on any error:
     /// conversion failures here are all EILSEQ-like.
-    pub(crate) fn get_mbs(
+    pub(crate) fn get_mbs_z(
         &mut self,
         a: Option<&mut ConvCache>,
     ) -> Result<Option<&[u8]>, ConvFailed> {
@@ -1622,8 +1641,9 @@ impl MString {
         Ok((self.set & AES_SET_MBS != 0).then_some(self.mbs.as_slice()))
     }
 
-    /// The UTF-8 form. `Ok(None)` if the string is not set.
-    pub(crate) fn get_utf8(
+    /// The UTF-8 form with its trailing NUL. `Ok(None)` if the string is
+    /// not set.
+    pub(crate) fn get_utf8_z(
         &mut self,
         mut a: Option<&mut ConvCache>,
     ) -> Result<Option<&[u8]>, ConvFailed> {
@@ -1638,15 +1658,16 @@ impl MString {
         }
         if self.set & AES_SET_MBS != 0 {
             let sc = conversion_to_charset(a, b"UTF-8", true).map_err(|_| ConvFailed)?;
-            strncpy_l(&mut self.utf8, &self.mbs, Some(&sc))?;
+            fill(&mut self.utf8, |v| strncpy_l(v, &self.mbs, Some(&sc)))?;
             self.set |= AES_SET_UTF8;
             return Ok(Some(&self.utf8));
         }
         Ok(None)
     }
 
-    /// The wide-character form. `Ok(None)` if the string is not set.
-    pub(crate) fn get_wcs(
+    /// The wide-character form with its trailing NUL. `Ok(None)` if the
+    /// string is not set.
+    pub(crate) fn get_wcs_z(
         &mut self,
         a: Option<&mut ConvCache>,
     ) -> Result<Option<&[wchar_t]>, ConvFailed> {
@@ -1661,8 +1682,7 @@ impl MString {
         }
         // Try converting MBS to WCS using native locale.
         if self.set & AES_SET_MBS != 0 {
-            self.wcs.clear();
-            if !charset::mb_to_wide(&self.mbs, &mut self.wcs) {
+            if !fill(&mut self.wcs, |v| charset::mb_to_wide(&self.mbs, v)) {
                 return Err(ConvFailed);
             }
             self.set |= AES_SET_WCS;
@@ -1671,11 +1691,12 @@ impl MString {
         Ok(None)
     }
 
-    /// The string in the charset of `sc` (the locale's if `None`). Returns
-    /// the string, if any, and whether everything converted. On failure the
-    /// string is the partial result with substitutions, as upstream
-    /// returns it alongside -1.
-    pub(crate) fn get_mbs_l(
+    /// The string in the charset of `sc` (the locale's if `None`) with its
+    /// trailing NUL. Returns the string, if any, and whether everything
+    /// converted. On failure the string is the partial result with
+    /// substitutions, as upstream returns it alongside -1. With a charset
+    /// the result lives in a scratch buffer that the next call rewrites.
+    pub(crate) fn get_mbs_l_z(
         &mut self,
         a: Option<&mut ConvCache>,
         sc: Option<&StringConv>,
@@ -1697,12 +1718,72 @@ impl MString {
                 // Conversion is unneeded.
                 return (Some(&self.mbs), true);
             }
-            ok = strncpy_l(&mut self.mbs_in_locale, &self.mbs, sc).is_ok();
+            ok = fill(&mut self.mbs_in_locale, |v| strncpy_l(v, &self.mbs, sc)).is_ok();
             (Some(&self.mbs_in_locale), ok)
         } else {
             // Either we have no string in any form, or conversion failed.
             (None, ok)
         }
+    }
+
+    /// `get_mbs_z` as a C string.
+    pub(crate) fn get_mbs_c(
+        &mut self,
+        a: Option<&mut ConvCache>,
+    ) -> Result<Option<&CStr>, ConvFailed> {
+        Ok(self.get_mbs_z(a)?.map(as_cstr))
+    }
+
+    /// `get_utf8_z` as a C string.
+    pub(crate) fn get_utf8_c(
+        &mut self,
+        a: Option<&mut ConvCache>,
+    ) -> Result<Option<&CStr>, ConvFailed> {
+        Ok(self.get_utf8_z(a)?.map(as_cstr))
+    }
+
+    /// `get_mbs_l_z` as a C string.
+    pub(crate) fn get_mbs_l_c(
+        &mut self,
+        a: Option<&mut ConvCache>,
+        sc: Option<&StringConv>,
+    ) -> (Option<&CStr>, bool) {
+        let (s, ok) = self.get_mbs_l_z(a, sc);
+        (s.map(as_cstr), ok)
+    }
+
+    /// The locale multibyte form without the terminator.
+    pub(crate) fn get_mbs(
+        &mut self,
+        a: Option<&mut ConvCache>,
+    ) -> Result<Option<&[u8]>, ConvFailed> {
+        Ok(self.get_mbs_z(a)?.map(unterminated))
+    }
+
+    /// The UTF-8 form without the terminator.
+    pub(crate) fn get_utf8(
+        &mut self,
+        a: Option<&mut ConvCache>,
+    ) -> Result<Option<&[u8]>, ConvFailed> {
+        Ok(self.get_utf8_z(a)?.map(unterminated))
+    }
+
+    /// The wide-character form without the terminator.
+    pub(crate) fn get_wcs(
+        &mut self,
+        a: Option<&mut ConvCache>,
+    ) -> Result<Option<&[wchar_t]>, ConvFailed> {
+        Ok(self.get_wcs_z(a)?.map(unterminated))
+    }
+
+    /// `get_mbs_l_z` without the terminator.
+    pub(crate) fn get_mbs_l(
+        &mut self,
+        a: Option<&mut ConvCache>,
+        sc: Option<&StringConv>,
+    ) -> (Option<&[u8]>, bool) {
+        let (s, ok) = self.get_mbs_l_z(a, sc);
+        (s.map(unterminated), ok)
     }
 }
 
@@ -1838,16 +1919,28 @@ mod tests {
 
     /// The NFC/NFD pattern file that upstream extracts from
     /// test_archive_string_conversion.txt.Z.uu.
-    fn load_normalization_data() -> Option<String> {
-        let dir = std::env::var_os("LIBARCHIVE_TEST_DIR")
+    ///
+    /// Looked up in `$LIBARCHIVE_TEST_DIR`, else the checkout's submodule,
+    /// else (in a worktree under `.claude/worktrees/`) the main checkout's.
+    fn load_normalization_data() -> String {
+        const NAME: &str = "test_archive_string_conversion.txt.Z.uu";
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let rel = "upstream/libarchive/libarchive/test";
+        let mut dirs: Vec<PathBuf> = std::env::var_os("LIBARCHIVE_TEST_DIR")
             .map(PathBuf::from)
+            .into_iter()
+            .collect();
+        dirs.push(manifest.join(rel));
+        dirs.extend(manifest.ancestors().nth(3).map(|root| root.join(rel)));
+        let uu = dirs
+            .iter()
+            .find_map(|d| std::fs::read(d.join(NAME)).ok())
             .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("upstream/libarchive/libarchive/test")
+                panic!("fixture {NAME} not found in {dirs:?}; set LIBARCHIVE_TEST_DIR")
             });
-        let uu = std::fs::read(dir.join("test_archive_string_conversion.txt.Z.uu")).ok()?;
-        let z = uudecode(&uu)?;
-        String::from_utf8(uncompress(&z)?).ok()
+        let z = uudecode(&uu).expect("fixture is not valid uuencode");
+        let text = uncompress(&z).expect("neither gzip nor uncompress could decompress the .Z");
+        String::from_utf8(text).expect("fixture is not UTF-8")
     }
 
     /// One `<code points>` pattern of the data file in every form the tests
@@ -1913,7 +2006,6 @@ mod tests {
 
     struct Convs {
         a: ConvCache,
-        a2: ConvCache,
         f8: Arc<StringConv>,
         f16be: Arc<StringConv>,
         f16le: Arc<StringConv>,
@@ -1931,7 +2023,6 @@ mod tests {
         }
         Convs {
             a,
-            a2,
             f8,
             f16be,
             f16le,
@@ -1990,7 +2081,6 @@ mod tests {
             assert!(ok);
             assert_eq!(mp, Some(&pc.utf8[..]), "WCS NFC to UTF-8 {ctx}");
         }
-        let _ = c.a2;
     }
 
     fn test_archive_string_normalization_mac_nfd(data: &str) {
@@ -2040,7 +2130,6 @@ mod tests {
             assert!(ok);
             assert_eq!(mp, Some(&pd.utf8[..]), "WCS NFD to UTF-8 {ctx}");
         }
-        let _ = c.a2;
     }
 
     fn test_archive_string_canonicalization() {
@@ -2112,13 +2201,7 @@ mod tests {
         // Upstream extracts test_archive_string_conversion.txt.Z with its
         // own reader; here the .uu is decoded and the .Z decompressed by
         // the system gzip.
-        let Some(data) = load_normalization_data() else {
-            skipping(
-                "test_archive_string_conversion.txt.Z.uu not found (set \
-                 LIBARCHIVE_TEST_DIR) or no gzip/uncompress available",
-            );
-            return;
-        };
+        let data = load_normalization_data();
         assert!(data.lines().count() > 18000, "pattern file truncated");
         test_archive_string_normalization_nfc(&data);
         test_archive_string_normalization_mac_nfd(&data);
@@ -2223,9 +2306,9 @@ mod tests {
         // All conversions should have succeeded
         assert!(mstr.update_utf8(None, utf8_string).is_ok());
         assert_eq!(mstr.set, AES_SET_MBS | AES_SET_WCS | AES_SET_UTF8);
-        assert_eq!(mstr.utf8, utf8_string);
-        assert_eq!(mstr.mbs, utf8_string);
-        assert_eq!(mstr.wcs, wcs_string);
+        assert_eq!(unterminated(&mstr.utf8), utf8_string);
+        assert_eq!(unterminated(&mstr.mbs), utf8_string);
+        assert_eq!(unterminated(&mstr.wcs), wcs_string);
     }
 
     #[test]
@@ -2245,8 +2328,8 @@ mod tests {
         // All conversions should have succeeded
         assert!(mstr.update_utf8(None, utf8_string).is_ok());
         assert_eq!(mstr.set, AES_SET_MBS | AES_SET_WCS | AES_SET_UTF8);
-        assert_eq!(mstr.utf8, utf8_string);
-        assert_eq!(mstr.mbs, koi8_string);
+        assert_eq!(unterminated(&mstr.utf8), utf8_string);
+        assert_eq!(unterminated(&mstr.mbs), koi8_string);
         // No guarantee of how WCS strings behave, however this test is
         // primarily meant for Windows.
     }
@@ -2263,7 +2346,7 @@ mod tests {
         }
         let mut mstr = MString::default();
         assert!(mstr.update_utf8(None, b"\xD0\xBF\xD1\x80\xD0\xB8").is_ok());
-        assert_eq!(mstr.mbs, b"\xD0\xD2\xC9");
+        assert_eq!(unterminated(&mstr.mbs), b"\xD0\xD2\xC9");
         let sc = conversion_to_charset(None, b"UTF-8", true).unwrap();
         let (utf8, ok) = mstr.get_mbs_l(None, Some(&sc));
         assert!(ok);
@@ -2374,6 +2457,54 @@ mod tests {
             run(Converter::NormalizeD, "a\u{301}\u{323}"),
             "a\u{323}\u{301}"
         );
+    }
+
+    #[test]
+    fn utf16_best_effort_keeps_normalization() {
+        // Without iconv, the best-effort converter must still run after the
+        // normalizer: "e" + U+0301 composes to U+00E9, which becomes '?'.
+        let flag =
+            SCONV_FROM_CHARSET | SCONV_BEST_EFFORT | SCONV_FROM_UTF16BE | SCONV_NORMALIZATION_C;
+        let mut st = State {
+            flag,
+            converters: Vec::new(),
+            cd: None,
+        };
+        st.setup_converter(false);
+        assert_eq!(
+            st.converters,
+            [Converter::NormalizeC, Converter::BestEffortFromUtf16Be]
+        );
+        let mut tmp = Vec::new();
+        assert_eq!(
+            st.run(st.converters[0], &mut tmp, b"\x00e\x03\x01", false),
+            0
+        );
+        let mut out = Vec::new();
+        assert_eq!(st.run(st.converters[1], &mut out, &tmp, false), -1);
+        assert_eq!(out, b"?");
+    }
+
+    #[test]
+    fn mstring_forms_are_nul_terminated() {
+        let _g = lock_locale();
+        let _ = set_locale_all("en_US.UTF-8");
+        let mut m = MString::default();
+        m.copy_utf8(b"hi");
+        assert_eq!(m.get_utf8_z(None).unwrap(), Some(&b"hi\0"[..]));
+        assert_eq!(m.get_utf8_c(None).unwrap().unwrap().to_bytes(), b"hi");
+        assert_eq!(m.get_mbs_c(None).unwrap().unwrap().to_bytes(), b"hi");
+        assert_eq!(m.get_wcs_z(None).unwrap(), Some(&[0x68, 0x69, 0][..]));
+        let (c, ok) = m.get_mbs_l_c(None, None);
+        assert!(ok && c.unwrap().to_bytes() == b"hi");
+        // An already-set form is not rewritten by a getter.
+        let before = m.get_utf8_z(None).unwrap().unwrap().as_ptr();
+        let _ = m.get_wcs_z(None);
+        assert_eq!(m.get_utf8_z(None).unwrap().unwrap().as_ptr(), before);
+        let mut e = MString::default();
+        assert_eq!(e.get_mbs_c(None).unwrap(), None);
+        e.copy_mbs(b"");
+        assert_eq!(e.get_mbs_z(None).unwrap(), Some(&b"\0"[..]));
     }
 
     /// Malformed input must never panic or hang, whatever the converter.

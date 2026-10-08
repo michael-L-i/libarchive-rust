@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate src/archive_string_composition.rs from upstream's
+"""Generate src/string_composition.rs from upstream's
 archive_string_composition.h, keeping every table entry exactly.
 
 usage: scripts/gen-string-composition PATH/TO/archive_string_composition.h
@@ -100,5 +100,5 @@ pub(crate) static U_DECOMPOSITION_TABLE: [(u32, u32, u32); {dec_n}] = [
 {dec}
 ];
 """
-target = Path(__file__).resolve().parent.parent / "src" / "archive_string_composition.rs"
+target = Path(__file__).resolve().parent.parent / "src" / "string_composition.rs"
 target.write_text(out)
