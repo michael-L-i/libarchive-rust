@@ -281,4 +281,5 @@ Differences:
   line that starts past the 128k window, and its `memchr` then reads on past
   the buffered data. We search only the bytes buffered, so a line that
   upstream finds within its buffer is found the same way, and a line it
-  would only find by reading out of bounds is not found.
+  would only find by reading out of bounds is not found. A line starting
+  exactly at the window's end gets an empty window, as upstream.

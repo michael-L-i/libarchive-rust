@@ -404,9 +404,10 @@ fn read_line_ahead<'r>(
         if data.len() < request && avail <= offset {
             break None;
         }
-        // Once the line starts past the cap, upstream's `avail - offset`
-        // wraps and its memchr searches on through the buffered data.
-        let end = if offset < avail { avail } else { data.len() };
+        // A line starting at the cap gets an empty window, as upstream. Past
+        // it, upstream's `avail - offset` wraps and its memchr reads on, so
+        // search the buffered data.
+        let end = if offset <= avail { avail } else { data.len() };
         let window = data.get(offset..end).unwrap_or_default();
         if let Some(i) = window.iter().position(|&c| c == b'\n') {
             let mut end = offset + i;
@@ -502,6 +503,16 @@ mod tests {
                 "base64, block {block}"
             );
         }
+    }
+
+    /// A `begin` line starting exactly at the 128k window's end is not seen,
+    /// so the input passes through raw, as with upstream.
+    #[test]
+    fn begin_at_the_window_end_is_not_found() {
+        let mut input = format!("{}\n", "a".repeat(1023)).repeat(128).into_bytes();
+        input.extend_from_slice(UU);
+        input.extend("`\n".repeat(200).bytes());
+        assert_eq!(decode(&input, 1 << 16).unwrap(), input);
     }
 
     /// `test_read_filter_uudecode_newlines`: 810 zero bytes with each kind of
