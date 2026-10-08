@@ -73,7 +73,8 @@ The crate builds `libarchive.{so,dylib,a}`: `[lib] name = "archive"`,
   is a `Cell`/`RefCell` in `Base`, or sits in the kind's own `RefCell`. A
   re-entrant borrow of the same kind panics, and `guard` turns that into
   `ARCHIVE_FATAL`; calls that touch only `Base` (`archive_set_error`,
-  `archive_errno`) always work. Never hold a borrow across a callback.
+  `archive_errno`) always work. Never hold a `Base` borrow across a
+  callback; the kind's borrow is held across callbacks by design.
 - Exported functions are thin: check the handle with the port of
   `__archive_check_magic` (same messages, same state machine), run the body
   under `guard`, convert arguments, call safe Rust, convert the result back.

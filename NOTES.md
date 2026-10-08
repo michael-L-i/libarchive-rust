@@ -39,10 +39,9 @@ differences.
   `ll`, `j` and `z`; anything else (including width, precision, flags, `%i`
   and `%p`) it prints literally from the `%`. libc handles all of those
   (`%jd`, `%ju`, `%zd`, `%llu` identically), so a message that relies on
-  upstream printing an unsupported conversion verbatim would differ. The
+  upstream printing an unsupported conversion verbatim would differ.
   A NULL `%s` prints `(null)` in both (glibc and macOS libc do the same).
-  `%S` and `%ls` are converted to
-  multibyte by the C locale in libc, but to the archive's charset by
+  `%S` and `%ls` are converted to multibyte by the C locale in libc, but to the archive's charset by
   `archive_string_append_from_wcs`, replacing unconvertible characters with
   `?`. If libc fails to format (`vsnprintf` returns a negative value, for
   example on an unconvertible wide character) or `malloc` fails, upstream
