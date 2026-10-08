@@ -27,6 +27,7 @@
 
 //! State shared by every kind of `struct archive` handle.
 
+use crate::util::Error;
 use std::ffi::{CStr, CString, c_int};
 
 pub const ARCHIVE_EOF: c_int = 1;
@@ -96,6 +97,75 @@ impl Base {
             file_count: 0,
             errno: 0,
             error: None,
+        }
+    }
+}
+
+/// What `struct archive_vtable` dispatches to. Each kind of handle implements
+/// the operations it supports; the defaults are what a kind without that
+/// slot reports. Operations that need an entry (`next_header`, `write_header`)
+/// and `read_data_block` join the trait with `archive_entry`.
+pub trait Ops {
+    fn close(&mut self, a: &mut Base) -> c_int;
+    /// Releases what the kind owns; the handle itself is dropped afterwards.
+    fn free(&mut self, a: &mut Base) -> c_int;
+
+    fn filter_count(&self) -> c_int {
+        0
+    }
+    fn filter_bytes(&self, _n: c_int) -> i64 {
+        -1
+    }
+    fn filter_code(&self, _n: c_int) -> c_int {
+        -1
+    }
+    fn filter_name(&self, _n: c_int) -> Option<&CStr> {
+        None
+    }
+
+    fn write_finish_entry(&mut self, _a: &mut Base) -> c_int {
+        ARCHIVE_FATAL
+    }
+    fn write_data(&mut self, _a: &mut Base, _buf: &[u8]) -> isize {
+        ARCHIVE_FATAL as isize
+    }
+    fn write_data_block(&mut self, a: &mut Base, _buf: &[u8], _offset: i64) -> isize {
+        a.state = state::FATAL;
+        a.raise(Error::fatal(
+            ARCHIVE_ERRNO_MISC,
+            "archive_write_data_block not supported",
+        )) as isize
+    }
+}
+
+/// What `struct archive` is for each kind of handle. A variant joins when
+/// something constructs it.
+pub enum Kind {
+    /// A stand-in for the tests, which have no real handle to build yet.
+    #[cfg(test)]
+    Test(Box<dyn Ops>),
+}
+
+impl Kind {
+    pub fn ops(&mut self) -> &mut dyn Ops {
+        match *self {
+            #[cfg(test)]
+            Kind::Test(ref mut ops) => &mut **ops,
+        }
+    }
+}
+
+/// A `struct archive *` is a leaked `Box<Handle>`.
+pub struct Handle {
+    pub base: Base,
+    pub kind: Kind,
+}
+
+impl Handle {
+    pub fn new(magic: u32, kind: Kind) -> Self {
+        Handle {
+            base: Base::new(magic),
+            kind,
         }
     }
 }
