@@ -749,21 +749,6 @@ pub extern "C" fn archive_read_extract_set_progress_callback(
 pub extern "C" fn archive_read_extract_set_skip_file(_a0: *mut Archive, _a1: i64, _a2: i64) {}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_close(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_free(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_finish(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_write_new() -> *mut Archive {
     std::ptr::null_mut()
 }
@@ -1170,46 +1155,6 @@ pub extern "C" fn archive_write_header(_a0: *mut Archive, _a1: *mut ArchiveEntry
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_write_data(_a0: *mut Archive, _a1: *const c_void, _a2: usize) -> isize {
-    ARCHIVE_FATAL as isize
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_data_block(
-    _a0: *mut Archive,
-    _a1: *const c_void,
-    _a2: usize,
-    _a3: i64,
-) -> isize {
-    ARCHIVE_FATAL as isize
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_finish_entry(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_close(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_fail(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_free(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_finish(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_option(
     _a: *mut Archive,
     _m: *const c_char,
@@ -1435,31 +1380,6 @@ pub extern "C" fn archive_read_disk_set_metadata_filter_callback(
     _client_data: *mut c_void,
 ) -> c_int {
     ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_free(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_filter_count(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_filter_bytes(_a0: *mut Archive, _a1: c_int) -> i64 {
-    ARCHIVE_FATAL as i64
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_filter_code(_a0: *mut Archive, _a1: c_int) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_filter_name(_a0: *mut Archive, _a1: c_int) -> *const c_char {
-    std::ptr::null()
 }
 
 #[unsafe(no_mangle)]
