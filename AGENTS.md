@@ -104,7 +104,11 @@ scripts/build-port              cargo build, relink upstream's tests against our
 scripts/run-tests [PATTERN...]  one process per test, parallel; checks the ratchet
 scripts/run-tests --update      add newly passing tests to tests/passing.txt
 scripts/run-tests --suite cat [PATTERN...]  front-end suite: cat, tar, cpio, unzip, or all
+scripts/diff-cat [GLOB...]      upstream vs our bsdcat over upstream's fixtures
 ```
+
+`diff-cat` is the main oracle for filters: it compares exit status, stdout and stderr
+per fixture and tags each with the filter it exercises, so a filter agent can filter on it.
 
 1. **Upstream test suite.** `libarchive/test/` holds 934 tests and 491 `.uu`
    fixtures, compiled unchanged and linked against our library. This is the

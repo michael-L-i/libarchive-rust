@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Differential bsdcat oracle: upstream's bsdcat against ours, over upstream's fixtures.
+
+Usage: scripts/diff-cat [-v] [GLOB...]
+
+Fixtures are upstream's *.uu files (decoded into build/diff-cat/fixtures/) and any
+other fixtures in upstream/libarchive/{libarchive,cat,tar,cpio,unzip}/test. GLOBs match
+fixture filenames. Exits 1 on differ-output, differ-status, port-crash or timeout.
+See AGENTS.md, "Oracle".
+"""
+
+import argparse
+import fnmatch
+import os
+import re
+import subprocess
+import sys
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ORACLE = os.path.join(ROOT, "build/oracle/bin/bsdcat")
+PORT = os.path.join(ROOT, "build/port/bin/bsdcat")
+CACHE = os.path.join(ROOT, "build/diff-cat/fixtures")
+DIRS = ("libarchive", "cat", "tar", "cpio", "unzip")
+TIMEOUT = 30
+FAILURES = ("differ-output", "differ-status", "port-crash", "timeout")
+MAGIC = [
+    (b"\x1f\x8b", "gzip"), (b"BZh", "bzip2"), (b"\xfd7zXZ\x00", "xz"), (b"]\x00\x00", "lzma"),
+    (b"LZIP", "lzip"), (b"\x28\xb5\x2f\xfd", "zstd"), (b"\x04\x22\x4d\x18", "lz4"),
+    (b"\x02\x21\x4c\x18", "lz4"), (b"\x1f\x9d", "Z"), (b"\xed\xab\xee\xdb", "rpm"),
+    (b"\x89LZO\x00\x0d\x0a\x1a\x0a", "lzop"), (b"begin ", "uu"), (b"begin-base64 ", "uu"),
+]
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def uu_line(line):
+    """Decode one uuencoded line like upstream's reader: the first char is the byte count."""
+    vals = [(c - 32) & 63 for c in line[1:]]
+    vals += [0] * (-len(vals) % 4)
+    raw = bytearray()
+    for i in range(0, len(vals), 4):
+        a, b, c, d = vals[i:i + 4]
+        raw += bytes([(a << 2 | b >> 4) & 255, (b << 4 | c >> 2) & 255, (c << 6 | d) & 255])
+    return bytes(raw[:(line[0] - 32) & 63])
+
+
+def decode_uu(data):
+    """Return (name, bytes) for a uuencoded file, or None if it has no begin line."""
+    lines = data.splitlines()
+    start = next((i for i, l in enumerate(lines) if l.startswith(b"begin ")), None)
+    if start is None:
+        return None
+    m = re.match(rb"begin \d+ (\S+)", lines[start])
+    out = bytearray()
+    for line in lines[start + 1:]:
+        if line.startswith(b"end"):
+            break
+        if line:
+            out += uu_line(line)
+    return os.path.basename(m.group(1).decode(errors="replace")), bytes(out)
+
+
+def materialize():
+    """List (label, name, path) for every fixture; re-decode a .uu only when its source is newer."""
+    fixtures = []
+    for d in DIRS:
+        src_dir = os.path.join(ROOT, "upstream/libarchive", d, "test")
+        cache_dir = os.path.join(CACHE, d)
+        os.makedirs(cache_dir, exist_ok=True)
+        for f in sorted(os.listdir(src_dir)):
+            src = os.path.join(src_dir, f)
+            if not os.path.isfile(src):
+                continue
+            with open(src, "rb") as fh:
+                decoded = decode_uu(fh.read()) if f.endswith(".uu") else None
+            if decoded:
+                name, data = decoded
+                path = os.path.join(cache_dir, name)
+                if not os.path.exists(path) or os.path.getmtime(path) < os.path.getmtime(src):
+                    with open(path, "wb") as fh:
+                        fh.write(data)
+            elif f.endswith((".c", ".h", ".txt")) or f == "README":
+                continue  # sources and docs; a .uu without a begin line is a raw fixture
+            else:
+                name, path = f, src
+            fixtures.append((f"{d}/{name}", name, path))
+    return fixtures
+
+
+def detect(path):
+    with open(path, "rb") as fh:
+        head = fh.read(16)
+        while head[:4] == b"\x50\x2a\x4d\x18":  # skippable frame (lz4 and zstd): look past it
+            fh.seek(int.from_bytes(head[4:8], "little") - 8, 1)
+            head = fh.read(16)
+    return next((name for magic, name in MAGIC if head.startswith(magic)), "other")
+
+
+def run(prog, path):
+    try:
+        p = subprocess.run([prog, path], capture_output=True, timeout=TIMEOUT, stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return None, b"", b""
+
+
+def compare(path):
+    o, p = run(ORACLE, path), run(PORT, path)
+    if o[0] is None or p[0] is None:
+        return "timeout", f"timeout after {TIMEOUT}s ({'oracle' if o[0] is None else 'port'})"
+    if p[0] < 0:
+        return "port-crash", f"port killed by signal {-p[0]}"
+    if o[0] != p[0]:
+        return "differ-status", f"exit {o[0]} (oracle) vs {p[0]} (port)"
+    if o[1] != p[1]:
+        i = next((i for i, (x, y) in enumerate(zip(o[1], p[1])) if x != y), min(len(o[1]), len(p[1])))
+        return "differ-output", f"stdout differs at byte {i} (oracle {len(o[1])} bytes, port {len(p[1])})"
+    if o[2] != p[2]:
+        return "differ-stderr", f"stderr oracle {o[2][:100]!r} port {p[2][:100]!r}"
+    return "same", ""
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Compare upstream and port bsdcat on upstream's fixtures.")
+    ap.add_argument("-v", "--verbose", action="store_true", help="list every non-same fixture")
+    ap.add_argument("globs", nargs="*", metavar="GLOB", help="fnmatch globs on fixture filenames")
+    a = ap.parse_args()
+    for prog in (ORACLE, PORT):
+        if not os.access(prog, os.X_OK):
+            die(f"missing {prog}; run scripts/build-oracle and scripts/build-port")
+
+    fixtures = [f for f in materialize() if not a.globs or any(fnmatch.fnmatchcase(f[1], g) for g in a.globs)]
+    if not fixtures:
+        die("no fixtures match " + " ".join(a.globs))
+    fixtures.sort()
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as ex:
+        verdicts = list(ex.map(lambda f: compare(f[2]), fixtures))
+    filters = [detect(path) for _, _, path in fixtures]
+    results = [(label, cls, why, filt) for (label, _, _), (cls, why), filt in zip(fixtures, verdicts, filters)]
+
+    counts = Counter(cls for _, cls, _, _ in results)
+    print(f"diff-cat: {counts['same']} same, {counts['differ-output']} differ-output, "
+          f"{counts['differ-status']} differ-status, {counts['differ-stderr']} differ-stderr, "
+          f"{counts['port-crash']} crash, {counts['timeout']} timeout")
+    print("filters: " + ", ".join(f"{k} {v}" for k, v in Counter(filters).most_common()))
+
+    bad = [r for r in results if r[1] != "same"]
+    shown = bad if a.verbose else bad[:20]
+    for label, cls, why, filt in shown:
+        print(f"  {cls:14} {filt:7} {label}: {why}")
+    if len(bad) > len(shown):
+        print(f"  ... {len(bad) - len(shown)} more (-v lists all)")
+
+    sys.exit(1 if any(counts[c] for c in FAILURES) else 0)
+
+
+if __name__ == "__main__":
+    main()
