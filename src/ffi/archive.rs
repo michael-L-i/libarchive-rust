@@ -10,6 +10,7 @@
 use super::{ARCHIVE_FATAL, ARCHIVE_OK, Archive, guard};
 use crate::archive::Handle;
 use crate::util::{VERSION_NUMBER, VERSION_STRING};
+use crate::version_details as vd;
 use std::ffi::{CStr, c_char, c_int, c_void};
 
 /// The prologue shared by every exported function that takes a handle: reject
@@ -243,6 +244,129 @@ pub extern "C" fn archive_write_data_block(
     })
 }
 
+// The version of each backend, NULL if it is not compiled in. There are no C
+// XML, regex or crypto backends here, so those are always NULL.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_version_details() -> *const c_char {
+    vd::details().as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_zlib_version() -> *const c_char {
+    cptr(vd::ZLIB)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_liblzma_version() -> *const c_char {
+    cptr(vd::LIBLZMA)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_bzlib_version() -> *const c_char {
+    cptr(vd::BZLIB)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_liblz4_version() -> *const c_char {
+    cptr(vd::LIBLZ4)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_libzstd_version() -> *const c_char {
+    cptr(vd::LIBZSTD)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_liblzo2_version() -> *const c_char {
+    cptr(vd::LIBLZO2)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_librichacl_version() -> *const c_char {
+    cptr(vd::LIBRICHACL)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_libacl_version() -> *const c_char {
+    cptr(vd::LIBACL)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_libattr_version() -> *const c_char {
+    cptr(vd::LIBATTR)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_libiconv_version() -> *const c_char {
+    cptr(vd::LIBICONV)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_libexpat_version() -> *const c_char {
+    std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_libbsdxml_version() -> *const c_char {
+    std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_libxml2_version() -> *const c_char {
+    std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_xmllite_version() -> *const c_char {
+    std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_mbedtls_version() -> *const c_char {
+    std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_nettle_version() -> *const c_char {
+    std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_openssl_version() -> *const c_char {
+    std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_libmd_version() -> *const c_char {
+    std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_commoncrypto_version() -> *const c_char {
+    std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_cng_version() -> *const c_char {
+    std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_wincrypt_version() -> *const c_char {
+    std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_libpcre_version() -> *const c_char {
+    std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_libpcre2_version() -> *const c_char {
+    std::ptr::null()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +455,14 @@ mod tests {
         assert_eq!(archive_filter_count(null), ARCHIVE_FATAL);
         assert_eq!(archive_errno(null), 0);
         assert_eq!(string(archive_error_string(null)), None);
+    }
+
+    #[test]
+    fn versions() {
+        assert_eq!(archive_version_number(), 3009000);
+        let s = string(archive_version_string()).unwrap_or_default();
+        assert!(string(archive_version_details()).is_some_and(|d| d.starts_with(&s)));
+        assert_eq!(string(archive_zlib_version()), None);
     }
 
     #[test]
