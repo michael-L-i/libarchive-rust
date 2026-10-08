@@ -242,3 +242,7 @@ Differences:
   switch and the read ends there (archive_read.c).
 - A C read callback that returns bytes with a NULL buffer fails with EINVAL
   ("Read callback returned a NULL buffer"); upstream copies from NULL.
+- A read error during a format bid aborts the open with the client's recorded
+  message. Upstream's `__archive_read_ahead` returns NULL there, so the bid
+  returns 0 and "Unrecognized archive format" overwrites the message. The
+  final code is `ARCHIVE_FATAL` either way (archive_read.c).
