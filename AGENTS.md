@@ -75,6 +75,13 @@ The crate builds `libarchive.{so,dylib,a}`: `[lib] name = "archive"`,
   `ARCHIVE_FATAL`; calls that touch only `Base` (`archive_set_error`,
   `archive_errno`) always work. Never hold a `Base` borrow across a
   callback; the kind's borrow is held across callbacks by design.
+- An entry a handle hands to C (e.g. from `archive_read_next_header`) is kept
+  by the handle as the raw pointer from `Box::into_raw`, not as a `Box`, so
+  the `&mut Entry` an exported `archive_entry_*` call derives never aliases a
+  live `Box`. The handle frees it with `Box::from_raw` when it is freed.
+- The locale conversion cache lives in `Base` as a shared
+  `Arc<Mutex<ConvCache>>`; `archive_entry_new2(a)` clones it into the entry,
+  so an entry never points at a freed handle.
 - Exported functions are thin: check the handle with the port of
   `__archive_check_magic` (same messages, same state machine), run the body
   under `guard`, convert arguments, call safe Rust, convert the result back.
