@@ -274,3 +274,13 @@ Differences:
 - A NULL command, which crashes upstream, fails with `ARCHIVE_FATAL`. A
   signature of more than `isize::MAX` bytes is ignored instead of reported as
   "Signature too large".
+
+## grzip, lrzip and lzop filters
+
+### Differences
+
+- lzop: upstream decodes with liblzo2 when it is compiled in. The oracle
+  build has none, so the port mirrors that configuration: it always runs
+  `lzop -d` and `archive_read_support_filter_lzop` returns `ARCHIVE_WARN`
+  ("Using external lzop program for lzop decompression"). The liblzo2 path
+  (`lzop_filter_read` and its block and checksum handling) is not ported.

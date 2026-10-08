@@ -9,7 +9,7 @@ use super::{
 };
 use crate::archive::{Base, Handle, Kind, READ_MAGIC, state};
 use crate::read::filter::{
-    all as filter_all, by_code as filter_by_code, none as filter_none, program,
+    all as filter_all, by_code as filter_by_code, grzip, lrzip, lzop, none as filter_none, program,
 };
 use crate::read::format::{all as format_all, by_code as format_by_code, empty, raw};
 use crate::read::{self, Read, Status};
@@ -213,6 +213,42 @@ pub extern "C" fn archive_read_append_filter_program_signature(
     signature_len: usize,
 ) -> c_int {
     with_program(a, cmd, signature, signature_len, read_append_filter::append_filter_program)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_filter_grzip(a: *mut Archive) -> c_int {
+    checked!(
+        __archive_read_register_bidder,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| code(&h.base, grzip::support(r, &h.base)))
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_filter_lrzip(a: *mut Archive) -> c_int {
+    checked!(
+        __archive_read_register_bidder,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| code(&h.base, lrzip::support(r, &h.base)))
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_filter_lzop(a: *mut Archive) -> c_int {
+    checked!(
+        __archive_read_register_bidder,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| code(&h.base, lzop::support(r, &h.base)))
+    )
 }
 
 #[unsafe(no_mangle)]
