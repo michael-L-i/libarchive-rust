@@ -6,6 +6,7 @@ use std::marker::{PhantomData, PhantomPinned};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 mod archive;
+pub(crate) mod entry;
 mod read;
 #[rustfmt::skip]
 mod stubs;

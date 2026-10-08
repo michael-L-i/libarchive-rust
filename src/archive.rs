@@ -28,8 +28,10 @@
 //! State shared by every kind of `struct archive` handle.
 
 use crate::read::Read;
+use crate::string::ConvCache;
 use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, c_int};
+use std::sync::{Arc, Mutex};
 
 #[allow(dead_code)] // reported by the readers (phase 1d)
 pub const ARCHIVE_EOF: c_int = 1;
@@ -83,7 +85,6 @@ pub mod state {
 /// that runs inside one may call back into the same handle (to set an error,
 /// say). So every field that changes is a `Cell` or `RefCell`; a nested call
 /// that touches only `Base` is always fine.
-#[derive(Debug)]
 pub struct Base {
     /// Identifies the kind of handle; catches calls on invalid pointers.
     pub magic: u32,
@@ -100,6 +101,9 @@ pub struct Base {
     /// Whether `archive_error_string` reports the buffer; `archive_set_error`
     /// without a message hides it without clearing it.
     pub(crate) error_shown: Cell<bool>,
+    /// The string conversions made for this handle (`a->sconv`). Entries made
+    /// for the handle share it, so it outlives the handle while one does.
+    pub(crate) conv: Arc<Mutex<ConvCache>>,
 }
 
 impl Base {
@@ -113,6 +117,7 @@ impl Base {
             errno: Cell::new(0),
             error: RefCell::new(Vec::new()),
             error_shown: Cell::new(false),
+            conv: Arc::default(),
         }
     }
 }

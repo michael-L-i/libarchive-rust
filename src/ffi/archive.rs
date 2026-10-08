@@ -43,7 +43,7 @@ macro_rules! checked {
 
 /// The `(buff, size)` pair of a C data argument. `None` if it cannot be a
 /// slice.
-fn bytes<'a>(buff: *const c_void, size: usize) -> Option<&'a [u8]> {
+pub(super) fn bytes<'a>(buff: *const c_void, size: usize) -> Option<&'a [u8]> {
     if size == 0 {
         return Some(&[]);
     }
@@ -54,7 +54,7 @@ fn bytes<'a>(buff: *const c_void, size: usize) -> Option<&'a [u8]> {
     Some(unsafe { std::slice::from_raw_parts(buff.cast(), size) })
 }
 
-fn cptr(s: Option<&CStr>) -> *const c_char {
+pub(super) fn cptr(s: Option<&CStr>) -> *const c_char {
     s.map_or(std::ptr::null(), CStr::as_ptr)
 }
 

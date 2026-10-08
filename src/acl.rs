@@ -30,8 +30,6 @@
 //! state behind `archive_entry_acl_next`. `Acl` also holds the file mode,
 //! because the three standard POSIX.1e entries live there.
 
-#![allow(dead_code)] // used by entry.rs in the next commit
-
 use crate::archive::{ARCHIVE_EOF, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN};
 use crate::string::{ConvCache, MString, StringConv};
 use libc::{mode_t, wchar_t};

@@ -1,5 +1,26 @@
 # Upstream tests that pass against libarchive-rust. Maintained by scripts/run-tests --update.
+test_acl_from_text
+test_acl_nfs4
+test_acl_nfs4_null_id_overflow
+test_acl_nfs4_null_id_overflow_w
+test_acl_nfs4_text_invalid
+test_acl_nfs4_text_numeric_id
+test_acl_nfs4_text_roundtrip
+test_acl_nfs4_text_types
+test_acl_posix1e
+test_acl_posix1e_text_invalid
+test_acl_posix1e_text_ismode
+test_acl_posix1e_text_numeric_id
+test_acl_posix1e_text_roundtrip
+test_acl_posix1e_text_solaris
+test_acl_to_text
 test_archive_api_feature
 test_archive_clear_error
 test_archive_read_close_twice
 test_archive_set_error
+test_entry
+test_entry_mac_metadata_self_copy
+test_entry_strmode
+test_sparse_clear
+test_sparse_iterator
+test_xattr_clear
