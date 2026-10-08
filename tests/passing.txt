@@ -1,6 +1,8 @@
 # Upstream tests that pass against libarchive-rust. Maintained by scripts/run-tests --update.
 cat/test_0
+cat/test_empty_gz
 cat/test_error
+cat/test_expand_gz
 cat/test_expand_plain
 cat/test_help
 cat/test_stdin
