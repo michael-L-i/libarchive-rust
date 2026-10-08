@@ -73,14 +73,6 @@ fn about(name: &Option<Vec<u8>>, what: &[u8]) -> Vec<u8> {
     }
 }
 
-fn whence_c(whence: Whence) -> i32 {
-    match whence {
-        Whence::Set => libc::SEEK_SET,
-        Whence::Cur => libc::SEEK_CUR,
-        Whence::End => libc::SEEK_END,
-    }
-}
-
 impl Filenames {
     /// A client over `names` (`None` for standard input), read in blocks of
     /// about `block_size`.
@@ -306,7 +298,7 @@ impl Client for Filenames {
             return Ok(0);
         };
         let r = match mine.fd {
-            Some(fd) => fd.lseek(offset, whence_c(whence)),
+            Some(fd) => fd.lseek(offset, whence.to_c()),
             None => Err(libc::EBADF),
         };
         // If the input is corrupted or truncated, fail.

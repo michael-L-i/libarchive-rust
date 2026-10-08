@@ -63,7 +63,10 @@ impl Output {
     fn pad_to(&mut self, a: &Base) -> c_int {
         const NULLS_SIZE: usize = 16384;
         if self.can_lseek {
-            let relative = self.target_offset - self.actual_offset;
+            let Some(relative) = self.target_offset.checked_sub(self.actual_offset) else {
+                a.set_error(ARCHIVE_ERRNO_MISC, Some(b"Seek error"));
+                return ARCHIVE_FATAL;
+            };
             let r = self.fd.lseek(relative, libc::SEEK_CUR);
             if r != Ok(self.target_offset) {
                 let errno = r.err().unwrap_or(ARCHIVE_ERRNO_MISC);
@@ -76,7 +79,11 @@ impl Output {
             self.nulls = vec![0; NULLS_SIZE];
         }
         while self.target_offset > self.actual_offset {
-            let left = usize::try_from(self.target_offset - self.actual_offset).unwrap_or(NULLS_SIZE);
+            let left = self
+                .target_offset
+                .checked_sub(self.actual_offset)
+                .and_then(|left| usize::try_from(left).ok())
+                .unwrap_or(NULLS_SIZE);
             let chunk = self.nulls.get(..left.min(NULLS_SIZE)).unwrap_or_default();
             match self.fd.write(chunk) {
                 Ok(n) if n > 0 => self.actual_offset += i64::try_from(n).unwrap_or(0),
@@ -107,12 +114,15 @@ impl Output {
 
         if let Some(declared) = self.declared_size {
             // We know the expected size, let's enforce that we don't overrun.
-            if self.target_offset > declared {
+            let room = declared
+                .checked_sub(self.target_offset)
+                .and_then(|room| usize::try_from(room).ok());
+            if self.target_offset > declared || room.is_none() {
                 // We're already beyond the end? Don't write any more.
                 self.target_offset = declared;
                 data = &[];
                 overran = true;
-            } else if let Ok(room) = usize::try_from(declared - self.target_offset)
+            } else if let Some(room) = room
                 && data.len() > room
             {
                 // This block is bigger than the expected remainder.
@@ -208,7 +218,7 @@ pub fn data_into_fd(r: &mut Read, a: &Base, fd: Fd) -> c_int {
     }
     if can_lseek {
         let offset = fd.lseek(0, libc::SEEK_CUR);
-        if offset.map(|o| o - fd_offset) != Ok(out.actual_offset) {
+        if offset.map(|o| o.checked_sub(fd_offset)) != Ok(Some(out.actual_offset)) {
             a.set_error(offset.err().unwrap_or(ARCHIVE_ERRNO_MISC), Some(b"Seek error"));
             return ARCHIVE_FATAL;
         }
@@ -230,6 +240,8 @@ mod tests {
         blocks: Vec<(i64, Vec<u8>)>,
         end: i64,
         next: usize,
+        /// The size the entry's header declares.
+        declared: Option<i64>,
     }
 
     impl Format for Blocks {
@@ -241,8 +253,11 @@ mod tests {
             1
         }
 
-        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {
-            Err(Error::status(ARCHIVE_EOF))
+        fn read_header(&mut self, _: &mut Reader<'_>, entry: &mut Entry) -> Result<(), Error> {
+            if let Some(size) = self.declared {
+                entry.set_size(size);
+            }
+            Ok(())
         }
 
         fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
@@ -257,11 +272,13 @@ mod tests {
     fn entry(blocks: &[(i64, &[u8])], end: i64, declared: Option<i64>) -> (Read, Base) {
         let mut r = Read::default();
         let blocks = blocks.iter().map(|(o, d)| (*o, d.to_vec())).collect();
-        r.register_format(Box::new(Blocks { blocks, end, next: 0 })).unwrap();
+        let format = Blocks { blocks, end, next: 0, declared };
+        r.register_format(Box::new(format)).unwrap();
         let a = Base::new(READ_MAGIC);
         assert_eq!(r.open(&a, Box::new(Memory::new(b"x".to_vec(), 1))), ARCHIVE_OK);
-        a.state.set(state::DATA);
-        r.entry_bytes_declared = declared;
+        // The declared size comes from the header, as it does for a caller.
+        assert_eq!(r.next_header2(&a, &mut Entry::new(None)), ARCHIVE_OK);
+        assert_eq!(r.entry_bytes_declared, declared);
         (r, a)
     }
 
@@ -349,5 +366,17 @@ mod tests {
         let (mut r, a) = entry(&[(0, b"ab")], 2, None);
         assert_eq!(data_into_fd(&mut r, &a, Fd(-1)), ARCHIVE_FATAL);
         assert_eq!((error(&a), a.errno.get()), ("Write error".into(), libc::EBADF));
+    }
+
+    #[test]
+    fn hostile_offsets_do_not_overflow() {
+        let (mut r, a) = entry(&[(-5, b"ab")], 0, Some(i64::MAX));
+        let mut f = temp_file();
+        let code = data_into_fd(&mut r, &a, Fd(f.as_raw_fd()));
+        assert!(code == ARCHIVE_FAILED || code == ARCHIVE_FATAL);
+        let (mut r, a) = entry(&[(i64::MAX - 1, b"ab")], i64::MAX, None);
+        let code = data_into_fd(&mut r, &a, Fd(f.as_raw_fd()));
+        assert!(code < ARCHIVE_OK);
+        assert_eq!(contents(&mut f), b"");
     }
 }

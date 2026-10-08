@@ -114,6 +114,15 @@ pub enum Whence {
 }
 
 impl Whence {
+    /// The C `whence` (`SEEK_SET` and friends).
+    pub fn to_c(self) -> c_int {
+        match self {
+            Whence::Set => libc::SEEK_SET,
+            Whence::Cur => libc::SEEK_CUR,
+            Whence::End => libc::SEEK_END,
+        }
+    }
+
     /// The origin for a C `whence`.
     pub fn from_c(whence: c_int) -> Option<Whence> {
         match whence {
@@ -1169,8 +1178,9 @@ pub trait Format: Any {
         }
     }
 
-    /// `archive_seek_data`.
-    fn seek_data(&mut self, _r: &mut Reader<'_>, _offset: i64, _whence: Whence) -> Result<i64, Error> {
+    /// `archive_seek_data`. `whence` is the caller's, unchecked, as upstream
+    /// passes it; `Whence::from_c` converts the valid ones.
+    fn seek_data(&mut self, _r: &mut Reader<'_>, _offset: i64, _whence: c_int) -> Result<i64, Error> {
         Err(Error::new(
             ARCHIVE_FAILED,
             ARCHIVE_ERRNO_MISC,
@@ -1552,7 +1562,7 @@ impl Read {
     }
 
     /// `archive_seek_data`, after the caller has checked the state.
-    pub fn seek_data(&mut self, a: &Base, offset: i64, whence: Whence) -> i64 {
+    pub fn seek_data(&mut self, a: &Base, offset: i64, whence: c_int) -> i64 {
         let Some((format, mut rd)) = self.active(a) else {
             return a.raise(Error::fatal(
                 ARCHIVE_ERRNO_PROGRAMMER,
@@ -2623,7 +2633,7 @@ mod tests {
     #[test]
     fn seek_data_is_refused_by_default() {
         let (mut r, a) = opened(Script::new(&[], 0));
-        assert_eq!(r.seek_data(&a, 0, Whence::Set), i64::from(ARCHIVE_FAILED));
+        assert_eq!(r.seek_data(&a, 0, libc::SEEK_SET), i64::from(ARCHIVE_FAILED));
         assert_eq!(error(&a), "Cannot seek data with this format");
         assert_eq!(a.errno.get(), ARCHIVE_ERRNO_MISC);
     }

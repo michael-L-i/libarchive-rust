@@ -74,14 +74,6 @@ impl CClient {
     }
 }
 
-fn whence_c(whence: Whence) -> c_int {
-    match whence {
-        Whence::Set => libc::SEEK_SET,
-        Whence::Cur => libc::SEEK_CUR,
-        Whence::End => libc::SEEK_END,
-    }
-}
-
 impl Client for CClient {
     fn nodes(&self) -> usize {
         self.callbacks.data.len().max(1)
@@ -154,7 +146,7 @@ impl Client for CClient {
             return Err(Error::status(ARCHIVE_FAILED));
         };
         // SAFETY: `new`'s contract.
-        let r = unsafe { seeker(self.archive, self.data(node), offset, whence_c(whence)) };
+        let r = unsafe { seeker(self.archive, self.data(node), offset, whence.to_c()) };
         if r < 0 { Err(failure(r)) } else { Ok(r) }
     }
 
@@ -202,7 +194,9 @@ impl UserMem {
                 len: 0,
             });
         }
-        (!ptr.is_null() && len <= isize::MAX as usize).then_some(UserMem {
+        // The block must fit in the address space without wrapping.
+        let fits = len <= isize::MAX as usize && ptr.addr().checked_add(len).is_some();
+        (!ptr.is_null() && fits).then_some(UserMem {
             ptr: ptr.cast(),
             len,
         })

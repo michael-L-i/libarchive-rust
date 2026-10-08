@@ -76,14 +76,6 @@ impl ReadFd {
     }
 }
 
-fn whence_c(whence: Whence) -> i32 {
-    match whence {
-        Whence::Set => libc::SEEK_SET,
-        Whence::Cur => libc::SEEK_CUR,
-        Whence::End => libc::SEEK_END,
-    }
-}
-
 impl Client for ReadFd {
     fn read(&mut self, _node: usize) -> Result<(), Error> {
         self.len = 0;
@@ -154,7 +146,7 @@ impl Client for ReadFd {
     }
 
     fn seek(&mut self, _node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
-        self.fd.lseek(offset, whence_c(whence)).map_err(|errno| {
+        self.fd.lseek(offset, whence.to_c()).map_err(|errno| {
             if errno == libc::ESPIPE {
                 Error::new(
                     ARCHIVE_FAILED,

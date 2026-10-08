@@ -15,7 +15,7 @@ use super::ArchiveEntry;
 use super::sys::Fd;
 use crate::entry::Entry;
 use crate::archive::ARCHIVE_EOF;
-use crate::read::{Data, Whence};
+use crate::read::Data;
 use crate::read_add_passphrase::PassphraseCallback;
 use crate::util::Error;
 use crate::{options, read_append_filter, read_data_into_fd, read_set_format, read_set_options};
@@ -580,12 +580,7 @@ pub extern "C" fn archive_seek_data(a: *mut Archive, offset: i64, whence: c_int)
         READ_MAGIC,
         state::DATA,
         i64::from(ARCHIVE_FATAL),
-        |h| {
-            let Some(whence) = Whence::from_c(whence) else {
-                return i64::from(h.base.raise(Error::fatal(libc::EINVAL, "Invalid whence")));
-            };
-            with_read(h, i64::from(ARCHIVE_FATAL), |r| r.seek_data(&h.base, offset, whence))
-        }
+        |h| with_read(h, i64::from(ARCHIVE_FATAL), |r| r.seek_data(&h.base, offset, whence))
     )
 }
 
@@ -1013,7 +1008,8 @@ pub(super) mod tests {
         assert_eq!((p.is_null(), n, off), (true, 0, 0));
         assert_eq!(archive_seek_data(a, 0, 0), i64::from(crate::archive::ARCHIVE_FAILED));
         assert_eq!(error(a).as_deref(), Some("Cannot seek data with this format"));
-        assert_eq!(archive_seek_data(a, 0, 77), i64::from(ARCHIVE_FATAL));
+        // A bad whence is the format's to judge.
+        assert_eq!(archive_seek_data(a, 0, 77), i64::from(crate::archive::ARCHIVE_FAILED));
         let a = opened();
         with(a, (), |h| h.base.state.set(state::DATA));
         assert_eq!(archive_read_data_skip(a), ARCHIVE_OK);

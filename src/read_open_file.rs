@@ -67,14 +67,6 @@ impl ReadFile {
     }
 }
 
-fn whence_c(whence: Whence) -> i32 {
-    match whence {
-        Whence::Set => libc::SEEK_SET,
-        Whence::Cur => libc::SEEK_CUR,
-        Whence::End => libc::SEEK_END,
-    }
-}
-
 impl Client for ReadFile {
     /// A stream in error that produced nothing fails the read. (Upstream
     /// records the error and reports end of file; see NOTES.md.)
@@ -120,7 +112,7 @@ impl Client for ReadFile {
     fn seek(&mut self, _node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
         // If we arrive here, the input is corrupted or truncated so fail.
         let fail = |errno| Error::fatal(errno, "Error seeking in FILE* pointer");
-        self.file.seek(offset, whence_c(whence)).map_err(fail)?;
+        self.file.seek(offset, whence.to_c()).map_err(fail)?;
         self.file.tell().map_err(fail)
     }
 }
