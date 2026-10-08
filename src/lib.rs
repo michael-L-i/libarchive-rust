@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod acl;
 mod archive;
 mod check_magic;
 mod ffi;
