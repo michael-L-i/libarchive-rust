@@ -21,6 +21,7 @@ test_archive_set_error
 test_entry
 test_entry_mac_metadata_self_copy
 test_entry_strmode
+test_link_resolver
 test_sparse_clear
 test_sparse_iterator
 test_xattr_clear

@@ -156,3 +156,29 @@ Differences:
 - `st_birthtime` is filled and read only where `struct stat` has it (macOS);
   elsewhere `archive_entry_copy_stat` unsets the birth time as upstream's
   fallback does.
+
+## archive_entry_link_resolver (`src/entry_link_resolver.rs`)
+
+Suspected upstream quirks, ported as-is:
+
+- `archive_entry_linkresolver_new` callocs the strategy, so a resolver that
+  never had `set_strategy` called matches like tar (strategy 0), not like old
+  cpio. Ours does the same.
+- An entry with `nlink` 0 gets `links = nlink - 1`, which wraps to `UINT_MAX`
+  as an unsigned int. Under the new-cpio strategy such an entry is held until
+  the resolver is freed, and `archive_entry_partial_links` reports that huge
+  count.
+
+Differences:
+
+- NULL resolver: upstream crashes. `archive_entry_linkify` leaves `*e` alone
+  and sets `*f` to NULL; `set_strategy` and `free` do nothing;
+  `archive_entry_partial_links` returns NULL with `*links` set to 0.
+- NULL `e` or `f` pointer in `archive_entry_linkify`: upstream crashes. Ours
+  skips the output that is missing.
+- The Windows `archive_entry_copy_hardlink_w` path (`_WIN32` without Cygwin)
+  is not ported. The narrow hardlink copy is used everywhere.
+- The held-back entries and the canonical clones are owned by the resolver as
+  `Box<Entry>`, not as raw pointers. C never holds a pointer to them, because
+  `archive_entry_linkify` swaps the pointers it hands out, so no pointer is
+  aliased.
