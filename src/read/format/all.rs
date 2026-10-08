@@ -29,12 +29,12 @@
 //! `archive_read_support_format_by_code` looks formats up in.
 
 use crate::archive::*;
-use crate::read::{Read, format_code as code};
+use crate::read::{Read, Status, format_code as code};
 use crate::util::Error;
 use std::ffi::c_int;
 
 /// Registers a format with the handle.
-pub type Support = fn(&mut Read) -> Result<(), Error>;
+pub type Support = fn(&mut Read) -> Result<Status, Error>;
 
 /// Every format code, with its registration function once it is ported.
 /// The order is the order of bidding.

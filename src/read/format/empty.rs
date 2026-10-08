@@ -27,16 +27,15 @@
 
 //! The empty format: a zero-length input is an archive with no entries.
 
-use crate::archive::*;
 use crate::entry::Entry;
-use crate::read::{Data, Format, Read, Reader, format_code};
+use crate::read::{Data, Format, Read, Reader, Status, format_code};
 use crate::util::Error;
 use std::ffi::c_int;
 
 struct Empty;
 
 /// `archive_read_support_format_empty`.
-pub fn support(r: &mut Read) -> Result<(), Error> {
+pub fn support(r: &mut Read) -> Result<Status, Error> {
     r.register_format(Box::new(Empty))
 }
 
@@ -53,9 +52,9 @@ impl Format for Empty {
         Ok(-1)
     }
 
-    fn read_header(&mut self, r: &mut Reader<'_>, _entry: &mut Entry) -> Result<(), Error> {
+    fn read_header(&mut self, r: &mut Reader<'_>, _entry: &mut Entry) -> Result<Status, Error> {
         r.set_format(format_code::EMPTY, c"Empty file");
-        Err(Error::recorded(ARCHIVE_EOF))
+        Ok(Status::Eof)
     }
 
     fn read_data<'x>(&'x mut self, _r: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {

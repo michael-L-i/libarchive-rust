@@ -45,7 +45,7 @@ pub fn support(r: &mut Read, a: &Base, code: c_int) -> c_int {
         ));
     };
     match register.map_or(Err(Error::recorded(ARCHIVE_FATAL)), |register| register(r)) {
-        Ok(()) => ARCHIVE_OK,
+        Ok(status) => status.code(),
         Err(e) => a.raise(e),
     }
 }

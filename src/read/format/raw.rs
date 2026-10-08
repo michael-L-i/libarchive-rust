@@ -29,7 +29,7 @@
 
 use crate::archive::*;
 use crate::entry::{AE_IFREG, Entry};
-use crate::read::{Data, Format, Read, Reader, format_code};
+use crate::read::{Data, Format, Read, Reader, Status, format_code};
 use crate::util::Error;
 use std::ffi::c_int;
 
@@ -42,7 +42,7 @@ struct Raw {
 }
 
 /// `archive_read_support_format_raw`.
-pub fn support(r: &mut Read) -> Result<(), Error> {
+pub fn support(r: &mut Read) -> Result<Status, Error> {
     r.register_format(Box::new(Raw::default()))
 }
 
@@ -71,9 +71,9 @@ impl Format for Raw {
     }
 
     /// Mock up a fake header.
-    fn read_header(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Result<(), Error> {
+    fn read_header(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Result<Status, Error> {
         if self.end_of_file {
-            return Err(Error::recorded(ARCHIVE_EOF));
+            return Ok(Status::Eof);
         }
 
         r.set_format(format_code::RAW, c"raw");
@@ -123,9 +123,9 @@ impl Format for Raw {
         })
     }
 
-    fn read_data_skip(&mut self, r: &mut Reader<'_>) -> Result<(), Error> {
+    fn read_data_skip(&mut self, r: &mut Reader<'_>) -> Result<Status, Error> {
         self.consume_last(r)?;
         self.end_of_file = true;
-        Ok(())
+        Ok(Status::Ok)
     }
 }

@@ -187,6 +187,7 @@ pub fn data_into_fd(r: &mut Read, a: &Base, fd: Fd) -> c_int {
                 out.target_offset = offset;
                 Step::Eof
             }
+            Data::Warn => Step::Stop(ARCHIVE_WARN),
         });
         match step {
             Ok(Step::Continue) => {}
@@ -230,7 +231,7 @@ pub fn data_into_fd(r: &mut Read, a: &Base, fd: Fd) -> c_int {
 mod tests {
     use super::*;
     use crate::entry::Entry;
-    use crate::read::{Format, Reader};
+    use crate::read::{Format, Reader, Status};
     use crate::read_open_memory::Memory;
     use std::io::{Read as _, Seek, SeekFrom};
     use std::os::fd::AsRawFd;
@@ -253,11 +254,11 @@ mod tests {
             Ok(1)
         }
 
-        fn read_header(&mut self, _: &mut Reader<'_>, entry: &mut Entry) -> Result<(), Error> {
+        fn read_header(&mut self, _: &mut Reader<'_>, entry: &mut Entry) -> Result<Status, Error> {
             if let Some(size) = self.declared {
                 entry.set_size(size);
             }
-            Ok(())
+            Ok(Status::Ok)
         }
 
         fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {

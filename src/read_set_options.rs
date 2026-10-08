@@ -30,7 +30,7 @@
 
 use crate::archive::*;
 use crate::options::{self, UNKNOWN_MODULE};
-use crate::read::Read;
+use crate::read::{Read, Status};
 use std::ffi::c_int;
 
 impl Read {
@@ -59,7 +59,9 @@ impl Read {
             }
 
             match r {
-                Ok(()) => rv = ARCHIVE_OK,
+                Ok(Status::Ok) => rv = ARCHIVE_OK,
+                // A format that doesn't know the option.
+                Ok(_) => {}
                 Err(e) if e.code == ARCHIVE_FATAL => {
                     a.raise(e);
                     return ARCHIVE_FATAL;
@@ -122,19 +124,19 @@ mod tests {
             Ok(0)
         }
 
-        fn options(&mut self, _: &Base, key: &[u8], value: Option<&[u8]>) -> Option<Result<(), Error>> {
+        fn options(&mut self, _: &Base, key: &[u8], value: Option<&[u8]>) -> Option<Result<Status, Error>> {
             Some(match key {
                 b"flag" => {
                     self.seen.push(format!("{:?}", value.map(String::from_utf8_lossy)));
-                    Ok(())
+                    Ok(Status::Ok)
                 }
                 b"broken" => Err(Error::fatal(libc::EINVAL, "Broken option")),
-                _ => Err(Error::recorded(ARCHIVE_WARN)),
+                _ => Ok(Status::Warn),
             })
         }
 
-        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {
-            Err(Error::recorded(ARCHIVE_EOF))
+        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<Status, Error> {
+            Ok(Status::Eof)
         }
 
         fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
@@ -154,8 +156,8 @@ mod tests {
             Ok(0)
         }
 
-        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {
-            Err(Error::recorded(ARCHIVE_EOF))
+        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<Status, Error> {
+            Ok(Status::Eof)
         }
 
         fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {

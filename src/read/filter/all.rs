@@ -29,12 +29,12 @@
 //! `archive_read_support_filter_by_code` looks filters up in.
 
 use crate::archive::*;
-use crate::read::{Read, filter_code as code};
+use crate::read::{Read, Status, filter_code as code};
 use crate::util::Error;
 use std::ffi::c_int;
 
 /// Registers a filter's bidder with the handle.
-pub type Support = fn(&mut Read) -> Result<(), Error>;
+pub type Support = fn(&mut Read) -> Result<Status, Error>;
 
 /// Every filter code (but `NONE` and `PROGRAM`, which are special), with its
 /// registration function once it is ported.

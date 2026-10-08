@@ -6,7 +6,7 @@ use super::{
     archive_seek_callback, archive_skip_callback, archive_switch_callback,
 };
 use crate::archive::*;
-use crate::read::{Client, Whence, worse};
+use crate::read::{Client, Status, Whence, worse};
 use crate::util::Error;
 use std::ffi::{c_int, c_void};
 
@@ -34,10 +34,13 @@ pub struct CClient {
     block: (*const u8, usize),
 }
 
-/// The `ARCHIVE_*` status of a callback that returned `r`, for a callback
-/// that has recorded its own error.
+/// The failure of a callback that returned `r` and has recorded its own
+/// error. A callback that only warns when it can't go on is a failure.
 fn failure(r: i64) -> Error {
-    Error::recorded(c_int::try_from(r).unwrap_or(ARCHIVE_FATAL))
+    match c_int::try_from(r) {
+        Ok(code) if code != ARCHIVE_WARN => Error::recorded(code),
+        _ => Error::recorded(ARCHIVE_FATAL),
+    }
 }
 
 fn status(r: c_int) -> Result<(), Error> {
@@ -150,22 +153,26 @@ impl Client for CClient {
         if r < 0 { Err(failure(r)) } else { Ok(r) }
     }
 
-    fn close(&mut self, node: usize) -> Result<(), Error> {
+    fn close(&mut self, node: usize) -> Result<Status, Error> {
         // The closer may free the buffer the reader handed out.
         self.block = (std::ptr::null(), 0);
         let Some(closer) = self.callbacks.closer else {
-            return Ok(());
+            return Ok(Status::Ok);
         };
         // SAFETY: `new`'s contract.
-        status(unsafe { closer(self.archive, self.data(node)) })
+        match unsafe { closer(self.archive, self.data(node)) } {
+            ARCHIVE_OK => Ok(Status::Ok),
+            ARCHIVE_WARN => Ok(Status::Warn),
+            r => Err(failure(r.into())),
+        }
     }
 
     fn switch(&mut self, from: usize, to: usize) -> Result<(), Error> {
         let Some(switcher) = self.callbacks.switcher else {
             // Attempt to call close and open instead.
             let closed = self.close(from);
-            let opened = self.open(to);
-            return worse(closed, opened);
+            let opened = self.open(to).map(|()| Status::Ok);
+            return worse(closed, opened).map(|_| ());
         };
         // SAFETY: `new`'s contract.
         status(unsafe { switcher(self.archive, self.data(from), self.data(to)) })

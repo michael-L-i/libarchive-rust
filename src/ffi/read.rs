@@ -14,7 +14,7 @@ use crate::read::{self, Read};
 use super::ArchiveEntry;
 use super::sys::Fd;
 use crate::entry::Entry;
-use crate::archive::ARCHIVE_EOF;
+use crate::archive::{ARCHIVE_EOF, ARCHIVE_WARN};
 use crate::read::Data;
 use crate::read_add_passphrase::PassphraseCallback;
 use crate::util::Error;
@@ -520,6 +520,7 @@ pub extern "C" fn archive_read_data_block(
             let block = r.read_data_block(&h.base, |data| match data {
                 Data::Block { data, offset } => (data.as_ptr().cast(), data.len(), offset, ARCHIVE_OK),
                 Data::Eof { offset } => (std::ptr::null(), 0, offset, ARCHIVE_EOF),
+                Data::Warn => (std::ptr::null(), 0, 0, ARCHIVE_WARN),
             });
             match block {
                 Ok((p, n, o, code)) => {
@@ -649,7 +650,7 @@ pub extern "C" fn archive_read_support_format_raw(a: *mut Archive) -> c_int {
         state::NEW,
         ARCHIVE_FATAL,
         |h| with_read(h, ARCHIVE_FATAL, |r| {
-            raw::support(r).map_or_else(|e| h.base.raise(e), |()| ARCHIVE_OK)
+            raw::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
         })
     )
 }
@@ -663,7 +664,7 @@ pub extern "C" fn archive_read_support_format_empty(a: *mut Archive) -> c_int {
         state::NEW,
         ARCHIVE_FATAL,
         |h| with_read(h, ARCHIVE_FATAL, |r| {
-            empty::support(r).map_or_else(|e| h.base.raise(e), |()| ARCHIVE_OK)
+            empty::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
         })
     )
 }
@@ -710,7 +711,7 @@ pub(super) mod tests {
         assert_eq!(archive_read_support_format_all(std::ptr::null_mut()), ARCHIVE_FATAL);
     }
 
-    use crate::read::{Data, Format, Reader};
+    use crate::read::{Data, Format, Reader, Status};
     use crate::util::Error as Err_;
 
     /// A format that bids on anything, for tests that only open.
@@ -730,16 +731,12 @@ pub(super) mod tests {
             _: &crate::archive::Base,
             key: &[u8],
             _: Option<&[u8]>,
-        ) -> Option<Result<(), Err_>> {
-            Some(if key == b"flag" {
-                Ok(())
-            } else {
-                Err(Err_::recorded(crate::archive::ARCHIVE_WARN))
-            })
+        ) -> Option<Result<Status, Err_>> {
+            Some(Ok(if key == b"flag" { Status::Ok } else { Status::Warn }))
         }
 
-        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Err_> {
-            Err(Err_::recorded(crate::archive::ARCHIVE_EOF))
+        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<Status, Err_> {
+            Ok(Status::Eof)
         }
 
         fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Err_> {
@@ -749,7 +746,9 @@ pub(super) mod tests {
 
     pub(in crate::ffi) fn register_anything(a: *mut Archive) {
         with(a, (), |h| {
-            with_read(h, (), |r| r.register_format(Box::new(Anything)).unwrap());
+            with_read(h, (), |r| {
+                r.register_format(Box::new(Anything)).unwrap();
+            });
         });
     }
 

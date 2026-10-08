@@ -44,7 +44,7 @@ pub fn support(r: &mut Read, code: c_int) -> c_int {
         .find(|(c, _)| *c == code)
         .and_then(|(_, register)| *register)
         .map_or(ARCHIVE_FATAL, |register| match register(r) {
-            Ok(()) => ARCHIVE_OK,
+            Ok(status) => status.code(),
             Err(e) => e.code,
         })
 }

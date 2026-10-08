@@ -31,7 +31,7 @@
 
 use crate::read_open_fd::buffer;
 use crate::ffi::sys::Fd;
-use crate::read::{Client, Whence};
+use crate::read::{Client, Status, Whence};
 use crate::util::Error;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -305,11 +305,11 @@ impl Client for Filenames {
         r.map_err(|errno| Error::fatal(errno, about(&mine.name, b"Error seeking in")))
     }
 
-    fn close(&mut self, node: usize) -> Result<(), Error> {
+    fn close(&mut self, node: usize) -> Result<Status, Error> {
         if let Some(mine) = self.nodes.get_mut(node) {
             mine.close();
         }
-        Ok(())
+        Ok(Status::Ok)
     }
 
     fn skip_file(&self) -> Option<(i64, i64)> {

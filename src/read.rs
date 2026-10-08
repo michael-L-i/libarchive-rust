@@ -134,6 +134,45 @@ impl Whence {
     }
 }
 
+/// How a call that can warn went: the failures are `Err`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// `ARCHIVE_OK`.
+    Ok,
+    /// `ARCHIVE_WARN`: it worked, but something was wrong. The message is
+    /// already recorded on the handle (see `Reader::warn`).
+    Warn,
+    /// `ARCHIVE_EOF`: there is nothing more. Only `Format::read_header` has
+    /// an end.
+    Eof,
+}
+
+impl Status {
+    /// The `ARCHIVE_*` code.
+    pub fn code(self) -> c_int {
+        match self {
+            Status::Ok => ARCHIVE_OK,
+            Status::Warn => ARCHIVE_WARN,
+            Status::Eof => ARCHIVE_EOF,
+        }
+    }
+}
+
+impl Base {
+    /// Records a warning, as `archive_set_error` before `return
+    /// ARCHIVE_WARN`, and gives the status to return.
+    pub fn warn(&self, errno: c_int, msg: impl AsRef<[u8]>) -> Status {
+        self.set_error(errno, Some(msg.as_ref()));
+        Status::Warn
+    }
+
+    /// Sets the format code and name `archive_format` reports.
+    pub fn set_format(&self, code: c_int, name: &'static CStr) {
+        self.format.set(code);
+        self.format_name.set(Some(name));
+    }
+}
+
 /// What a decompression filter implements. A filter owns its output buffer
 /// and exposes it as the current block; the stage above it copies from the
 /// block only when a request spans blocks, so most reads are zero-copy.
@@ -161,15 +200,15 @@ pub trait Filter {
     /// Fills in the entry with what the filter's header says (the gzip
     /// file name and time, say), for formats that make an entry from a
     /// stream with no structure. The default has nothing to add.
-    fn read_header(&mut self, _up: &mut Reader<'_>, _entry: &mut Entry) -> Result<(), Error> {
-        Ok(())
+    fn read_header(&mut self, _up: &mut Reader<'_>, _entry: &mut Entry) -> Result<Status, Error> {
+        Ok(Status::Ok)
     }
 
     /// Closes just this filter; the stage below is closed separately. A
     /// failure is reported by `archive_read_close`, but every filter is
     /// closed regardless.
-    fn close(&mut self, _a: &Base) -> Result<(), Error> {
-        Ok(())
+    fn close(&mut self, _a: &Base) -> Result<Status, Error> {
+        Ok(Status::Ok)
     }
 }
 
@@ -224,8 +263,8 @@ pub trait Client {
     }
 
     /// Closes node `node`.
-    fn close(&mut self, _node: usize) -> Result<(), Error> {
-        Ok(())
+    fn close(&mut self, _node: usize) -> Result<Status, Error> {
+        Ok(Status::Ok)
     }
 
     /// The device and inode of the input being read, if it is a regular
@@ -238,16 +277,19 @@ pub trait Client {
     /// old node is closed and the new one opened.
     fn switch(&mut self, from: usize, to: usize) -> Result<(), Error> {
         let closed = self.close(from);
-        worse(closed, self.open(to))
+        let opened = self.open(to).map(|()| Status::Ok);
+        worse(closed, opened).map(|_| ())
     }
 }
 
-/// Of two results, the failing one with the lower code (the worse error).
-pub(crate) fn worse(a: Result<(), Error>, b: Result<(), Error>) -> Result<(), Error> {
+/// Of two results, the worse: the failure with the lower code, else a
+/// warning, else OK.
+pub(crate) fn worse(a: Result<Status, Error>, b: Result<Status, Error>) -> Result<Status, Error> {
     match (a, b) {
         (Err(a), Err(b)) => Err(if b.code < a.code { b } else { a }),
-        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
-        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), _) | (_, Err(e)) => Err(e),
+        (Ok(Status::Warn), _) | (_, Ok(Status::Warn)) => Ok(Status::Warn),
+        _ => Ok(Status::Ok),
     }
 }
 
@@ -292,8 +334,8 @@ impl ClientFilter {
     }
 
     /// `client_close_proxy`: closes every node, returning the worst failure.
-    fn close_all(&mut self) -> Result<(), Error> {
-        let mut r = Ok(());
+    fn close_all(&mut self) -> Result<Status, Error> {
+        let mut r = Ok(Status::Ok);
         for i in 0..self.nodes.len() {
             r = worse(r, self.client.close(i));
         }
@@ -425,7 +467,7 @@ impl Filter for ClientFilter {
         self.client.block()
     }
 
-    fn close(&mut self, _a: &Base) -> Result<(), Error> {
+    fn close(&mut self, _a: &Base) -> Result<Status, Error> {
         self.close_all()
     }
 }
@@ -795,9 +837,9 @@ impl Stage {
     }
 
     /// Closes the filter once, and frees the buffer.
-    fn close(&mut self, a: &Base) -> Result<(), Error> {
+    fn close(&mut self, a: &Base) -> Result<Status, Error> {
         let r = if self.closed {
-            Ok(())
+            Ok(Status::Ok)
         } else {
             self.closed = true;
             self.imp.filter_mut().close(a)
@@ -851,10 +893,10 @@ impl Reader<'_> {
     }
 
     /// `__archive_read_header`: lets the top filter fill in `entry`.
-    pub fn read_filter_header(&mut self, entry: &mut Entry) -> Result<(), Error> {
+    pub fn read_filter_header(&mut self, entry: &mut Entry) -> Result<Status, Error> {
         match self.split() {
             Some((top, mut up)) => top.imp.filter_mut().read_header(&mut up, entry),
-            None => Ok(()),
+            None => Ok(Status::Ok),
         }
     }
 
@@ -955,8 +997,12 @@ impl Reader<'_> {
 
     /// Sets the format code and name `archive_format` reports.
     pub fn set_format(&self, code: c_int, name: &'static CStr) {
-        self.a.format.set(code);
-        self.a.format_name.set(Some(name));
+        self.a.set_format(code, name);
+    }
+
+    /// Records a warning; return the `Status` it gives to say so.
+    pub fn warn(&self, errno: c_int, msg: impl AsRef<[u8]>) -> Status {
+        self.a.warn(errno, msg)
     }
 
     /// `__archive_read_reset_passphrase`: call when you start looking for a
@@ -1052,8 +1098,10 @@ impl Read {
     fn close_filters(&mut self, a: &Base) -> c_int {
         let mut r = ARCHIVE_OK;
         for stage in self.chain.iter_mut().rev() {
-            if let Err(e) = stage.close(a) {
-                r = r.min(a.raise(e));
+            match stage.close(a) {
+                Ok(Status::Warn) => r = r.min(ARCHIVE_WARN),
+                Ok(_) => {}
+                Err(e) => r = r.min(a.raise(e)),
             }
         }
         r
@@ -1130,17 +1178,21 @@ pub enum Data<'r> {
     /// The end of the entry's data, at `offset` (a sparse file may end in a
     /// hole).
     Eof { offset: i64 },
+    /// A problem with the entry's data, already recorded on the handle (see
+    /// `Reader::warn`): there is no block this time, and the caller gets
+    /// `ARCHIVE_WARN`. A later call may carry on.
+    Warn,
 }
 
 /// What a format reader implements. A format owns its own state in `self`;
 /// everything it reads comes through the `Reader` passed to each call, so a
 /// format's state, the stream and the entry are separate borrows.
 ///
-/// Statuses follow `util::Error`: `Ok` is `ARCHIVE_OK`; `Err(e)` carries any
-/// other code. `ARCHIVE_WARN` and `ARCHIVE_FAILED` are `Err`, too: the core
-/// records the message and carries on as upstream does. A format that wants
-/// to warn but continue finishes its work first, then returns the warning.
-/// `Error::recorded(ARCHIVE_EOF)` is end of archive.
+/// A call that can warn returns `Result<Status, Error>`. `Status::Warn` means
+/// carry on, with the warning already recorded (`Reader::warn`); `Err` is only
+/// `ARCHIVE_FAILED` (this entry can't be read, but the next may be) or
+/// `ARCHIVE_FATAL`, with its message in the `Error`. So a warning never ends
+/// the function early by way of `?`.
 pub trait Format: Any {
     /// The name `archive_read_set_format` and the option modules use.
     fn name(&self) -> &'static str;
@@ -1152,20 +1204,21 @@ pub trait Format: Any {
     fn bid(&mut self, r: &mut Reader<'_>, best_bid: c_int) -> Result<c_int, Error>;
 
     /// Handles a format option. `None` if the format has no options at all;
-    /// otherwise `Ok` if it took the option and `Err` with `ARCHIVE_WARN`
-    /// if it doesn't know it.
+    /// otherwise `Status::Ok` if it took the option and `Status::Warn` if it
+    /// doesn't know it.
     fn options(
         &mut self,
         _a: &Base,
         _key: &[u8],
         _value: Option<&[u8]>,
-    ) -> Option<Result<(), Error>> {
+    ) -> Option<Result<Status, Error>> {
         None
     }
 
-    /// Reads the next entry's header into `entry`. At the end of the
-    /// archive, `Error::recorded(ARCHIVE_EOF)`.
-    fn read_header(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Result<(), Error>;
+    /// Reads the next entry's header into `entry`: `Status::Eof` at the end
+    /// of the archive, `Status::Warn` for an entry that is usable but not
+    /// quite right.
+    fn read_header(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Result<Status, Error>;
 
     /// The next block of the entry's data. A format that returns the data in
     /// place (the usual zero-copy case) consumes it on its next call, since
@@ -1173,10 +1226,12 @@ pub trait Format: Any {
     fn read_data<'x>(&'x mut self, r: &'x mut Reader<'_>) -> Result<Data<'x>, Error>;
 
     /// Skips the rest of the entry's data. The default reads and discards it.
-    fn read_data_skip(&mut self, r: &mut Reader<'_>) -> Result<(), Error> {
+    fn read_data_skip(&mut self, r: &mut Reader<'_>) -> Result<Status, Error> {
         loop {
-            if let Data::Eof { .. } = self.read_data(r)? {
-                return Ok(());
+            match self.read_data(r)? {
+                Data::Block { .. } => {}
+                Data::Eof { .. } => return Ok(Status::Ok),
+                Data::Warn => return Ok(Status::Warn),
             }
         }
     }
@@ -1231,10 +1286,10 @@ const MAX_NUMBER_FILTERS: usize = 25;
 impl Read {
     /// `__archive_read_register_format`. A format of a type that is already
     /// registered is a warning (and is dropped).
-    pub fn register_format(&mut self, format: Box<dyn Format>) -> Result<(), Error> {
+    pub fn register_format(&mut self, format: Box<dyn Format>) -> Result<Status, Error> {
         let id = (*format).type_id();
         if self.formats.iter().any(|f| (**f).type_id() == id) {
-            return Err(Error::recorded(ARCHIVE_WARN));
+            return Ok(Status::Warn);
         }
         if self.formats.len() >= MAX_REGISTERED {
             return Err(Error::fatal(
@@ -1243,11 +1298,11 @@ impl Read {
             ));
         }
         self.formats.push(format);
-        Ok(())
+        Ok(Status::Ok)
     }
 
     /// `__archive_read_register_bidder`.
-    pub fn register_bidder(&mut self, bidder: Box<dyn FilterBidder>) -> Result<(), Error> {
+    pub fn register_bidder(&mut self, bidder: Box<dyn FilterBidder>) -> Result<Status, Error> {
         if self.bidders.len() >= MAX_REGISTERED {
             return Err(Error::fatal(
                 libc::ENOMEM,
@@ -1255,7 +1310,7 @@ impl Read {
             ));
         }
         self.bidders.push(bidder);
-        Ok(())
+        Ok(Status::Ok)
     }
 
     /// `archive_read_append_filter_last_bidder`: puts the filter of the most
@@ -1560,12 +1615,13 @@ impl Read {
     pub fn read_data_skip(&mut self, a: &Base) -> c_int {
         let r = match self.active(a) {
             Some((format, mut rd)) => format.read_data_skip(&mut rd),
-            None => Ok(()),
+            None => Ok(Status::Ok),
         };
-        let mut code = r.map_or_else(|e| a.raise(e), |()| ARCHIVE_OK);
-        if code == ARCHIVE_EOF {
-            code = ARCHIVE_OK;
-        }
+        let code = match r {
+            Ok(Status::Warn) => ARCHIVE_WARN,
+            Ok(_) => ARCHIVE_OK,
+            Err(e) => a.raise(e),
+        };
         if code == ARCHIVE_FATAL {
             a.state.set(state::FATAL);
         } else {
@@ -1617,11 +1673,13 @@ impl Read {
                 let mut leftover = Vec::new();
                 let mut out_of_order = false;
                 let mut eof = false;
+                let mut warned = false;
                 let got = self.read_data_block(a, |d| match d {
                     Data::Eof { offset } => {
                         blk_off = offset;
                         eof = true;
                     }
+                    Data::Warn => warned = true,
                     Data::Block { data, offset } => {
                         blk_off = offset;
                         if blk_off < out_off {
@@ -1634,6 +1692,9 @@ impl Read {
                 });
                 if let Err(code) = got {
                     break 'read code as isize;
+                }
+                if warned {
+                    break 'read ARCHIVE_WARN as isize;
                 }
                 (st.output_offset, st.offset, st.pending) = (out_off, blk_off, leftover);
                 if eof && blk_off == out_off {
@@ -1738,9 +1799,10 @@ impl Read {
 
         a.file_count.set(a.file_count.get() + 1);
         let r2 = match self.active(a) {
-            Some((format, mut rd)) => format
-                .read_header(&mut rd, entry)
-                .map_or_else(|e| a.raise(e), |()| ARCHIVE_OK),
+            Some((format, mut rd)) => match format.read_header(&mut rd, entry) {
+                Ok(status) => status.code(),
+                Err(e) => a.raise(e),
+            },
             None => ARCHIVE_FATAL,
         };
 
@@ -1899,9 +1961,9 @@ mod tests {
             Ok(to)
         }
 
-        fn close(&mut self, node: usize) -> Result<(), Error> {
+        fn close(&mut self, node: usize) -> Result<Status, Error> {
             self.note(format!("close {node}"));
-            Ok(())
+            Ok(Status::Ok)
         }
     }
 
@@ -1934,9 +1996,9 @@ mod tests {
             &self.out
         }
 
-        fn close(&mut self, _a: &Base) -> Result<(), Error> {
+        fn close(&mut self, _a: &Base) -> Result<Status, Error> {
             *self.closed.borrow_mut() = true;
-            Ok(())
+            Ok(Status::Ok)
         }
     }
 
@@ -2309,9 +2371,9 @@ mod tests {
             fn block(&self) -> &[u8] {
                 &[]
             }
-            fn close(&mut self, node: usize) -> Result<(), Error> {
+            fn close(&mut self, node: usize) -> Result<Status, Error> {
                 self.0.borrow_mut().push(format!("close {node}"));
-                Ok(())
+                Ok(Status::Ok)
             }
         }
         let closed = Rc::new(Cell_::new(Vec::new()));
@@ -2347,8 +2409,8 @@ mod tests {
             Ok(self.bid)
         }
 
-        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {
-            Err(Error::recorded(ARCHIVE_EOF))
+        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<Status, Error> {
+            Ok(Status::Eof)
         }
 
         fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
@@ -2460,7 +2522,7 @@ mod tests {
         let log = Rc::default();
         let mut r = Read::default();
         r.register_format(fake::<0>(1, &log)).unwrap();
-        assert_eq!(r.register_format(fake::<0>(1, &log)).unwrap_err().code, ARCHIVE_WARN);
+        assert_eq!(r.register_format(fake::<0>(1, &log)).unwrap(), Status::Warn);
         assert_eq!(r.formats.len(), 1);
         for _ in 0..16 {
             r.register_bidder(Box::new(UpperBidder(1))).unwrap();
@@ -2570,10 +2632,12 @@ mod tests {
             Ok(1)
         }
 
-        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {
+        fn read_header(&mut self, r: &mut Reader<'_>, _: &mut Entry) -> Result<Status, Error> {
             match self.headers.pop().unwrap_or(ARCHIVE_EOF) {
-                ARCHIVE_OK => Ok(()),
-                code => Err(Error::new(code, 0, if code == ARCHIVE_WARN { "odd" } else { "" })),
+                ARCHIVE_OK => Ok(Status::Ok),
+                ARCHIVE_WARN => Ok(r.warn(0, "odd")),
+                ARCHIVE_EOF => Ok(Status::Eof),
+                code => Err(Error::new(code, 0, "bad header")),
             }
         }
 
@@ -2630,7 +2694,7 @@ mod tests {
         let (mut r, a) = opened(Script::new(&[(7, b"hi")], 9));
         let first = r.read_data_block(&a, |d| match d {
             Data::Block { data, offset } => Some((data.to_vec(), offset)),
-            Data::Eof { .. } => None,
+            Data::Eof { .. } | Data::Warn => None,
         });
         assert_eq!(first, Ok(Some((b"hi".to_vec(), 7))));
         assert!(matches!(r.read_data_block(&a, |d| matches!(d, Data::Eof { offset: 9 })), Ok(true)));
@@ -2718,5 +2782,71 @@ mod tests {
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"abc"), ARCHIVE_FATAL);
         assert_eq!((error(&a), a.state.get()), ("bidder failed".into(), state::FATAL));
+    }
+
+    /// A format whose data ends in a warning.
+    struct WarnsAtTheEnd(bool);
+
+    impl Format for WarnsAtTheEnd {
+        fn name(&self) -> &'static str {
+            "warns"
+        }
+
+        fn bid(&mut self, _: &mut Reader<'_>, _: c_int) -> Result<c_int, Error> {
+            Ok(1)
+        }
+
+        fn read_header(&mut self, r: &mut Reader<'_>, _: &mut Entry) -> Result<Status, Error> {
+            // Record the warning first, then go on: nothing is skipped.
+            let warned = r.warn(libc::EILSEQ, "header oddity");
+            r.set_format(7, c"warns");
+            Ok(warned)
+        }
+
+        fn read_data<'x>(&'x mut self, r: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
+            if std::mem::replace(&mut self.0, true) {
+                return Ok(Data::Eof { offset: 0 });
+            }
+            r.warn(libc::EILSEQ, "bad checksum");
+            Ok(Data::Warn)
+        }
+    }
+
+    #[test]
+    fn warnings_continue_and_are_not_errors() {
+        let mut r = Read::default();
+        r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"x"), ARCHIVE_OK);
+        let mut e = Entry::new(None);
+        assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_WARN);
+        // The entry is usable: the state is DATA and the format got set.
+        assert_eq!((a.state.get(), a.format.get()), (state::DATA, 7));
+        assert_eq!(error(&a), "header oddity");
+        // The data's warning is a status, with no block.
+        let got = r.read_data_block(&a, |d| matches!(d, Data::Warn));
+        assert_eq!(got, Ok(true));
+        assert_eq!(error(&a), "bad checksum");
+        // A skip stops at a warning and reports it, but the handle is fine.
+        let (mut r, a) = {
+            let mut r = Read::default();
+            r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap();
+            let a = Base::new(READ_MAGIC);
+            open_with(&mut r, &a, b"x");
+            (r, a)
+        };
+        a.state.set(state::DATA);
+        assert_eq!(r.read_data_skip(&a), ARCHIVE_WARN);
+        assert_eq!(a.state.get(), state::HEADER);
+        // read_data hands the status on, as upstream's archive_read_data does.
+        let (mut r, a) = {
+            let mut r = Read::default();
+            r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap();
+            let a = Base::new(READ_MAGIC);
+            open_with(&mut r, &a, b"x");
+            (r, a)
+        };
+        a.state.set(state::DATA);
+        assert_eq!(r.read_data(&a, &mut [0; 4]), ARCHIVE_WARN as isize);
     }
 }
