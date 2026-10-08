@@ -99,10 +99,6 @@ impl Filenames {
         }
     }
 
-    /// The device and inode of the current node, if it is a regular file.
-    pub fn identity(&self) -> Option<(i64, i64)> {
-        self.nodes.get(self.current)?.identity
-    }
 }
 
 /// Whether `fd` is a device that seeks like a disk.
@@ -313,8 +309,9 @@ impl Client for Filenames {
         Ok(Status::Ok)
     }
 
+    /// The device and inode of the current node, if it is a regular file.
     fn skip_file(&self) -> Option<(i64, i64)> {
-        self.identity()
+        self.nodes.get(self.current)?.identity
     }
 }
 

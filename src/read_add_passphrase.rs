@@ -25,7 +25,6 @@
 
 // Ported from libarchive/archive_read_add_passphrase.c.
 
-#![allow(dead_code)] // used by the format readers (phases 3-4)
 
 //! Decryption passphrases: the list `archive_read_add_passphrase` builds, the
 //! callback of last resort, and the candidate iteration format readers drive
@@ -44,10 +43,13 @@ pub struct Passphrases {
     list: VecDeque<Vec<u8>>,
     /// How many candidates are left to try for the current entry; negative
     /// before the first `next` after a `reset`.
+    #[allow(dead_code)] // read by `next`, which the format readers call
     candidate: i32,
     callback: Option<PassphraseCallback>,
 }
 
+// `reset` and `next` are for the encrypted-format readers (phases 3-4).
+#[allow(dead_code)]
 impl Passphrases {
     fn rotate(&mut self) {
         if self.list.len() > 1 {

@@ -232,3 +232,13 @@ Differences:
   and, on Linux, block devices count.
 - Passphrases are zeroed before they are freed (behind `black_box`), as
   upstream does with `memset`.
+- `archive_read_data_into_fd`: a `write` that returns 0 for a non-empty
+  buffer is a "Write error" (EIO); upstream loops forever. Offsets use
+  checked subtraction; one that overflows is an overrun.
+- A C open or switch callback that returns `ARCHIVE_WARN` is a failure and
+  reports `ARCHIVE_FATAL`; upstream returns the warning from
+  `archive_read_open1` (the archive is fatal either way). A close callback's
+  warning during a volume switch is ignored; upstream treats it as a failed
+  switch and the read ends there (archive_read.c).
+- A C read callback that returns bytes with a NULL buffer fails with EINVAL
+  ("Read callback returned a NULL buffer"); upstream copies from NULL.

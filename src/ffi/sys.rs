@@ -1,5 +1,3 @@
-#![allow(dead_code)] // used by the clients being ported (filenames, data_into_fd)
-
 //! Safe wrappers over the file-descriptor and `FILE *` calls the read
 //! clients make. All `unsafe` for that lives here.
 
@@ -21,10 +19,6 @@ impl Stat {
 
     pub fn is_reg(&self) -> bool {
         self.kind() == u32::from(libc::S_IFREG)
-    }
-
-    pub fn is_chr(&self) -> bool {
-        self.kind() == u32::from(libc::S_IFCHR)
     }
 
     pub fn is_blk(&self) -> bool {
@@ -145,7 +139,7 @@ mod tests {
         f.flush().unwrap();
         let fd = Fd(f.as_raw_fd());
         let st = fd.fstat().unwrap();
-        assert!(st.is_reg() && !st.is_chr() && !st.is_blk());
+        assert!(st.is_reg() && !st.is_blk());
         assert_eq!(st.size, 11);
         let mut buf = [0; 5];
         assert_eq!(fd.lseek(6, libc::SEEK_SET), Ok(6));

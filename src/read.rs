@@ -25,8 +25,6 @@
 
 // Ported from libarchive/archive_read.c.
 
-// The format readers and filters that use this API arrive in later phases.
-#![allow(dead_code)]
 
 //! The read side of `struct archive`: the filter chain with its read-ahead
 //! buffer, and the traits that format readers and decompression filters are
@@ -126,6 +124,7 @@ impl Whence {
     }
 
     /// The origin for a C `whence`.
+    #[allow(dead_code)] // for the formats' seek_data (phase 4)
     pub fn from_c(whence: c_int) -> Option<Whence> {
         match whence {
             libc::SEEK_SET => Some(Whence::Set),
@@ -161,6 +160,7 @@ impl Status {
 }
 
 impl Base {
+    #[allow(dead_code)] // for the format readers (phases 3-4)
     /// Records a warning, as `archive_set_error` before `return
     /// ARCHIVE_WARN`, and gives the status to return.
     pub fn warn(&self, errno: c_int, msg: impl AsRef<[u8]>) -> Status {
@@ -280,6 +280,7 @@ pub trait Client {
 
     /// The device and inode of the input being read, if it is a regular
     /// file: extraction must not overwrite it.
+    #[allow(dead_code)] // for archive_read_extract (phase 5)
     fn skip_file(&self) -> Option<(i64, i64)> {
         None
     }
@@ -890,6 +891,8 @@ pub struct Reader<'a> {
     passphrases: &'a mut Passphrases,
 }
 
+// What the format readers and filters (phases 2-4) call; the tests use all of it.
+#[allow(dead_code)]
 impl<'a> Reader<'a> {
     /// The handle, to record warnings and set the format. The reference does
     /// not borrow the reader, so it can be used while a `read_ahead` slice is
@@ -1116,6 +1119,7 @@ pub fn new() -> Handle {
 
 impl Read {
     /// A reader over the whole chain.
+    #[cfg(test)]
     pub fn reader<'a>(&'a mut self, a: &'a Base) -> Reader<'a> {
         Reader {
             chain: &mut self.chain,
@@ -1227,6 +1231,7 @@ pub enum Data<'r> {
     /// A problem with the entry's data, already recorded on the handle (see
     /// `Reader::warn`): there is no block this time, and the caller gets
     /// `ARCHIVE_WARN`. A later call may carry on.
+    #[allow(dead_code)] // returned by the zip and rar readers (phase 4)
     Warn,
 }
 
@@ -1365,6 +1370,7 @@ impl Read {
     }
 
     /// `__archive_read_register_bidder`.
+    #[allow(dead_code)] // called by the filters' `support` functions (phase 2)
     pub fn register_bidder(&mut self, bidder: Box<dyn FilterBidder>) -> Result<Status, Error> {
         if self.bidders.len() >= MAX_REGISTERED {
             return Err(Error::fatal(
@@ -1804,6 +1810,7 @@ impl Read {
 
     /// The device and inode of the input, which extraction must not
     /// overwrite.
+    #[allow(dead_code)] // for archive_read_extract (phase 5)
     pub fn skip_file(&self) -> Option<(i64, i64)> {
         self.skip_file.or_else(|| match &self.chain.first()?.imp {
             Imp::Client(c) => c.client.skip_file(),
