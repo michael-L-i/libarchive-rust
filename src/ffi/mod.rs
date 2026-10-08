@@ -7,7 +7,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[rustfmt::skip]
 mod stubs;
-#[allow(dead_code)]
 pub(crate) mod charset;
 
 macro_rules! opaque {

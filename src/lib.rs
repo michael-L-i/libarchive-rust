@@ -2,5 +2,5 @@
 
 pub mod ffi;
 
-#[allow(dead_code)]
+mod archive_string;
 mod archive_string_composition;
