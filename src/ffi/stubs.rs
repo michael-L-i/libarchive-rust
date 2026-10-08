@@ -21,11 +21,6 @@ use super::{
 use std::ffi::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_new() -> *mut Archive {
-    std::ptr::null_mut()
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_compression_all(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }

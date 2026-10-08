@@ -67,14 +67,22 @@ The crate builds `libarchive.{so,dylib,a}`: `[lib] name = "archive"`,
   every kind shares (magic, state, error, format) plus a `Kind` enum for read,
   write, write-disk, read-disk and match. A `struct archive_entry *` is a
   leaked `Box<Entry>`. The `*_free` functions reclaim them.
+- Exported functions borrow the handle as `&Handle`, never `&mut`: client
+  callbacks (open, read, skip, close, passphrase) can call back into the same
+  handle, and two live `&mut` would be undefined behavior. State that changes
+  is a `Cell`/`RefCell` in `Base`, or sits in the kind's own `RefCell`. A
+  re-entrant borrow of the same kind panics, and `guard` turns that into
+  `ARCHIVE_FATAL`; calls that touch only `Base` (`archive_set_error`,
+  `archive_errno`) always work. Never hold a borrow across a callback.
 - Exported functions are thin: check the handle with the port of
   `__archive_check_magic` (same messages, same state machine), run the body
   under `guard`, convert arguments, call safe Rust, convert the result back.
 - Archive strings are bytes (`Vec<u8>`, `&[u8]`), never `String`; pathnames
   aren't UTF-8.
-- A returned `const char *` points into a `CString` owned by the handle or
-  entry, valid until that field changes or the object is freed, as upstream
-  promises.
+- A returned `const char *` points into a NUL-terminated buffer owned by the
+  handle or entry, valid until that field changes or the object is freed, as
+  upstream promises. Clear and refill the buffer in place (upstream's
+  `archive_string` model); never drop or replace it while the handle lives.
 - libc (locale, iconv, file descriptors, stat) is reached only through safe
   wrappers in `src/ffi/`.
 

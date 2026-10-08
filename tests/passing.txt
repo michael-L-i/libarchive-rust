@@ -1,2 +1,5 @@
 # Upstream tests that pass against libarchive-rust. Maintained by scripts/run-tests --update.
 test_archive_api_feature
+test_archive_clear_error
+test_archive_read_close_twice
+test_archive_set_error

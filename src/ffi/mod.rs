@@ -6,6 +6,7 @@ use std::marker::{PhantomData, PhantomPinned};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 mod archive;
+mod read;
 #[rustfmt::skip]
 mod stubs;
 
@@ -37,9 +38,7 @@ pub type archive_switch_callback =
 pub type archive_passphrase_callback =
     Option<unsafe extern "C" fn(*mut Archive, *mut c_void) -> *const c_char>;
 
-pub use crate::archive::{
-    ARCHIVE_EOF, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_RETRY, ARCHIVE_WARN,
-};
+pub use crate::archive::{ARCHIVE_FATAL, ARCHIVE_OK};
 
 /// Runs `f`, returning `fallback` if it panics so panics never cross the C ABI.
 pub fn guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {

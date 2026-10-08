@@ -71,7 +71,7 @@ impl Base {
     /// Returns `ARCHIVE_OK`, or records the error, makes the handle fatal and
     /// returns `ARCHIVE_FATAL`. Exported functions reach this through
     /// `ffi::archive::checked`.
-    pub fn check_magic(&mut self, magic: u32, states: u32, func: &str) -> c_int {
+    pub fn check_magic(&self, magic: u32, states: u32, func: &str) -> c_int {
         // If this isn't some form of archive handle, the library user has
         // screwed up so badly that we have no reliable way to report an error.
         let Some(handle_type) = handle_type_name(self.magic) else {
@@ -85,20 +85,20 @@ impl Base {
             format!(
                 "PROGRAMMER ERROR: Function '{func}' invoked on '{handle_type}' archive object, which is not supported"
             )
-        } else if self.state & states == 0 {
+        } else if self.state.get() & states == 0 {
             // If we're already FATAL, don't overwrite the error.
-            if self.state == state::FATAL {
+            if self.state.get() == state::FATAL {
                 return ARCHIVE_FATAL;
             }
             format!(
                 "INTERNAL ERROR: Function '{func}' invoked with archive structure in state '{}', should be in state '{}'",
-                all_states(self.state),
+                all_states(self.state.get()),
                 all_states(states)
             )
         } else {
             return ARCHIVE_OK;
         };
-        self.state = state::FATAL;
+        self.state.set(state::FATAL);
         self.raise(Error::fatal(ARCHIVE_ERRNO_MISC, err))
     }
 }
@@ -107,31 +107,30 @@ impl Base {
 mod tests {
     use super::*;
 
-    fn error(a: &Base) -> &str {
-        a.error_string()
-            .and_then(|e| std::str::from_utf8(e).ok())
-            .unwrap_or("")
+    fn error(a: &Base) -> String {
+        let msg = a.error_string();
+        msg.map_or_else(String::new, |m| String::from_utf8_lossy(&m).into_owned())
     }
 
     #[test]
     fn right_kind_and_state_passes() {
-        let mut a = Base::new(READ_MAGIC);
+        let a = Base::new(READ_MAGIC);
         assert_eq!(
             a.check_magic(READ_MAGIC, state::NEW | state::OPEN, "f"),
             ARCHIVE_OK
         );
-        assert_eq!((a.state, error(&a)), (state::NEW, ""));
+        assert_eq!((a.state.get(), error(&a)), (state::NEW, String::new()));
     }
 
     #[test]
     fn wrong_kind_is_fatal() {
-        let mut a = Base::new(WRITE_DISK_MAGIC);
+        let a = Base::new(WRITE_DISK_MAGIC);
         assert_eq!(
             a.check_magic(READ_MAGIC, state::ANY, "archive_read_close"),
             ARCHIVE_FATAL
         );
-        assert_eq!(a.state, state::FATAL);
-        assert_eq!(a.errno, -1);
+        assert_eq!(a.state.get(), state::FATAL);
+        assert_eq!(a.errno.get(), -1);
         assert_eq!(
             error(&a),
             "PROGRAMMER ERROR: Function 'archive_read_close' invoked on 'archive_write_disk' archive object, which is not supported"
@@ -140,13 +139,13 @@ mod tests {
 
     #[test]
     fn wrong_state_names_both_states() {
-        let mut a = Base::new(READ_MAGIC);
-        a.state = state::DATA | state::EOF;
+        let a = Base::new(READ_MAGIC);
+        a.state.set(state::DATA | state::EOF);
         assert_eq!(
             a.check_magic(READ_MAGIC, state::NEW | state::OPEN | state::CLOSED, "g"),
             ARCHIVE_FATAL
         );
-        assert_eq!(a.state, state::FATAL);
+        assert_eq!(a.state.get(), state::FATAL);
         assert_eq!(
             error(&a),
             "INTERNAL ERROR: Function 'g' invoked with archive structure in state 'data/eof', should be in state 'new/open/closed'"
@@ -155,11 +154,11 @@ mod tests {
 
     #[test]
     fn fatal_state_keeps_its_error() {
-        let mut a = Base::new(MATCH_MAGIC);
-        a.state = state::FATAL;
+        let a = Base::new(MATCH_MAGIC);
+        a.state.set(state::FATAL);
         a.set_error(3, Some(b"first"));
         assert_eq!(a.check_magic(MATCH_MAGIC, state::NEW, "h"), ARCHIVE_FATAL);
-        assert_eq!((a.errno, error(&a)), (3, "first"));
+        assert_eq!((a.errno.get(), error(&a)), (3, "first".to_string()));
     }
 
     #[test]

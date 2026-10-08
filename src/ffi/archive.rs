@@ -8,7 +8,7 @@
 //! stays valid until that field changes or the handle is freed.
 
 use super::{ARCHIVE_FATAL, ARCHIVE_OK, Archive, guard};
-use crate::archive::Handle;
+use crate::archive::{Handle, READ_MAGIC, state};
 use crate::util::{VERSION_NUMBER, VERSION_STRING};
 use crate::version_details as vd;
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -16,40 +16,42 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 /// The prologue shared by every exported function that takes a handle: reject
 /// NULL, then run `f` on the handle under `guard`, so a panic becomes
 /// `fallback` instead of crossing the C ABI.
-pub(super) fn with<T: Copy>(a: *mut Archive, fallback: T, f: impl FnOnce(&mut Handle) -> T) -> T {
+///
+/// `f` gets a `&Handle`, never a `&mut`: a client callback running inside
+/// can call back into the same handle (see `Base`).
+pub(super) fn with<T: Copy>(a: *mut Archive, fallback: T, f: impl FnOnce(&Handle) -> T) -> T {
     guard(fallback, || {
         // SAFETY: `a` is NULL or a handle leaked by a `archive_*_new`
-        // function; as in C, the caller must not use it concurrently.
-        unsafe { a.cast::<Handle>().as_mut() }.map_or(fallback, f)
+        // function, and it is only ever borrowed shared.
+        unsafe { a.cast::<Handle>().as_ref() }.map_or(fallback, f)
     })
 }
 
 /// `with`, preceded by `__archive_check_magic`: if the handle is not of kind
-/// `magic` in one of `states`, record the error and return `fallback`.
-#[allow(dead_code)] // The first user is archive_read_new's family in phase 1d.
-pub(super) fn checked<T: Copy>(
-    a: *mut Archive,
-    magic: u32,
-    states: u32,
-    func: &str,
-    fallback: T,
-    f: impl FnOnce(&mut Handle) -> T,
-) -> T {
-    with(a, fallback, |h| {
-        if h.base.check_magic(magic, states, func) == ARCHIVE_FATAL {
-            return fallback;
-        }
-        f(h)
-    })
+/// `magic` in one of `states`, record the error and return `fallback`. The
+/// function name in the error message is taken from `$name`.
+macro_rules! checked {
+    ($name:ident, $a:expr, $magic:expr, $states:expr, $fallback:expr, |$h:ident| $body:expr) => {
+        with($a, $fallback, |$h| {
+            if $h.base.check_magic($magic, $states, stringify!($name)) == ARCHIVE_FATAL {
+                return $fallback;
+            }
+            $body
+        })
+    };
 }
 
-/// The `(buff, size)` pair of a C data argument.
-fn bytes<'a>(buff: *const c_void, size: usize) -> &'a [u8] {
-    if buff.is_null() {
-        return &[];
+/// The `(buff, size)` pair of a C data argument. `None` if it cannot be a
+/// slice.
+fn bytes<'a>(buff: *const c_void, size: usize) -> Option<&'a [u8]> {
+    if size == 0 {
+        return Some(&[]);
+    }
+    if buff.is_null() || size > isize::MAX as usize {
+        return None;
     }
     // SAFETY: the caller promises `size` readable bytes at `buff`.
-    unsafe { std::slice::from_raw_parts(buff.cast(), size) }
+    Some(unsafe { std::slice::from_raw_parts(buff.cast(), size) })
 }
 
 fn cptr(s: Option<&CStr>) -> *const c_char {
@@ -78,7 +80,7 @@ pub extern "C" fn archive_version_string() -> *const c_char {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_errno(a: *mut Archive) -> c_int {
-    with(a, 0, |h| h.base.errno)
+    with(a, 0, |h| h.base.errno.get())
 }
 
 #[unsafe(no_mangle)]
@@ -104,17 +106,17 @@ pub extern "C" fn archive_copy_error(dest: *mut Archive, src: *mut Archive) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_file_count(a: *mut Archive) -> c_int {
-    with(a, 0, |h| h.base.file_count)
+    with(a, 0, |h| h.base.file_count.get())
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_format(a: *mut Archive) -> c_int {
-    with(a, 0, |h| h.base.format)
+    with(a, 0, |h| h.base.format.get())
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_format_name(a: *mut Archive) -> *const c_char {
-    with(a, std::ptr::null(), |h| cptr(h.base.format_name))
+    with(a, std::ptr::null(), |h| cptr(h.base.format_name.get()))
 }
 
 #[unsafe(no_mangle)]
@@ -124,7 +126,7 @@ pub extern "C" fn archive_compression(a: *mut Archive) -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_compression_name(a: *mut Archive) -> *const c_char {
-    with(a, std::ptr::null(), |h| cptr(h.filter_name(0)))
+    with(a, std::ptr::null(), |h| h.filter_name(0))
 }
 
 /// Number of compressed bytes processed.
@@ -170,7 +172,7 @@ pub extern "C" fn archive_filter_count(a: *mut Archive) -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_filter_name(a: *mut Archive, n: c_int) -> *const c_char {
-    with(a, std::ptr::null(), |h| cptr(h.filter_name(n)))
+    with(a, std::ptr::null(), |h| h.filter_name(n))
 }
 
 #[unsafe(no_mangle)]
@@ -185,7 +187,8 @@ pub extern "C" fn archive_free(a: *mut Archive) -> c_int {
     }
     guard(ARCHIVE_FATAL, || {
         // SAFETY: `a` is a live handle and the caller gives up ownership.
-        unsafe { Box::from_raw(a.cast::<Handle>()) }.free()
+        let h = unsafe { Box::from_raw(a.cast::<Handle>()) };
+        (*h).free()
     })
 }
 
@@ -211,7 +214,14 @@ pub extern "C" fn archive_write_finish(a: *mut Archive) -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_close(a: *mut Archive) -> c_int {
-    with(a, ARCHIVE_FATAL, |h| h.close())
+    checked!(
+        archive_read_close,
+        a,
+        READ_MAGIC,
+        state::ANY | state::FATAL,
+        ARCHIVE_FATAL,
+        |h| h.close()
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -232,7 +242,7 @@ pub extern "C" fn archive_write_finish_entry(a: *mut Archive) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_data(a: *mut Archive, buff: *const c_void, size: usize) -> isize {
     with(a, ARCHIVE_FATAL as isize, |h| {
-        h.write_data(bytes(buff, size))
+        bytes(buff, size).map_or(ARCHIVE_FATAL as isize, |b| h.write_data(b))
     })
 }
 
@@ -244,7 +254,7 @@ pub extern "C" fn archive_write_data_block(
     offset: i64,
 ) -> isize {
     with(a, ARCHIVE_FATAL as isize, |h| {
-        h.write_data_block(bytes(buff, size), offset)
+        bytes(buff, size).map_or(ARCHIVE_FATAL as isize, |b| h.write_data_block(b, offset))
     })
 }
 
@@ -374,37 +384,10 @@ pub extern "C" fn archive_libpcre2_version() -> *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{ARCHIVE_WARN, Base};
-    use crate::archive::{Kind, Ops, READ_MAGIC, WRITE_MAGIC, state};
-    use std::ffi::c_char;
+    use crate::ffi::read::archive_read_new;
 
     unsafe extern "C" {
         fn archive_set_error(a: *mut Archive, errno: c_int, fmt: *const c_char, ...);
-    }
-
-    struct Fake;
-
-    impl Ops for Fake {
-        fn close(&mut self, _a: &mut Base) -> c_int {
-            ARCHIVE_OK
-        }
-        fn free(&mut self, _a: &mut Base) -> c_int {
-            ARCHIVE_WARN
-        }
-        fn filter_count(&self) -> c_int {
-            1
-        }
-        fn filter_code(&self, n: c_int) -> c_int {
-            n + 5
-        }
-        fn filter_name(&self, _n: c_int) -> Option<&CStr> {
-            Some(c"fake")
-        }
-    }
-
-    fn new_handle(magic: u32) -> *mut Archive {
-        let h = Handle::new(magic, Kind::Test(Box::new(Fake)));
-        Box::into_raw(Box::new(h)).cast()
     }
 
     fn string(p: *const c_char) -> Option<String> {
@@ -414,7 +397,7 @@ mod tests {
 
     #[test]
     fn set_error_formats_and_reports() {
-        let a = new_handle(READ_MAGIC);
+        let a = archive_read_new();
         assert_eq!(string(archive_error_string(a)), None);
         // SAFETY: `a` is a live handle and the format matches its arguments.
         unsafe { archive_set_error(a, 22, c"bad %s #%d".as_ptr(), c"entry".as_ptr(), 7 as c_int) };
@@ -424,7 +407,7 @@ mod tests {
             Some("bad entry #7")
         );
 
-        let b = new_handle(READ_MAGIC);
+        let b = archive_read_new();
         archive_copy_error(b, a);
         assert_eq!(
             string(archive_error_string(b)).as_deref(),
@@ -441,13 +424,13 @@ mod tests {
             (archive_errno(b), string(archive_error_string(b))),
             (5, None)
         );
-        assert_eq!(archive_free(a), ARCHIVE_WARN);
-        assert_eq!(archive_free(b), ARCHIVE_WARN);
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+        assert_eq!(archive_free(b), ARCHIVE_OK);
     }
 
     #[test]
     fn error_string_pointer_survives_clear_and_shorter_messages() {
-        let a = new_handle(READ_MAGIC);
+        let a = archive_read_new();
         // SAFETY: `a` is a live handle and the formats take no arguments.
         unsafe { archive_set_error(a, 1, c"a long first message".as_ptr()) };
         let p = archive_error_string(a);
@@ -458,21 +441,42 @@ mod tests {
         unsafe { archive_set_error(a, 1, c"short".as_ptr()) };
         assert_eq!(archive_error_string(a), p);
         assert_eq!(string(p).as_deref(), Some("short"));
-        assert_eq!(archive_free(a), ARCHIVE_WARN);
+        assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 
     #[test]
-    fn dispatch_and_null_handles() {
-        let a = new_handle(WRITE_MAGIC);
-        assert_eq!(archive_filter_count(a), 1);
-        assert_eq!(archive_compression(a), 5);
-        assert_eq!(string(archive_compression_name(a)).as_deref(), Some("fake"));
+    fn read_handle_lifecycle() {
+        let a = archive_read_new();
+        assert!(!a.is_null());
+        assert_eq!((archive_filter_count(a), archive_compression(a)), (0, -1));
+        assert_eq!(string(archive_compression_name(a)), None);
+        assert_eq!(archive_position_compressed(a), -1);
+        archive_clear_error(a);
+        assert_eq!(archive_read_close(a), ARCHIVE_OK);
+        assert_eq!(archive_read_close(a), ARCHIVE_OK);
         assert_eq!(archive_write_fail(a), state::FATAL as c_int);
-        assert_eq!(archive_write_free(a), ARCHIVE_WARN);
+        assert_eq!(archive_read_free(a), ARCHIVE_OK);
+
+        let b = archive_read_new();
+        assert_eq!(archive_free(b), ARCHIVE_OK);
+    }
+
+    #[test]
+    fn bad_arguments_are_rejected() {
+        let a = archive_read_new();
+        let byte = 0u8;
+        let p = std::ptr::from_ref(&byte).cast();
+        assert_eq!(archive_write_data(a, p, usize::MAX), ARCHIVE_FATAL as isize);
+        assert_eq!(
+            archive_write_data(a, std::ptr::null(), 1),
+            ARCHIVE_FATAL as isize
+        );
+        assert_eq!(archive_free(a), ARCHIVE_OK);
 
         let null = std::ptr::null_mut();
         assert_eq!(archive_free(null), ARCHIVE_OK);
         assert_eq!(archive_filter_count(null), ARCHIVE_FATAL);
+        assert_eq!(archive_read_close(null), ARCHIVE_FATAL);
         assert_eq!(archive_errno(null), 0);
         assert_eq!(string(archive_error_string(null)), None);
     }

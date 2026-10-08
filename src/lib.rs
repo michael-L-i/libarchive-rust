@@ -1,8 +1,9 @@
 #![deny(unsafe_code)]
 
-pub mod archive;
-pub mod check_magic;
-pub mod ffi;
-pub mod util;
-pub mod version_details;
-pub mod r#virtual;
+mod archive;
+mod check_magic;
+mod ffi;
+mod read;
+mod util;
+mod version_details;
+mod r#virtual;
