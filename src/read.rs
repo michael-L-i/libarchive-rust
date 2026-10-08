@@ -902,6 +902,13 @@ pub struct Read {
     pub(crate) formats: Vec<Box<dyn Format>>,
     /// The active format: an index into `formats`.
     pub(crate) format: Option<usize>,
+    /// File offset of the beginning of the most recently read header.
+    header_position: i64,
+    /// Declared size of the entry whose header was most recently read, if
+    /// any: lets format-agnostic consumers like `archive_read_data_into_fd`
+    /// cap their output at the size an entry actually promised.
+    pub(crate) entry_bytes_declared: Option<i64>,
+    read_data: ReadData,
 }
 
 /// `archive_read_new`.
@@ -1063,7 +1070,7 @@ pub trait Format: Any {
     /// The next block of the entry's data. A format that returns the data in
     /// place (the usual zero-copy case) consumes it on its next call, since
     /// the slice must stay valid until then.
-    fn read_data<'r>(&mut self, r: &'r mut Reader<'_>) -> Result<Data<'r>, Error>;
+    fn read_data<'x>(&'x mut self, r: &'x mut Reader<'_>) -> Result<Data<'x>, Error>;
 
     /// Skips the rest of the entry's data. The default reads and discards it.
     fn read_data_skip(&mut self, r: &mut Reader<'_>) -> Result<(), Error> {
@@ -1356,6 +1363,296 @@ impl Read {
         self.format = Some(index);
         if warn { ARCHIVE_WARN } else { ARCHIVE_OK }
     }
+}
+
+/// Copies `data`, which starts at entry offset `blk_off`, into `dest` after
+/// the `written` bytes already there, padding the gap since the last output
+/// (`out_off`) with zeros: callers of `archive_read_data` can be completely
+/// ignorant of sparse files. Returns how many bytes of `data` it used.
+fn copy_out(
+    dest: &mut [u8],
+    written: &mut usize,
+    out_off: &mut i64,
+    blk_off: &mut i64,
+    data: &[u8],
+) -> usize {
+    let total = dest.len();
+    // Compute the amount of zero padding needed.
+    let space = i64::try_from(total - *written).unwrap_or(i64::MAX);
+    let gap = if out_off.saturating_add(space) < *blk_off {
+        total - *written
+    } else if *out_off < *blk_off {
+        usize::try_from(*blk_off - *out_off).unwrap_or(0)
+    } else {
+        0
+    };
+    if let Some(zeros) = dest.get_mut(*written..*written + gap) {
+        zeros.fill(0);
+    }
+    *written += gap;
+    *out_off = out_off.saturating_add(i64::try_from(gap).unwrap_or(0));
+
+    // Copy data if there is any space left.
+    let n = data.len().min(total - *written);
+    if let Some(out) = dest.get_mut(*written..*written + n) {
+        out.copy_from_slice(&data[..n]);
+    }
+    *written += n;
+    let n64 = i64::try_from(n).unwrap_or(0);
+    *out_off = out_off.saturating_add(n64);
+    *blk_off = blk_off.saturating_add(n64);
+    n
+}
+
+impl Read {
+    /// The active format and a `Reader` over the chain, as separate borrows.
+    fn active<'a>(&'a mut self, a: &'a Base) -> Option<(&'a mut dyn Format, Reader<'a>)> {
+        let format = self.formats.get_mut(self.format?)?;
+        let rd = Reader {
+            chain: &mut self.chain,
+            a,
+            passphrases: &mut self.passphrases,
+        };
+        Some((format.as_mut(), rd))
+    }
+
+    /// `_archive_read_data_block`, after the caller has checked the state:
+    /// gets the next block of the entry's data and gives it to `f`, which
+    /// must copy what it needs (or hand out a pointer that stays valid until
+    /// the next read). `Err` is the status to return, already recorded.
+    pub fn read_data_block<R>(
+        &mut self,
+        a: &Base,
+        f: impl FnOnce(Data<'_>) -> R,
+    ) -> Result<R, c_int> {
+        let Some((format, mut rd)) = self.active(a) else {
+            a.state.set(state::FATAL);
+            return Err(a.raise(Error::fatal(
+                ARCHIVE_ERRNO_PROGRAMMER,
+                "Internal error: No format->read_data function registered",
+            )));
+        };
+        match format.read_data(&mut rd) {
+            Ok(data) => Ok(f(data)),
+            Err(e) => {
+                let code = a.raise(e);
+                if code == ARCHIVE_FATAL {
+                    a.state.set(state::FATAL);
+                }
+                Err(code)
+            }
+        }
+    }
+
+    /// `archive_read_data_skip`, after the caller has checked the state:
+    /// skips over all remaining data in this entry.
+    pub fn read_data_skip(&mut self, a: &Base) -> c_int {
+        let r = match self.active(a) {
+            Some((format, mut rd)) => format.read_data_skip(&mut rd),
+            None => Ok(()),
+        };
+        let mut code = r.map_or_else(|e| a.raise(e), |()| ARCHIVE_OK);
+        if code == ARCHIVE_EOF {
+            code = ARCHIVE_OK;
+        }
+        if code == ARCHIVE_FATAL {
+            a.state.set(state::FATAL);
+        } else {
+            a.state.set(state::HEADER);
+        }
+        code
+    }
+
+    /// `archive_seek_data`, after the caller has checked the state.
+    pub fn seek_data(&mut self, a: &Base, offset: i64, whence: Whence) -> i64 {
+        let Some((format, mut rd)) = self.active(a) else {
+            return a.raise(Error::fatal(
+                ARCHIVE_ERRNO_PROGRAMMER,
+                "Internal error: no format",
+            ))
+            .into();
+        };
+        match format.seek_data(&mut rd, offset, whence) {
+            Ok(r) => r,
+            Err(e) => {
+                let code = a.raise(e);
+                if code == ARCHIVE_FATAL {
+                    a.state.set(state::FATAL);
+                }
+                code.into()
+            }
+        }
+    }
+
+    /// `__archive_reset_read_data`: forgets the state of `read_data`, for a
+    /// new entry.
+    fn reset_read_data(&mut self) {
+        self.read_data = ReadData::default();
+    }
+
+    /// `archive_read_data`, after the caller has checked the state: a
+    /// `read(2)`-style read of the entry's data, with holes filled with
+    /// zeros. Returns the byte count, or a negative status. Don't mix this
+    /// with `read_data_block` on one entry.
+    pub fn read_data(&mut self, a: &Base, dest: &mut [u8]) -> isize {
+        let mut st = std::mem::take(&mut self.read_data);
+        let mut written = 0;
+        let result = 'read: loop {
+            if written == dest.len() {
+                break written as isize;
+            }
+            if st.offset == st.output_offset && st.pending.is_empty() {
+                let (mut out_off, mut blk_off) = (st.output_offset, st.offset);
+                let mut leftover = Vec::new();
+                let mut out_of_order = false;
+                let mut eof = false;
+                let got = self.read_data_block(a, |d| match d {
+                    Data::Eof { offset } => {
+                        blk_off = offset;
+                        eof = true;
+                    }
+                    Data::Block { data, offset } => {
+                        blk_off = offset;
+                        if blk_off < out_off {
+                            out_of_order = true;
+                            return;
+                        }
+                        let n = copy_out(dest, &mut written, &mut out_off, &mut blk_off, data);
+                        leftover = data[n..].to_vec();
+                    }
+                });
+                if let Err(code) = got {
+                    break 'read code as isize;
+                }
+                (st.output_offset, st.offset, st.pending) = (out_off, blk_off, leftover);
+                if eof && blk_off == out_off {
+                    break 'read written as isize;
+                }
+                if out_of_order || blk_off < out_off {
+                    break 'read a.raise(Error::new(
+                        ARCHIVE_RETRY,
+                        ARCHIVE_ERRNO_FILE_FORMAT,
+                        "Encountered out-of-order sparse blocks",
+                    )) as isize;
+                }
+                continue;
+            }
+            if st.offset < st.output_offset {
+                break a.raise(Error::new(
+                    ARCHIVE_RETRY,
+                    ARCHIVE_ERRNO_FILE_FORMAT,
+                    "Encountered out-of-order sparse blocks",
+                )) as isize;
+            }
+            let n = copy_out(
+                dest,
+                &mut written,
+                &mut st.output_offset,
+                &mut st.offset,
+                &st.pending,
+            );
+            st.pending.drain(..n);
+        };
+        self.read_data = st;
+        result
+    }
+
+    /// `archive_read_header_position`.
+    pub fn header_position(&self) -> i64 {
+        self.header_position
+    }
+
+    /// `archive_read_format_capabilities`.
+    pub fn format_capabilities(&self) -> c_int {
+        self.format
+            .and_then(|i| self.formats.get(i))
+            .map_or(0, |f| f.capabilities())
+    }
+
+    /// `archive_read_has_encrypted_entries`.
+    pub fn has_encrypted_entries(&self) -> c_int {
+        if self.format_capabilities() & CAPS_ENCRYPT == 0 {
+            // Format in general doesn't support encryption.
+            return ENCRYPTION_UNSUPPORTED;
+        }
+        // A reader potentially has read enough data now.
+        self.format
+            .and_then(|i| self.formats.get(i))
+            .map_or(ENCRYPTION_DONT_KNOW, |f| f.has_encrypted_entries())
+    }
+
+    /// `_archive_read_next_header2`, after the caller has checked the state.
+    pub fn next_header2(&mut self, a: &Base, entry: &mut Entry) -> c_int {
+        let mut r1 = ARCHIVE_OK;
+        // TODO(part B): archive_entry_clear(entry)
+        a.clear_error();
+
+        // If client didn't consume entire data, skip any remainder (This is
+        // especially important for GNU incremental directories.) A header
+        // that failed to parse (DATA_RECOVERY) still needs the same
+        // treatment: whatever of its body the format reader left unconsumed
+        // must be skipped before we can read the next header.
+        if matches!(a.state.get(), state::DATA | state::DATA_RECOVERY) {
+            r1 = self.read_data_skip(a);
+            if r1 == ARCHIVE_EOF {
+                a.set_error(libc::EIO, Some(b"Premature end-of-file"));
+            }
+            if r1 == ARCHIVE_EOF || r1 == ARCHIVE_FATAL {
+                a.state.set(state::FATAL);
+                return ARCHIVE_FATAL;
+            }
+        }
+
+        // Record start-of-header offset in uncompressed stream.
+        self.header_position = self.chain.last().map_or(0, |s| s.position);
+
+        a.file_count.set(a.file_count.get() + 1);
+        let r2 = match self.active(a) {
+            Some((format, mut rd)) => format
+                .read_header(&mut rd, entry)
+                .map_or_else(|e| a.raise(e), |()| ARCHIVE_OK),
+            None => ARCHIVE_FATAL,
+        };
+
+        // EOF and FATAL are persistent at this layer. By modifying the
+        // state, we guarantee that future calls to read a header or read
+        // data will fail.
+        match r2 {
+            ARCHIVE_EOF => {
+                a.state.set(state::EOF);
+                // Revert a file counter.
+                a.file_count.set(a.file_count.get() - 1);
+            }
+            ARCHIVE_OK | ARCHIVE_WARN => a.state.set(state::DATA),
+            ARCHIVE_FATAL => a.state.set(state::FATAL),
+            // This entry's header could not be parsed, so its metadata
+            // cannot be trusted. DATA_RECOVERY still permits skipping past
+            // it (the format reader is responsible for ensuring that's
+            // actually possible), but blocks archive_read_data() and
+            // friends, which all check for DATA specifically.
+            ARCHIVE_FAILED => a.state.set(state::DATA_RECOVERY),
+            _ => {}
+        }
+
+        // TODO(part B): the entry's size, if it is set and the header is
+        // OK or a WARN, for archive_read_data_into_fd to enforce.
+        self.entry_bytes_declared = None;
+        self.reset_read_data();
+
+        // EOF always wins; otherwise return the worst error.
+        if r2 < r1 || r2 == ARCHIVE_EOF { r2 } else { r1 }
+    }
+}
+
+/// The state of `archive_read_data` between calls: how far the output has
+/// got, and the rest of the block it was copying from.
+#[derive(Default)]
+struct ReadData {
+    /// Offset in the entry of the next byte `read_data` hands out.
+    output_offset: i64,
+    /// Offset in the entry of the first byte of `pending`.
+    offset: i64,
+    pending: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -1917,7 +2214,7 @@ mod tests {
             Err(Error::status(ARCHIVE_EOF))
         }
 
-        fn read_data<'r>(&mut self, _: &'r mut Reader<'_>) -> Result<Data<'r>, Error> {
+        fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
             Ok(Data::Eof { offset: 0 })
         }
     }
@@ -2106,5 +2403,166 @@ mod tests {
         r.select_format(&a, "one");
         assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_FATAL);
         assert_eq!(error(&a), "Registered format does not match");
+    }
+
+    /// A format that serves scripted data blocks and header statuses.
+    struct Script {
+        blocks: Vec<(i64, Vec<u8>)>,
+        end: i64,
+        next: usize,
+        headers: Vec<c_int>,
+        caps: c_int,
+    }
+
+    impl Script {
+        fn new(blocks: &[(i64, &[u8])], end: i64) -> Self {
+            Script {
+                blocks: blocks.iter().map(|(o, d)| (*o, d.to_vec())).collect(),
+                end,
+                next: 0,
+                headers: Vec::new(),
+                caps: 0,
+            }
+        }
+    }
+
+    impl Format for Script {
+        fn name(&self) -> &'static str {
+            "script"
+        }
+
+        fn bid(&mut self, _: &mut Reader<'_>, _: c_int) -> c_int {
+            1
+        }
+
+        fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {
+            match self.headers.pop().unwrap_or(ARCHIVE_EOF) {
+                ARCHIVE_OK => Ok(()),
+                code => Err(Error::new(code, 0, if code == ARCHIVE_WARN { "odd" } else { "" })),
+            }
+        }
+
+        fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
+            let block = self.blocks.get(self.next);
+            self.next += 1;
+            Ok(match block {
+                Some((offset, data)) => Data::Block { data, offset: *offset },
+                None => Data::Eof { offset: self.end },
+            })
+        }
+
+        fn capabilities(&self) -> c_int {
+            self.caps
+        }
+    }
+
+    fn opened(script: Script) -> (Read, Base) {
+        let mut r = Read::default();
+        r.register_format(Box::new(script)).unwrap();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"x"), ARCHIVE_OK);
+        a.state.set(state::DATA);
+        (r, a)
+    }
+
+    #[test]
+    fn read_data_copies_blocks_and_fills_holes_with_zeros() {
+        let (mut r, a) = opened(Script::new(&[(0, b"abc"), (5, b"de")], 9));
+        let mut buf = [b'#'; 4];
+        // Small destination: blocks are split across calls.
+        assert_eq!(r.read_data(&a, &mut buf), 4);
+        assert_eq!(&buf, b"abc\0");
+        assert_eq!(r.read_data(&a, &mut buf), 4);
+        assert_eq!(&buf, b"\0de\0");
+        let mut big = [b'#'; 10];
+        // The trailing hole up to the end offset is zeros, then EOF.
+        assert_eq!(r.read_data(&a, &mut big), 1);
+        assert_eq!(big[0], 0);
+        assert_eq!(r.read_data(&a, &mut big), 0);
+        assert_eq!(r.read_data(&a, &mut []), 0);
+    }
+
+    #[test]
+    fn read_data_rejects_out_of_order_blocks() {
+        let (mut r, a) = opened(Script::new(&[(0, b"abcd"), (2, b"xx")], 6));
+        let mut buf = [0; 16];
+        assert_eq!(r.read_data(&a, &mut buf), ARCHIVE_RETRY as isize);
+        assert_eq!(error(&a), "Encountered out-of-order sparse blocks");
+    }
+
+    #[test]
+    fn read_data_block_hands_out_the_formats_blocks() {
+        let (mut r, a) = opened(Script::new(&[(7, b"hi")], 9));
+        let first = r.read_data_block(&a, |d| match d {
+            Data::Block { data, offset } => Some((data.to_vec(), offset)),
+            Data::Eof { .. } => None,
+        });
+        assert_eq!(first, Ok(Some((b"hi".to_vec(), 7))));
+        assert!(matches!(r.read_data_block(&a, |d| matches!(d, Data::Eof { offset: 9 })), Ok(true)));
+    }
+
+    #[test]
+    fn data_skip_discards_the_rest_and_ends_in_the_header_state() {
+        let (mut r, a) = opened(Script::new(&[(0, b"a"), (1, b"b")], 2));
+        assert_eq!(r.read_data_skip(&a), ARCHIVE_OK);
+        assert_eq!(a.state.get(), state::HEADER);
+        assert_eq!(r.format, Some(0));
+        // The default skip read everything.
+        assert_eq!(r.format.map(|i| r.formats[i].name()), Some("script"));
+    }
+
+    #[test]
+    fn seek_data_is_refused_by_default() {
+        let (mut r, a) = opened(Script::new(&[], 0));
+        assert_eq!(r.seek_data(&a, 0, Whence::Set), i64::from(ARCHIVE_FAILED));
+        assert_eq!(error(&a), "Cannot seek data with this format");
+        assert_eq!(a.errno.get(), ARCHIVE_ERRNO_MISC);
+    }
+
+    #[test]
+    fn next_header_moves_through_the_states() {
+        let mut script = Script::new(&[], 0);
+        // Popped from the back: OK, WARN, FAILED, then EOF.
+        script.headers = vec![ARCHIVE_EOF, ARCHIVE_FAILED, ARCHIVE_WARN, ARCHIVE_OK];
+        let mut r = Read::default();
+        r.register_format(Box::new(script)).unwrap();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"abcdef"), ARCHIVE_OK);
+        let mut e = Entry;
+        assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_OK);
+        assert_eq!((a.state.get(), a.file_count.get()), (state::DATA, 1));
+        // The remaining data of the entry is skipped first.
+        assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_WARN);
+        assert_eq!((a.state.get(), error(&a)), (state::DATA, "odd".to_string()));
+        assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_FAILED);
+        assert_eq!(a.state.get(), state::DATA_RECOVERY);
+        assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_EOF);
+        assert_eq!((a.state.get(), a.file_count.get()), (state::EOF, 3));
+    }
+
+    #[test]
+    fn header_position_is_where_the_header_started() {
+        let mut script = Script::new(&[], 0);
+        script.headers = vec![ARCHIVE_OK, ARCHIVE_OK];
+        let mut r = Read::default();
+        r.register_format(Box::new(script)).unwrap();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(open_with(&mut r, &a, b"abcdef"), ARCHIVE_OK);
+        r.reader(&a).consume(2).unwrap();
+        r.next_header2(&a, &mut Entry);
+        assert_eq!(r.header_position(), 2);
+    }
+
+    #[test]
+    fn encryption_queries_follow_the_formats_capabilities() {
+        let mut r = Read::default();
+        assert_eq!(r.format_capabilities(), 0);
+        assert_eq!(r.has_encrypted_entries(), ENCRYPTION_UNSUPPORTED);
+        let mut s = Script::new(&[], 0);
+        s.caps = 1;
+        r.register_format(Box::new(s)).unwrap();
+        r.format = Some(0);
+        assert_eq!(r.format_capabilities(), 1);
+        assert_eq!(r.has_encrypted_entries(), ENCRYPTION_DONT_KNOW);
     }
 }
