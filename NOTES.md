@@ -186,3 +186,55 @@ Differences:
   `Box<Entry>`, not as raw pointers. C never holds a pointer to them, because
   `archive_entry_linkify` swaps the pointers it hands out, so no pointer is
   aliased.
+
+## Read core (`archive_read`, `archive_read_open_*`, options, passphrases)
+
+### Ported as-is
+
+- A read error or fatal state met while consuming (`__archive_read_consume`)
+  replaces the error with "Truncated input file (needed N bytes, only 0
+  available)" (archive_read.c).
+- When a client has a seeker but no skipper, a skip of over 64k uses the raw
+  client seek with `SEEK_CUR` and compares the node-relative offset it returns
+  with the stream position, so it fails on any volume but the first of a
+  multi-volume client (archive_read.c).
+- Without a switch callback, a multi-volume client's closer is called on a
+  volume when the reader moves on and again for every volume at close, so a
+  closer that frees its data frees it twice (archive_read.c).
+- `archive_read_set_format` for a format that failed to register leaves the
+  active format unchanged; upstream leaves it pointing at an empty slot.
+- `archive_read_data_into_fd` compares the absolute offset `lseek` returns
+  with the entry offset when seeking over a hole, so it reports "Seek error"
+  if the file was not at offset 0 when it started
+  (archive_read_data_into_fd.c).
+
+### Differences
+
+- Client data: upstream dereferences a NULL dataset if `archive_read_open1` is
+  called with a reader but no `archive_read_set_callback_data`. Ours reads
+  one node with NULL data. `archive_read_open_memory` with a NULL buffer and a
+  size, and `archive_read_open_FILE(NULL)`, fail with `ARCHIVE_FATAL` and
+  EINVAL instead of crashing.
+- An empty item in an options string (`a,,b` or a trailing comma) is skipped;
+  upstream passes it to the handlers as an option with no name (archive_options.c).
+- A `FILE *` read that returns no bytes with the stream in error fails the
+  read (fatal); upstream records the error and reports end of file
+  (archive_read_open_file.c). The client trait returns errors rather than
+  setting them and continuing.
+- `archive_read_extract_set_skip_file`'s device and inode are also provided by
+  the filename client for its current file (`Client::skip_file`), where
+  upstream's open callback sets them as a side effect.
+- Format cleanup is `Drop`; there is no `cleanup` callback. Formats and
+  bidders are dropped with the handle, after the client callbacks have run.
+- `Format::read_data` that fails with `ARCHIVE_WARN` hands no data to
+  `archive_read_data_block`; upstream leaves whatever the format stored in the
+  out parameters (no in-library caller looks at it).
+- `data_start_node` and `data_end_node` are not kept; nothing reads them.
+  `read_data_is_posix_read` and `read_data_requested` are not kept either;
+  only the rar reader uses them, and it will get them through `Reader` when
+  it is ported.
+- Disk-like device detection for FreeBSD, NetBSD, OpenBSD and DragonFly
+  ioctls (archive_read_open_filename.c) is not ported; only regular files
+  and, on Linux, block devices count.
+- Passphrases are zeroed before they are freed (behind `black_box`), as
+  upstream does with `memset`.
