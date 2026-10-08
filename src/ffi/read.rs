@@ -9,7 +9,8 @@ use super::{
 };
 use crate::archive::{Handle, Kind, READ_MAGIC, state};
 use crate::read::filter::{
-    all as filter_all, by_code as filter_by_code, compress, none as filter_none, uu as filter_uu,
+    all as filter_all, by_code as filter_by_code, compress, none as filter_none, rpm,
+    uu as filter_uu,
 };
 use crate::read::format::{all as format_all, by_code as format_by_code, empty, raw};
 use crate::read::{self, Read, Status};
@@ -78,6 +79,23 @@ pub extern "C" fn archive_read_support_filter_compress(a: *mut Archive) -> c_int
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_compression_compress(a: *mut Archive) -> c_int {
     archive_read_support_filter_compress(a)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_filter_rpm(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_filter_rpm,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| support_filter(h, rpm::support)
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_compression_rpm(a: *mut Archive) -> c_int {
+    archive_read_support_filter_rpm(a)
 }
 
 #[unsafe(no_mangle)]

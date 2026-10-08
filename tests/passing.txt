@@ -59,6 +59,7 @@ test_read_filter_zstd_raw_loop
 test_read_format_7zip_issue2765
 test_read_format_7zip_sfx_elf64trunc
 test_read_format_empty
+test_read_format_huge_rpm
 test_read_too_many_filters
 test_sparse_clear
 test_sparse_iterator

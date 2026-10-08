@@ -53,11 +53,6 @@ pub extern "C" fn archive_read_support_compression_program_signature(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_compression_rpm(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_compression_xz(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
@@ -117,11 +112,6 @@ pub extern "C" fn archive_read_support_filter_program_signature(
     _a2: *const c_void,
     _a3: usize,
 ) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_rpm(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
 
