@@ -250,30 +250,29 @@ Differences:
   returns 0 and "Unrecognized archive format" overwrites the message. The
   final code is `ARCHIVE_FATAL` either way (archive_read.c).
 
-## lz4 filter (`src/read/filter/lz4.rs`)
+## Read filter uu (`src/read/filter/uu.rs`)
 
-Upstream's frame parsing is ported; the block decoder is `lz4_flex` 0.14.0
-(`safe-decode`), and the frame header and block checksums use `xxhash-rust`
-0.8.19 (`xxh32`). The xxh32 module of `xxhash-rust` has one `unsafe` block
-inside the crate, not in ours.
+### Ported as-is
 
-Ported as-is (the oracle confirms each):
+- The base64 bid accepts any first line made only of base64 characters,
+  `=` included, and an empty line too. Upstream's `====` score after that
+  test can never be reached, because the loop has already consumed the line,
+  so it is not ported (archive_read_support_filter_uu.c).
+- A body line that would take one `read` past 64k (`total + 2 * len`, so a
+  line over 32k when it is the first of the block) ends that `read`. When
+  nothing was decoded before it, the `read` returns nothing, which the core
+  takes as end of stream, so the rest of the input is dropped without an
+  error.
+- Lines end at the first LF in the window, and a CR is a line end only when
+  no LF is found in the window: `a\rb\nc` is the line `a\rb`. A lone CR that
+  is the last byte in the window waits for one more byte (CR LF), and at the
+  end of the input it ends the line.
+- A final line without a newline is never a line, so `end` with no newline
+  at the end of the input is "Insufficient compressed data".
+- A header name of one byte is dropped (`namelen > 1`), and a name ends at
+  a NUL.
 
-- An empty frame, or a block that decodes to zero bytes, ends the stream: the
-  frames after it are never read. This holds for any frame, the first or a
-  later one.
-- A zero-length legacy block is a decompression failure
-  (`lz4 decompression failed`), where a zero-length LZ4 block is the end of
-  the stream.
-- Bytes after the last frame that are not a frame are ignored silently; so is
-  a trailing 1 to 3 bytes.
-- A linked block refers back to the previous block only, not the output
-  before it. A previous block shorter than 64 KiB leaves the rest of the
-  window zero-filled, so the back-references see zeros, not the older output.
-- The preset dictionary flag is read and ignored; the frame is decoded with no
-  dictionary, as upstream does.
-- `Malformed lz4 data` (capital M) is upstream's message for a bad skippable
-  frame; the other malformed messages are lowercase.
+### Differences
 
 - The bidder's MINIX padding test (`if (len == 1 && ...) ++p; --len;`) is a
   no-op upstream: the next line read overwrites both `p` and `len`. It is not
@@ -407,24 +406,58 @@ Differences:
   `lzop -d` and `archive_read_support_filter_lzop` returns `ARCHIVE_WARN`
   ("Using external lzop program for lzop decompression"). The liblzo2 path
   (`lzop_filter_read` and its block and checksum handling) is not ported.
-Differences:
+
+## lz4 filter (`src/read/filter/lz4.rs`)
+
+Upstream's frame parsing is ported. The block decoder is `lz4_flex` 0.14.0
+with `safe-decode` and `safe-encode`, and the frame header and block checksums
+use `xxhash-rust` 0.8.19 (`xxh32`). That build compiles four `unsafe` blocks
+inside `xxhash-rust` (three in `utils.rs`, one in `xxh32.rs`); none is in this
+crate.
+
+### Ported as-is
+
+- An empty frame, or a block that decodes to zero bytes, ends the stream: the
+  frames after it are never read. This holds for any frame, the first or a
+  later one.
+- A block header of `0x80000000` (stored flag, size zero) is decoded as a
+  compressed block of zero bytes, which fails with `lz4 decompression failed`.
+  The legacy format has no stored flag, and its zero-length block fails the
+  same way.
+- A zero-length legacy block is a decompression failure
+  (`lz4 decompression failed`), where a zero-length LZ4 block is the end of
+  the stream.
+- Bytes after the last frame that are not a frame are ignored silently; so is
+  a trailing 1 to 3 bytes.
+- A linked block refers back to the previous block only, not the output
+  before it. A previous block shorter than 64 KiB leaves the rest of the
+  window zero-filled, so the back-references see zeros, not the older output.
+- The preset dictionary flag is read and ignored; the frame is decoded with no
+  dictionary, as upstream does.
+- `Malformed lz4 data` (capital M) is upstream's message for a bad skippable
+  frame; the other malformed messages are lowercase.
+
+### Differences
 
 - `archive_liblz4_version` reports `lz4_flex 0.14.0`, not the LZ4 library
   version: the oracle links Homebrew liblz4 1.10.0, and the backend here is a
   Rust crate, so `archive_version_details` reads `liblz4/lz4_flex 0.14.0`.
+- `lz4_flex` is more lenient than liblz4 1.10 on hostile or non-conforming
+  blocks. For example, a block that breaks LZ4's end-of-block rule (fewer than
+  five final literal bytes) fails upstream with `lz4 decompression failed`, but
+  `lz4_flex` decodes it. Taking the reviewer's example, after a block of
+  `hello`, the block `10 'x' 05 00 | 20 'zz'` is decoded here and rejected
+  upstream. Such blocks are accepted where upstream rejects them; they never
+  cause unsafe access, because the decoder is `safe-decode`.
 - Frame and block parsing and every checksum follow upstream
   (`DONT_FAIL_ON_CRC_ERROR` is not defined there, so checksum errors fail).
 
 Oracle notes:
 
-- The differential runs on the 17 upstream lz4 fixtures and on 5,838
-  generated truncations and mutations of them: identical stdout, exit
-  status and stderr, except where the oracle's stdout is empty and ours
-  is not (553 cases, all with the same stderr). Upstream's uu bidder reads
-  the decompressed stream in 160-byte steps, and a binary tar stream needs
-  more than the first 3 KiB block before a line break, so the look-ahead fails
-  the open before any output. The uu filter is not ported yet, so that bidder
-  is absent here. Recheck these cases when the uu unit lands.
+- All 5,838 generated truncations and mutations of the 17 upstream lz4 fixtures
+  match the oracle: stdout, exit status and stderr. An earlier run showed 553
+  stdout differences where the oracle emitted nothing. They came from the uu
+  bidder's search window (fixed on main by `0c8ecb6`), not from this filter.
 
 Phase 5 look-ahead: `lz4_flex` (feature `frame`) has a frame writer with
 linked or independent blocks and block and content checksums, which is the
