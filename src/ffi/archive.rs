@@ -197,9 +197,16 @@ pub extern "C" fn archive_free(a: *mut Archive) -> c_int {
             return ARCHIVE_FATAL;
         }
         let r = h.free();
-        // SAFETY: the caller gives up ownership, and nothing refers to the
-        // handle any more.
-        drop(unsafe { Box::from_raw(a.cast::<Handle>()) });
+        let entry = h.take_read_entry();
+        // SAFETY: the entry is a `Box` leak that only this handle owned, and
+        // nothing refers to it or the handle any more; the caller gives up
+        // ownership of the handle.
+        unsafe {
+            if !entry.is_null() {
+                drop(Box::from_raw(entry));
+            }
+            drop(Box::from_raw(a.cast::<Handle>()));
+        }
         r
     })
 }

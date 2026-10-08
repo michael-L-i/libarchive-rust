@@ -11,7 +11,9 @@ use crate::archive::{Handle, Kind, READ_MAGIC, state};
 use crate::read::filter::{all as filter_all, by_code as filter_by_code, none as filter_none};
 use crate::read::format::{all as format_all, by_code as format_by_code};
 use crate::read::{self, Read};
+use super::ArchiveEntry;
 use super::sys::Fd;
+use crate::entry::Entry;
 use crate::archive::ARCHIVE_EOF;
 use crate::read::{Data, Whence};
 use crate::read_add_passphrase::PassphraseCallback;
@@ -599,6 +601,50 @@ pub extern "C" fn archive_read_data_into_fd(a: *mut Archive, fd: c_int) -> c_int
     )
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_next_header2(a: *mut Archive, entry: *mut ArchiveEntry) -> c_int {
+    checked!(
+        archive_read_next_header,
+        a,
+        READ_MAGIC,
+        state::HEADER | state::DATA | state::DATA_RECOVERY,
+        ARCHIVE_FATAL,
+        |h| {
+            // SAFETY: `entry` is NULL or a live entry the caller owns, which
+            // nothing else uses during the call.
+            match unsafe { entry.cast::<Entry>().as_mut() } {
+                Some(entry) => h.read_next_header2(entry),
+                None => ARCHIVE_FATAL,
+            }
+        }
+    )
+}
+
+/// Reads the next header into the handle's own entry and returns it, even
+/// when the header failed.
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_next_header(a: *mut Archive, entryp: *mut *mut ArchiveEntry) -> c_int {
+    put(entryp, std::ptr::null_mut());
+    checked!(
+        archive_read_next_header,
+        a,
+        READ_MAGIC,
+        state::HEADER | state::DATA | state::DATA_RECOVERY,
+        ARCHIVE_FATAL,
+        |h| {
+            let entry = h.read_entry();
+            // SAFETY: the handle's entry is a live `Box` leak, only used
+            // through this pointer and the ones handed to the caller.
+            let r = match unsafe { entry.as_mut() } {
+                Some(e) => h.read_next_header2(e),
+                None => ARCHIVE_FATAL,
+            };
+            put(entryp, entry.cast());
+            r
+        }
+    )
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -641,7 +687,7 @@ pub(super) mod tests {
         assert_eq!(archive_read_support_format_all(std::ptr::null_mut()), ARCHIVE_FATAL);
     }
 
-    use crate::read::{Data, Entry, Format, Reader};
+    use crate::read::{Data, Format, Reader};
     use crate::util::Error as Err_;
 
     /// A format that bids on anything, for tests that only open.
@@ -945,6 +991,26 @@ pub(super) mod tests {
         assert_eq!(archive_read_data_skip(a), ARCHIVE_OK);
         assert_eq!(with(a, 0, |h| h.base.state.get()), state::HEADER);
         assert_eq!(archive_read_data_skip(a), ARCHIVE_FATAL);
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+    }
+
+    #[test]
+    fn next_header_returns_the_handles_entry() {
+        let a = opened();
+        let mut e: *mut ArchiveEntry = std::ptr::null_mut();
+        assert_eq!(archive_read_next_header(a, &mut e), crate::archive::ARCHIVE_EOF);
+        assert!(!e.is_null());
+        assert_eq!(with(a, 0, |h| h.base.state.get()), state::EOF);
+        // Wrong state now.
+        assert_eq!(archive_read_next_header(a, &mut e), ARCHIVE_FATAL);
+        assert!(e.is_null());
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+
+        let a = opened();
+        let own = crate::ffi::entry::archive_entry_new2(a);
+        assert_eq!(archive_read_next_header2(a, own), crate::archive::ARCHIVE_EOF);
+        assert_eq!(archive_read_next_header2(a, std::ptr::null_mut()), ARCHIVE_FATAL);
+        crate::ffi::entry::archive_entry_free(own);
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 }

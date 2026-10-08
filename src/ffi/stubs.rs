@@ -12,7 +12,7 @@ use super::{
     archive_passphrase_callback,
     archive_write_callback,
 };
-use std::ffi::{c_char, c_int, c_long, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_long, c_void};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_compression_bzip2(_a0: *mut Archive) -> c_int {
@@ -260,19 +260,6 @@ pub extern "C" fn archive_read_append_filter_program_signature(
     _a2: *const c_void,
     _a3: usize,
 ) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_next_header(
-    _a0: *mut Archive,
-    _a1: *mut *mut ArchiveEntry,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_next_header2(_a0: *mut Archive, _a1: *mut ArchiveEntry) -> c_int {
     ARCHIVE_FATAL
 }
 

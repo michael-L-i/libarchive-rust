@@ -102,7 +102,8 @@ pub fn set_filter_option(m: Option<&[u8]>) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::read::{Data, Entry, Format, Reader};
+    use crate::entry::Entry;
+    use crate::read::{Data, Format, Reader};
     use crate::util::Error;
 
     /// A format with a single boolean option `flag`, and a `broken` one that

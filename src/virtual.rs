@@ -29,6 +29,7 @@
 //! its own implementation: a `match` on `Kind`, where later units add arms.
 
 use crate::archive::*;
+use crate::entry::Entry;
 use crate::util::Error;
 use std::ffi::{c_char, c_int};
 
@@ -63,6 +64,34 @@ impl Handle {
             Kind::Read(r) => r
                 .try_borrow()
                 .map_or(i64::from(ARCHIVE_FATAL), |r| r.filter_bytes(n)),
+        }
+    }
+
+    /// `archive_read_next_header2` and the read half of `next_header`:
+    /// reads the next header into `entry`.
+    pub fn read_next_header2(&self, entry: &mut Entry) -> c_int {
+        match &self.kind {
+            Kind::Read(r) => r
+                .try_borrow_mut()
+                .map_or(ARCHIVE_FATAL, |mut r| r.next_header2(&self.base, entry)),
+        }
+    }
+
+    /// The entry a read handle reads headers into, or NULL.
+    pub fn read_entry(&self) -> *mut Entry {
+        match &self.kind {
+            Kind::Read(r) => r
+                .try_borrow()
+                .map_or(std::ptr::null_mut(), |r| r.entry()),
+        }
+    }
+
+    /// Takes the read handle's entry for `archive_free` to free.
+    pub fn take_read_entry(&self) -> *mut Entry {
+        match &self.kind {
+            Kind::Read(r) => r
+                .try_borrow_mut()
+                .map_or(std::ptr::null_mut(), |mut r| r.take_entry()),
         }
     }
 

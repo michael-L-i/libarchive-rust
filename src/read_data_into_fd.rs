@@ -219,7 +219,8 @@ pub fn data_into_fd(r: &mut Read, a: &Base, fd: Fd) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::read::{Entry, Format, Reader};
+    use crate::entry::Entry;
+    use crate::read::{Format, Reader};
     use crate::read_open_memory::Memory;
     use std::io::{Read as _, Seek, SeekFrom};
     use std::os::fd::AsRawFd;

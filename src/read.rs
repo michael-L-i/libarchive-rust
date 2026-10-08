@@ -47,6 +47,7 @@
 //! chain below itself, so the same `Reader` methods serve both.
 
 use crate::archive::*;
+use crate::entry::Entry;
 use crate::read_add_passphrase::Passphrases;
 use crate::util::Error;
 use std::any::Any;
@@ -966,6 +967,10 @@ pub struct Read {
     /// cap their output at the size an entry actually promised.
     pub(crate) entry_bytes_declared: Option<i64>,
     read_data: ReadData,
+    /// The entry `archive_read_next_header` hands out: a raw pointer from
+    /// `Box::into_raw`, so the `&mut Entry` C calls derive never aliases a
+    /// live `Box`. `archive_free` takes it back with `take_entry`.
+    entry: *mut Entry,
     /// The device and inode extraction must not overwrite, as the client or
     /// `archive_read_extract_set_skip_file` set it.
     pub(crate) skip_file: Option<(i64, i64)>,
@@ -976,9 +981,17 @@ pub struct Read {
 
 /// `archive_read_new`.
 pub fn new() -> Handle {
+    let base = Base::new(READ_MAGIC);
+    // Like archive_entry_new2: the entry converts text with the handle's
+    // conversions.
+    let entry = Box::into_raw(Box::new(Entry::new(Some(base.conv.clone()))));
+    let read = Read {
+        entry,
+        ..Read::default()
+    };
     Handle {
-        base: Base::new(READ_MAGIC),
-        kind: Kind::Read(RefCell::new(Read::default())),
+        base,
+        kind: Kind::Read(RefCell::new(read)),
     }
 }
 
@@ -1081,10 +1094,6 @@ impl Read {
         self.get_filter(n).map(|s| s.imp.filter().name())
     }
 }
-
-/// Stands in for `crate::entry::Entry` until phase 1c lands.
-// TODO(part B): delete this and `use crate::entry::Entry`.
-pub struct Entry;
 
 /// What `Format::read_data` produces.
 pub enum Data<'r> {
@@ -1621,6 +1630,16 @@ impl Read {
         result
     }
 
+    /// The handle's entry, as `archive_read_next_header` returns it.
+    pub fn entry(&self) -> *mut Entry {
+        self.entry
+    }
+
+    /// Gives up the entry, for `archive_free` to free. NULL afterwards.
+    pub fn take_entry(&mut self) -> *mut Entry {
+        std::mem::replace(&mut self.entry, std::ptr::null_mut())
+    }
+
     /// The device and inode of the input, which extraction must not
     /// overwrite.
     pub fn skip_file(&self) -> Option<(i64, i64)> {
@@ -1657,7 +1676,7 @@ impl Read {
     /// `_archive_read_next_header2`, after the caller has checked the state.
     pub fn next_header2(&mut self, a: &Base, entry: &mut Entry) -> c_int {
         let mut r1 = ARCHIVE_OK;
-        // TODO(part B): archive_entry_clear(entry)
+        entry.clear();
         a.clear_error();
 
         // If client didn't consume entire data, skip any remainder (This is
@@ -1707,9 +1726,11 @@ impl Read {
             _ => {}
         }
 
-        // TODO(part B): the entry's size, if it is set and the header is
-        // OK or a WARN, for archive_read_data_into_fd to enforce.
-        self.entry_bytes_declared = None;
+        // The entry's size, if it is set, for archive_read_data_into_fd to
+        // enforce.
+        self.entry_bytes_declared = (matches!(r2, ARCHIVE_OK | ARCHIVE_WARN)
+            && entry.size_is_set() != 0)
+            .then(|| entry.size());
         self.reset_read_data();
 
         // EOF always wins; otherwise return the worst error.
@@ -2601,7 +2622,7 @@ mod tests {
         r.register_format(Box::new(script)).unwrap();
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"abcdef"), ARCHIVE_OK);
-        let mut e = Entry;
+        let mut e = Entry::new(None);
         assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_OK);
         assert_eq!((a.state.get(), a.file_count.get()), (state::DATA, 1));
         // The remaining data of the entry is skipped first.
@@ -2622,7 +2643,7 @@ mod tests {
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"abcdef"), ARCHIVE_OK);
         r.reader(&a).consume(2).unwrap();
-        r.next_header2(&a, &mut Entry);
+        r.next_header2(&a, &mut Entry::new(None));
         assert_eq!(r.header_position(), 2);
     }
 
