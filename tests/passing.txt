@@ -1,11 +1,13 @@
 # Upstream tests that pass against libarchive-rust. Maintained by scripts/run-tests --update.
 cat/test_0
 cat/test_empty_gz
+cat/test_empty_lz4
 cat/test_empty_xz
 cat/test_error
 cat/test_error_mixed
 cat/test_expand_Z
 cat/test_expand_gz
+cat/test_expand_lz4
 cat/test_expand_mixed
 cat/test_expand_plain
 cat/test_expand_xz
@@ -61,6 +63,7 @@ test_read_files_compressed
 test_read_filter_compress_empty2
 test_read_filter_compress_invalid
 test_read_filter_compress_truncated
+test_read_filter_lz4_raw_skip
 test_read_filter_uudecode_base64_raw
 test_read_filter_uudecode_invalid_mode
 test_read_filter_uudecode_mode_digits
