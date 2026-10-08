@@ -87,23 +87,6 @@ impl Strategy {
     }
 }
 
-/// Which links `next_entry` takes: those holding an entry, or those without
-/// one.
-#[derive(Clone, Copy)]
-enum Pick {
-    Deferred,
-    Partial,
-}
-
-impl Pick {
-    fn matches(self, held: bool) -> bool {
-        match self {
-            Pick::Deferred => held,
-            Pick::Partial => !held,
-        }
-    }
-}
-
 /// One remembered file.
 struct Link {
     /// A clone of the first entry seen for this (dev, ino). `partial_links`
@@ -168,7 +151,7 @@ impl LinkResolver {
         let Some(mut entry) = entry else {
             // The end of the stream: the next held-back entry, if any.
             let deferred = self
-                .next_entry(Pick::Deferred)
+                .next_entry(true)
                 .and_then(|le| le.entry.take());
             return (deferred, None);
         };
@@ -262,14 +245,15 @@ impl LinkResolver {
         Some(&mut chain[pos])
     }
 
-    /// The first link of `pick` in bucket order, head of chain first. It is
-    /// removed from the table and kept as the spare.
-    fn next_entry(&mut self, pick: Pick) -> Option<&mut Link> {
+    /// The first link in bucket order, head of chain first, that holds a
+    /// deferred entry (`deferred`) or doesn't. It is removed from the table and
+    /// kept as the spare.
+    fn next_entry(&mut self, deferred: bool) -> Option<&mut Link> {
         self.spare = None;
         for chain in &mut self.buckets {
             let Some(pos) = chain
                 .iter()
-                .rposition(|le| pick.matches(le.entry.is_some()))
+                .rposition(|le| le.entry.is_some() == deferred)
             else {
                 continue;
             };
@@ -307,8 +291,8 @@ impl LinkResolver {
         chain.last_mut()
     }
 
-    /// Doubles the table. Chains are walked head first, as upstream does, so
-    /// each chain keeps its order.
+    /// Doubles the table. Chains are walked head first and re-inserted at the
+    /// head, which reverses their order, as upstream's does.
     fn grow(&mut self) {
         let Some(new_size) = self.buckets.len().checked_mul(2) else {
             return;
@@ -329,8 +313,7 @@ impl LinkResolver {
     /// `archive_entry_partial_links`: the next link that has not yet been
     /// seen all the way, with the number of links still to come.
     pub(crate) fn partial_links(&mut self) -> (Option<Box<Entry>>, u32) {
-        self.spare = None;
-        match self.next_entry(Pick::Partial) {
+        match self.next_entry(false) {
             Some(le) => (le.canonical.take(), le.links),
             None => (None, 0),
         }
