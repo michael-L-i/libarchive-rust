@@ -1,5 +1,5 @@
 use crate::entry::{AE_IFREG, Entry};
-use crate::read::{Data, Format, Reader, Status};
+use crate::read::{Data, Format, Reader, Status, format_code};
 use crate::util::Error;
 use std::ffi::c_int;
 
@@ -76,7 +76,7 @@ impl Format for Ar {
         let name = h.get(..16).unwrap_or_default().trim_ascii_end();
         let nameless = name.is_empty();
         entry.set_pathname(name.strip_suffix(b"/").unwrap_or(name));
-        a.set_format(0x70000, c"ar");
+        a.set_format(format_code::AR, c"ar");
 
         entry.set_filetype(u32::from(AE_IFREG));
         entry.set_size(size);
