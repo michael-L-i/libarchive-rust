@@ -8,7 +8,9 @@ Date 2026-10-08. Upstream pin `8bb3bbdc`. Run: port.
 |---|---:|---:|---:|
 | acl | 15 | 19 | 21 |
 | archive | 9 | 123 | 134 |
+| cat | 6 | 18 | 18 |
 | compat | 0 | 29 | 30 |
+| cpio | 1 | 43 | 49 |
 | entry | 3 | 3 | 3 |
 | fuzz | 9 | 9 | 9 |
 | read_filter | 2 | 15 | 19 |
@@ -28,6 +30,8 @@ Date 2026-10-08. Upstream pin `8bb3bbdc`. Run: port.
 | read_format_warc | 0 | 6 | 6 |
 | read_format_xar | 0 | 10 | 10 |
 | read_format_zip | 0 | 98 | 110 |
+| tar | 0 | 72 | 79 |
+| unzip | 3 | 29 | 30 |
 | write_filter | 0 | 19 | 21 |
 | write_format_7zip | 0 | 18 | 18 |
 | write_format_ar | 0 | 1 | 1 |
