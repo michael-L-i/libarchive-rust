@@ -160,6 +160,12 @@ pub trait Client {
         Ok(())
     }
 
+    /// The device and inode of the input being read, if it is a regular
+    /// file: extraction must not overwrite it.
+    fn skip_file(&self) -> Option<(i64, i64)> {
+        None
+    }
+
     /// Moves from node `from` to node `to`. Without a dedicated switch, the
     /// old node is closed and the new one opened.
     fn switch(&mut self, from: usize, to: usize) -> Result<(), Error> {
@@ -909,6 +915,9 @@ pub struct Read {
     /// cap their output at the size an entry actually promised.
     pub(crate) entry_bytes_declared: Option<i64>,
     read_data: ReadData,
+    /// The device and inode extraction must not overwrite, as the client or
+    /// `archive_read_extract_set_skip_file` set it.
+    pub(crate) skip_file: Option<(i64, i64)>,
 }
 
 /// `archive_read_new`.
@@ -1555,6 +1564,15 @@ impl Read {
         };
         self.read_data = st;
         result
+    }
+
+    /// The device and inode of the input, which extraction must not
+    /// overwrite.
+    pub fn skip_file(&self) -> Option<(i64, i64)> {
+        self.skip_file.or_else(|| match &self.chain.first()?.imp {
+            Imp::Client(c) => c.client.skip_file(),
+            Imp::Filter(_) => None,
+        })
     }
 
     /// `archive_read_header_position`.

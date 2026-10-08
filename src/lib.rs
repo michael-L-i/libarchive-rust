@@ -16,6 +16,7 @@ mod read;
 mod read_add_passphrase;
 mod read_open_fd;
 mod read_open_file;
+mod read_open_filename;
 mod read_open_memory;
 mod read_set_options;
 mod string;
