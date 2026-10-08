@@ -46,6 +46,8 @@ const FHCRC: u8 = 2;
 const FEXTRA: u8 = 4;
 const FNAME: u8 = 8;
 const FCOMMENT: u8 = 16;
+/// The flag bits that must be clear.
+const RESERVED: u8 = 0xe0;
 
 /// The bid for a valid header: 24 bits for the magic bytes, 3 for the flags
 /// byte. The header CRC isn't checked, so it adds nothing.
@@ -77,11 +79,7 @@ struct Bidder;
 
 impl FilterBidder for Bidder {
     fn bid(&mut self, up: &mut Reader<'_>) -> Result<c_int, Error> {
-        Ok(if peek_header(up, None).is_some() {
-            BID
-        } else {
-            0
-        })
+        Ok(peek_header(up, None).map_or(0, |_| BID))
     }
 
     fn init(&mut self, _up: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error> {
@@ -107,15 +105,9 @@ impl Filter for Gzip {
     fn read(&mut self, up: &mut Reader<'_>) -> Result<(), Error> {
         self.filled = 0;
         while self.filled < self.out.len() && !self.eof {
-            let mut stream = match self.stream.take() {
-                Some(stream) => stream,
-                None => match self.start_member(up)? {
-                    Some(stream) => stream,
-                    None => {
-                        self.eof = true;
-                        continue;
-                    }
-                },
+            let Some(mut stream) = self.next_stream(up)? else {
+                self.eof = true;
+                break;
             };
             if self.inflate(&mut stream, up)? {
                 self.read_trailer(up)?;
@@ -143,14 +135,31 @@ impl Filter for Gzip {
 }
 
 impl Gzip {
-    /// Reads the header of the next member and starts its decompressor. `None`
-    /// at the end of the stream: input that is not a gzip header (including
-    /// trailing garbage) ends it without an error.
+    /// The decompressor of the member being read, or of the next member once
+    /// the last one has ended. `None` at the end of the stream.
+    fn next_stream(&mut self, up: &mut Reader<'_>) -> Result<Option<Decompress>, Error> {
+        match self.stream.take() {
+            Some(stream) => Ok(Some(stream)),
+            None => self.start_member(up),
+        }
+    }
+
+    /// Reads the header of the next member and starts its decompressor. Input
+    /// that is not a gzip header (including trailing garbage) ends the stream
+    /// without an error.
     fn start_member(&mut self, up: &mut Reader<'_>) -> Result<Option<Decompress>, Error> {
         let Some(len) = peek_header(up, Some(&mut self.meta)) else {
             return Ok(None);
         };
-        up.consume(len)?;
+        // A short input (an extra field longer than the input) is not an error
+        // here: the read below reports it, as upstream does.
+        let _ = up.consume(len);
+        if up.read_ahead(1).is_err() {
+            return Err(Error::fatal(
+                ARCHIVE_ERRNO_MISC,
+                "Failed to read gzip input",
+            ));
+        }
         Ok(Some(Decompress::new(false)))
     }
 
@@ -180,8 +189,7 @@ impl Gzip {
         Ok(ended)
     }
 
-    /// The 8-byte trailer is the CRC32 and ISIZE. Upstream reads them and
-    /// doesn't check them, and neither does this.
+    /// The 8-byte trailer (CRC32 and ISIZE) is not checked, as upstream.
     fn read_trailer(&mut self, up: &mut Reader<'_>) -> Result<(), Error> {
         // Upstream fails here with no message of its own.
         if up.read_ahead(8).ok().flatten().is_none() {
@@ -198,7 +206,7 @@ impl Gzip {
 fn peek_header(up: &mut Reader<'_>, mut meta: Option<&mut Meta>) -> Option<usize> {
     let fixed: [u8; 10] = *peek(up, 10)?.first_chunk()?;
     // Deflate is the only method, and no reserved flag may be set.
-    if fixed[..3] != [0x1f, 0x8b, 0x08] || fixed[3] & 0xe0 != 0 {
+    if fixed[..3] != [0x1f, 0x8b, 0x08] || fixed[3] & RESERVED != 0 {
         return None;
     }
     let flags = fixed[3];
@@ -264,12 +272,14 @@ mod tests {
     use flate2::{Compression, GzBuilder};
     use std::io::Write;
 
-    /// A client that hands out `block` bytes per read.
+    /// A client that hands out `block` bytes per read, and fails once `pos`
+    /// reaches `fail_at`.
     struct Blocks {
         data: Vec<u8>,
         pos: usize,
         block: usize,
         out: Vec<u8>,
+        fail_at: usize,
     }
 
     impl Blocks {
@@ -279,12 +289,16 @@ mod tests {
                 pos: 0,
                 block,
                 out: Vec::new(),
+                fail_at: usize::MAX,
             })
         }
     }
 
     impl Client for Blocks {
         fn read(&mut self, _a: &Base, _node: usize) -> Result<(), Error> {
+            if self.pos >= self.fail_at {
+                return Err(Error::fatal(ARCHIVE_ERRNO_MISC, "client read failed"));
+            }
             let end = self.data.len().min(self.pos + self.block);
             self.out = self.data.get(self.pos..end).unwrap_or_default().to_vec();
             self.pos = end;
@@ -431,6 +445,45 @@ mod tests {
             (status, error.as_str()),
             (ARCHIVE_FATAL, "gzip decompression failed")
         );
+    }
+
+    /// A header whose extra field declares 512 bytes, followed by 14.
+    fn short_extra() -> Vec<u8> {
+        let mut gz = vec![0x1f, 0x8b, 0x08, FEXTRA, 0, 0, 0, 0, 0, 3, 0, 2];
+        gz.extend_from_slice(&[0; 14]);
+        gz
+    }
+
+    #[test]
+    fn a_short_extra_field_is_truncation_as_upstream() {
+        let (out, status, error) = decode(&short_extra(), 5);
+        assert_eq!(
+            (out.len(), status, error.as_str()),
+            (0, ARCHIVE_FATAL, "truncated gzip input")
+        );
+        // The first member's output is lost with the read that fails, as upstream.
+        let gz = [member(b"abc", None, 0), short_extra()].concat();
+        let (out, status, error) = decode(&gz, 3);
+        assert_eq!(
+            (out.len(), status, error.as_str()),
+            (0, ARCHIVE_FATAL, "truncated gzip input")
+        );
+    }
+
+    #[test]
+    fn a_read_error_after_the_header_is_reported_as_upstream() {
+        let gz = member(b"x", None, 0);
+        let mut r = Read::default();
+        let a = Base::new(READ_MAGIC);
+        assert_eq!(support(&mut r).unwrap(), Status::Ok);
+        assert_eq!(raw::support(&mut r).unwrap(), Status::Ok);
+        let mut client = Blocks::new(gz, 10);
+        client.fail_at = 10;
+        assert_eq!(r.open(&a, client), ARCHIVE_FATAL);
+        let error = a
+            .error_string()
+            .map_or_else(String::new, |m| String::from_utf8_lossy(&m).into_owned());
+        assert_eq!(error, "Failed to read gzip input");
     }
 
     #[test]
