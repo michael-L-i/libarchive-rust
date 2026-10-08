@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Build pinned upstream libarchive into build/oracle (the reference for the port).
+# Upstream is read-only; everything is written under build/oracle.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+src="$root/upstream/libarchive"
+bld="$root/build/oracle"
+log="$bld/build.log"
+mkdir -p "$bld"
+
+jobs=$(sysctl -n hw.ncpu 2>/dev/null || nproc)
+
+# Homebrew keg prefixes for libraries the macOS SDK lacks (zlib, bzip2, libxml2, iconv come from the SDK).
+prefixes=""
+if command -v brew >/dev/null 2>&1; then
+  for f in xz zstd lz4 libb2 expat openssl@3 libiconv; do
+    p="$(brew --prefix "$f" 2>/dev/null || true)"
+    [ -n "$p" ] && [ -d "$p" ] && prefixes="${prefixes:+$prefixes;}$p"
+  done
+fi
+
+args=(
+  -G "Unix Makefiles"
+  -S "$src" -B "$bld"
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+  -DENABLE_TEST=ON
+)
+[ -n "$prefixes" ] && args+=(-DCMAKE_PREFIX_PATH="$prefixes")
+
+# Reconfigure only when the cache is missing or the arguments changed.
+stamp="$bld/.configure-args"
+want="$(printf '%s\n' "${args[@]}")"
+if [ ! -f "$bld/CMakeCache.txt" ] || [ "$(cat "$stamp" 2>/dev/null)" != "$want" ]; then
+  echo "configuring $bld"
+  rm -f "$bld/CMakeCache.txt" # dropped -D flags would otherwise persist in the cache
+  cmake "${args[@]}" >"$log" 2>&1 || { tail -n 40 "$log" >&2; echo "configure failed, see $log" >&2; exit 1; }
+  printf '%s\n' "$want" >"$stamp"
+fi
+
+start=$SECONDS
+echo "building with $jobs jobs (log: $log)"
+if ! cmake --build "$bld" --parallel "$jobs" >>"$log" 2>&1; then
+  grep -E "error|Error" "$log" | head -n 20 >&2 || true
+  echo "build failed, see $log" >&2
+  exit 1
+fi
+echo "build done in $((SECONDS - start))s"
+
+echo
+echo "libraries:"
+for f in libarchive.a libarchive.dylib libarchive.so; do
+  [ -e "$bld/libarchive/$f" ] && echo "  $bld/libarchive/$f"
+done
+echo "tests and tools (in $bld/bin):"
+for b in libarchive_test bsdtar_test bsdcpio_test bsdcat_test bsdunzip_test bsdtar bsdcpio bsdcat bsdunzip; do
+  [ -x "$bld/bin/$b" ] && echo "  $bld/bin/$b"
+done
+echo "compile_commands.json: $bld/compile_commands.json"
+echo "config.h: $bld/config.h"
+echo "libarchive_test object dir: $bld/libarchive/test/CMakeFiles/libarchive_test.dir"
+echo "libarchive_test link.txt: $bld/libarchive/test/CMakeFiles/libarchive_test.dir/link.txt"
+
+echo
+echo "features:"
+grep -E '^#define (HAVE_LIBZ|HAVE_BZLIB_H|HAVE_LIBLZMA|HAVE_LZMA_STREAM_ENCODER_MT|HAVE_LIBZSTD|HAVE_ZSTD_H|HAVE_LZ4_H|HAVE_LIBLZ4|HAVE_BLAKE2_H|HAVE_LIBB2|HAVE_ICONV|HAVE_LIBXML2|HAVE_LIBEXPAT|HAVE_LIBCRYPTO|HAVE_LIBNETTLE|HAVE_LIBMBEDCRYPTO|HAVE_LIBLZO2)\b' "$bld/config.h" \
+  | sed 's/^#define /  /' || true
+"$bld/bin/bsdtar" --version | sed 's/^/  /'
