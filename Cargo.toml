@@ -1,0 +1,15 @@
+[package]
+name = "libarchive-rust"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+
+[lib]
+name = "archive"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"

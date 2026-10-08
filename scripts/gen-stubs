@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Generate src/ffi/stubs.rs: one error-returning stub per public C function.
+
+Prototypes come from `cc -E -P` over archive.h and archive_entry.h, so they are
+exactly what a C consumer sees on this platform.
+"""
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+HEADERS = ROOT / "upstream/libarchive/libarchive"
+FFI = ROOT / "src/ffi"
+SKIP = {"archive_set_error"}  # variadic: src/ffi/variadic.c
+
+BASE = {  # C base type -> (rust type, std::ffi import or None)
+    "void": "c_void", "char": "c_char", "int": "c_int", "unsigned": "c_uint",
+    "unsigned int": "c_uint", "uint": "c_uint", "long": "c_long",
+    "unsigned long": "c_ulong", "unsigned char": "c_uchar", "size_t": "usize", "ssize_t": "isize",
+    "la_ssize_t": "isize", "la_int64_t": "i64", "int64_t": "i64",
+    "la_uint64_t": "u64", "uint64_t": "u64", "time_t": "libc::time_t",
+    "dev_t": "libc::dev_t", "mode_t": "libc::mode_t", "wchar_t": "libc::wchar_t",
+    "FILE": "libc::FILE", "struct stat": "libc::stat",
+    "struct archive": "Archive", "struct archive_entry": "ArchiveEntry",
+    "struct archive_acl": "ArchiveAcl",
+    "struct archive_entry_linkresolver": "ArchiveEntryLinkresolver",
+}
+INT_WORDS = {"unsigned", "signed", "long", "short", "int", "char"}
+QUAL = {"restrict", "__restrict", "inline", "extern", "static", "volatile"}
+FFI_NAMES = {"c_void", "c_char", "c_int", "c_uint", "c_long", "c_ulong", "c_uchar"}
+CALLBACKS = set()  # callback typedef names, filled from the headers
+
+
+def preprocess():
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "all.c"
+        src.write_text("#include <archive.h>\n#include <archive_entry.h>\n")
+        out = subprocess.run(["cc", "-E", "-P", f"-I{HEADERS}", str(src)],
+                             check=True, capture_output=True, text=True)
+    return out.stdout
+
+
+def strip_balanced(text, open_, close):
+    """Remove outermost open_..close groups (and their contents)."""
+    out, depth, start = [], 0, 0
+    for i, ch in enumerate(text):
+        if ch == open_:
+            if depth == 0:
+                out.append(text[start:i])
+            depth += 1
+        elif ch == close:
+            depth -= 1
+            if depth == 0:
+                start = i + 1
+    out.append(text[start:])
+    return "".join(out)
+
+
+def declarations(text):
+    # drop __attribute__((...)) with arbitrary nesting
+    while "__attribute__" in text:
+        i = text.index("__attribute__")
+        j = text.index("((", i)
+        depth, k = 0, j
+        while True:
+            depth += text[k] == "("
+            depth -= text[k] == ")"
+            k += 1
+            if depth == 0:
+                break
+        text = text[:i] + text[k:]
+    text = strip_balanced(text, "{", "}")
+    return [" ".join(d.split()) for d in text.split(";") if d.strip()]
+
+
+def split_args(s):
+    args, depth, cur = [], 0, ""
+    for ch in s:
+        if ch == "," and depth == 0:
+            args.append(cur.strip())
+            cur = ""
+            continue
+        depth += ch == "("
+        depth -= ch == ")"
+        cur += ch
+    if cur.strip():
+        args.append(cur.strip())
+    return args
+
+
+class Ty:
+    """A parsed C type: rust spelling plus what a stub should return."""
+
+    def __init__(self, rust, kind, const=False):
+        self.rust, self.kind, self.const = rust, kind, const  # kind: void/int/ptr/fn
+
+
+def parse_type(s, named):
+    """Parse 'const char *name' into (Ty, name)."""
+    m = re.match(r"^(.*?)\(\s*\*\s*(\w*)\s*\)\s*\((.*)\)$", s)
+    if m:
+        ret, _ = parse_type(m.group(1), False)
+        args = [parse_type(a, True)[0].rust for a in split_args(m.group(3))
+                if a != "void"]
+        r = "" if ret.kind == "void" else f" -> {ret.rust}"
+        return Ty(f'Option<unsafe extern "C" fn({", ".join(args)}){r}>', "fn"), m.group(2)
+    toks = [t for t in re.findall(r"\w+|\*", s) if t not in QUAL]
+    const, i = False, 0
+    while i < len(toks) and toks[i] == "const":
+        const, i = True, i + 1
+    if toks[i] == "struct":
+        base, i = f"struct {toks[i + 1]}", i + 2
+    elif toks[i] in INT_WORDS:
+        j = i
+        while j < len(toks) and toks[j] in INT_WORDS:
+            j += 1
+        base, i = " ".join(toks[i:j]), j
+    else:
+        base, i = toks[i], i + 1
+    stars = []  # const-ness of each pointee level, innermost first
+    cur = const
+    name = ""
+    for t in toks[i:]:
+        if t == "*":
+            stars.append(cur)
+            cur = False
+        elif t == "const":
+            cur = True
+        elif not name:
+            name = t
+    if base == "signed int":
+        base = "int"
+    if base in CALLBACKS:
+        if len(stars) != 1:
+            sys.exit(f"gen-stubs: unexpected callback use: {s}")
+        return Ty(base, "fn"), name
+    if base not in BASE:
+        sys.exit(f"gen-stubs: cannot map type '{base}' in '{s}'")
+    rust = BASE[base]
+    if not stars:
+        if base == "void":
+            return Ty("()", "void"), name
+        if base.startswith("struct") and base != "struct stat" or base == "FILE":
+            sys.exit(f"gen-stubs: by-value opaque type in '{s}'")
+        return Ty(rust, "int"), name
+    for c in stars:
+        rust = f"*{'const' if c else 'mut'} {rust}"
+    return Ty(rust, "ptr", stars[-1]), name
+
+
+def snake(ident):
+    return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", ident.lstrip("_")).lower()
+
+
+def stub(name, ret, params):
+    r = "" if ret.kind == "void" else f" -> {ret.rust}"
+    if ret.kind == "void":
+        body = ""
+    elif ret.kind == "ptr":
+        body = "std::ptr::null()" if ret.const else "std::ptr::null_mut()"
+    elif ret.kind == "fn":
+        body = "None"
+    else:
+        body = "ARCHIVE_FATAL" if ret.rust == "c_int" else f"ARCHIVE_FATAL as {ret.rust}"
+    args = ", ".join(f"{n}: {t.rust}" for n, t in params)
+    sig = f'pub extern "C" fn {name}({args}){r} {{'
+    if len(sig) > 100:  # rustfmt style
+        args = "".join(f"\n    {n}: {t.rust}," for n, t in params) + "\n"
+        sig = f'pub extern "C" fn {name}({args}){r} {{'
+    inner = f"\n    {body}\n" if body else ""
+    return f"#[unsafe(no_mangle)]\n{sig}{inner}}}\n"
+
+
+def defined_elsewhere():
+    found = set()
+    for f in FFI.glob("**/*.rs"):
+        if f.name not in ("stubs.rs", "mod.rs"):
+            found |= set(re.findall(r"\bfn\s+(archive_\w+)\s*\(", f.read_text()))
+    return found
+
+
+def main():
+    parsed, protos = 0, []
+    decls = declarations(preprocess())
+    for d in decls:
+        m = re.match(r"^typedef .*\b(archive_\w+_callback)\s*\(", d)
+        if m:
+            CALLBACKS.add(m.group(1))
+    for d in decls:
+        m = re.match(r"^(?!typedef\b)(.*?)\b(archive_\w+)\s*\((.*)\)$", d)
+        if not m or not m.group(1).strip():
+            continue
+        parsed += 1
+        ret, _ = parse_type(m.group(1), False)
+        raw = split_args(m.group(3))
+        name = m.group(2)
+        if raw and raw[-1] == "...":
+            if name not in SKIP:
+                sys.exit(f"gen-stubs: unexpected variadic {name}")
+            protos.append((name, None, None))
+            continue
+        params = []
+        for k, a in enumerate(raw):
+            if a == "void":
+                continue
+            t, pn = parse_type(a, True)
+            params.append((f"_{snake(pn)}" if pn else f"_a{k}", t))
+        protos.append((name, ret, params))
+    names = [p[0] for p in protos]
+    if len(set(names)) != len(names):
+        sys.exit("gen-stubs: duplicate declarations")
+    elsewhere = defined_elsewhere()
+    out = [(n, r, p) for n, r, p in protos if n not in SKIP and n not in elsewhere]
+    body = "\n".join(stub(*o) for o in out)
+    used = set(re.findall(r"\b\w+\b", body))
+    ffi = sorted(used & FFI_NAMES)
+    local = sorted(u for u in used if u in {"Archive", "ArchiveEntry", "ArchiveAcl",
+        "ArchiveEntryLinkresolver", "ARCHIVE_FATAL"} or u in CALLBACKS)
+    header = (
+        "// Generated by scripts/gen-stubs; do not edit by hand.\n"
+        "// Every stub returns an error. Delete a stub when its function is ported;\n"
+        "// rerunning the script skips functions already defined elsewhere in src/ffi/.\n\n"
+        "use super::{\n" + "".join(f"    {n},\n" for n in local) + "};\n"
+        f"use std::ffi::{{{', '.join(ffi)}}};\n\n"
+    )
+    (FFI / "stubs.rs").write_text(header + body)
+    print(f"parsed {parsed}, emitted {len(out)}, skipped {parsed - len(out)}")
+
+
+main()
