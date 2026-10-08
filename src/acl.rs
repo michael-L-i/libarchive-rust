@@ -610,7 +610,8 @@ impl Acl {
                 id,
             );
         }
-        Some(s)
+        // Entries may have been skipped.
+        (!s.is_empty()).then_some(s)
     }
 
     /// Parse a wide ACL text string. See `parse_nl`.
