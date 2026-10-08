@@ -321,8 +321,11 @@ def main():
     if first:
         log = log_path(out_dir, first)
         print(f"first failure: {first} ({status[first]}) log: {log}")
-        with open(log, errors="replace") as f:
-            tail = f.read().splitlines()[-10:]
+        try:
+            with open(log, errors="replace") as f:
+                tail = f.read().splitlines()[-10:]
+        except FileNotFoundError:  # a concurrent run in this tree cleared logs/
+            tail = ["(log removed by a concurrent run)"]
         for line in tail:
             print("    " + line)
 
