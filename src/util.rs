@@ -28,7 +28,7 @@
 
 //! Errors, library version and the accessors common to all handles.
 
-use crate::archive::{ARCHIVE_FATAL, Base};
+use crate::archive::{ARCHIVE_FATAL, ARCHIVE_RETRY, ARCHIVE_WARN, Base};
 use std::cell::Ref;
 use std::ffi::{CStr, c_int};
 
@@ -37,9 +37,10 @@ pub const VERSION_STRING: &CStr = c"libarchive 3.9.0dev";
 
 /// An error with the three things `archive_set_error` records, plus the
 /// return code the C function reports. Code below `src/ffi/` returns
-/// `Result<_, Error>` (std's) and `?`-propagates it. A caller that must report
-/// upstream's "set error, return `ARCHIVE_WARN`" says so with
-/// `a.raise(Error::new(ARCHIVE_WARN, errno, msg))`.
+/// `Result<_, Error>` (std's) and `?`-propagates it. The code is a failure:
+/// `ARCHIVE_RETRY`, `ARCHIVE_FAILED` or `ARCHIVE_FATAL`. Upstream's "set
+/// error, return `ARCHIVE_WARN`" is `Base::warn`, and the end of the input is
+/// `Status::Eof`; neither is an `Error`.
 ///
 /// The message is bytes, not `String`: it may embed a pathname.
 #[derive(Debug, PartialEq, Eq)]
@@ -67,13 +68,20 @@ impl Error {
     }
 
     /// An error of this `code` whose message was already recorded where it
-    /// happened: `raise` leaves the handle's error alone.
-    pub fn recorded(code: c_int) -> Self {
+    /// happened: `raise` leaves the handle's error alone. Only the
+    /// `Reader`/`Client` machinery may use it, to pass a failure up that it
+    /// has already recorded; everyone else gives a message.
+    pub(crate) fn recorded(code: c_int) -> Self {
         Error {
             recorded: true,
             ..Self::new(code, 0, Vec::new())
         }
     }
+}
+
+/// Whether `code` is one an `Error` may carry.
+pub(crate) fn is_failure(code: c_int) -> bool {
+    code < ARCHIVE_WARN || code == ARCHIVE_RETRY
 }
 
 impl Base {
@@ -95,6 +103,7 @@ impl Base {
     /// Records `e` (unless it is `recorded` already) and returns the code to
     /// hand back to the C caller.
     pub fn raise(&self, e: Error) -> c_int {
+        debug_assert!(is_failure(e.code), "an Error carries a failure, not {}", e.code);
         if !e.recorded {
             self.set_error(e.errno, Some(&e.msg));
         }
@@ -137,7 +146,7 @@ impl Base {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{ARCHIVE_FAILED, ARCHIVE_WARN, READ_MAGIC};
+    use crate::archive::{ARCHIVE_EOF, ARCHIVE_FAILED, ARCHIVE_OK, READ_MAGIC};
 
     #[test]
     fn set_and_clear_error() {
@@ -162,12 +171,25 @@ mod tests {
     #[test]
     fn raise_records_and_returns_code() {
         let a = Base::new(READ_MAGIC);
-        assert_eq!(a.raise(Error::new(ARCHIVE_WARN, 22, "odd")), ARCHIVE_WARN);
+        assert_eq!(a.raise(Error::new(ARCHIVE_FAILED, 22, "odd")), ARCHIVE_FAILED);
         assert_eq!(
             (a.errno.get(), a.error_string().as_deref()),
             (22, Some(b"odd".as_slice()))
         );
         assert_eq!(a.raise(Error::fatal(1, "no")), ARCHIVE_FATAL);
+    }
+
+    #[test]
+    fn only_failures_are_errors() {
+        assert!([ARCHIVE_RETRY, ARCHIVE_FAILED, ARCHIVE_FATAL].into_iter().all(is_failure));
+        assert!(![ARCHIVE_OK, ARCHIVE_EOF, ARCHIVE_WARN].into_iter().any(is_failure));
+    }
+
+    #[test]
+    #[should_panic(expected = "carries a failure")]
+    #[cfg(debug_assertions)]
+    fn raising_a_warning_is_a_bug() {
+        let _ = Base::new(READ_MAGIC).raise(Error::new(ARCHIVE_WARN, 0, "odd"));
     }
 
     #[test]

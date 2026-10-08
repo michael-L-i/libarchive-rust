@@ -7,7 +7,7 @@ use super::{
 };
 use crate::archive::*;
 use crate::read::{Client, Status, Whence, worse};
-use crate::util::Error;
+use crate::util::{Error, is_failure};
 use std::ffi::{c_int, c_void};
 
 /// What `archive_read_set_*_callback` and `archive_read_set_callback_data`
@@ -35,10 +35,11 @@ pub struct CClient {
 }
 
 /// The failure of a callback that returned `r` and has recorded its own
-/// error. A callback that only warns when it can't go on is a failure.
+/// error. A callback that only warns, or returns anything but a failure code,
+/// when it can't go on is fatal.
 fn failure(r: i64) -> Error {
     match c_int::try_from(r) {
-        Ok(code) if code != ARCHIVE_WARN => Error::recorded(code),
+        Ok(code) if is_failure(code) => Error::recorded(code),
         _ => Error::recorded(ARCHIVE_FATAL),
     }
 }
