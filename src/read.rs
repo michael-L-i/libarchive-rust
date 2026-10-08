@@ -102,6 +102,8 @@ pub mod format_code {
     pub const RAR_V5: c_int = 0x100000;
 }
 
+#[cfg(test)]
+mod ar_example;
 pub mod filter;
 pub mod format;
 
@@ -194,7 +196,11 @@ pub trait Filter {
     /// copies them into its own block.
     fn read(&mut self, up: &mut Reader<'_>) -> Result<(), Error>;
 
-    /// The block `read` produced; it stays put until the next `read`.
+    /// The block the last `read` produced, exactly: the same bytes and the
+    /// same length every time it is called, until the next `read`. The stage
+    /// records the length after `read` and indexes into the block later, so
+    /// a block that changes (or a `read` that leaves `block` stale) corrupts
+    /// the stream; debug builds assert on it.
     fn block(&self) -> &[u8];
 
     /// Fills in the entry with what the filter's header says (the gzip
@@ -239,7 +245,8 @@ pub trait Client {
     /// the end of the node.
     fn read(&mut self, _a: &Base, node: usize) -> Result<(), Error>;
 
-    /// The block `read` produced; it stays put until the next `read`.
+    /// The block the last `read` produced, exactly, until the next `read`
+    /// (see `Filter::block`).
     fn block(&self) -> &[u8];
 
     /// Whether `skip` is worth calling. When it is not, the core reads and
@@ -565,10 +572,9 @@ impl Stage {
             Loc::Client => (self.imp.filter().block(), self.client_next, self.client_avail),
             Loc::Copy => (self.buffer.as_slice(), self.next, self.avail),
         };
-        start
-            .checked_add(len)
-            .and_then(|end| buf.get(start..end))
-            .unwrap_or_default()
+        let end = start.saturating_add(len);
+        debug_assert!(end <= buf.len(), "a stage's data is outside its buffer");
+        buf.get(start..end).unwrap_or_default()
     }
 
     /// `read_client_data`: pulls the next block from the filter. Returns its
@@ -645,6 +651,11 @@ impl Stage {
             // is available.
             let tocopy = (min - self.avail).min(self.client_avail);
             let end = self.client_next.saturating_add(tocopy);
+            debug_assert_eq!(
+                self.client_total,
+                self.imp.filter().block().len(),
+                "a filter's block() must be what its last read produced"
+            );
             let src = self.imp.filter().block().get(self.client_next..end);
             let Some(src) = src else {
                 // The filter's block shrank under us.
@@ -937,6 +948,31 @@ impl<'a> Reader<'a> {
         Ok(top.data(loc))
     }
 
+    /// Reads the next `n` bytes into a `Vec` and consumes them, or `None`
+    /// (nothing consumed) if the input ends first. For fixed-size fields a
+    /// format keeps, where a `read_ahead` slice would be in the way.
+    pub fn read_exact_vec(&mut self, n: usize) -> Result<Option<Vec<u8>>, Error> {
+        let Some(data) = self.read_ahead(n)? else {
+            return Ok(None);
+        };
+        let bytes = data.get(..n).unwrap_or_default().to_vec();
+        self.consume(n)?;
+        Ok(Some(bytes))
+    }
+
+    /// Consumes `n` bytes that a `read_ahead` (or `peek_available`) just
+    /// showed were there: `consume`, but running out is a bug in the caller,
+    /// which debug builds assert on, rather than a truncated input.
+    pub fn consume_ahead(&mut self, n: usize) -> Result<(), Error> {
+        debug_assert!(
+            self.chain
+                .last()
+                .is_some_and(|s| s.avail + s.client_avail >= n),
+            "consume_ahead({n}) without that much read ahead"
+        );
+        self.consume(n)
+    }
+
     /// `__archive_read_consume`: moves the file pointer forward by `n`, which
     /// the reader should have looked at (or not) first. It is a fatal error
     /// for the stream to end first, or for `n` to be negative.
@@ -1198,11 +1234,28 @@ pub enum Data<'r> {
 /// everything it reads comes through the `Reader` passed to each call, so a
 /// format's state, the stream and the entry are separate borrows.
 ///
+/// # Statuses
+///
 /// A call that can warn returns `Result<Status, Error>`. `Status::Warn` means
 /// carry on, with the warning already recorded (`Reader::warn`); `Err` is only
 /// `ARCHIVE_FAILED` (this entry can't be read, but the next may be) or
 /// `ARCHIVE_FATAL`, with its message in the `Error`. So a warning never ends
 /// the function early by way of `?`.
+///
+/// # Deferred consume
+///
+/// A format that returns data in place from `read_data` can't consume it
+/// first: the slice must stay valid until the next call. So it remembers how
+/// much is pending and consumes it at the top of its next `read_header`,
+/// `read_data_skip` or `read_data` call. All three must do this, or the
+/// stream is left in the wrong place.
+///
+/// # Example
+///
+/// A small `ar` reader, the shape every reader has. It is compiled and run by
+/// the tests.
+///
+#[doc = concat!("```ignore\n", include_str!("read/ar_example.rs"), "```")]
 pub trait Format: Any {
     /// The name `archive_read_set_format` and the option modules use.
     fn name(&self) -> &'static str;
@@ -2875,5 +2928,118 @@ mod tests {
         base.warn(libc::EILSEQ, "noted");
         assert_eq!((data, position), (&b"hello"[..], 0));
         assert_eq!((a.format.get(), error(&a)), (5, "noted".to_string()));
+    }
+
+    /// An `ar` member: name, mtime, mode and data, padded to even length.
+    fn ar_member(name: &str, mtime: u64, data: &[u8]) -> Vec<u8> {
+        let mut m = format!("{name:<16}{mtime:<12}{:<6}{:<6}{:<8}{:<10}`\n", 0, 0, "100644", data.len())
+            .into_bytes();
+        m.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            m.push(b'\n');
+        }
+        m
+    }
+
+    fn ar_archive(members: &[Vec<u8>]) -> Vec<u8> {
+        let mut a = b"!<arch>\n".to_vec();
+        for m in members {
+            a.extend_from_slice(m);
+        }
+        a
+    }
+
+    fn ar_open(bytes: &[u8], read_size: usize) -> (Read, Base) {
+        let mut r = Read::default();
+        r.register_format(Box::new(ar_example::Ar::default())).unwrap();
+        let a = Base::new(READ_MAGIC);
+        let mem = crate::read_open_memory::Memory::new(bytes.to_vec(), read_size);
+        assert_eq!(r.open(&a, Box::new(mem)), ARCHIVE_OK);
+        (r, a)
+    }
+
+    fn ar_data(r: &mut Read, a: &Base) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let more = r.read_data_block(a, |d| match d {
+                Data::Block { data, .. } => {
+                    out.extend_from_slice(data);
+                    true
+                }
+                _ => false,
+            });
+            if more != Ok(true) {
+                return out;
+            }
+        }
+    }
+
+    #[test]
+    fn the_ar_example_reads_members_in_place() {
+        let bytes = ar_archive(&[
+            ar_member("hello.txt/", 1000, b"hello"),
+            ar_member("b/", 2000, b"abcdefghijklmnop"),
+            ar_member("c/", 3000, b"xy"),
+        ]);
+        // Small blocks make the data span several read_ahead calls.
+        for read_size in [3, 7, 1000] {
+            let (mut r, a) = ar_open(&bytes, read_size);
+            let mut e = Entry::new(None);
+            assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_OK);
+            assert_eq!((e.size(), a.format.get()), (5, 0x70000));
+            assert_eq!(e.pathname().map(|p| p.to_bytes().to_vec()), Some(b"hello.txt".to_vec()));
+            assert_eq!(e.mtime(), 1000);
+            assert_eq!(ar_data(&mut r, &a), b"hello");
+            // The padding byte and unread data are skipped.
+            assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_OK);
+            assert_eq!(ar_data(&mut r, &a), b"abcdefghijklmnop");
+            assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_OK);
+            assert_eq!(r.read_data_skip(&a), ARCHIVE_OK);
+            assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_EOF);
+            assert_eq!(r.header_position(), bytes.len() as i64);
+        }
+    }
+
+    #[test]
+    fn the_ar_example_reports_broken_input() {
+        let good = ar_archive(&[ar_member("a/", 1, b"data")]);
+        // Truncated in the middle of a header.
+        let (mut r, a) = ar_open(&good[..good.len() - 30], 16);
+        let mut e = Entry::new(None);
+        assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_FATAL);
+        assert_eq!(error(&a), "Truncated ar archive");
+        // Truncated in the middle of the data.
+        let (mut r, a) = ar_open(&good[..good.len() - 2], 16);
+        assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_OK);
+        // Like upstream's archive_read_data, the error wins over the 2 bytes.
+        assert_eq!(r.read_data(&a, &mut [0; 8]), ARCHIVE_FATAL as isize);
+        assert_eq!(error(&a), "Truncated ar archive");
+        // A bad signature.
+        let mut bad = good.clone();
+        bad[8 + 58] = b'x';
+        let (mut r, a) = ar_open(&bad, 16);
+        assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_FATAL);
+        assert_eq!(error(&a), "Incorrect file header signature");
+        // A warning keeps the entry.
+        let nameless = ar_archive(&[ar_member("", 1, b"data")]);
+        let (mut r, a) = ar_open(&nameless, 16);
+        assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_WARN);
+        assert_eq!((a.state.get(), error(&a)), (state::DATA, "ar member without a name".into()));
+        assert_eq!(ar_data(&mut r, &a), b"data");
+    }
+
+    #[test]
+    fn helpers_read_fixed_amounts() {
+        let (mem, _) = Mem::new(b"0123456789", 3);
+        let (mut r, a) = setup(mem);
+        let mut rd = r.reader(&a);
+        assert_eq!(rd.read_exact_vec(4).unwrap(), Some(b"0123".to_vec()));
+        assert_eq!(rd.position(), 4);
+        // Too little: nothing is consumed.
+        assert_eq!(rd.read_exact_vec(7).unwrap(), None);
+        assert_eq!(rd.position(), 4);
+        assert!(rd.read_ahead(2).unwrap().is_some());
+        rd.consume_ahead(2).unwrap();
+        assert_eq!(rd.peek_available(1).unwrap().first(), Some(&b'6'));
     }
 }
