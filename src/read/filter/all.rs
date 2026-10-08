@@ -28,7 +28,7 @@
 //! The filters `archive_read_support_filter_all` enables, and the table
 //! `archive_read_support_filter_by_code` looks filters up in.
 
-use super::{compress, grzip, gzip, lrzip, lzop, rpm, xz};
+use super::{compress, grzip, gzip, lrzip, lz4, lzop, rpm, xz};
 use crate::archive::*;
 use crate::read::{Read, Status, filter_code as code};
 use crate::util::Error;
@@ -55,7 +55,7 @@ pub const FILTERS: &[(c_int, Option<Support>)] = &[
     (code::LRZIP, Some(lrzip::support)),
     (code::LZOP, Some(lzop::support)),
     (code::GRZIP, Some(grzip::support)),
-    (code::LZ4, None),
+    (code::LZ4, Some(lz4::support)),
     (code::ZSTD, None),
 ];
 
