@@ -20,11 +20,6 @@ pub extern "C" fn archive_read_support_compression_bzip2(_a0: *mut Archive) -> c
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_compression_compress(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_compression_gzip(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
@@ -69,11 +64,6 @@ pub extern "C" fn archive_read_support_compression_xz(_a0: *mut Archive) -> c_in
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_bzip2(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_compress(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
 

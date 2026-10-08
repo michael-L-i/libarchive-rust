@@ -9,10 +9,10 @@ use super::{
 };
 use crate::archive::{Handle, Kind, READ_MAGIC, state};
 use crate::read::filter::{
-    all as filter_all, by_code as filter_by_code, none as filter_none, uu as filter_uu,
+    all as filter_all, by_code as filter_by_code, compress, none as filter_none, uu as filter_uu,
 };
 use crate::read::format::{all as format_all, by_code as format_by_code, empty, raw};
-use crate::read::{self, Read};
+use crate::read::{self, Read, Status};
 use super::ArchiveEntry;
 use super::sys::Fd;
 use crate::entry::Entry;
@@ -54,6 +54,30 @@ pub extern "C" fn archive_read_support_filter_none(a: *mut Archive) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_compression_none(a: *mut Archive) -> c_int {
     archive_read_support_filter_none(a)
+}
+
+/// Registers a decompression filter's bidder: what the filter exports do.
+fn support_filter(h: &Handle, support: fn(&mut Read) -> Result<Status, Error>) -> c_int {
+    with_read(h, ARCHIVE_FATAL, |r| {
+        support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_filter_compress(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_filter_compress,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| support_filter(h, compress::support)
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_compression_compress(a: *mut Archive) -> c_int {
+    archive_read_support_filter_compress(a)
 }
 
 #[unsafe(no_mangle)]
