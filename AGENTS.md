@@ -172,8 +172,14 @@ when a unit is:
   readers and writers (path traversal and symlink safety)
 - a Haiku attempt that failed twice on the same oracle failures
 
+Escalate to **Opus 5.5** (`claude-opus-5-5`) when a unit is really stuck:
+Sonnet has failed twice on the same oracle failures, or a divergence from
+upstream persists that no one can explain. Hand Opus the failing tests, what
+was tried, and the evidence so far; drop back to the default model for the
+next unit.
+
 In Claude Code, `porter` and `reviewer` in `.claude/agents/` default to Haiku.
-Pass `model: "sonnet"` on the Agent call to escalate.
+Pass `model: "sonnet"` or `model: "opus"` on the Agent call to escalate.
 
 Per unit:
 

@@ -14,6 +14,10 @@ module, and the oracle tests that must pass.
 3. Iterate until the named tests pass and `cargo clippy -- -D warnings` is
    clean.
 
+If you can't get the same oracle failures to pass after two honest attempts,
+stop and say so in your report, with what you tried, so the orchestrator can
+escalate the unit (Haiku → Sonnet → Opus, per AGENTS.md).
+
 Commit incrementally in upstream style (AGENTS.md, Commits). Every commit
 builds, is clippy clean and holds the ratchet. Report back: the commit range,
 tests now passing, tests still failing, and any upstream behavior you suspect
