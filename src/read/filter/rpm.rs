@@ -113,14 +113,16 @@ fn skip_prologue(up: &mut Reader<'_>) -> Result<(), Error> {
         let Some(head) = head else {
             return Err(no_message());
         };
-        if head[..4] != [0x8E, 0xAD, 0xE8, 0x01] {
+        if head.first_chunk::<4>() != Some(&[0x8E, 0xAD, 0xE8, 0x01]) {
             break;
         }
         seen_header = true;
-        // Both counts are 32-bit, so the length cannot overflow a u64.
-        let section = u64::from(be32(&head[8..12]));
-        let bytes = u64::from(be32(&head[12..16]));
-        up.consume(MIN_HEADER_SIZE as u64 + section * 16 + bytes)?;
+        // The header, then 16 bytes per index entry and the data. Both counts
+        // are 32-bit, so the length cannot overflow a u64.
+        let [.., s0, s1, s2, s3, b0, b1, b2, b3] = head;
+        let section = u64::from(u32::from_be_bytes([s0, s1, s2, s3]));
+        let bytes = u64::from(u32::from_be_bytes([b0, b1, b2, b3]));
+        up.consume(16 + section * 16 + bytes)?;
         skip_padding(up)?;
     }
     if !seen_header {
@@ -149,11 +151,6 @@ fn skip_padding(up: &mut Reader<'_>) -> Result<(), Error> {
 /// handle keeps whatever it had.
 fn no_message() -> Error {
     Error::recorded(ARCHIVE_FATAL)
-}
-
-/// `archive_be32dec`.
-fn be32(b: &[u8]) -> u32 {
-    b.iter().fold(0, |n, &byte| (n << 8) | u32::from(byte))
 }
 
 #[cfg(test)]
