@@ -148,7 +148,7 @@ pub trait Filter {
     /// Produces the next block, readable through `block`. An empty block is
     /// end of input. An error is fatal for the stage: the filter has its
     /// message set in the `Error` (or has already recorded it, for a bare
-    /// `Error::status`), and the stage reports `ARCHIVE_FATAL` from then on.
+    /// `Error::recorded`), and the stage reports `ARCHIVE_FATAL` from then on.
     ///
     /// `up` reads the stage below. Whatever `up` hands out is only valid
     /// until the next call on it, so a filter that passes bytes through
@@ -220,7 +220,7 @@ pub trait Client {
     /// Seeks within node `node` and returns the new offset in the node. A
     /// negative-code error means the node cannot seek.
     fn seek(&mut self, _node: usize, _offset: i64, _whence: Whence) -> Result<i64, Error> {
-        Err(Error::status(ARCHIVE_FAILED))
+        Err(Error::recorded(ARCHIVE_FAILED))
     }
 
     /// Closes node `node`.
@@ -330,7 +330,7 @@ impl ClientFilter {
                 }
                 offset = offset.saturating_sub(self.nodes[cursor].begin_position);
                 if offset < 0 || offset > self.nodes[cursor].total_size {
-                    return Err(Error::status(ARCHIVE_FATAL));
+                    return Err(Error::recorded(ARCHIVE_FATAL));
                 }
                 r = self.client.seek(cursor, offset, Whence::Set)?;
             }
@@ -538,7 +538,7 @@ impl Stage {
             self.client_avail = 0;
             self.fatal = true;
             up.a.raise(e);
-            return Err(Error::status(ARCHIVE_FATAL));
+            return Err(Error::recorded(ARCHIVE_FATAL));
         }
         let n = self.imp.filter().block().len();
         self.client_total = n;
@@ -552,7 +552,7 @@ impl Stage {
     /// is end of file. Does not move the file pointer.
     fn fill(&mut self, up: &mut Reader<'_>, request: usize) -> Result<Loc, Error> {
         if self.fatal {
-            return Err(Error::status(ARCHIVE_FATAL));
+            return Err(Error::recorded(ARCHIVE_FATAL));
         }
         // request == 0 is perfectly well-defined.
         let min = request.max(1);
@@ -593,7 +593,7 @@ impl Stage {
             if let Err(e) = self.make_room(min) {
                 self.fatal = true;
                 up.a.raise(e);
-                return Err(Error::status(ARCHIVE_FATAL));
+                return Err(Error::recorded(ARCHIVE_FATAL));
             }
             // Don't waste time buffering more than we need to, or more than
             // is available.
@@ -603,7 +603,7 @@ impl Stage {
             let Some(src) = src else {
                 // The filter's block shrank under us.
                 self.fatal = true;
-                return Err(Error::status(ARCHIVE_FATAL));
+                return Err(Error::recorded(ARCHIVE_FATAL));
             };
             self.buffer.extend_from_slice(src);
             // Remove this data from the client buffer and add it to the copy
@@ -648,7 +648,7 @@ impl Stage {
     /// only at end of file. An error is recorded and makes the stage fatal.
     fn advance(&mut self, up: &mut Reader<'_>, request: i64) -> Result<i64, Error> {
         if self.fatal {
-            return Err(Error::status(ARCHIVE_FATAL));
+            return Err(Error::recorded(ARCHIVE_FATAL));
         }
         let mut request = request;
         let mut skipped = 0;
@@ -669,7 +669,7 @@ impl Stage {
                 let get = self.client_skip(up, request)?;
                 if get < 0 || get > request {
                     self.fatal = true;
-                    return Err(Error::status(ARCHIVE_FATAL));
+                    return Err(Error::recorded(ARCHIVE_FATAL));
                 }
                 if get == 0 {
                     break;
@@ -695,7 +695,7 @@ impl Stage {
             let after = self.client_seek(up, request, Whence::Cur)?;
             if Some(after) != before.checked_add(request) {
                 self.fatal = true;
-                return Err(Error::status(ARCHIVE_FATAL));
+                return Err(Error::recorded(ARCHIVE_FATAL));
             }
             self.position = after;
             skipped += request;
@@ -729,7 +729,7 @@ impl Stage {
         };
         c.client.skip(c.cursor, request).map_err(|e| {
             self.fatal = true;
-            Error::status(up.a.raise(e))
+            Error::recorded(up.a.raise(e))
         })
     }
 
@@ -745,11 +745,11 @@ impl Stage {
         whence: Whence,
     ) -> Result<i64, Error> {
         let Imp::Client(c) = &mut self.imp else {
-            return Err(Error::status(ARCHIVE_FAILED));
+            return Err(Error::recorded(ARCHIVE_FAILED));
         };
         c.client.seek(c.cursor, offset, whence).map_err(|e| {
             self.fatal = true;
-            Error::status(up.a.raise(e))
+            Error::recorded(up.a.raise(e))
         })
     }
 
@@ -757,13 +757,13 @@ impl Stage {
     /// buffered. Fails with `ARCHIVE_FAILED` if the stage can't seek.
     fn seek(&mut self, up: &mut Reader<'_>, offset: i64, whence: Whence) -> Result<i64, Error> {
         if self.closed || self.fatal {
-            return Err(Error::status(ARCHIVE_FATAL));
+            return Err(Error::recorded(ARCHIVE_FATAL));
         }
         let Imp::Client(c) = &mut self.imp else {
-            return Err(Error::status(ARCHIVE_FAILED));
+            return Err(Error::recorded(ARCHIVE_FAILED));
         };
         if !self.can_seek {
-            return Err(Error::status(ARCHIVE_FAILED));
+            return Err(Error::recorded(ARCHIVE_FAILED));
         }
         let r = c.seek(self.position, offset, whence);
 
@@ -789,7 +789,7 @@ impl Stage {
             }
             Err(e) => {
                 self.fatal = true;
-                Err(Error::status(up.a.raise(e)))
+                Err(Error::recorded(up.a.raise(e)))
             }
         }
     }
@@ -825,7 +825,7 @@ fn eat(next: &mut usize, avail: &mut usize, request: i64) -> i64 {
 /// over the stages below it.
 ///
 /// Every method that fails has already recorded the error on the handle
-/// (the message, or `Error::status` when the callee did), so the `Error` it
+/// (the message, or `Error::recorded` when the callee did), so the `Error` it
 /// returns is a bare status that is safe to `?` upward.
 pub struct Reader<'a> {
     chain: &'a mut [Stage],
@@ -893,7 +893,7 @@ impl Reader<'_> {
         let a = self.a;
         let request = match n.try_into() {
             Ok(n) if n >= 0 => n,
-            _ => return Err(Error::status(ARCHIVE_FATAL)),
+            _ => return Err(Error::recorded(ARCHIVE_FATAL)),
         };
         if request == 0 {
             return Ok(());
@@ -911,7 +911,7 @@ impl Reader<'_> {
             ARCHIVE_ERRNO_MISC,
             format!("Truncated input file (needed {request} bytes, only {skipped} available)"),
         ));
-        Err(Error::status(ARCHIVE_FATAL))
+        Err(Error::recorded(ARCHIVE_FATAL))
     }
 
     /// Moves the file pointer forward by up to `n` bytes, using the client's
@@ -920,7 +920,7 @@ impl Reader<'_> {
     /// stream being an error.
     pub fn skip(&mut self, n: i64) -> Result<i64, Error> {
         if n < 0 {
-            return Err(Error::status(ARCHIVE_FATAL));
+            return Err(Error::recorded(ARCHIVE_FATAL));
         }
         match self.split() {
             Some((top, mut up)) => top.advance(&mut up, n),
@@ -934,7 +934,7 @@ impl Reader<'_> {
     pub fn seek(&mut self, offset: i64, whence: Whence) -> Result<i64, Error> {
         match self.split() {
             Some((top, mut up)) => top.seek(&mut up, offset, whence),
-            None => Err(Error::status(ARCHIVE_FATAL)),
+            None => Err(Error::recorded(ARCHIVE_FATAL)),
         }
     }
 
@@ -1137,7 +1137,7 @@ pub enum Data<'r> {
 /// other code. `ARCHIVE_WARN` and `ARCHIVE_FAILED` are `Err`, too: the core
 /// records the message and carries on as upstream does. A format that wants
 /// to warn but continue finishes its work first, then returns the warning.
-/// `Error::status(ARCHIVE_EOF)` is end of archive.
+/// `Error::recorded(ARCHIVE_EOF)` is end of archive.
 pub trait Format: Any {
     /// The name `archive_read_set_format` and the option modules use.
     fn name(&self) -> &'static str;
@@ -1161,7 +1161,7 @@ pub trait Format: Any {
     }
 
     /// Reads the next entry's header into `entry`. At the end of the
-    /// archive, `Error::status(ARCHIVE_EOF)`.
+    /// archive, `Error::recorded(ARCHIVE_EOF)`.
     fn read_header(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Result<(), Error>;
 
     /// The next block of the entry's data. A format that returns the data in
@@ -1231,7 +1231,7 @@ impl Read {
     pub fn register_format(&mut self, format: Box<dyn Format>) -> Result<(), Error> {
         let id = (*format).type_id();
         if self.formats.iter().any(|f| (**f).type_id() == id) {
-            return Err(Error::status(ARCHIVE_WARN));
+            return Err(Error::recorded(ARCHIVE_WARN));
         }
         if self.formats.len() >= MAX_REGISTERED {
             return Err(Error::fatal(
@@ -1879,7 +1879,7 @@ mod tests {
                 Whence::End => len + offset,
             };
             if !(0..=len).contains(&to) {
-                return Err(Error::status(ARCHIVE_FATAL));
+                return Err(Error::recorded(ARCHIVE_FATAL));
             }
             self.pos = to as usize;
             self.note(format!("seek {node} {whence:?} {offset} -> {to}"));
@@ -2157,7 +2157,7 @@ mod tests {
         assert_eq!(rd.read_ahead(8).unwrap(), &data[..8]);
         rd.consume(8).unwrap();
         let e = rd.read_ahead(1).unwrap_err();
-        assert!(e.is_status() && e.code == ARCHIVE_FATAL);
+        assert!(e.recorded && e.code == ARCHIVE_FATAL);
         assert_eq!((error(&a), a.errno.get()), ("Error reading test input".into(), libc::EIO));
         a.clear_error();
         // Once a stream has failed, so does everything after it.
@@ -2330,7 +2330,7 @@ mod tests {
         }
 
         fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {
-            Err(Error::status(ARCHIVE_EOF))
+            Err(Error::recorded(ARCHIVE_EOF))
         }
 
         fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {

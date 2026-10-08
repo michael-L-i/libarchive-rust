@@ -73,7 +73,7 @@ impl Format for Raw {
     /// Mock up a fake header.
     fn read_header(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Result<(), Error> {
         if self.end_of_file {
-            return Err(Error::status(ARCHIVE_EOF));
+            return Err(Error::recorded(ARCHIVE_EOF));
         }
 
         r.set_format(format_code::RAW, c"raw");
@@ -111,7 +111,7 @@ impl Format for Raw {
             None => {
                 avail = i64::MAX - offset;
                 if avail == 0 {
-                    return Err(Error::status(ARCHIVE_FATAL));
+                    return Err(Error::recorded(ARCHIVE_FATAL));
                 }
                 self.offset = i64::MAX;
             }

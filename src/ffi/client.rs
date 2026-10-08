@@ -37,7 +37,7 @@ pub struct CClient {
 /// The `ARCHIVE_*` status of a callback that returned `r`, for a callback
 /// that has recorded its own error.
 fn failure(r: i64) -> Error {
-    Error::status(c_int::try_from(r).unwrap_or(ARCHIVE_FATAL))
+    Error::recorded(c_int::try_from(r).unwrap_or(ARCHIVE_FATAL))
 }
 
 fn status(r: c_int) -> Result<(), Error> {
@@ -89,7 +89,7 @@ impl Client for CClient {
 
     fn read(&mut self, node: usize) -> Result<(), Error> {
         let Some(reader) = self.callbacks.reader else {
-            return Err(Error::status(ARCHIVE_FATAL));
+            return Err(Error::recorded(ARCHIVE_FATAL));
         };
         let mut buff = std::ptr::null();
         // SAFETY: `new`'s contract.
@@ -105,7 +105,7 @@ impl Client for CClient {
             }
             Err(_) => {
                 self.block = (std::ptr::null(), 0);
-                Err(Error::status(ARCHIVE_FATAL))
+                Err(Error::recorded(ARCHIVE_FATAL))
             }
         }
     }
@@ -143,7 +143,7 @@ impl Client for CClient {
 
     fn seek(&mut self, node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
         let Some(seeker) = self.callbacks.seeker else {
-            return Err(Error::status(ARCHIVE_FAILED));
+            return Err(Error::recorded(ARCHIVE_FAILED));
         };
         // SAFETY: `new`'s contract.
         let r = unsafe { seeker(self.archive, self.data(node), offset, whence.to_c()) };

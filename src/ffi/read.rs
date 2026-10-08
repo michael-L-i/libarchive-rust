@@ -734,12 +734,12 @@ pub(super) mod tests {
             Some(if key == b"flag" {
                 Ok(())
             } else {
-                Err(Err_::status(crate::archive::ARCHIVE_WARN))
+                Err(Err_::recorded(crate::archive::ARCHIVE_WARN))
             })
         }
 
         fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Err_> {
-            Err(Err_::status(crate::archive::ARCHIVE_EOF))
+            Err(Err_::recorded(crate::archive::ARCHIVE_EOF))
         }
 
         fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Err_> {

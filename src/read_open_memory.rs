@@ -106,7 +106,7 @@ impl<D: AsRef<[u8]>> Client for Memory<D> {
                 self.pos = usize::try_from(p).unwrap_or(0);
                 Ok(p)
             }
-            _ => Err(Error::status(ARCHIVE_FATAL)),
+            _ => Err(Error::recorded(ARCHIVE_FATAL)),
         }
     }
 }

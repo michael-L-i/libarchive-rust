@@ -55,7 +55,7 @@ impl Format for Empty {
 
     fn read_header(&mut self, r: &mut Reader<'_>, _entry: &mut Entry) -> Result<(), Error> {
         r.set_format(format_code::EMPTY, c"Empty file");
-        Err(Error::status(ARCHIVE_EOF))
+        Err(Error::recorded(ARCHIVE_EOF))
     }
 
     fn read_data<'x>(&'x mut self, _r: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {

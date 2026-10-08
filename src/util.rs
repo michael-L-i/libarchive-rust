@@ -47,6 +47,9 @@ pub struct Error {
     pub code: c_int,
     pub errno: c_int,
     pub msg: Vec<u8>,
+    /// The error is already on the handle (a client callback called
+    /// `archive_set_error`, say), so `raise` only reports its code.
+    pub recorded: bool,
 }
 
 impl Error {
@@ -55,6 +58,7 @@ impl Error {
             code,
             errno,
             msg: msg.into(),
+            recorded: false,
         }
     }
 
@@ -62,18 +66,13 @@ impl Error {
         Self::new(ARCHIVE_FATAL, errno, msg)
     }
 
-    /// A bare status code with nothing to record: `ARCHIVE_EOF`, or an error
-    /// whose message was already recorded where it happened (a client
-    /// callback called `archive_set_error`, say). `raise` leaves the handle's
-    /// error alone for these.
-    #[allow(dead_code)] // used by the read core's chain (next commits)
-    pub fn status(code: c_int) -> Self {
-        Self::new(code, 0, Vec::new())
-    }
-
-    /// Whether this is a `status`: no errno and no message.
-    pub fn is_status(&self) -> bool {
-        self.errno == 0 && self.msg.is_empty()
+    /// An error of this `code` whose message was already recorded where it
+    /// happened: `raise` leaves the handle's error alone.
+    pub fn recorded(code: c_int) -> Self {
+        Error {
+            recorded: true,
+            ..Self::new(code, 0, Vec::new())
+        }
     }
 }
 
@@ -93,10 +92,10 @@ impl Base {
         }
     }
 
-    /// Records `e` (unless it is a bare `Error::status`) and returns the code
-    /// to hand back to the C caller.
+    /// Records `e` (unless it is `recorded` already) and returns the code to
+    /// hand back to the C caller.
     pub fn raise(&self, e: Error) -> c_int {
-        if !e.is_status() {
+        if !e.recorded {
             self.set_error(e.errno, Some(&e.msg));
         }
         e.code
@@ -138,7 +137,7 @@ impl Base {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{ARCHIVE_WARN, READ_MAGIC};
+    use crate::archive::{ARCHIVE_FAILED, ARCHIVE_WARN, READ_MAGIC};
 
     #[test]
     fn set_and_clear_error() {
@@ -172,16 +171,17 @@ mod tests {
     }
 
     #[test]
-    fn raising_a_status_keeps_the_recorded_error() {
+    fn raising_a_recorded_error_keeps_the_recorded_error() {
         let a = Base::new(READ_MAGIC);
         a.set_error(9, Some(b"earlier"));
-        assert_eq!(a.raise(Error::status(ARCHIVE_FATAL)), ARCHIVE_FATAL);
+        assert_eq!(a.raise(Error::recorded(ARCHIVE_FATAL)), ARCHIVE_FATAL);
         assert_eq!(
             (a.errno.get(), a.error_string().as_deref()),
             (9, Some(b"earlier".as_slice()))
         );
-        assert!(!Error::new(ARCHIVE_WARN, 0, "x").is_status());
-        assert!(!Error::new(ARCHIVE_WARN, 5, "").is_status());
+        // An empty message with no errno is still a message to record.
+        assert_eq!(a.raise(Error::new(ARCHIVE_FAILED, 0, "")), ARCHIVE_FAILED);
+        assert_eq!((a.errno.get(), a.error_string().as_deref()), (0, None));
     }
 
     #[test]

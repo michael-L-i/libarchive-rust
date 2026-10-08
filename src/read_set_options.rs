@@ -129,12 +129,12 @@ mod tests {
                     Ok(())
                 }
                 b"broken" => Err(Error::fatal(libc::EINVAL, "Broken option")),
-                _ => Err(Error::status(ARCHIVE_WARN)),
+                _ => Err(Error::recorded(ARCHIVE_WARN)),
             })
         }
 
         fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {
-            Err(Error::status(ARCHIVE_EOF))
+            Err(Error::recorded(ARCHIVE_EOF))
         }
 
         fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
@@ -155,7 +155,7 @@ mod tests {
         }
 
         fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<(), Error> {
-            Err(Error::status(ARCHIVE_EOF))
+            Err(Error::recorded(ARCHIVE_EOF))
         }
 
         fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
