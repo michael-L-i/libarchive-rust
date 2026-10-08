@@ -6,7 +6,6 @@ use super::{
     ARCHIVE_FATAL,
     Archive,
     ArchiveEntry,
-    ArchiveEntryLinkresolver,
     archive_close_callback,
     archive_free_callback,
     archive_open_callback,
@@ -1468,33 +1467,4 @@ pub extern "C" fn archive_match_include_gname_w(
     _a1: *const libc::wchar_t,
 ) -> c_int {
     ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_entry_linkresolver_new() -> *mut ArchiveEntryLinkresolver {
-    std::ptr::null_mut()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_entry_linkresolver_set_strategy(
-    _a0: *mut ArchiveEntryLinkresolver,
-    _a1: c_int,
-) {}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_entry_linkresolver_free(_a0: *mut ArchiveEntryLinkresolver) {}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_entry_linkify(
-    _a0: *mut ArchiveEntryLinkresolver,
-    _a1: *mut *mut ArchiveEntry,
-    _a2: *mut *mut ArchiveEntry,
-) {}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_entry_partial_links(
-    _res: *mut ArchiveEntryLinkresolver,
-    _links: *mut c_uint,
-) -> *mut ArchiveEntry {
-    std::ptr::null_mut()
 }

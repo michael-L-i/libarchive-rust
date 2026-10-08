@@ -50,7 +50,7 @@ fn wptr(s: Option<&[wchar_t]>) -> *const wchar_t {
 }
 
 /// Stores `v` through an out parameter, if the caller gave one.
-fn put<T>(p: *mut T, v: T) {
+pub(super) fn put<T>(p: *mut T, v: T) {
     if !p.is_null() {
         // SAFETY: the caller passes NULL or a pointer to writable storage.
         unsafe { p.write(v) };

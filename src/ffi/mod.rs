@@ -7,6 +7,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 mod archive;
 pub(crate) mod entry;
+mod entry_link_resolver;
 mod read;
 #[rustfmt::skip]
 mod stubs;

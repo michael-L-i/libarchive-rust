@@ -5,6 +5,7 @@ mod archive;
 mod check_magic;
 mod entry;
 mod entry_copy_stat;
+mod entry_link_resolver;
 mod entry_sparse;
 mod entry_stat;
 mod entry_strmode;
