@@ -12,6 +12,7 @@ mod read;
 #[rustfmt::skip]
 mod stubs;
 pub(crate) mod charset;
+pub(crate) mod sys;
 
 macro_rules! opaque {
     ($($name:ident),*) => {$(
