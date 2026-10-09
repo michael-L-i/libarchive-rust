@@ -33,6 +33,7 @@ test_acl_posix1e_text_numeric_id
 test_acl_posix1e_text_roundtrip
 test_acl_posix1e_text_solaris
 test_acl_to_text
+test_ar_mode
 test_archive_api_feature
 test_archive_clear_error
 test_archive_read_append_filter
@@ -75,6 +76,7 @@ test_read_filter_uudecode_raw
 test_read_filter_zstd_raw_loop
 test_read_format_7zip_issue2765
 test_read_format_7zip_sfx_elf64trunc
+test_read_format_ar
 test_read_format_empty
 test_read_format_huge_rpm
 test_read_format_raw

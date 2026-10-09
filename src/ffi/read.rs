@@ -18,7 +18,7 @@ use crate::read::filter::{
     lrzip, lz4 as filter_lz4, lzop, none as filter_none, program, rpm, uu as filter_uu,
     xz as filter_xz, zstd as filter_zstd,
 };
-use crate::read::format::{all as format_all, by_code as format_by_code, empty, raw, warc};
+use crate::read::format::{all as format_all, ar, by_code as format_by_code, empty, raw};
 use crate::read::{self, Read, Status};
 use crate::read_add_passphrase::PassphraseCallback;
 use crate::util::Error;
@@ -1045,6 +1045,20 @@ pub extern "C" fn archive_read_next_header(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_ar(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_ar,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            ar::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_raw(a: *mut Archive) -> c_int {
     checked!(
         archive_read_support_format_raw,
@@ -1068,20 +1082,6 @@ pub extern "C" fn archive_read_support_format_empty(a: *mut Archive) -> c_int {
         ARCHIVE_FATAL,
         |h| with_read(h, ARCHIVE_FATAL, |r| {
             empty::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_format_warc(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_warc,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            warc::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
         })
     )
 }
