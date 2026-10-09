@@ -16,6 +16,7 @@ mod options;
 mod pack_dev;
 mod ppmd;
 mod ppmd7;
+mod ppmd8;
 mod read;
 mod read_add_passphrase;
 mod read_append_filter;
