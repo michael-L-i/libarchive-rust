@@ -931,6 +931,9 @@ pub struct Reader<'a> {
     chain: &'a mut [Stage],
     a: &'a Base,
     passphrases: &'a mut Passphrases,
+    /// The handle's own entry (upstream's `a->entry`), for the calls a
+    /// format makes in the middle of reading data that upstream passes it to.
+    entry: Option<&'a mut Entry>,
 }
 
 impl<'a> Reader<'a> {
@@ -948,8 +951,20 @@ impl<'a> Reader<'a> {
             chain: below,
             a: self.a,
             passphrases: &mut *self.passphrases,
+            entry: None,
         };
         Some((top, up))
+    }
+
+    /// Calls `f` with this reader and the handle's own entry, which upstream's
+    /// `a->entry` is: what a format passes to the header reads it makes in
+    /// the middle of `read_data`, `read_data_skip` and `seek_data`. `None`
+    /// outside those.
+    pub fn with_entry<T>(&mut self, f: impl FnOnce(&mut Self, Option<&mut Entry>) -> T) -> T {
+        let mut entry = self.entry.take();
+        let result = f(self, entry.as_deref_mut());
+        self.entry = entry;
+        result
     }
 
     /// `__archive_read_header`: lets the top filter fill in `entry`.
@@ -1232,6 +1247,7 @@ impl Read {
             chain: &mut self.chain,
             a,
             passphrases: &mut self.passphrases,
+            entry: None,
         }
     }
 
@@ -1516,6 +1532,7 @@ impl Read {
             chain,
             a,
             passphrases,
+            entry: None,
         };
         match bidder.init(&mut rd) {
             Ok(filter) => {
@@ -1541,6 +1558,7 @@ impl Read {
                     chain: &mut self.chain,
                     a,
                     passphrases: &mut self.passphrases,
+                    entry: None,
                 };
                 let bid = match bidder.bid(&mut rd) {
                     Ok(bid) => bid,
@@ -1559,6 +1577,7 @@ impl Read {
                 chain: &mut self.chain,
                 a,
                 passphrases: &mut self.passphrases,
+                entry: None,
             };
             let Some(best) = best else {
                 // If no bidder, we're done. Verify the filter by asking it
@@ -1594,6 +1613,7 @@ impl Read {
             chain: &mut self.chain,
             a,
             passphrases: &mut self.passphrases,
+            entry: None,
         };
         // An error from a bidder, say a failed read, is fatal.
         let Ok(bid) = format.bid(&mut rd, best_bid).map_err(|e| a.raise(e)) else {
@@ -1765,6 +1785,7 @@ impl Read {
             chain: &mut self.chain,
             a,
             passphrases: &mut self.passphrases,
+            entry: None,
         }
         .flush()
     }
@@ -1779,12 +1800,17 @@ impl Read {
     }
 
     /// The active format and a `Reader` over the chain, as separate borrows.
-    fn active<'a>(&'a mut self, a: &'a Base) -> Option<(&'a mut dyn Format, Reader<'a>)> {
+    fn active<'a>(
+        &'a mut self,
+        a: &'a Base,
+        entry: Option<&'a mut Entry>,
+    ) -> Option<(&'a mut dyn Format, Reader<'a>)> {
         let format = self.formats.get_mut(self.format?)?;
         let rd = Reader {
             chain: &mut self.chain,
             a,
             passphrases: &mut self.passphrases,
+            entry,
         };
         Some((format.as_mut(), rd))
     }
@@ -1796,12 +1822,13 @@ impl Read {
     pub fn read_data_block<R>(
         &mut self,
         a: &Base,
+        entry: Option<&mut Entry>,
         f: impl FnOnce(Data<'_>) -> R,
     ) -> Result<R, c_int> {
         if let Err(e) = self.flush(a) {
             return Err(Self::fail(a, e));
         }
-        let Some((format, mut rd)) = self.active(a) else {
+        let Some((format, mut rd)) = self.active(a, entry) else {
             a.state.set(state::FATAL);
             return Err(a.raise(Error::fatal(
                 ARCHIVE_ERRNO_PROGRAMMER,
@@ -1816,8 +1843,8 @@ impl Read {
 
     /// `archive_read_data_skip`, after the caller has checked the state:
     /// skips over all remaining data in this entry.
-    pub fn read_data_skip(&mut self, a: &Base) -> c_int {
-        let r = self.flush(a).and_then(|()| match self.active(a) {
+    pub fn read_data_skip(&mut self, a: &Base, entry: Option<&mut Entry>) -> c_int {
+        let r = self.flush(a).and_then(|()| match self.active(a, entry) {
             Some((format, mut rd)) => format.read_data_skip(&mut rd),
             None => Ok(Status::Ok),
         });
@@ -1835,11 +1862,17 @@ impl Read {
     }
 
     /// `archive_seek_data`, after the caller has checked the state.
-    pub fn seek_data(&mut self, a: &Base, offset: i64, whence: c_int) -> i64 {
+    pub fn seek_data(
+        &mut self,
+        a: &Base,
+        entry: Option<&mut Entry>,
+        offset: i64,
+        whence: c_int,
+    ) -> i64 {
         if let Err(e) = self.flush(a) {
             return Self::fail(a, e).into();
         }
-        let Some((format, mut rd)) = self.active(a) else {
+        let Some((format, mut rd)) = self.active(a, entry) else {
             return a
                 .raise(Error::fatal(
                     ARCHIVE_ERRNO_PROGRAMMER,
@@ -1868,12 +1901,16 @@ impl Read {
     /// `read(2)`-style read of the entry's data, with holes filled with
     /// zeros. Returns the byte count, or a negative status. Don't mix this
     /// with `read_data_block` on one entry.
-    pub fn read_data(&mut self, a: &Base, dest: &mut [u8]) -> isize {
+    pub fn read_data(&mut self, a: &Base, mut entry: Option<&mut Entry>, dest: &mut [u8]) -> isize {
         let mut st = std::mem::take(&mut self.read_data);
         let mut written = 0;
         let result = 'read: loop {
             if written == dest.len() {
-                a.read_data_requested.set(None);
+                // Upstream's `while (s > 0)` leaves the flags alone when it
+                // doesn't run.
+                if !dest.is_empty() {
+                    a.read_data_requested.set(None);
+                }
                 break written as isize;
             }
             if st.offset == st.output_offset && st.pos == st.pending.len() {
@@ -1883,7 +1920,7 @@ impl Read {
                 let mut out_of_order = false;
                 let mut eof = false;
                 let mut warned = false;
-                let got = self.read_data_block(a, |d| match d {
+                let got = self.read_data_block(a, entry.as_deref_mut(), |d| match d {
                     Data::Eof { offset } => {
                         blk_off = offset;
                         eof = true;
@@ -1994,7 +2031,7 @@ impl Read {
         // treatment: whatever of its body the format reader left unconsumed
         // must be skipped before we can read the next header.
         if matches!(a.state.get(), state::DATA | state::DATA_RECOVERY) {
-            r1 = self.read_data_skip(a);
+            r1 = self.read_data_skip(a, Some(&mut *entry));
             if r1 == ARCHIVE_EOF {
                 a.set_error(libc::EIO, Some(b"Premature end-of-file"));
             }
@@ -2012,7 +2049,7 @@ impl Read {
         self.header_position = self.chain.last().map_or(0, |s| s.position);
 
         a.file_count.set(a.file_count.get() + 1);
-        let r2 = match flushed.map(|()| self.active(a)) {
+        let r2 = match flushed.map(|()| self.active(a, None)) {
             Ok(Some((format, mut rd))) => match format.read_header(&mut rd, entry) {
                 Ok(status) => status.code(),
                 Err(e) => a.raise(e),
@@ -2968,36 +3005,36 @@ mod tests {
         let (mut r, a) = opened(Script::new(&[(0, b"abc"), (5, b"de")], 9));
         let mut buf = [b'#'; 4];
         // Small destination: blocks are split across calls.
-        assert_eq!(r.read_data(&a, &mut buf), 4);
+        assert_eq!(r.read_data(&a, None, &mut buf), 4);
         assert_eq!(&buf, b"abc\0");
-        assert_eq!(r.read_data(&a, &mut buf), 4);
+        assert_eq!(r.read_data(&a, None, &mut buf), 4);
         assert_eq!(&buf, b"\0de\0");
         let mut big = [b'#'; 10];
         // The trailing hole up to the end offset is zeros, then EOF.
-        assert_eq!(r.read_data(&a, &mut big), 1);
+        assert_eq!(r.read_data(&a, None, &mut big), 1);
         assert_eq!(big[0], 0);
-        assert_eq!(r.read_data(&a, &mut big), 0);
-        assert_eq!(r.read_data(&a, &mut []), 0);
+        assert_eq!(r.read_data(&a, None, &mut big), 0);
+        assert_eq!(r.read_data(&a, None, &mut []), 0);
     }
 
     #[test]
     fn read_data_rejects_out_of_order_blocks() {
         let (mut r, a) = opened(Script::new(&[(0, b"abcd"), (2, b"xx")], 6));
         let mut buf = [0; 16];
-        assert_eq!(r.read_data(&a, &mut buf), ARCHIVE_RETRY as isize);
+        assert_eq!(r.read_data(&a, None, &mut buf), ARCHIVE_RETRY as isize);
         assert_eq!(error(&a), "Encountered out-of-order sparse blocks");
     }
 
     #[test]
     fn read_data_block_hands_out_the_formats_blocks() {
         let (mut r, a) = opened(Script::new(&[(7, b"hi")], 9));
-        let first = r.read_data_block(&a, |d| match d {
+        let first = r.read_data_block(&a, None, |d| match d {
             Data::Block { data, offset } => Some((data.to_vec(), offset)),
             Data::Eof { .. } | Data::Warn { .. } => None,
         });
         assert_eq!(first, Ok(Some((b"hi".to_vec(), 7))));
         assert!(matches!(
-            r.read_data_block(&a, |d| matches!(d, Data::Eof { offset: 9 })),
+            r.read_data_block(&a, None, |d| matches!(d, Data::Eof { offset: 9 })),
             Ok(true)
         ));
     }
@@ -3005,7 +3042,7 @@ mod tests {
     #[test]
     fn data_skip_discards_the_rest_and_ends_in_the_header_state() {
         let (mut r, a) = opened(Script::new(&[(0, b"a"), (1, b"b")], 2));
-        assert_eq!(r.read_data_skip(&a), ARCHIVE_OK);
+        assert_eq!(r.read_data_skip(&a, None), ARCHIVE_OK);
         assert_eq!(a.state.get(), state::HEADER);
         assert_eq!(r.format, Some(0));
         // The default skip read everything.
@@ -3016,7 +3053,7 @@ mod tests {
     fn seek_data_is_refused_by_default() {
         let (mut r, a) = opened(Script::new(&[], 0));
         assert_eq!(
-            r.seek_data(&a, 0, libc::SEEK_SET),
+            r.seek_data(&a, None, 0, libc::SEEK_SET),
             i64::from(ARCHIVE_FAILED)
         );
         assert_eq!(error(&a), "Cannot seek data with this format");
@@ -3139,7 +3176,7 @@ mod tests {
         assert_eq!((a.state.get(), a.format.get()), (state::DATA, 7));
         assert_eq!(error(&a), "header oddity");
         // The data's warning is a status, with no block.
-        let got = r.read_data_block(&a, |d| matches!(d, Data::Warn { .. }));
+        let got = r.read_data_block(&a, None, |d| matches!(d, Data::Warn { .. }));
         assert_eq!(got, Ok(true));
         assert_eq!(error(&a), "bad checksum");
         // A skip stops at a warning and reports it, but the handle is fine.
@@ -3154,7 +3191,7 @@ mod tests {
             (r, a)
         };
         a.state.set(state::DATA);
-        assert_eq!(r.read_data_skip(&a), ARCHIVE_WARN);
+        assert_eq!(r.read_data_skip(&a, None), ARCHIVE_WARN);
         assert_eq!(a.state.get(), state::HEADER);
         // read_data hands the status on, as upstream's archive_read_data does.
         let (mut r, a) = {
@@ -3168,7 +3205,7 @@ mod tests {
             (r, a)
         };
         a.state.set(state::DATA);
-        assert_eq!(r.read_data(&a, &mut [0; 4]), ARCHIVE_WARN as isize);
+        assert_eq!(r.read_data(&a, None, &mut [0; 4]), ARCHIVE_WARN as isize);
     }
 
     #[test]
@@ -3228,7 +3265,7 @@ mod tests {
     fn ar_data(r: &mut Read, a: &Base) -> Vec<u8> {
         let mut out = Vec::new();
         loop {
-            let more = r.read_data_block(a, |d| match d {
+            let more = r.read_data_block(a, None, |d| match d {
                 Data::Block { data, .. } => {
                     out.extend_from_slice(data);
                     true
@@ -3264,7 +3301,7 @@ mod tests {
             assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_OK);
             assert_eq!(ar_data(&mut r, &a), b"abcdefghijklmnop");
             assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_OK);
-            assert_eq!(r.read_data_skip(&a), ARCHIVE_OK);
+            assert_eq!(r.read_data_skip(&a, None), ARCHIVE_OK);
             assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_EOF);
             assert_eq!(r.header_position(), bytes.len() as i64);
         }
@@ -3282,7 +3319,7 @@ mod tests {
         let (mut r, a) = ar_open(&good[..good.len() - 2], 16);
         assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_OK);
         // Like upstream's archive_read_data, the error wins over the 2 bytes.
-        assert_eq!(r.read_data(&a, &mut [0; 8]), ARCHIVE_FATAL as isize);
+        assert_eq!(r.read_data(&a, None, &mut [0; 8]), ARCHIVE_FATAL as isize);
         assert_eq!(error(&a), "Truncated ar archive");
         // A bad signature.
         let mut bad = good.clone();
@@ -3305,7 +3342,7 @@ mod tests {
     /// stream position seen from outside after each one.
     fn blocks(r: &mut Read, a: &Base) -> (Vec<(i64, Vec<u8>)>, Vec<i64>) {
         let (mut blocks, mut positions) = (Vec::new(), Vec::new());
-        while let Ok(Some(block)) = r.read_data_block(a, |d| match d {
+        while let Ok(Some(block)) = r.read_data_block(a, None, |d| match d {
             Data::Block { data, offset } => Some((offset, data.to_vec())),
             _ => None,
         }) {
@@ -3353,9 +3390,9 @@ mod tests {
         );
         assert_eq!(r2.open(&a, Box::new(mem)), ARCHIVE_OK);
         assert_eq!(r2.next_header2(&a, &mut e), ARCHIVE_OK);
-        assert!(r2.read_data_block(&a, |_| ()).is_ok());
+        assert!(r2.read_data_block(&a, None, |_| ()).is_ok());
         assert_eq!(r2.filter_bytes(0), 0);
-        assert_eq!(r2.read_data_skip(&a), ARCHIVE_OK);
+        assert_eq!(r2.read_data_skip(&a, None), ARCHIVE_OK);
         assert_eq!(r2.filter_bytes(0), 7);
         assert_eq!(r2.next_header2(&a, &mut e), ARCHIVE_EOF);
         assert_eq!(r2.header_position(), 7);
@@ -3403,11 +3440,12 @@ mod tests {
         assert_eq!(
             r.read_data_block(
                 &a,
+                None,
                 |d| matches!(d, Data::Block { data, .. } if data == b"1234")
             ),
             Ok(true)
         );
-        assert_eq!(r.read_data_block(&a, |_| ()), Err(ARCHIVE_FATAL));
+        assert_eq!(r.read_data_block(&a, None, |_| ()), Err(ARCHIVE_FATAL));
         assert_eq!(
             (a.state.get(), error(&a)),
             (state::FATAL, truncated.to_string())
@@ -3415,7 +3453,7 @@ mod tests {
 
         // The skip that the next header does.
         let (mut r, a, mut e) = over();
-        assert!(r.read_data_block(&a, |_| ()).is_ok());
+        assert!(r.read_data_block(&a, None, |_| ()).is_ok());
         assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_FATAL);
         assert_eq!(
             (a.state.get(), error(&a)),
@@ -3424,13 +3462,13 @@ mod tests {
 
         // An explicit read_data_skip.
         let (mut r, a, _) = over();
-        assert!(r.read_data_block(&a, |_| ()).is_ok());
-        assert_eq!(r.read_data_skip(&a), ARCHIVE_FATAL);
+        assert!(r.read_data_block(&a, None, |_| ()).is_ok());
+        assert_eq!(r.read_data_skip(&a, None), ARCHIVE_FATAL);
         assert_eq!(error(&a), truncated);
 
         // The reader's own calls report it as consume does.
         let (mut r, a, _) = over();
-        assert!(r.read_data_block(&a, |_| ()).is_ok());
+        assert!(r.read_data_block(&a, None, |_| ()).is_ok());
         let mut rd = r.reader(&a);
         assert_eq!(
             rd.read_ahead(1).unwrap_err(),

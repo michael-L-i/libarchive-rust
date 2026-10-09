@@ -83,7 +83,7 @@ fn read_all(r: &mut Read, a: &Base) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut buf = vec![0; 1 << 16];
     loop {
-        match r.read_data(a, &mut buf) {
+        match r.read_data(a, None, &mut buf) {
             0 => return Ok(out),
             n if n < 0 => return Err(message(a)),
             n => out.extend_from_slice(buf.get(..n as usize).unwrap_or_default()),

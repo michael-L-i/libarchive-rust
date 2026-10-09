@@ -473,7 +473,7 @@ mod tests {
         }
         let mut out = Vec::new();
         loop {
-            match r.read_data_block(&a, |d| match d {
+            match r.read_data_block(&a, None, |d| match d {
                 Data::Block { data, .. } => Some(data.to_vec()),
                 _ => None,
             }) {

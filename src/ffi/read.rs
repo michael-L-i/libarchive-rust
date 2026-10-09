@@ -37,6 +37,18 @@ pub(super) fn with_read<T>(h: &Handle, fallback: T, f: impl FnOnce(&mut Read) ->
     }
 }
 
+/// The handle's own entry (`a->entry`), which upstream's formats fill in
+/// from the header reads they make in the middle of reading data. Take it
+/// before `with_read`, which holds the read state.
+// The entry is a separate allocation the handle only points to.
+#[allow(clippy::mut_from_ref)]
+fn own_entry(h: &Handle) -> Option<&mut Entry> {
+    // SAFETY: the handle's entry is a live `Box` leak, only used through
+    // this pointer and the ones handed to the caller, and nothing else
+    // holds a reference to it during the call.
+    unsafe { h.read_entry().as_mut() }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_new() -> *mut Archive {
     guard(std::ptr::null_mut(), || {
@@ -909,29 +921,32 @@ pub extern "C" fn archive_read_data_block(
         READ_MAGIC,
         state::DATA,
         ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            let block = r.read_data_block(&h.base, |data| match data {
-                Data::Block { data, offset } => {
-                    (data.as_ptr().cast(), data.len(), offset, ARCHIVE_OK)
+        |h| {
+            let entry = own_entry(h);
+            with_read(h, ARCHIVE_FATAL, |r| {
+                let block = r.read_data_block(&h.base, entry, |data| match data {
+                    Data::Block { data, offset } => {
+                        (data.as_ptr().cast(), data.len(), offset, ARCHIVE_OK)
+                    }
+                    Data::Eof { offset } => (std::ptr::null(), 0, offset, ARCHIVE_EOF),
+                    Data::Warn { offset } => (std::ptr::null(), 0, offset, ARCHIVE_WARN),
+                });
+                match block {
+                    Ok((p, n, o, code)) => {
+                        // The block stays valid until the next read.
+                        put(buff, p);
+                        put(size, n);
+                        put(offset, o);
+                        code
+                    }
+                    Err(code) => {
+                        put(buff, std::ptr::null());
+                        put(size, 0);
+                        code
+                    }
                 }
-                Data::Eof { offset } => (std::ptr::null(), 0, offset, ARCHIVE_EOF),
-                Data::Warn { offset } => (std::ptr::null(), 0, offset, ARCHIVE_WARN),
-            });
-            match block {
-                Ok((p, n, o, code)) => {
-                    // The block stays valid until the next read.
-                    put(buff, p);
-                    put(size, n);
-                    put(offset, o);
-                    code
-                }
-                Err(code) => {
-                    put(buff, std::ptr::null());
-                    put(size, 0);
-                    code
-                }
-            }
-        })
+            })
+        }
     )
 }
 
@@ -952,7 +967,10 @@ pub extern "C" fn archive_read_data(a: *mut Archive, buff: *mut c_void, size: us
         }
         // SAFETY: the caller passes `size` writable bytes at `buff`.
         let dest = unsafe { std::slice::from_raw_parts_mut(buff.cast::<u8>(), size) };
-        with_read(h, fatal, |r| r.read_data(&h.base, dest))
+        {
+            let entry = own_entry(h);
+            with_read(h, fatal, |r| r.read_data(&h.base, entry, dest))
+        }
     })
 }
 
@@ -964,7 +982,10 @@ pub extern "C" fn archive_read_data_skip(a: *mut Archive) -> c_int {
         READ_MAGIC,
         state::DATA | state::DATA_RECOVERY,
         ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| r.read_data_skip(&h.base))
+        |h| {
+            let entry = own_entry(h);
+            with_read(h, ARCHIVE_FATAL, |r| r.read_data_skip(&h.base, entry))
+        }
     )
 }
 
@@ -976,8 +997,12 @@ pub extern "C" fn archive_seek_data(a: *mut Archive, offset: i64, whence: c_int)
         READ_MAGIC,
         state::DATA,
         i64::from(ARCHIVE_FATAL),
-        |h| with_read(h, i64::from(ARCHIVE_FATAL), |r| r
-            .seek_data(&h.base, offset, whence))
+        |h| {
+            let entry = own_entry(h);
+            with_read(h, i64::from(ARCHIVE_FATAL), |r| {
+                r.seek_data(&h.base, entry, offset, whence)
+            })
+        }
     )
 }
 
@@ -989,11 +1014,12 @@ pub extern "C" fn archive_read_data_into_fd(a: *mut Archive, fd: c_int) -> c_int
         READ_MAGIC,
         state::DATA,
         ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| read_data_into_fd::data_into_fd(
-            r,
-            &h.base,
-            Fd(fd)
-        ))
+        |h| {
+            let entry = own_entry(h);
+            with_read(h, ARCHIVE_FATAL, |r| {
+                read_data_into_fd::data_into_fd(r, &h.base, entry, Fd(fd))
+            })
+        }
     )
 }
 

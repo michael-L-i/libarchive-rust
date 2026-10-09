@@ -28,6 +28,7 @@
 //! `archive_read_data_into_fd`: copying an entry's data to a file.
 
 use crate::archive::*;
+use crate::entry::Entry;
 use crate::ffi::sys::Fd;
 use crate::read::{Data, Read};
 use crate::util::Error;
@@ -162,7 +163,7 @@ impl Output {
 
 /// `archive_read_data_into_fd`, after the caller has checked the state:
 /// writes the rest of the entry to `fd`, seeking over holes if it can.
-pub fn data_into_fd(r: &mut Read, a: &Base, fd: Fd) -> c_int {
+pub fn data_into_fd(r: &mut Read, a: &Base, mut entry: Option<&mut Entry>, fd: Fd) -> c_int {
     let declared_size = r.entry_bytes_declared;
     let (can_lseek, fd_offset) = match fd.fstat() {
         Ok(st) if st.is_reg() => match fd.lseek(0, libc::SEEK_CUR) {
@@ -181,7 +182,7 @@ pub fn data_into_fd(r: &mut Read, a: &Base, fd: Fd) -> c_int {
     };
 
     let mut status = loop {
-        let step = r.read_data_block(a, |data| match data {
+        let step = r.read_data_block(a, entry.as_deref_mut(), |data| match data {
             Data::Block { data, offset } => out.block(a, data, offset),
             Data::Eof { offset } => {
                 out.target_offset = offset;
@@ -330,7 +331,10 @@ mod tests {
     fn writes_blocks_and_seeks_over_holes() {
         let (mut r, a) = entry(&[(0, b"abc"), (6, b"def")], 12, None);
         let mut f = temp_file();
-        assert_eq!(data_into_fd(&mut r, &a, Fd(f.as_raw_fd())), ARCHIVE_OK);
+        assert_eq!(
+            data_into_fd(&mut r, &a, None, Fd(f.as_raw_fd())),
+            ARCHIVE_OK
+        );
         // The trailing hole is created by seeking, so the file ends at 9.
         assert_eq!(contents(&mut f), b"abc\0\0\0def");
     }
@@ -339,7 +343,10 @@ mod tests {
     fn writes_zeros_where_it_cannot_seek() {
         let (mut r, a) = entry(&[(2, b"ab")], 7, None);
         let (mut reader, writer) = std::io::pipe().unwrap();
-        assert_eq!(data_into_fd(&mut r, &a, Fd(writer.as_raw_fd())), ARCHIVE_OK);
+        assert_eq!(
+            data_into_fd(&mut r, &a, None, Fd(writer.as_raw_fd())),
+            ARCHIVE_OK
+        );
         drop(writer);
         let mut v = Vec::new();
         reader.read_to_end(&mut v).unwrap();
@@ -350,7 +357,10 @@ mod tests {
     fn stops_at_the_declared_size() {
         let (mut r, a) = entry(&[(0, b"abcdef")], 6, Some(4));
         let mut f = temp_file();
-        assert_eq!(data_into_fd(&mut r, &a, Fd(f.as_raw_fd())), ARCHIVE_FAILED);
+        assert_eq!(
+            data_into_fd(&mut r, &a, None, Fd(f.as_raw_fd())),
+            ARCHIVE_FAILED
+        );
         assert_eq!(contents(&mut f), b"abcd");
         assert_eq!(
             error(&a),
@@ -360,26 +370,35 @@ mod tests {
         // A block that starts beyond the end writes nothing.
         let (mut r, a) = entry(&[(0, b"ab"), (9, b"zz")], 11, Some(4));
         let mut f = temp_file();
-        assert_eq!(data_into_fd(&mut r, &a, Fd(f.as_raw_fd())), ARCHIVE_FAILED);
+        assert_eq!(
+            data_into_fd(&mut r, &a, None, Fd(f.as_raw_fd())),
+            ARCHIVE_FAILED
+        );
         assert_eq!(contents(&mut f), b"ab");
 
         // So does a trailing hole.
         let (mut r, a) = entry(&[(0, b"ab")], 10, Some(4));
         let mut f = temp_file();
-        assert_eq!(data_into_fd(&mut r, &a, Fd(f.as_raw_fd())), ARCHIVE_FAILED);
+        assert_eq!(
+            data_into_fd(&mut r, &a, None, Fd(f.as_raw_fd())),
+            ARCHIVE_FAILED
+        );
         assert_eq!(contents(&mut f), b"ab");
 
         // Within the declared size is fine.
         let (mut r, a) = entry(&[(0, b"ab")], 2, Some(2));
         let mut f = temp_file();
-        assert_eq!(data_into_fd(&mut r, &a, Fd(f.as_raw_fd())), ARCHIVE_OK);
+        assert_eq!(
+            data_into_fd(&mut r, &a, None, Fd(f.as_raw_fd())),
+            ARCHIVE_OK
+        );
         assert_eq!(contents(&mut f), b"ab");
     }
 
     #[test]
     fn write_errors_are_fatal() {
         let (mut r, a) = entry(&[(0, b"ab")], 2, None);
-        assert_eq!(data_into_fd(&mut r, &a, Fd(-1)), ARCHIVE_FATAL);
+        assert_eq!(data_into_fd(&mut r, &a, None, Fd(-1)), ARCHIVE_FATAL);
         assert_eq!(
             (error(&a), a.errno.get()),
             ("Write error".into(), libc::EBADF)
@@ -390,10 +409,10 @@ mod tests {
     fn hostile_offsets_do_not_overflow() {
         let (mut r, a) = entry(&[(-5, b"ab")], 0, Some(i64::MAX));
         let mut f = temp_file();
-        let code = data_into_fd(&mut r, &a, Fd(f.as_raw_fd()));
+        let code = data_into_fd(&mut r, &a, None, Fd(f.as_raw_fd()));
         assert!(code == ARCHIVE_FAILED || code == ARCHIVE_FATAL);
         let (mut r, a) = entry(&[(i64::MAX - 1, b"ab")], i64::MAX, None);
-        let code = data_into_fd(&mut r, &a, Fd(f.as_raw_fd()));
+        let code = data_into_fd(&mut r, &a, None, Fd(f.as_raw_fd()));
         assert!(code < ARCHIVE_OK);
         assert_eq!(contents(&mut f), b"");
     }
