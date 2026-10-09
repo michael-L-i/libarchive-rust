@@ -2591,3 +2591,90 @@ impl Rar {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Unicode name decoder against upstream's, compiled from the
+    /// pinned source: (case, size, end, FNV-1a of the name and its two
+    /// terminating NULs). The names are pseudo-random bytes with a NUL
+    /// somewhere, which is what makes `read_header` decode one.
+    #[test]
+    fn unicode_names_decode_as_upstream_does() {
+        let case_name = |case: u64| {
+            let mut state = 77 + case;
+            let mut rnd = move || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u32
+            };
+            let n = 1 + rnd() % 40;
+            let zpos = (rnd() % n) as usize;
+            let mut name: Vec<u8> = (0..n)
+                .map(|_| if rnd() % 7 == 0 { 0 } else { rnd() as u8 })
+                .collect();
+            if !case.is_multiple_of(5) {
+                name[zpos] = 0;
+            }
+            name
+        };
+        let fnv = |bytes: &[u8]| {
+            bytes.iter().fold(2166136261u32, |h, &b| {
+                (h ^ u32::from(b)).wrapping_mul(16777619)
+            })
+        };
+        let expected = [
+            (0, 65, 19, 0x15d03f7d),
+            (1, 79, 17, 0x41244716),
+            (2, 75, 12, 0x7171b0ca),
+            (3, 1, 4, 0x117697cd),
+            (4, 1, 3, 0x117697cd),
+            (5, 1, 9, 0x117697cd),
+            (6, 17, 16, 0x9c17d519),
+            (7, 31, 10, 0xd295c06f),
+            (8, 43, 19, 0xc2035e45),
+            (9, 57, 7, 0x6e3089ce),
+            (10, 53, 13, 0x97a54716),
+            (11, 67, 18, 0xc4a8e2f3),
+            (12, 81, 9, 0xa9672943),
+            (13, 77, 24, 0x637411d5),
+            (14, 1, 5, 0x117697cd),
+            (15, 25, 6, 0xdb6975d7),
+            (16, 1, 10, 0x117697cd),
+            (17, 17, 17, 0xed018392),
+            (18, 49, 6, 0xac1141cf),
+            (19, 45, 11, 0xb3cdc07),
+            (20, 59, 20, 0x852c36d3),
+            (21, 73, 8, 0x40220565),
+            (22, 69, 23, 0xa906fb95),
+            (23, 1, 1, 0x117697cd),
+            (24, 3, 8, 0xada63f00),
+            (26, 27, 9, 0x9bb864ff),
+            (27, 41, 12, 0x37cf57fc),
+            (28, 37, 17, 0x7747a2bf),
+            (29, 51, 13, 0xf6076853),
+            (30, 63, 23, 0xf2de5873),
+            (31, 61, 8, 0xdec9c77),
+            (32, 75, 31, 0x8a5c8640),
+            (33, 71, 19, 0x4018bd0b),
+            (34, 1, 2, 0x117697cd),
+            (35, 19, 7, 0xcaa85d73),
+            (36, 5, 7, 0x1595ae9e),
+            (37, 15, 14, 0x6b70533b),
+            (38, 43, 11, 0xec62ffe6),
+            (39, 39, 8, 0x3a0d028d),
+            (40, 53, 26, 0xad0cfcce),
+        ];
+        for (case, size, end, hash) in expected {
+            let name = case_name(case);
+            let decoded = decode_unicode_name(&name);
+            assert_eq!(
+                (decoded.size, decoded.end, fnv(&decoded.buf)),
+                (size, end, hash),
+                "case {case}"
+            );
+        }
+    }
+}
