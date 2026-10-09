@@ -196,7 +196,6 @@ impl Sink for Pipeline<'_> {
 }
 
 impl Write {
-    #[allow(dead_code)] // Used by the compression filter API.
     pub fn add_filter(&mut self, filter: Box<dyn Filter>) -> c_int {
         self.filters.push(filter);
         self.bytes.push(0);
@@ -527,7 +526,6 @@ impl Write {
     }
 }
 
-#[allow(dead_code)] // Shared padding helper for block-oriented formats.
 pub fn zeros(sink: &mut dyn Sink, mut count: u64) -> Result<(), Error> {
     let block = [0u8; 8192];
     while count > 0 {
@@ -539,7 +537,6 @@ pub fn zeros(sink: &mut dyn Sink, mut count: u64) -> Result<(), Error> {
 }
 
 /// A private seekable spool, unlinked immediately so errors cannot leave it behind.
-#[allow(dead_code)] // Shared by XAR, ISO9660 and 7zip writers as they land.
 pub(crate) fn temp_file() -> Result<std::fs::File, Error> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};

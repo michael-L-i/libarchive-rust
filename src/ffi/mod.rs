@@ -8,8 +8,13 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 #[macro_use]
 mod archive;
 pub(crate) mod client;
+pub(crate) mod disk;
+#[cfg(target_vendor = "apple")]
+pub(crate) mod disk_acl;
+pub(crate) mod disk_sys;
 pub(crate) mod entry;
 mod entry_link_resolver;
+pub(crate) mod matching;
 mod read;
 mod read_open;
 pub(crate) mod write;

@@ -18,8 +18,11 @@ mod entry_strmode;
 mod entry_xattr;
 mod ffi;
 mod hmac;
+mod matching;
 mod options;
 mod pack_dev;
+mod parse_date;
+mod pathmatch;
 mod ppmd;
 mod ppmd7;
 mod ppmd8;
@@ -42,7 +45,5 @@ mod version_details;
 mod r#virtual;
 mod write;
 
-#[allow(dead_code)] // Disk-specific FFI entry points are wired by the disk unit.
 mod read_disk;
-#[allow(dead_code)]
 mod write_disk;

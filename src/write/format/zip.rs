@@ -552,7 +552,10 @@ impl Format for Zip {
             let level = [b'0' + self.level];
             f.options(b"compression-level", Some(&level))?;
             if method == 14 {
-                let prefix = [9, 4, 5, 0, 0x5d, 0, 0, 0x80, 0];
+                let options = lzma_rust2::LzmaOptions::with_preset(self.level.into());
+                let mut prefix = vec![9, 4, 5, 0, 0x5d];
+                prefix.extend_from_slice(&options.dict_size.to_le_bytes());
+                let prefix = member.cipher.encrypt(&prefix);
                 sink.write(&prefix)?;
                 self.written += 9;
                 member.packed += 9;

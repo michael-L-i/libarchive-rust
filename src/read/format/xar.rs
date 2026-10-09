@@ -660,9 +660,33 @@ impl Format for Xar {
             self.move_reading_point(r, xattr.offset)?;
             self.contents.init(xattr.encoding, self.entry_encoding);
             self.sums.init(xattr.a_sum.alg, xattr.e_sum.alg)?;
-            let (_, d, _) = self
-                .contents
-                .rd_contents(&mut self.sums, r, xattr.length, None)?;
+            // Attribute values are owned by Entry; collect incremental decoder
+            // output instead of assuming one client block contains the value.
+            // Bound allocation independently of the untrusted TOC size field.
+            if xattr.size > 64 * 1024 * 1024 {
+                return Err(Error::fatal(
+                    ARCHIVE_ERRNO_MISC,
+                    "XAR attribute exceeds size limit",
+                ));
+            }
+            let mut value = Vec::new();
+            let mut remaining = xattr.length;
+            while remaining != 0 || self.contents.has_pending() {
+                let (used, data, _) =
+                    self.contents
+                        .rd_contents(&mut self.sums, r, remaining, None)?;
+                if value.len() as u64 + data.len() as u64 > xattr.size {
+                    return Err(Error::fatal(ARCHIVE_ERRNO_MISC, "Decompressed size error"));
+                }
+                value
+                    .try_reserve(data.len())
+                    .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate XAR attribute"))?;
+                value.extend_from_slice(data);
+                r.consume(used)?;
+                self.offset = self.offset.wrapping_add(used as u64);
+                remaining -= used as u64;
+            }
+            let d = value.as_slice();
             if d.len() as u64 != xattr.size {
                 return Err(Error::fatal(ARCHIVE_ERRNO_MISC, "Decompressed size error"));
             }

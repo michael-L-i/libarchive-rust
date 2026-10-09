@@ -918,6 +918,31 @@ pub extern "C" fn archive_read_data_block(
     size: *mut usize,
     offset: *mut i64,
 ) -> c_int {
+    if let Some(ret) = with(a, None, |h| match &h.kind {
+        Kind::ReadDisk(d) => Some(d.borrow_mut().data_block(&h.base).map_or_else(
+            |e| e,
+            |(data, o)| {
+                put(
+                    buff,
+                    if data.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        data.as_ptr().cast()
+                    },
+                );
+                put(size, data.len());
+                put(offset, o);
+                if data.is_empty() {
+                    ARCHIVE_EOF
+                } else {
+                    ARCHIVE_OK
+                }
+            },
+        )),
+        _ => None,
+    }) {
+        return ret;
+    }
     checked!(
         archive_read_data_block,
         a,
@@ -960,6 +985,14 @@ pub extern "C" fn archive_read_data(a: *mut Archive, buff: *mut c_void, size: us
         if size == 0 {
             return 0;
         }
+        if let Kind::ReadDisk(d) = &h.kind {
+            if buff.is_null() || size > isize::MAX as usize {
+                return fatal;
+            }
+            // SAFETY: caller supplies size writable bytes.
+            let dest = unsafe { std::slice::from_raw_parts_mut(buff.cast::<u8>(), size) };
+            return d.borrow_mut().data(&h.base, dest);
+        }
         // Upstream gets here by way of archive_read_data_block.
         let name = "archive_read_data_block";
         if h.base.check_magic(READ_MAGIC, state::DATA, name) == ARCHIVE_FATAL {
@@ -979,6 +1012,12 @@ pub extern "C" fn archive_read_data(a: *mut Archive, buff: *mut c_void, size: us
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_data_skip(a: *mut Archive) -> c_int {
+    if let Some(ret) = with(a, None, |h| match &h.kind {
+        Kind::ReadDisk(d) => Some(d.borrow_mut().skip(&h.base)),
+        _ => None,
+    }) {
+        return ret;
+    }
     checked!(
         archive_read_data_skip,
         a,
@@ -1011,6 +1050,49 @@ pub extern "C" fn archive_seek_data(a: *mut Archive, offset: i64, whence: c_int)
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_data_into_fd(a: *mut Archive, fd: c_int) -> c_int {
+    if let Some(ret) = with(a, None, |h| match &h.kind {
+        Kind::ReadDisk(d) => Some({
+            let mut disk = d.borrow_mut();
+            let mut bytes = vec![0; 64 * 1024];
+            let output = Fd(fd);
+            loop {
+                let n = disk.data(&h.base, &mut bytes);
+                if n < 0 {
+                    break n as c_int;
+                }
+                if n == 0 {
+                    break ARCHIVE_OK;
+                }
+                let mut remaining = &bytes[..n as usize];
+                let mut error = None;
+                while !remaining.is_empty() {
+                    match output.write(remaining) {
+                        Ok(0) => {
+                            error = Some(
+                                h.base
+                                    .raise(crate::util::Error::fatal(libc::EIO, "Write failed")),
+                            );
+                            break;
+                        }
+                        Ok(n) => remaining = &remaining[n..],
+                        Err(e) if e == libc::EINTR => continue,
+                        Err(e) => {
+                            error =
+                                Some(h.base.raise(crate::util::Error::fatal(e, "Write failed")));
+                            break;
+                        }
+                    }
+                }
+                if let Some(error) = error {
+                    break error;
+                }
+            }
+        }),
+        _ => None,
+    }) {
+        return ret;
+    }
+
     checked!(
         archive_read_data_into_fd,
         a,
@@ -1028,6 +1110,16 @@ pub extern "C" fn archive_read_data_into_fd(a: *mut Archive, fd: c_int) -> c_int
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_next_header2(a: *mut Archive, entry: *mut ArchiveEntry) -> c_int {
+    if let Some(ret) = with(a, None, |h| match &h.kind {
+        Kind::ReadDisk(_) => Some({
+            // SAFETY: entry is a caller-owned live entry or NULL.
+            unsafe { entry.cast::<Entry>().as_mut() }
+                .map_or(ARCHIVE_FATAL, |e| h.read_next_header2(e))
+        }),
+        _ => None,
+    }) {
+        return ret;
+    }
     checked!(
         archive_read_next_header,
         a,
@@ -1053,6 +1145,17 @@ pub extern "C" fn archive_read_next_header(
     entryp: *mut *mut ArchiveEntry,
 ) -> c_int {
     put(entryp, std::ptr::null_mut());
+    if let Some(ret) = with(a, None, |h| match &h.kind {
+        Kind::ReadDisk(_) => Some({
+            let ptr = h.read_entry();
+            put(entryp, ptr.cast());
+            // SAFETY: handle owns the live entry pointer, used exclusively here.
+            unsafe { ptr.as_mut() }.map_or(ARCHIVE_FATAL, |e| h.read_next_header2(e))
+        }),
+        _ => None,
+    }) {
+        return ret;
+    }
     let r = checked!(
         archive_read_next_header,
         a,

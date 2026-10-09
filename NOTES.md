@@ -1681,6 +1681,20 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   with data but no folder, a pack stream index outside the table), the
   reader fails with "Damaged 7-Zip archive".
 
+## Matching (`src/matching.rs`, `pathmatch.rs`, `parse_date.rs`)
+
+- Inclusion patterns are anchored and optionally recursive; exclusions match
+  each pathname component. Inclusion hits are recorded before exclusions so
+  an explicitly excluded pathname is not reported as missing.
+- Date tokenization retains upstream's 250-token and 9999-number bounds;
+  Unix epoch strings bypass that tokenizer. The conversion retains upstream's
+  every-fourth-year leap count (including century years).
+- File-time exclusions overwrite previous conditions for the same pathname.
+  Missing ctime uses mtime for inclusion filters, as upstream does.
+- Lists and trees use owned strings and standard collections. Pattern-file
+  contents are read through Rust's file API, with CR/LF or NUL separation;
+  no compression or charset conversion is applied to file contents.
+
 ## Write compression filters
 
 - gzip (miniz_oxide), bzip2 (crabz2), XZ/LZMA/lzip (lzma-rust2), LZ4
@@ -1710,6 +1724,56 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - Unix compress, uuencode and base64 encoding are native ports. Base64
   reports the UU filter code, as upstream does; it has its own filter name.
 
+## XAR writing and attribute streaming
+
+- XAR data and attributes are spooled in private, immediately unlinked files;
+  the compressed XML table is emitted at close. SHA-1, MD5, SHA-256 and SHA-512
+  checksums and none/zlib/bzip2/LZMA/XZ data encodings are supported. Safe codec
+  output is valid but need not match the C encoders byte for byte.
+- Upstream checks an attribute's entire decompressed size after one decoder
+  call, so small input blocks can fail even for a valid archive. The Rust
+  reader collects incremental attribute output, checks both sizes and sums,
+  and bounds each owned attribute at 64 MiB before allocating. This permits
+  writer round trips through small callback blocks without uncontrolled
+  allocation from the XML size field.
+## Disk traversal and extraction (`src/read_disk.rs`, `src/write_disk.rs`)
+
+- Disk writes keep each parent directory open and create/open/link children
+  relative to its descriptor. `SECURE_SYMLINKS` opens every ancestor with
+  `O_NOFOLLOW`; replacing an ancestor after the check cannot redirect a write.
+  `SECURE_NODOTDOT` and `SECURE_NOABSOLUTEPATHS` check both destination and
+  hardlink source. Symlink targets remain literal, as upstream permits.
+- Directory metadata is deferred until close, with each entry's extraction
+  options retained; data-less hardlinks leave the target's metadata alone.
+  Short writes are extended to the entry size and block writes seek to their
+  explicit offsets. Ownership/permission failures are warnings.
+- Logical and hybrid disk walks fall back to the symlink for a broken target
+  or a directory ancestor cycle. Matching queries use the live match handle
+  so unmatched inclusion counts reflect the walk. Descend requests made from
+  callbacks are recorded without reborrowing the active disk state.
+- Platform calls and client callbacks live only in `src/ffi/disk*.rs`.
+  Extended attribute lists are bounded to 1 MiB and individual values to
+
+- Bare `HHMM` date tokens set hour/minute fields without incrementing
+  upstream's `HaveTime`: alone they resolve to midnight; with a date they
+  supply its time, and a following explicit time can override them.
+- ZIP LZMA properties use the safe encoder's actual preset dictionary size.
+  Encryption covers the ZIP-LZMA prefix as well as compressed bytes, including
+  the AES authentication checksum.
+  16 MiB before allocating. Darwin ACLs are translated through native ACL
+  APIs. Mac metadata uses native `fcopyfile` packing/unpacking; AppleDouble
+  entries are merged into their sibling using the same anchored directory.
+- HFS compression uses safe miniz_oxide zlib blocks. Resource-fork headers,
+  inline attributes and compression flags match upstream; compressed block
+  bytes can differ from zlib. Optional compression is limited to files of
+  256 MiB, with larger files retaining an ordinary data fork to bound the
+  resource buffer. Failure to enable compression restores the data fork.
+- `SAFE_WRITES` creates a fresh sibling with `O_EXCL` and renames it on entry
+  completion. A failed/abandoned write removes only its owned temporary.
+  Sparse metadata is discovered through `SEEK_DATA`/`SEEK_HOLE`; block reads
+  skip holes, while ordinary reads preserve zero bytes. Sparse maps are
+  bounded to one million extents. Remote filesystem detection uses native
+  `statfs`; synthetic status is unknown (-1) on macOS, as upstream's build.
 ## Archive writers
 
 - Writer lifecycle, callback/file/fd/FILE/memory outputs, format/filter options,

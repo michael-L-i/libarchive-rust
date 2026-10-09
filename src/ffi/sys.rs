@@ -203,25 +203,39 @@ pub fn try_zeroed_vec(len: usize) -> Option<Vec<u8>> {
     Some(unsafe { Vec::from_raw_parts(p, len, len) })
 }
 
-/// UTC calendar fields for archive timestamps.
-pub fn gmtime(secs: i64) -> Option<Tm> {
+/// Calendar fields, standard timezone offset west of UTC, and DST state.
+pub(crate) fn date_clock(secs: i64, utc: bool) -> Option<(Tm, i64, bool)> {
     let secs = libc::time_t::try_from(secs).ok()?;
-    // SAFETY: gmtime_r reads secs and initializes the owned tm on success.
+    // SAFETY: both routines initialize our own writable tm on success.
     let t = unsafe {
         let mut t = std::mem::zeroed::<libc::tm>();
-        if libc::gmtime_r(&secs, &mut t).is_null() {
+        let result = if utc {
+            libc::gmtime_r(&secs, &mut t)
+        } else {
+            libc::localtime_r(&secs, &mut t)
+        };
+        if result.is_null() {
             return None;
         }
         t
     };
-    Some(Tm {
-        year: t.tm_year,
-        mon: t.tm_mon,
-        mday: t.tm_mday,
-        hour: t.tm_hour,
-        min: t.tm_min,
-        sec: t.tm_sec,
-    })
+    Some((
+        Tm {
+            year: t.tm_year,
+            mon: t.tm_mon,
+            mday: t.tm_mday,
+            hour: t.tm_hour,
+            min: t.tm_min,
+            sec: t.tm_sec,
+        },
+        -(t.tm_gmtoff as i64) + if t.tm_isdst > 0 { 3600 } else { 0 },
+        t.tm_isdst > 0,
+    ))
+}
+
+/// UTC calendar fields for archive timestamps.
+pub fn gmtime(secs: i64) -> Option<Tm> {
+    date_clock(secs, true).map(|v| v.0)
 }
 
 #[cfg(test)]

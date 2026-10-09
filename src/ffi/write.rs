@@ -524,6 +524,13 @@ pub extern "C" fn archive_write_set_format_cpio_pwb(a: *mut Archive) -> c_int {
     })
 }
 #[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_xar(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::xar::Xar::default()))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_zip(a: *mut Archive) -> c_int {
     with_writer_named(a, "archive_write_set_format_zip", |b, w| {
         w.set_format(b, Box::new(crate::write::format::zip::Zip::default()))
