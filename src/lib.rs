@@ -7,6 +7,7 @@ mod blake2s_ref;
 mod blake2sp_ref;
 mod check_magic;
 mod cmdline;
+mod crc32;
 mod cryptor;
 mod digest;
 mod entry;
@@ -32,6 +33,8 @@ mod read_set_format;
 mod read_set_options;
 mod string;
 mod string_composition;
+#[allow(dead_code)] // used by the zip, 7zip, rar, rar5, lha and xar readers (phase 4)
+mod time;
 mod util;
 mod version_details;
 mod r#virtual;
