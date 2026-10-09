@@ -6,11 +6,7 @@ use super::{
     ARCHIVE_FATAL,
     Archive,
     ArchiveEntry,
-    archive_close_callback,
-    archive_free_callback,
-    archive_open_callback,
     archive_passphrase_callback,
-    archive_write_callback,
 };
 use std::ffi::{c_char, c_int, c_long, c_void};
 
@@ -38,42 +34,6 @@ pub extern "C" fn archive_read_extract_set_progress_callback(
     _progress_func: Option<unsafe extern "C" fn(*mut c_void)>,
     _user_data: *mut c_void,
 ) {}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_new() -> *mut Archive {
-    std::ptr::null_mut()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_bytes_per_block(
-    _a0: *mut Archive,
-    _bytes_per_block: c_int,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_get_bytes_per_block(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_bytes_in_last_block(
-    _a0: *mut Archive,
-    _bytes_in_last_block: c_int,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_get_bytes_in_last_block(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_skip_file(_a0: *mut Archive, _a1: i64, _a2: i64) -> c_int {
-    ARCHIVE_FATAL
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_compression_bzip2(_a0: *mut Archive) -> c_int {
@@ -293,11 +253,6 @@ pub extern "C" fn archive_write_set_format_pax_restricted(_a0: *mut Archive) -> 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_raw(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_shar(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
@@ -380,39 +335,6 @@ pub extern "C" fn archive_write_zip_set_compression_zstd(_a0: *mut Archive) -> c
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_write_open(
-    _a0: *mut Archive,
-    _a1: *mut c_void,
-    _a2: archive_open_callback,
-    _a3: archive_write_callback,
-    _a4: archive_close_callback,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_open2(
-    _a0: *mut Archive,
-    _a1: *mut c_void,
-    _a2: archive_open_callback,
-    _a3: archive_write_callback,
-    _a4: archive_close_callback,
-    _a5: archive_free_callback,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_open_fd(_a0: *mut Archive, _fd: c_int) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_open_filename(_a0: *mut Archive, _file: *const c_char) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_write_open_filename_w(
     _a0: *mut Archive,
     _file: *const libc::wchar_t,
@@ -421,67 +343,7 @@ pub extern "C" fn archive_write_open_filename_w(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_write_open_file(_a0: *mut Archive, _file: *const c_char) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_write_open_FILE(_a0: *mut Archive, _a1: *mut libc::FILE) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_open_memory(
-    _a0: *mut Archive,
-    _buffer: *mut c_void,
-    _buff_size: usize,
-    _used: *mut usize,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_header(_a0: *mut Archive, _a1: *mut ArchiveEntry) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_option(
-    _a: *mut Archive,
-    _m: *const c_char,
-    _o: *const c_char,
-    _v: *const c_char,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_filter_option(
-    _a: *mut Archive,
-    _m: *const c_char,
-    _o: *const c_char,
-    _v: *const c_char,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_option(
-    _a: *mut Archive,
-    _m: *const c_char,
-    _o: *const c_char,
-    _v: *const c_char,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_options(_a: *mut Archive, _opts: *const c_char) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_passphrase(_a: *mut Archive, _p: *const c_char) -> c_int {
     ARCHIVE_FATAL
 }
 
