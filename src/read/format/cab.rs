@@ -29,6 +29,8 @@
 //! blocks (stored, MSZIP or LZX), and the CFFILEs that are slices of a
 //! folder's uncompressed bytes.
 
+mod lzx;
+
 use crate::archive::*;
 use crate::entry::{AE_IFREG, Entry, Mode};
 use crate::ffi::sys::mktime_local;
@@ -36,6 +38,7 @@ use crate::read::{ARCHIVE_ERRNO_FILE_FORMAT, Data, Format, Read, Reader, Status,
 use crate::string::{StringConv, conversion_charset_name, conversion_from_charset};
 use crate::util::Error;
 use libc::wchar_t;
+use lzx::Lzx;
 use miniz_oxide::inflate::TINFLStatus;
 use miniz_oxide::inflate::core::inflate_flags::{
     TINFL_FLAG_HAS_MORE_INPUT, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
@@ -51,6 +54,7 @@ const RESERVE_PRESENT: u16 = 0x0004;
 
 const COMPTYPE_NONE: u16 = 0x0000;
 const COMPTYPE_MSZIP: u16 = 0x0001;
+const COMPTYPE_LZX: u16 = 0x0003;
 const COMPRESSION_NAME: [&str; 4] = ["NONE", "MSZIP", "Quantum", "LZX"];
 
 const FOLD_CONTINUED_FROM_PREV: u16 = 0xFFFD;
@@ -97,6 +101,7 @@ struct Cffolder {
     cfdata_offset_in_cab: u32,
     cfdata_count: u16,
     comptype: u16,
+    compdata: u16,
     compname: &'static str,
     /// At the time reading CFDATA.
     cfdata: Cfdata,
@@ -198,6 +203,7 @@ struct Cab {
     inflate: Option<Box<DecompressorOxide>>,
     /// How many bytes before `OUT` in `ubuf` are the MSZIP dictionary.
     dict_len: usize,
+    lzx: Option<Lzx>,
 }
 
 /// `archive_read_support_format_cab`.
@@ -801,6 +807,7 @@ impl Cab {
                 cfdata_offset_in_cab: le32(q, 0),
                 cfdata_count: le16(q, 4),
                 comptype: comptype & 0x0F,
+                compdata: comptype >> 8,
                 ..Cffolder::default()
             };
             // Get a compression name.
@@ -1101,6 +1108,7 @@ impl Cab {
         match folder.comptype {
             COMPTYPE_NONE => self.read_ahead_cfdata_none(r),
             COMPTYPE_MSZIP => self.read_ahead_cfdata_deflate(r),
+            COMPTYPE_LZX => self.read_ahead_cfdata_lzx(r),
             // Unsupported compression.
             _ => Err(Error::new(
                 ARCHIVE_FAILED,
@@ -1301,6 +1309,82 @@ impl Cab {
             }
             self.ubuf.copy_within(OUT..OUT + size, OUT - size);
             self.dict_len = size;
+        }
+
+        self.cfdata()?.uncompressed_avail = uavail;
+        self.buffered_cfdata()
+    }
+
+    fn read_ahead_cfdata_lzx(&mut self, r: &mut Reader<'_>) -> Result<Ahead, Error> {
+        self.ensure_ubuf();
+        let cfdata = self.cfdata()?;
+        let uavail = cfdata.uncompressed_avail;
+        let size = usize::from(cfdata.uncompressed_size);
+        if uavail == cfdata.uncompressed_size {
+            return self.buffered_cfdata();
+        }
+
+        let folder = folder_of(&mut self.cfheader, self.entry_cffolder)?;
+        if !folder.decompress_init {
+            let Some(lzx) = Lzx::new(folder.compdata) else {
+                return Err(Error::fatal(
+                    ARCHIVE_ERRNO_MISC,
+                    "Can't initialize LZX decompression",
+                ));
+            };
+            self.lzx = Some(lzx);
+            // We've initialized decompression for this stream.
+            folder.decompress_init = true;
+        }
+
+        // Clean up remaining bits of previous CFDATA.
+        let Some(lzx) = self.lzx.as_mut() else {
+            return Err(fatal());
+        };
+        lzx.cleanup_bitstream();
+        let mut total_out = usize::from(uavail);
+        while total_out < size {
+            let Some(d) = ahead(r, 1) else {
+                return Err(Error::fatal(
+                    ARCHIVE_ERRNO_FILE_FORMAT,
+                    "Truncated CAB file data",
+                ));
+            };
+            let remaining = usize::from(self.cfdata()?.compressed_bytes_remaining);
+            let bytes_avail = d.len().min(remaining);
+            let (Some(lzx), Some(out)) = (
+                self.lzx.as_mut(),
+                self.ubuf.get_mut(OUT + total_out..OUT + size),
+            ) else {
+                return Err(fatal());
+            };
+            let done = lzx.decode(
+                d.get(..bytes_avail).unwrap_or_default(),
+                out,
+                remaining == bytes_avail,
+            );
+            if done.status == lzx::Status::Failed {
+                return Err(Error::fatal(
+                    ARCHIVE_ERRNO_MISC,
+                    format!("LZX decompression failed ({ARCHIVE_FAILED})"),
+                ));
+            }
+            total_out += done.written;
+            let cfdata = self.cfdata()?;
+            cfdata.unconsumed = done.consumed as i64;
+            cfdata.sum_pending = true;
+            self.minimum_consume_cfdata(r, done.consumed as i64)?;
+        }
+        let uavail = total_out as u16;
+
+        // Make sure a read pointer advances to next CFDATA.
+        self.consume_remaining_compressed(r)?;
+
+        // Translation reversal of x86 processor CALL byte sequence (E8).
+        let index = self.folder()?.cfdata_index;
+        if let (Some(lzx), Some(buffer)) = (self.lzx.as_ref(), self.ubuf.get_mut(OUT..OUT + size)) {
+            let offset = (index - 1).wrapping_mul(MAX_UNCOMPRESS_SIZE as i32);
+            lzx.translation(buffer, offset);
         }
 
         self.cfdata()?.uncompressed_avail = uavail;
