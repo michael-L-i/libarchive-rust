@@ -27,6 +27,9 @@
 
 // Ported from libarchive/archive_write_disk_posix.c.
 
+#[cfg(target_vendor = "apple")]
+mod hfs;
+
 use crate::archive::{ARCHIVE_FAILED, ARCHIVE_OK, ARCHIVE_WARN, Base, state};
 use crate::entry::Entry;
 use crate::ffi::disk_sys::Target;
@@ -56,10 +59,12 @@ pub struct WriteDisk {
     pub group: crate::ffi::disk::IdLookup,
     file: Option<File>,
     current: Option<(PathBuf, Entry, Target, c_int)>,
-    directories: Vec<(PathBuf, Entry, Target, c_int)>,
+    directories: Vec<(Entry, Target, c_int)>,
     offset: u64,
+    max_offset: u64,
     limit: Option<u64>,
     skipped: bool,
+    atomic: Option<Target>,
 }
 
 fn failure(a: &Base, err: std::io::Error, action: &str, path: &Path) -> c_int {
@@ -98,7 +103,7 @@ impl WriteDisk {
         if self.options & SECURE_NOABSOLUTEPATHS != 0 && path.is_absolute() {
             return a.raise(Error::new(
                 ARCHIVE_FAILED,
-                ARCHIVE_FAILED,
+                crate::archive::ARCHIVE_ERRNO_MISC,
                 "Path is absolute",
             ));
         }
@@ -107,7 +112,7 @@ impl WriteDisk {
         {
             return a.raise(Error::new(
                 ARCHIVE_FAILED,
-                ARCHIVE_FAILED,
+                crate::archive::ARCHIVE_ERRNO_MISC,
                 "Path contains '..'",
             ));
         }
@@ -121,7 +126,7 @@ impl WriteDisk {
             if self.options & SECURE_NOABSOLUTEPATHS != 0 && target.is_absolute() {
                 return a.raise(Error::new(
                     ARCHIVE_FAILED,
-                    ARCHIVE_FAILED,
+                    crate::archive::ARCHIVE_ERRNO_MISC,
                     "Path is absolute",
                 ));
             }
@@ -130,7 +135,7 @@ impl WriteDisk {
             {
                 return a.raise(Error::new(
                     ARCHIVE_FAILED,
-                    ARCHIVE_FAILED,
+                    crate::archive::ARCHIVE_ERRNO_MISC,
                     "Path contains '..'",
                 ));
             }
@@ -187,6 +192,7 @@ impl WriteDisk {
             }
         }
         self.offset = 0;
+        self.max_offset = 0;
         self.limit = (entry.size_is_set() != 0).then(|| entry.size().max(0) as u64);
         if entry.hardlink_is_set() != 0 && entry.size_is_set() == 0 {
             self.limit = Some(0);
@@ -212,9 +218,21 @@ impl WriteDisk {
                     result => result,
                 }
             } else if entry.filetype() == libc::S_IFREG || entry.filetype() == 0 {
-                target
-                    .open(entry.mode() as u32 & 0o777)
-                    .map(|file| self.file = Some(file))
+                if self.options & 0x40000 != 0 {
+                    match target.atomic_file(entry.mode() as u32 & 0o777) {
+                        Ok((tmp, file)) => {
+                            self.atomic = Some(target);
+                            target = tmp;
+                            self.file = Some(file);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    target
+                        .open(entry.mode() as u32 & 0o777)
+                        .map(|file| self.file = Some(file))
+                }
             } else {
                 target.special(entry.mode() as u32, entry.rdev() as u64)
             };
@@ -256,9 +274,21 @@ impl WriteDisk {
         let Some(file) = &mut self.file else {
             return 0;
         };
-        match file.write_all(&data[..len]) {
+        let result = if self.options & 0x1000 != 0 {
+            data[..len].chunks(4096).try_for_each(|chunk| {
+                if chunk.iter().all(|&b| b == 0) {
+                    file.seek(SeekFrom::Current(chunk.len() as i64)).map(|_| ())
+                } else {
+                    file.write_all(chunk)
+                }
+            })
+        } else {
+            file.write_all(&data[..len])
+        };
+        match result {
             Ok(()) => {
                 self.offset += len as u64;
+                self.max_offset = self.max_offset.max(self.offset);
                 len as isize
             }
             Err(e) => a
@@ -290,20 +320,68 @@ impl WriteDisk {
     }
 
     pub fn finish_entry(&mut self, a: &Base) -> c_int {
-        let Some((path, entry, target, options)) = self.current.take() else {
+        let Some((path, entry, mut target, options)) = self.current.take() else {
             return ARCHIVE_OK;
         };
+        a.state.set(state::HEADER);
         if !self.skipped {
             if let Some(file) = self.file.take()
-                && let Some(size) = self.limit
-                && let Err(e) = file.set_len(size)
+                && let Err(e) = file.set_len(self.limit.unwrap_or(self.max_offset))
             {
                 return failure(a, e, "Can't truncate", &path);
             }
+            if let Some(destination) = self.atomic.take() {
+                if let Err(e) = target.rename_to(&destination) {
+                    let _ = target.remove(false);
+                    return failure(a, e, "Can't rename temporary file", &path);
+                }
+                target = destination;
+            }
+            #[cfg(target_vendor = "apple")]
+            if let Some(name) = path
+                .file_name()
+                .map(std::ffi::OsStr::as_bytes)
+                .filter(|name| name.starts_with(b"._"))
+                && let Ok(dest) = target.sibling(&name[2..])
+                && dest.stat().is_ok_and(|st| {
+                    [libc::S_IFREG, libc::S_IFDIR, libc::S_IFLNK]
+                        .contains(&(st.st_mode & libc::S_IFMT))
+                })
+            {
+                use std::io::Read;
+                if let Ok(mut file) = target.read_file() {
+                    let mut magic = [0; 8];
+                    if file.read_exact(&mut magic).is_ok() && magic == [0, 5, 22, 7, 0, 2, 0, 0] {
+                        let size = file.metadata().map_or(0, |m| m.len());
+                        if size > 16 * 1024 * 1024 {
+                            return a
+                                .warn(libc::ENOMEM, "AppleDouble metadata is too large")
+                                .code();
+                        }
+                        let mut bytes = Vec::from(magic);
+                        if let Err(e) = file.read_to_end(&mut bytes) {
+                            return failure(a, e, "Can't read metadata", &path);
+                        }
+                        if let Err(e) = dest.unpack_mac_metadata(&bytes) {
+                            return a
+                                .warn(
+                                    e.raw_os_error().unwrap_or(libc::EIO),
+                                    "Failed to restore metadata",
+                                )
+                                .code();
+                        }
+                        if let Err(e) = target.remove(false) {
+                            return failure(a, e, "Can't remove AppleDouble", &path);
+                        }
+                        a.state.set(state::HEADER);
+                        return ARCHIVE_OK;
+                    }
+                }
+            }
             if entry.filetype() == libc::S_IFDIR {
-                self.directories.push((path, entry, target, options));
+                self.directories.push((entry, target, options));
             } else {
-                let ret = self.restore(a, &path, &entry, &target, options);
+                let ret = self.restore(a, &entry, &target, options);
                 if ret < 0 {
                     return ret;
                 }
@@ -313,14 +391,7 @@ impl WriteDisk {
         ARCHIVE_OK
     }
 
-    fn restore(
-        &mut self,
-        a: &Base,
-        path: &Path,
-        entry: &Entry,
-        target: &Target,
-        options: c_int,
-    ) -> c_int {
+    fn restore(&mut self, a: &Base, entry: &Entry, target: &Target, options: c_int) -> c_int {
         if entry.hardlink_is_set() != 0 && (entry.size_is_set() == 0 || entry.size() == 0) {
             return ARCHIVE_OK;
         }
@@ -330,15 +401,16 @@ impl WriteDisk {
             let uid = self.user.lookup(names.uname(), entry.uid(), false);
             let gid = self.group.lookup(names.gname(), entry.gid(), true);
             if let Err(e) = target.owner(uid, gid) {
-                a.warn(
-                    e.raw_os_error().unwrap_or(libc::EPERM),
-                    "Can't restore owner",
-                )
-                .code();
+                let _ = a
+                    .warn(
+                        e.raw_os_error().unwrap_or(libc::EPERM),
+                        "Can't restore owner",
+                    )
+                    .code();
                 ret = ARCHIVE_WARN;
             }
         }
-        if entry.filetype() != libc::S_IFLNK {
+        if entry.filetype() != libc::S_IFLNK || options & PERM != 0 {
             let mut mode = if options & PERM != 0 {
                 entry.mode() as u32 & 0o7777
             } else {
@@ -353,11 +425,12 @@ impl WriteDisk {
                 }
             }
             if let Err(e) = target.chmod(mode) {
-                a.warn(
-                    e.raw_os_error().unwrap_or(libc::EPERM),
-                    "Can't restore permissions",
-                )
-                .code();
+                let _ = a
+                    .warn(
+                        e.raw_os_error().unwrap_or(libc::EPERM),
+                        "Can't restore permissions",
+                    )
+                    .code();
                 ret = ARCHIVE_WARN;
             }
         }
@@ -369,7 +442,7 @@ impl WriteDisk {
             ret = ARCHIVE_WARN;
         }
         if options & 0x80 != 0
-            && let Err(e) = crate::ffi::disk_sys::write_xattrs(path, entry)
+            && let Err(e) = target.write_xattrs(entry)
         {
             a.warn(
                 e.raw_os_error().unwrap_or(libc::EIO),
@@ -377,6 +450,50 @@ impl WriteDisk {
             )
             .code();
             ret = ARCHIVE_WARN;
+        }
+        #[cfg(target_vendor = "apple")]
+        if options & 0x20 != 0
+            && let Err(e) = target.metadata_file().and_then(|file| {
+                crate::ffi::disk_acl::write(&file, entry, &mut self.user, &mut self.group)
+            })
+        {
+            ret = a
+                .warn(e.raw_os_error().unwrap_or(libc::EIO), "Can't restore ACL")
+                .code();
+        }
+        #[cfg(target_vendor = "apple")]
+        if entry.filetype() == libc::S_IFREG
+            && options & 0x4000 == 0
+            && (options & 0x8000 != 0
+                || entry.fflags().0 & libc::UF_COMPRESSED as std::ffi::c_ulong != 0)
+            && let Err(e) = hfs::compress(target, entry.size().max(0) as u64)
+        {
+            ret = a
+                .warn(
+                    e.raw_os_error().unwrap_or(libc::EIO),
+                    "Failed to compress file",
+                )
+                .code();
+        }
+        if options & 0x2000 != 0
+            && let Some(metadata) = entry.mac_metadata()
+            && let Err(e) = target.unpack_mac_metadata(metadata)
+        {
+            let _ = a.warn(
+                e.raw_os_error().unwrap_or(libc::EIO),
+                "Failed to restore metadata",
+            );
+            ret = ARCHIVE_WARN;
+        }
+        if options & 0x40 != 0 {
+            let (set, clear) = entry.fflags();
+            if let Err(e) = target.flags(set as u32, clear as u32) {
+                let _ = a.warn(
+                    e.raw_os_error().unwrap_or(libc::EIO),
+                    "Can't restore file flags",
+                );
+                ret = ARCHIVE_WARN;
+            }
         }
         ret
     }
@@ -386,10 +503,20 @@ impl WriteDisk {
             return crate::archive::ARCHIVE_FATAL;
         }
         let mut ret = self.finish_entry(a);
-        while let Some((path, entry, target, options)) = self.directories.pop() {
-            ret = ret.min(self.restore(a, &path, &entry, &target, options));
+        while let Some((entry, target, options)) = self.directories.pop() {
+            ret = ret.min(self.restore(a, &entry, &target, options));
         }
         a.state.set(state::CLOSED);
         ret
+    }
+}
+
+impl Drop for WriteDisk {
+    fn drop(&mut self) {
+        if self.atomic.is_some()
+            && let Some((_, _, target, _)) = &self.current
+        {
+            let _ = target.remove(false);
+        }
     }
 }

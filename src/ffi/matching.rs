@@ -70,6 +70,9 @@ impl MatchingHandle {
             (h.base.magic == MATCH_MAGIC).then_some(Self(p))
         })
     }
+    pub(crate) fn copy_error(self, dest: &Base) {
+        with(self.0, (), |h| dest.copy_error(&h.base));
+    }
     pub(crate) fn path_excluded(self, e: &mut Entry) -> c_int {
         operation(self.0, "archive_match_path_excluded", |b, m| {
             Ok(m.path_excluded(b, e))

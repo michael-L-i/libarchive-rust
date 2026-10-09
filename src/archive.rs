@@ -87,6 +87,8 @@ pub struct Base {
     pub(crate) disk_can_descend: Cell<bool>,
     pub(crate) disk_descend_requested: Cell<bool>,
     pub(crate) disk_filesystem: Cell<c_int>,
+    pub(crate) disk_remote: Cell<c_int>,
+    pub(crate) disk_synthetic: Cell<c_int>,
     pub state: Cell<u32>,
     pub format: Cell<c_int>,
     /// `archive_format_name`, as most formats set it.
@@ -124,6 +126,8 @@ impl Base {
             disk_can_descend: Cell::new(false),
             disk_descend_requested: Cell::new(false),
             disk_filesystem: Cell::new(-1),
+            disk_remote: Cell::new(-1),
+            disk_synthetic: Cell::new(-1),
             state: Cell::new(state::NEW),
             format: Cell::new(0),
             format_name: Cell::new(None),
