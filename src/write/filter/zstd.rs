@@ -89,6 +89,7 @@ struct Input {
     rx: Receiver<Vec<u8>>,
     data: Vec<u8>,
     at: usize,
+    ready: SyncSender<()>,
 }
 impl Read for Input {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
@@ -99,7 +100,8 @@ impl Read for Input {
             match self.rx.recv() {
                 Ok(v) => {
                     self.data = v;
-                    self.at = 0
+                    self.at = 0;
+                    let _ = self.ready.try_send(());
                 }
                 Err(_) => return Ok(0),
             }
@@ -110,12 +112,16 @@ impl Read for Input {
         Ok(n)
     }
 }
-struct Output(SyncSender<Vec<u8>>);
+struct Output {
+    tx: SyncSender<Vec<u8>>,
+    ready: SyncSender<()>,
+}
 impl Write for Output {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.0
+        self.tx
             .send(data.to_vec())
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        let _ = self.ready.try_send(());
         Ok(data.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -126,11 +132,16 @@ struct Worker {
     tx: Option<SyncSender<Vec<u8>>>,
     rx: Receiver<Vec<u8>>,
     thread: Option<JoinHandle<bool>>,
+    ready: Receiver<()>,
+    pending: Vec<u8>,
+    chunk_size: usize,
 }
 impl Worker {
     fn new(level: i64) -> Result<Self, Error> {
         let (tx, input) = mpsc::sync_channel(1);
         let (output, rx) = mpsc::sync_channel(1);
+        // Coalesced wakeups cover either resource that can unblock a send.
+        let (notify, ready) = mpsc::sync_channel(1);
         let size = if level <= 1 {
             16 * 1024
         } else if level <= 3 {
@@ -153,8 +164,12 @@ impl Worker {
                         rx: input,
                         data: Vec::new(),
                         at: 0,
+                        ready: notify.clone(),
                     });
-                    encoder.set_drain(Output(output));
+                    encoder.set_drain(Output {
+                        tx: output,
+                        ready: notify,
+                    });
                     encoder.compress();
                 })
                 .is_ok()
@@ -164,6 +179,9 @@ impl Worker {
             tx: Some(tx),
             rx,
             thread: Some(thread),
+            ready,
+            pending: Vec::with_capacity(size.min(65536)),
+            chunk_size: size.min(65536),
         })
     }
     fn drain(&self, sink: &mut dyn Sink) -> Result<(), Error> {
@@ -174,31 +192,48 @@ impl Worker {
             }
         }
     }
-    fn write(&self, data: &[u8], sink: &mut dyn Sink) -> Result<(), Error> {
-        for part in data.chunks(65536) {
-            let mut pending = part.to_vec();
-            loop {
-                self.drain(sink)?;
-                match self
-                    .tx
-                    .as_ref()
-                    .ok_or_else(|| Error::fatal(-1, "Zstd encoder closed"))?
-                    .try_send(pending)
-                {
-                    Ok(()) => break,
-                    Err(TrySendError::Full(v)) => {
-                        pending = v;
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    Err(TrySendError::Disconnected(_)) => {
-                        return Err(Error::fatal(-1, "Zstd compression failed"));
-                    }
+    fn send(&self, mut pending: Vec<u8>, sink: &mut dyn Sink) -> Result<(), Error> {
+        loop {
+            self.drain(sink)?;
+            match self
+                .tx
+                .as_ref()
+                .ok_or_else(|| Error::fatal(-1, "Zstd encoder closed"))?
+                .try_send(pending)
+            {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(v)) => {
+                    pending = v;
+                    self.ready
+                        .recv()
+                        .map_err(|_| Error::fatal(-1, "Zstd compression failed"))?;
                 }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(Error::fatal(-1, "Zstd compression failed"));
+                }
+            }
+        }
+    }
+    fn write(&mut self, mut data: &[u8], sink: &mut dyn Sink) -> Result<(), Error> {
+        // Tar headers and padding are often only 512 bytes. Amortize channel
+        // traffic without letting input or compressed output grow unbounded.
+        while !data.is_empty() {
+            let n = data.len().min(self.chunk_size - self.pending.len());
+            self.pending.extend_from_slice(&data[..n]);
+            data = &data[n..];
+            if self.pending.len() == self.chunk_size {
+                let pending =
+                    std::mem::replace(&mut self.pending, Vec::with_capacity(self.chunk_size));
+                self.send(pending, sink)?;
             }
         }
         self.drain(sink)
     }
     fn finish(mut self, sink: &mut dyn Sink) -> Result<(), Error> {
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            self.send(pending, sink)?;
+        }
         self.tx = None;
         while let Ok(data) = self.rx.recv() {
             sink.write(&data)?;
@@ -364,7 +399,7 @@ impl Filter for Zstd {
                 .min(65536)
                 .min(usize::try_from(room).unwrap_or(usize::MAX));
             if n > 0 {
-                if let Some(w) = &self.worker {
+                if let Some(w) = &mut self.worker {
                     w.write(
                         &input[..n],
                         &mut Count {
@@ -419,10 +454,87 @@ mod tests {
             tx: Some(tx),
             rx,
             thread: Some(thread),
+            ready: mpsc::channel().1,
+            pending: Vec::new(),
+            chunk_size: 65536,
         };
         ready.wait();
         drop(worker);
         assert!(stopped.load(Ordering::Acquire));
+    }
+
+    #[derive(Default)]
+    struct Bytes(Vec<u8>);
+    impl Sink for Bytes {
+        fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+            self.0.extend_from_slice(data);
+            Ok(())
+        }
+    }
+    #[test]
+    fn tiny_writes_and_partial_batches_produce_the_same_valid_stream() {
+        for size in [0, 1, 65535, 65536, 65537, 262149] {
+            let data: Vec<_> = (0..size)
+                .map(|n: usize| (n.wrapping_mul(37) >> 5) as u8)
+                .collect();
+            let mut whole = Zstd::default();
+            let mut a = Bytes::default();
+            whole.write(&data, &mut a).unwrap();
+            whole.close(&mut a).unwrap();
+            let mut fragmented = Zstd::default();
+            let mut b = Bytes::default();
+            for chunk in data.chunks(73) {
+                fragmented.write(chunk, &mut b).unwrap();
+            }
+            fragmented.close(&mut b).unwrap();
+            assert_eq!(a.0, b.0);
+            let mut decoded = Vec::new();
+            ruzstd::decoding::StreamingDecoder::new(b.0.as_slice())
+                .unwrap()
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, data);
+        }
+    }
+
+    #[test]
+    fn batched_input_preserves_file_and_input_limited_frames() {
+        for level in [1, 3, 9] {
+            for frame_per_file in [false, true] {
+                let mut filter = Zstd {
+                    level,
+                    frame_per_file,
+                    ..Zstd::default()
+                };
+                if !frame_per_file {
+                    filter.max_in = 1024;
+                }
+                let mut out = Bytes::default();
+                let mut expected = Vec::new();
+                for size in [511, 16385, 65537] {
+                    let data: Vec<_> = (0..size)
+                        .map(|n: usize| (n.wrapping_mul(37) >> 5) as u8)
+                        .collect();
+                    for chunk in data.chunks(73) {
+                        filter.write(chunk, &mut out).unwrap();
+                    }
+                    filter.finish_entry(&mut out).unwrap();
+                    expected.extend_from_slice(&data);
+                }
+                filter.close(&mut out).unwrap();
+                let mut input = out.0.as_slice();
+                let mut decoded = Vec::new();
+                let mut frames = 0;
+                while !input.is_empty() {
+                    let mut decoder = ruzstd::decoding::StreamingDecoder::new(input).unwrap();
+                    decoder.read_to_end(&mut decoded).unwrap();
+                    input = decoder.into_inner();
+                    frames += 1;
+                }
+                assert_eq!(decoded, expected);
+                assert!(frames >= 3);
+            }
+        }
     }
 
     struct FailedSink;
