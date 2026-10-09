@@ -63,6 +63,8 @@ pub struct WriteDisk {
     directories: Vec<(Entry, Target, c_int)>,
     offset: u64,
     max_offset: u64,
+    file_offset: Option<u64>,
+    file_len: Option<u64>,
     limit: Option<u64>,
     skipped: bool,
     atomic: Option<Target>,
@@ -263,6 +265,8 @@ impl WriteDisk {
                 }
             }
         }
+        self.file_offset = self.file.as_ref().map(|_| 0);
+        self.file_len = self.file.as_ref().map(|_| 0);
         self.current = Some((path, entry, target, self.options));
         a.state.set(state::DATA);
         a.file_count.set(a.file_count.get() + 1);
@@ -291,17 +295,23 @@ impl WriteDisk {
         let Some(file) = &mut self.file else {
             return 0;
         };
-        let result = if self.options & 0x1000 != 0 {
-            data[..len].chunks(4096).try_for_each(|chunk| {
-                if chunk.iter().all(|&b| b == 0) {
-                    file.seek(SeekFrom::Current(chunk.len() as i64)).map(|_| ())
-                } else {
-                    file.write_all(chunk)
-                }
-            })
-        } else {
-            file.write_all(&data[..len])
-        };
+        let sparse = self.options & 0x1000 != 0;
+        let chunk_size = if sparse { 4096 } else { len.max(1) };
+        let result = data[..len].chunks(chunk_size).try_for_each(|chunk| {
+            if sparse && chunk.iter().all(|&b| b == 0) {
+                self.file_offset = Some(file.seek(SeekFrom::Current(chunk.len() as i64))?);
+            } else {
+                file.write_all(chunk)?;
+                self.file_offset = self
+                    .file_offset
+                    .and_then(|n| n.checked_add(chunk.len() as u64));
+                self.file_len = self
+                    .file_len
+                    .zip(self.file_offset)
+                    .map(|(len, end)| len.max(end));
+            }
+            Ok::<_, std::io::Error>(())
+        });
         match result {
             Ok(()) => {
                 self.offset += len as u64;
@@ -309,9 +319,13 @@ impl WriteDisk {
                 self.bytes = self.bytes.saturating_add(len as i64);
                 len as isize
             }
-            Err(e) => a
-                .warn(e.raw_os_error().unwrap_or(libc::EIO), "Write failed")
-                .code() as isize,
+            Err(e) => {
+                // write_all can fail after a partial write, leaving both unknown.
+                self.file_offset = None;
+                self.file_len = None;
+                a.warn(e.raw_os_error().unwrap_or(libc::EIO), "Write failed")
+                    .code() as isize
+            }
         }
     }
 
@@ -320,13 +334,19 @@ impl WriteDisk {
             return a.raise(Error::new(ARCHIVE_FAILED, libc::EINVAL, "Invalid offset"));
         };
         if let Some(file) = &mut self.file
-            && let Err(e) = file.seek(SeekFrom::Start(offset))
+            && self.file_offset != Some(offset)
         {
-            return a.raise(Error::new(
-                ARCHIVE_FAILED,
-                e.raw_os_error().unwrap_or(libc::EIO),
-                "Seek failed",
-            ));
+            match file.seek(SeekFrom::Start(offset)) {
+                Ok(position) => self.file_offset = Some(position),
+                Err(e) => {
+                    self.file_offset = None;
+                    return a.raise(Error::new(
+                        ARCHIVE_FAILED,
+                        e.raw_os_error().unwrap_or(libc::EIO),
+                        "Seek failed",
+                    ));
+                }
+            }
         }
         self.offset = offset;
         let result = self.data(a, data);
@@ -344,8 +364,10 @@ impl WriteDisk {
         a.state.set(state::HEADER);
         if !self.skipped {
             let file = self.file.take();
+            let length = self.limit.unwrap_or(self.max_offset);
             if let Some(file) = &file
-                && let Err(e) = file.set_len(self.limit.unwrap_or(self.max_offset))
+                && self.file_len != Some(length)
+                && let Err(e) = file.set_len(length)
             {
                 return failure(a, e, "Can't truncate", &path);
             }
@@ -545,5 +567,110 @@ impl Drop for WriteDisk {
         {
             let _ = target.remove(false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::WRITE_DISK_MAGIC;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Output(PathBuf);
+    impl Output {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "libarchive-disk-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> PathBuf {
+            self.0.join("file")
+        }
+        fn header(&self, disk: &mut WriteDisk, base: &Base, size: Option<i64>) {
+            let mut entry = Entry::new(None);
+            entry.set_pathname(self.path().as_os_str().as_bytes());
+            entry.set_mode(libc::S_IFREG | 0o600);
+            if let Some(size) = size {
+                entry.set_size(size);
+            }
+            assert_eq!(disk.header(base, &entry), ARCHIVE_OK);
+        }
+    }
+    impl Drop for Output {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn contiguous_and_backward_blocks_preserve_file_length() {
+        for size in [None, Some(8)] {
+            let output = Output::new();
+            std::fs::write(output.path(), [1; 100]).unwrap();
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = WriteDisk::default();
+            output.header(&mut disk, &base, size);
+            assert_eq!(disk.file_len, Some(0));
+            assert_eq!(disk.data_block(&base, b"abcd", 0), ARCHIVE_OK);
+            assert_eq!(disk.data(&base, b"efgh"), 4);
+            assert_eq!(disk.file_offset, Some(8));
+            assert_eq!(disk.file_len, Some(8));
+            assert_eq!(disk.data_block(&base, b"XY", 2), ARCHIVE_OK);
+            assert_eq!(disk.file_offset, Some(4));
+            assert_eq!(disk.file_len, Some(8));
+            assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+            assert_eq!(std::fs::read(output.path()).unwrap(), b"abXYefgh");
+        }
+    }
+
+    #[test]
+    fn sparse_trailing_holes_and_short_files_are_extended() {
+        for (size, sparse) in [(None, true), (Some(12), true), (Some(12), false)] {
+            let output = Output::new();
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = WriteDisk::default();
+            if sparse {
+                disk.options |= 0x1000;
+            }
+            output.header(&mut disk, &base, size);
+            assert_eq!(disk.data_block(&base, b"xy", 2), ARCHIVE_OK);
+            assert_eq!(disk.data_block(&base, &[0; 4], 4), ARCHIVE_OK);
+            assert_eq!(disk.file_offset, Some(8));
+            assert_eq!(disk.file_len, Some(if sparse { 4 } else { 8 }));
+            assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+            let mut expected = vec![0; size.unwrap_or(8) as usize];
+            expected[2..4].copy_from_slice(b"xy");
+            assert_eq!(std::fs::read(output.path()).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn failed_write_invalidates_cached_offset_and_length() {
+        let output = Output::new();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        output.header(&mut disk, &base, Some(4));
+        // A read-only handle gives a deterministic write error without filling
+        // the disk or relying on a platform-specific device.
+        disk.file = Some(File::open(output.path()).unwrap());
+        assert!(disk.data(&base, b"a") < 0);
+        assert_eq!(disk.file_offset, None);
+        assert_eq!(disk.file_len, None);
+        disk.file = Some(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(output.path())
+                .unwrap(),
+        );
+        assert_eq!(disk.data_block(&base, b"xy", 2), ARCHIVE_OK);
+        assert_eq!(disk.file_offset, Some(4));
+        assert_eq!(disk.file_len, None);
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+        assert_eq!(std::fs::read(output.path()).unwrap(), b"\0\0xy");
     }
 }
