@@ -32,6 +32,7 @@
 use crate::archive::*;
 use crate::entry::{AE_IFREG, Entry};
 use crate::read::{ARCHIVE_ERRNO_FILE_FORMAT, Data, Format, Read, Reader, Status, format_code};
+use crate::time::days_from_civil;
 use crate::util::Error;
 use std::ffi::c_int;
 
@@ -345,15 +346,4 @@ fn strtoi_lim(s: &[u8], pos: &mut usize, llim: i64, ulim: i64) -> Option<i64> {
 
 fn expect(s: &[u8], pos: &mut usize, want: u8) -> Option<()> {
     (s.get(*pos) == Some(&want)).then(|| *pos += 1)
-}
-
-/// Days from 1970-01-01 to the proleptic Gregorian date `y-m-d`.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }

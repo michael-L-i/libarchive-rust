@@ -248,8 +248,9 @@ impl Ppmd7 {
         const PREV: u32 = 8;
         let head = self.align_offset.wrapping_add(self.size);
         let mut n = head;
-        // Every node is visited at most once in a sound model.
-        let mut budget = self.size / UNIT_SIZE + 2;
+        // A sound model has at most `size / UNIT_SIZE` free blocks, and each
+        // of the three passes takes at most one step per block.
+        let mut budget = self.size / UNIT_SIZE * 3 + 2;
         self.glue_count = 255;
 
         // Create doubly-linked list of free blocks.

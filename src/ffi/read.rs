@@ -19,7 +19,8 @@ use crate::read::filter::{
     xz as filter_xz, zstd as filter_zstd,
 };
 use crate::read::format::{
-    all as format_all, ar, by_code as format_by_code, cpio, empty, mtree, raw, sevenzip, warc,
+    all as format_all, ar, by_code as format_by_code, cab, cpio, empty, iso9660, lha, mtree, raw,
+    sevenzip, tar, warc, xar,
 };
 use crate::read::{self, Read, Status};
 use crate::read_add_passphrase::PassphraseCallback;
@@ -914,7 +915,7 @@ pub extern "C" fn archive_read_data_block(
                     (data.as_ptr().cast(), data.len(), offset, ARCHIVE_OK)
                 }
                 Data::Eof { offset } => (std::ptr::null(), 0, offset, ARCHIVE_EOF),
-                Data::Warn => (std::ptr::null(), 0, 0, ARCHIVE_WARN),
+                Data::Warn { offset } => (std::ptr::null(), 0, offset, ARCHIVE_WARN),
             });
             match block {
                 Ok((p, n, o, code)) => {
@@ -1089,6 +1090,49 @@ pub extern "C" fn archive_read_support_format_cpio(a: *mut Archive) -> c_int {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_lha(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_lha,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            lha::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_tar(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_tar,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            tar::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+/// An alias of `archive_read_support_format_tar`.
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_gnutar(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_gnutar,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            tar::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_raw(a: *mut Archive) -> c_int {
     checked!(
         archive_read_support_format_raw,
@@ -1131,6 +1175,34 @@ pub extern "C" fn archive_read_support_format_empty(a: *mut Archive) -> c_int {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_cab(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_cab,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            cab::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_iso9660(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_iso9660,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            iso9660::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_warc(a: *mut Archive) -> c_int {
     checked!(
         archive_read_support_format_warc,
@@ -1140,6 +1212,20 @@ pub extern "C" fn archive_read_support_format_warc(a: *mut Archive) -> c_int {
         ARCHIVE_FATAL,
         |h| with_read(h, ARCHIVE_FATAL, |r| {
             warc::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_xar(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_xar,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            xar::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
         })
     )
 }
@@ -1166,12 +1252,17 @@ pub(super) mod tests {
         type Export = extern "C" fn(*mut Archive) -> c_int;
         let formats: &[(c_int, Export)] = &[
             (format::AR, archive_read_support_format_ar),
+            (format::CAB, archive_read_support_format_cab),
             (format::SEVENZIP, archive_read_support_format_7zip),
             (format::CPIO, archive_read_support_format_cpio),
             (format::EMPTY, archive_read_support_format_empty),
+            (format::ISO9660, archive_read_support_format_iso9660),
+            (format::LHA, archive_read_support_format_lha),
             (format::MTREE, archive_read_support_format_mtree),
             (format::RAW, archive_read_support_format_raw),
+            (format::TAR, archive_read_support_format_tar),
             (format::WARC, archive_read_support_format_warc),
+            (format::XAR, archive_read_support_format_xar),
         ];
         let filters: &[(c_int, Export)] = &[
             (filter::BZIP2, archive_read_support_filter_bzip2),
@@ -1213,6 +1304,10 @@ pub(super) mod tests {
                 assert_eq!(archive_free(a), ARCHIVE_OK);
             }
         }
+        // The alias of the tar export, which has no table entry of its own.
+        let a = archive_read_new();
+        assert_eq!(archive_read_support_format_gnutar(a), ARCHIVE_OK);
+        assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 
     #[test]

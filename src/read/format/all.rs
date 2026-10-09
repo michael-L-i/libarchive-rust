@@ -52,10 +52,10 @@ pub const FORMATS: &[(c_int, Option<Support>)] = &[
     (code::AR, Some(super::ar::support)),
     (code::CPIO, Some(super::cpio::support)),
     (code::EMPTY, Some(super::empty::support)),
-    (code::LHA, None),
+    (code::LHA, Some(super::lha::support)),
     (code::MTREE, Some(super::mtree::support)),
-    (code::TAR, None),
-    (code::XAR, None),
+    (code::TAR, Some(super::tar::support)),
+    (code::XAR, Some(super::xar::support)),
     (code::WARC, Some(super::warc::support)),
     // Install expensive bidders last. By doing them last, we increase the
     // chance that a high bid from someone else will make it unnecessary for
@@ -63,10 +63,10 @@ pub const FORMATS: &[(c_int, Option<Support>)] = &[
     //
     // These have potentially large look-ahead.
     (code::SEVENZIP, Some(super::sevenzip::support)),
-    (code::CAB, None),
+    (code::CAB, Some(super::cab::support)),
     (code::RAR, None),
     (code::RAR_V5, None),
-    (code::ISO9660, None),
+    (code::ISO9660, Some(super::iso9660::support)),
     // Seek is really bad, since it forces the read-ahead logic to discard
     // buffered data.
     (code::ZIP, None),

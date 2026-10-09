@@ -183,6 +183,26 @@ pub fn localtime(secs: i64) -> Option<Tm> {
     })
 }
 
+/// A zeroed `Vec<u8>` of `len` bytes, or `None` if the memory isn't
+/// available. The allocator hands out lazily zeroed pages, so a large
+/// vector costs nothing until it is used (`vec![0; n]` can't fail
+/// gracefully, and `try_reserve` plus `resize` touches every page).
+pub fn try_zeroed_vec(len: usize) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<u8>(len).ok()?;
+    // SAFETY: `layout` has a non-zero size.
+    let p = unsafe { std::alloc::alloc_zeroed(layout) };
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: `p` comes from the global allocator with the layout of
+    // `[u8; len]`, which is what `Vec<u8>` frees it with; `len` equals the
+    // capacity, and all `len` bytes are initialised (to zero).
+    Some(unsafe { Vec::from_raw_parts(p, len, len) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +233,16 @@ mod tests {
         assert_eq!(fd.read(&mut [0; 1]), Err(libc::EBADF));
         assert_eq!(fd.write(b"x"), Err(libc::EBADF));
         assert_eq!(fd.lseek(0, libc::SEEK_CUR), Err(libc::EBADF));
+    }
+
+    #[test]
+    fn zeroed_vec_is_zeroed() {
+        assert_eq!(try_zeroed_vec(0), Some(Vec::new()));
+        assert_eq!(try_zeroed_vec(1), Some(vec![0]));
+        let v = try_zeroed_vec(3 << 20).unwrap();
+        assert_eq!(v.len(), 3 << 20);
+        assert!(v.iter().all(|&b| b == 0));
+        assert!(try_zeroed_vec(usize::MAX).is_none());
     }
 
     fn tempfile_with(data: &[u8]) -> std::fs::File {

@@ -4,9 +4,14 @@
 pub mod all;
 pub mod ar;
 pub mod by_code;
+pub mod cab;
 pub mod cpio;
 pub mod empty;
+pub mod iso9660;
+pub mod lha;
 pub mod mtree;
 pub mod raw;
 pub mod sevenzip;
+pub mod tar;
 pub mod warc;
+pub mod xar;
