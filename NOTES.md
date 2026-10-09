@@ -771,8 +771,8 @@ Phase 5 needs:
   Joliet names are in use; it is printed as "(null)".
 - A zisofs block of zero length (a hole) is returned as a whole block of
   zeros, even past the end of the declared size.
-- With a negative extent, an empty file gets a huge offset, and `-1` for
-  empty files and symbolic links sorts after everything else in the heap.
+- Empty files and symbolic links get the offset `-1`, which `offset << 16`
+  turns into the largest key but one, so they come out of the heap last.
 - The heap key is `offset << 16` plus the heap's length, which is not a
   counter: after entries come out, keys of different entries can be equal,
   and for 65536 or more pending entries they are not unique at all. Which of
