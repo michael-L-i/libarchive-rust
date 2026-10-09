@@ -254,6 +254,15 @@ pub extern "C" fn archive_write_finish(a: *mut Archive) -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_close(a: *mut Archive) -> c_int {
+    if let Some(ret) = with(a, None, |h| {
+        if matches!(h.kind, crate::archive::Kind::ReadDisk(_)) {
+            Some(h.close())
+        } else {
+            None
+        }
+    }) {
+        return ret;
+    }
     checked!(
         archive_read_close,
         a,

@@ -8,6 +8,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 #[macro_use]
 mod archive;
 pub(crate) mod client;
+pub(crate) mod disk;
+pub(crate) mod disk_sys;
 pub(crate) mod entry;
 mod entry_link_resolver;
 pub(crate) mod matching;

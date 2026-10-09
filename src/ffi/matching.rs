@@ -61,10 +61,8 @@ fn entry(
         f(b, m, e)
     })
 }
-#[allow(dead_code)] // Used by the disk reader being integrated in Phase 5.
 #[derive(Clone, Copy)]
 pub(crate) struct MatchingHandle(*mut Archive);
-#[allow(dead_code)] // Removed when the disk reader lands.
 impl MatchingHandle {
     /// The caller retains the handle until the disk reader no longer uses it.
     pub(crate) fn new(p: *mut Archive) -> Option<Self> {

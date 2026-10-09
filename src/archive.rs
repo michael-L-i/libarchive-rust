@@ -84,6 +84,9 @@ pub mod state {
 pub struct Base {
     /// Identifies the kind of handle; catches calls on invalid pointers.
     pub magic: u32,
+    pub(crate) disk_can_descend: Cell<bool>,
+    pub(crate) disk_descend_requested: Cell<bool>,
+    pub(crate) disk_filesystem: Cell<c_int>,
     pub state: Cell<u32>,
     pub format: Cell<c_int>,
     /// `archive_format_name`, as most formats set it.
@@ -118,6 +121,9 @@ impl Base {
     pub fn new(magic: u32) -> Self {
         Base {
             magic,
+            disk_can_descend: Cell::new(false),
+            disk_descend_requested: Cell::new(false),
+            disk_filesystem: Cell::new(-1),
             state: Cell::new(state::NEW),
             format: Cell::new(0),
             format_name: Cell::new(None),
@@ -139,12 +145,10 @@ impl Base {
 /// `ARCHIVE_FATAL`) instead of aliasing.
 #[allow(clippy::large_enum_variant)] // Handles live on the heap; kinds own their state.
 pub enum Kind {
-    Read(RefCell<Read>),
     Match(RefCell<crate::matching::Matching>),
+    Read(RefCell<Read>),
     Write(RefCell<crate::write::Write>),
-    #[allow(dead_code)] // Constructed by disk FFI.
     WriteDisk(RefCell<crate::write_disk::WriteDisk>),
-    #[allow(dead_code)]
     ReadDisk(RefCell<crate::read_disk::ReadDisk>),
 }
 

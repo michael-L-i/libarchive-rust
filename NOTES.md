@@ -1736,3 +1736,22 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   and bounds each owned attribute at 64 MiB before allocating. This permits
   writer round trips through small callback blocks without uncontrolled
   allocation from the XML size field.
+## Disk traversal and extraction (`src/read_disk.rs`, `src/write_disk.rs`)
+
+- Disk writes keep each parent directory open and create/open/link children
+  relative to its descriptor. `SECURE_SYMLINKS` opens every ancestor with
+  `O_NOFOLLOW`; replacing an ancestor after the check cannot redirect a write.
+  `SECURE_NODOTDOT` and `SECURE_NOABSOLUTEPATHS` check both destination and
+  hardlink source. Symlink targets remain literal, as upstream permits.
+- Directory metadata is deferred until close, with each entry's extraction
+  options retained; data-less hardlinks leave the target's metadata alone.
+  Short writes are extended to the entry size and block writes seek to their
+  explicit offsets. Ownership/permission failures are warnings.
+- Logical and hybrid disk walks fall back to the symlink for a broken target
+  or a directory ancestor cycle. Matching queries use the live match handle
+  so unmatched inclusion counts reflect the walk. Descend requests made from
+  callbacks are recorded without reborrowing the active disk state.
+- Platform calls and client callbacks live only in `src/ffi/disk*.rs`.
+  Extended attribute lists are bounded to 1 MiB and individual values to
+  16 MiB before allocating. Platform-specific ACL/Mac metadata restoration
+  and AppleDouble/HFS handling are still being completed.

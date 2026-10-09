@@ -29,12 +29,12 @@
 
 use crate::archive::{ARCHIVE_FAILED, ARCHIVE_OK, ARCHIVE_WARN, Base, state};
 use crate::entry::Entry;
+use crate::ffi::disk_sys::Target;
 use crate::util::Error;
 use std::ffi::c_int;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
 
 pub const OWNER: c_int = 1;
@@ -52,9 +52,11 @@ pub const SECURE_NOABSOLUTEPATHS: c_int = 0x10000;
 pub struct WriteDisk {
     pub options: c_int,
     pub skip_file: Option<(i64, i64)>,
+    pub user: crate::ffi::disk::IdLookup,
+    pub group: crate::ffi::disk::IdLookup,
     file: Option<File>,
-    current: Option<(PathBuf, Entry)>,
-    directories: Vec<(PathBuf, Entry)>,
+    current: Option<(PathBuf, Entry, Target, c_int)>,
+    directories: Vec<(PathBuf, Entry, Target, c_int)>,
     offset: u64,
     limit: Option<u64>,
     skipped: bool,
@@ -75,6 +77,7 @@ impl WriteDisk {
             return previous;
         }
         a.clear_error();
+        a.state.set(state::HEADER);
         self.skipped = false;
         let mut entry = entry.clone_entry();
         let Some(name) = entry.pathname().map(|p| p.to_bytes().to_vec()) else {
@@ -132,33 +135,35 @@ impl WriteDisk {
                 ));
             }
         }
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if self.options & SECURE_SYMLINKS != 0 {
-                let mut prefix = PathBuf::new();
-                for component in parent.components() {
-                    prefix.push(component.as_os_str());
-                    if fs::symlink_metadata(&prefix).is_ok_and(|m| m.file_type().is_symlink()) {
-                        if self.options & UNLINK == 0 {
-                            return a.raise(Error::new(
-                                ARCHIVE_FAILED,
-                                libc::EPERM,
-                                "Cannot extract through symlink",
-                            ));
-                        }
-                        if let Err(e) = fs::remove_file(&prefix) {
-                            return failure(a, e, "Can't unlink", &prefix);
-                        }
-                    }
-                }
-            }
-            if self.options & NO_AUTODIR == 0
-                && let Err(e) = fs::create_dir_all(parent)
-            {
-                return failure(a, e, "Can't create", parent);
+        let secure = self.options & SECURE_SYMLINKS != 0;
+        let mut target = match Target::prepare(
+            &path,
+            secure,
+            self.options & UNLINK != 0,
+            self.options & NO_AUTODIR == 0,
+        ) {
+            Ok(t) => t,
+            Err(e) => return failure(a, e, "Can't create parent directory", &path),
+        };
+        if !secure
+            && self.options & UNLINK == 0
+            && entry.filetype() == libc::S_IFDIR
+            && std::fs::metadata(&path).is_ok_and(|m| m.is_dir())
+            && std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink())
+            && let Ok(real) = std::fs::canonicalize(&path)
+        {
+            match Target::prepare(&real, false, false, false) {
+                Ok(t) => target = t,
+                Err(e) => return failure(a, e, "Can't follow directory", &path),
             }
         }
-        if let Ok(existing) = fs::symlink_metadata(&path) {
-            if self.skip_file == Some((existing.dev() as i64, existing.ino() as i64)) {
+        if let Ok(existing) = target.stat() {
+            let directory = existing.st_mode & libc::S_IFMT == libc::S_IFDIR;
+            if directory && entry.filetype() == libc::S_IFDIR && self.options & PERM == 0 {
+                entry.set_perm(existing.st_mode);
+            }
+
+            if self.skip_file == Some((existing.st_dev as i64, existing.st_ino as i64)) {
                 return a.raise(Error::new(
                     ARCHIVE_FAILED,
                     libc::EPERM,
@@ -166,79 +171,81 @@ impl WriteDisk {
                 ));
             }
             if self.options & NO_OVERWRITE != 0
-                || (self.options & NO_OVERWRITE_NEWER != 0 && existing.mtime() > entry.mtime())
+                || (self.options & NO_OVERWRITE_NEWER != 0 && existing.st_mtime > entry.mtime())
             {
                 self.skipped = true;
-            } else if !(existing.is_dir() && entry.filetype() == libc::S_IFDIR)
+            } else if !(directory && entry.filetype() == libc::S_IFDIR)
                 && (self.options & UNLINK != 0
-                    || existing.file_type().is_symlink()
+                    || existing.st_mode & libc::S_IFMT == libc::S_IFLNK
+                    || directory
+                    || entry.filetype() == libc::S_IFDIR
                     || hardlink.is_some()
                     || link.is_some())
+                && let Err(e) = target.remove(directory)
             {
-                let result = if existing.is_dir() {
-                    fs::remove_dir(&path)
-                } else {
-                    fs::remove_file(&path)
-                };
-                if let Err(e) = result {
-                    return failure(a, e, "Can't unlink", &path);
-                }
+                return failure(a, e, "Can't unlink", &path);
             }
         }
         self.offset = 0;
         self.limit = (entry.size_is_set() != 0).then(|| entry.size().max(0) as u64);
+        if entry.hardlink_is_set() != 0 && entry.size_is_set() == 0 {
+            self.limit = Some(0);
+        }
         if !self.skipped {
-            let result = if let Some(target) = hardlink {
-                fs::hard_link(&target, &path)
-            } else if let Some(target) = link {
+            let result = if let Some(source) = hardlink {
+                Target::prepare(&source, secure, false, false)
+                    .and_then(|source| target.hardlink(&source, secure))
+            } else if let Some(link) = link {
                 self.limit = Some(0);
-                symlink(target, &path)
+                target.symlink(&link)
             } else if entry.filetype() == libc::S_IFDIR {
                 self.limit = Some(0);
-                match fs::create_dir(&path) {
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {
+                match target.mkdir(0o777) {
+                    Err(e)
+                        if e.raw_os_error() == Some(libc::EEXIST)
+                            && target
+                                .stat()
+                                .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR) =>
+                    {
                         Ok(())
                     }
                     result => result,
                 }
             } else if entry.filetype() == libc::S_IFREG || entry.filetype() == 0 {
-                let mode = entry.mode() as u32 & 0o777;
-                OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(mode)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&path)
-                    .map(|file| {
-                        self.file = Some(file);
-                    })
+                target
+                    .open(entry.mode() as u32 & 0o777)
+                    .map(|file| self.file = Some(file))
             } else {
-                Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
+                target.special(entry.mode() as u32, entry.rdev() as u64)
             };
             if let Err(e) = result {
                 return failure(a, e, "Can't create", &path);
             }
-            // Hard links carrying data replace the linked contents.
             if self.file.is_none() && entry.hardlink_is_set() != 0 && self.limit != Some(0) {
-                match OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&path)
-                {
+                match target.open(entry.mode() as u32 & 0o777) {
                     Ok(file) => self.file = Some(file),
                     Err(e) => return failure(a, e, "Can't open", &path),
                 }
             }
         }
-        self.current = Some((path, entry));
+        self.current = Some((path, entry, target, self.options));
         a.state.set(state::DATA);
         a.file_count.set(a.file_count.get() + 1);
         ARCHIVE_OK
     }
 
     pub fn data(&mut self, a: &Base, data: &[u8]) -> isize {
+        if a.check_magic(
+            crate::archive::WRITE_DISK_MAGIC,
+            state::DATA,
+            "archive_write_data",
+        ) < ARCHIVE_OK
+        {
+            return crate::archive::ARCHIVE_FATAL as isize;
+        }
+        if !data.is_empty() && (self.limit == Some(0) || (!self.skipped && self.file.is_none())) {
+            return a.warn(0, "Attempt to write to an empty file").code() as isize;
+        }
         let len = self.limit.map_or(data.len(), |n| {
             data.len().min(n.saturating_sub(self.offset) as usize)
         });
@@ -254,11 +261,9 @@ impl WriteDisk {
                 self.offset += len as u64;
                 len as isize
             }
-            Err(e) => a.raise(Error::new(
-                ARCHIVE_WARN,
-                e.raw_os_error().unwrap_or(libc::EIO),
-                "Write failed",
-            )) as isize,
+            Err(e) => a
+                .warn(e.raw_os_error().unwrap_or(libc::EIO), "Write failed")
+                .code() as isize,
         }
     }
 
@@ -285,7 +290,7 @@ impl WriteDisk {
     }
 
     pub fn finish_entry(&mut self, a: &Base) -> c_int {
-        let Some((path, entry)) = self.current.take() else {
+        let Some((path, entry, target, options)) = self.current.take() else {
             return ARCHIVE_OK;
         };
         if !self.skipped {
@@ -296,9 +301,9 @@ impl WriteDisk {
                 return failure(a, e, "Can't truncate", &path);
             }
             if entry.filetype() == libc::S_IFDIR {
-                self.directories.push((path, entry));
+                self.directories.push((path, entry, target, options));
             } else {
-                let ret = self.restore(a, &path, &entry);
+                let ret = self.restore(a, &path, &entry, &target, options);
                 if ret < 0 {
                     return ret;
                 }
@@ -308,23 +313,81 @@ impl WriteDisk {
         ARCHIVE_OK
     }
 
-    fn restore(&self, a: &Base, path: &Path, entry: &Entry) -> c_int {
-        if entry.filetype() != libc::S_IFLNK
-            && self.options & PERM != 0
-            && let Err(e) = fs::set_permissions(
-                path,
-                fs::Permissions::from_mode(entry.mode() as u32 & 0o7777),
-            )
-        {
-            return failure(a, e, "Can't set permissions", path);
+    fn restore(
+        &mut self,
+        a: &Base,
+        path: &Path,
+        entry: &Entry,
+        target: &Target,
+        options: c_int,
+    ) -> c_int {
+        if entry.hardlink_is_set() != 0 && (entry.size_is_set() == 0 || entry.size() == 0) {
+            return ARCHIVE_OK;
         }
-        ARCHIVE_OK
+        let mut ret = ARCHIVE_OK;
+        if options & OWNER != 0 {
+            let mut names = entry.clone_entry();
+            let uid = self.user.lookup(names.uname(), entry.uid(), false);
+            let gid = self.group.lookup(names.gname(), entry.gid(), true);
+            if let Err(e) = target.owner(uid, gid) {
+                a.warn(
+                    e.raw_os_error().unwrap_or(libc::EPERM),
+                    "Can't restore owner",
+                )
+                .code();
+                ret = ARCHIVE_WARN;
+            }
+        }
+        if entry.filetype() != libc::S_IFLNK {
+            let mut mode = if options & PERM != 0 {
+                entry.mode() as u32 & 0o7777
+            } else {
+                entry.mode() as u32 & 0o777 & !crate::ffi::disk_sys::umask()
+            };
+            if let Ok(st) = target.stat() {
+                if st.st_uid as i64 != entry.uid() {
+                    mode &= !0o4000;
+                }
+                if st.st_gid as i64 != entry.gid() {
+                    mode &= !0o2000;
+                }
+            }
+            if let Err(e) = target.chmod(mode) {
+                a.warn(
+                    e.raw_os_error().unwrap_or(libc::EPERM),
+                    "Can't restore permissions",
+                )
+                .code();
+                ret = ARCHIVE_WARN;
+            }
+        }
+        if options & TIME != 0
+            && let Err(e) = target.times(entry)
+        {
+            a.warn(e.raw_os_error().unwrap_or(libc::EIO), "Can't restore times")
+                .code();
+            ret = ARCHIVE_WARN;
+        }
+        if options & 0x80 != 0
+            && let Err(e) = crate::ffi::disk_sys::write_xattrs(path, entry)
+        {
+            a.warn(
+                e.raw_os_error().unwrap_or(libc::EIO),
+                "Can't restore extended attributes",
+            )
+            .code();
+            ret = ARCHIVE_WARN;
+        }
+        ret
     }
 
     pub fn close(&mut self, a: &Base) -> c_int {
+        if a.state.get() == state::FATAL {
+            return crate::archive::ARCHIVE_FATAL;
+        }
         let mut ret = self.finish_entry(a);
-        while let Some((path, entry)) = self.directories.pop() {
-            ret = ret.min(self.restore(a, &path, &entry));
+        while let Some((path, entry, target, options)) = self.directories.pop() {
+            ret = ret.min(self.restore(a, &path, &entry, &target, options));
         }
         a.state.set(state::CLOSED);
         ret
