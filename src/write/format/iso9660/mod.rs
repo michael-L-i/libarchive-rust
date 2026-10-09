@@ -36,6 +36,7 @@ const BLOCK: usize = 2048;
 const ER:&[u8]=b"ER\xed\x01\x0aT\x87\x01RRIP_1991ATHE ROCK RIDGE INTERCHANGE PROTOCOL PROVIDES SUPPORT FOR POSIX FILE SYSTEM SEMANTICSPLEASE CONTACT DISC PUBLISHER FOR SPECIFICATION SOURCE.  SEE PUBLISHER IDENTIFIER IN PRIMARY VOLUME DESCRIPTOR FOR CONTACT INFORMATION.";
 // boot.rs is implemented independently by the integration agent.
 mod boot;
+mod info;
 use boot::{Boot, Media};
 struct Node {
     entry: Entry,
@@ -131,6 +132,7 @@ pub struct Iso9660 {
     primary_children: HashMap<usize, Vec<usize>>,
     primary_parent: HashMap<usize, usize>,
     too_deep: Option<usize>,
+    info_options: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 impl Default for Iso9660 {
     fn default() -> Self {
@@ -156,7 +158,7 @@ impl Default for Iso9660 {
             pad: true,
             limit_depth: true,
             limit_dirs: true,
-            allow_vernum: false,
+            allow_vernum: true,
             zisofs: false,
             compression: 6,
             strings,
@@ -179,6 +181,7 @@ impl Default for Iso9660 {
             primary_children: HashMap::new(),
             primary_parent: HashMap::new(),
             too_deep: None,
+            info_options: Vec::new(),
         }
     }
 }
@@ -353,7 +356,9 @@ fn ascii_identifier(
     }
     stem.push(b'.');
     stem.extend_from_slice(ext);
-    stem.extend_from_slice(b";1");
+    if allow_vernum {
+        stem.extend_from_slice(b";1");
+    }
     stem
 }
 impl Iso9660 {
@@ -456,17 +461,20 @@ impl Iso9660 {
                         }
                         if tree == 0 {
                             let ext = base.iter().rposition(|&b| b == b'.').unwrap_or(base.len());
-                            let capacity: usize =
-                                if self.level == 1 {
-                                    8
-                                } else if self.level <= 3 {
-                                    31usize.saturating_sub((base.len() - ext).saturating_sub(
-                                        if self.nodes[i].directory { 0 } else { 2 },
-                                    ))
-                                } else {
-                                    let max = if self.rr != 0 { 193usize } else { 207usize };
-                                    max.saturating_sub(base.len() - ext)
-                                };
+                            let capacity: usize = if self.level == 1 {
+                                8
+                            } else if self.level <= 3 {
+                                31usize.saturating_sub((base.len() - ext).saturating_sub(
+                                    if self.nodes[i].directory || !self.allow_vernum {
+                                        0
+                                    } else {
+                                        2
+                                    },
+                                ))
+                            } else {
+                                let max = if self.rr != 0 { 193usize } else { 207usize };
+                                max.saturating_sub(base.len() - ext)
+                            };
                             let stem = &base[..ext.min(capacity.saturating_sub(3))];
                             name = stem.to_vec();
                             name.extend_from_slice(suffix.as_bytes());
@@ -1329,6 +1337,29 @@ impl Format for Iso9660 {
             }
             _ => return Ok(ARCHIVE_WARN),
         }
+        let key = if key == b"Rockridge" {
+            b"rockridge".as_slice()
+        } else {
+            key
+        };
+        self.info_options.retain(|(k, _)| k != key);
+        let changed = match key {
+            b"allow-vernum" | b"pad" | b"limit-depth" | b"limit-dirs" => value.is_none(),
+            b"joliet" => self.joliet != 1,
+            b"rockridge" => self.rr != 2,
+            b"zisofs" | b"boot-info-table" | b"boot" => value.is_some(),
+            b"iso-level" => self.level != 1,
+            b"compression-level" => self.compression != 6,
+            _ => true,
+        };
+        if changed {
+            let value = match key {
+                b"boot-load-seg" => Some(format!("{:x}", self.boot.load_segment).into_bytes()),
+                b"boot-load-size" => Some(self.boot.load_size.to_string().into_bytes()),
+                _ => value.map(<[u8]>::to_vec),
+            };
+            self.info_options.push((key.to_vec(), value));
+        }
         Ok(ARCHIVE_OK)
     }
     fn header(&mut self, a: &Base, e: &mut Entry, _: &mut dyn Sink) -> Result<c_int, Error> {
@@ -1413,6 +1444,9 @@ impl Format for Iso9660 {
             return Ok(());
         };
         if self.remaining != 0 && self.remaining == self.nodes[index].size {
+            if !self.boot_enabled || self.nodes[index].path != normalize(&self.boot.filename) {
+                self.nodes[index].size = 0;
+            }
             return Ok(());
         }
         let zero = [0; 65536];
@@ -1633,15 +1667,16 @@ impl Iso9660 {
                 self.nodes[i].size = 0;
             }
         }
-        for i in 1..self.nodes.len() {
-            let links = 1 + self.nodes.iter().filter(|n| n.hardlink == Some(i)).count() as u32;
-            if links > 1 {
-                self.nodes[i].entry.set_nlink(links);
-                for node in &mut self.nodes {
-                    if node.hardlink == Some(i) {
-                        node.entry.set_nlink(links);
-                    }
-                }
+        let mut links = vec![1u32; self.nodes.len()];
+        for node in &self.nodes {
+            if let Some(i) = node.hardlink {
+                links[i] = links[i].saturating_add(1);
+            }
+        }
+        for (i, node) in self.nodes.iter_mut().enumerate().skip(1) {
+            let count = links[node.hardlink.unwrap_or(i)];
+            if count > 1 {
+                node.entry.set_nlink(count);
             }
         }
         let deep = self
@@ -1661,6 +1696,15 @@ impl Iso9660 {
             ));
         }
         self.relocate()?;
+        for node in &mut self.nodes {
+            if node.virtual_dir {
+                node.entry.set_mtime(self.birth, 0);
+                node.entry.set_atime(self.birth, 0);
+                node.entry.set_ctime(self.birth, 0);
+                node.entry.set_uid(identities.0.into());
+                node.entry.set_gid(identities.1.into());
+            }
+        }
         self.identifiers()?;
         let mut primary = self.tree(0)?;
         let mut joliet = if self.joliet != 0 {
@@ -1766,10 +1810,7 @@ impl Iso9660 {
         terminator[1..6].copy_from_slice(b"CD001");
         terminator[6] = 1;
         sink.write(&terminator)?;
-        let mut information = vec![0; BLOCK];
-        let info = b"INFO libarchive 3.9.0dev";
-        information[..info.len()].copy_from_slice(info);
-        sink.write(&information)?;
+        sink.write(&info::block(self.birth, &self.info_options)?)?;
         for (kind, tree) in [(0, Some(&primary)), (1, joliet.as_ref())] {
             if let Some(tree) = tree {
                 sink.write(&self.path_table(tree, kind, false))?;
@@ -1851,6 +1892,68 @@ impl Iso9660 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Discard;
+    impl Sink for Discard {
+        fn write(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn root_entry_is_ignored_and_version_option_is_preserved() {
+        let mut iso = Iso9660::default();
+        let base = Base::new(crate::archive::WRITE_MAGIC);
+        let mut root = Entry::new(None);
+        root.set_pathname(b".");
+        root.set_mode(0o40700);
+        root.set_uid(123);
+        root.set_mtime(456, 0);
+        iso.header(&base, &mut root, &mut Discard).unwrap();
+        assert_eq!(iso.nodes[0].entry.uid(), 0);
+        assert_eq!(iso.nodes[0].entry.mtime(), 0);
+        assert!(iso.nodes[0].virtual_dir);
+        iso.options(&base, b"allow-vernum", None).unwrap();
+        iso.directory(&[b'a'; 40]).unwrap();
+        iso.directory(&[b'A'; 40]).unwrap();
+        let mut e = Entry::new(None);
+        e.set_mode(0o100444);
+        e.set_pathname(b"file");
+        e.set_size(0);
+        iso.header(&base, &mut e, &mut Discard).unwrap();
+        iso.identifiers().unwrap();
+        let i = iso.names[b"file".as_slice()];
+        assert_eq!(iso.nodes[i].ident[0], b"FILE.");
+        assert_eq!(iso.info_options, vec![(b"allow-vernum".to_vec(), None)]);
+    }
+    #[test]
+    fn joliet_rejects_path_longer_than_240_bytes() {
+        let mut iso = Iso9660::default();
+        let name = [b'a'; 64];
+        let mut path = Vec::new();
+        for _ in 0..4 {
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(&name);
+        }
+        iso.directory(&path).unwrap();
+        assert!(iso.identifiers().is_err());
+    }
+
+    #[test]
+    fn unwritten_regular_file_is_empty_without_spooling_zeroes() {
+        let mut iso = Iso9660::default();
+        let base = Base::new(crate::archive::WRITE_MAGIC);
+        let mut e = Entry::new(None);
+        e.set_pathname(b"empty");
+        e.set_mode(0o100444);
+        e.set_size(1 << 30);
+        iso.header(&base, &mut e, &mut Discard).unwrap();
+        iso.finish_entry(&mut Discard).unwrap();
+        let i = iso.names[b"empty".as_slice()];
+        assert_eq!(iso.nodes[i].size, 0);
+        assert_eq!(iso.spool_size, 0);
+        assert!(iso.data_order.is_empty());
+    }
     #[test]
     fn truncated_directory_names_are_unique() {
         let mut iso = Iso9660 {
