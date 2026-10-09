@@ -435,8 +435,6 @@ impl Lzma2Stream {
             ));
         }
 
-        self.lz.ensure_capacity()?;
-
         let mut in_pos = 0;
         let mut out_pos = 0;
         // Set when a decode pass could make no progress at all. Without this
@@ -635,6 +633,7 @@ impl Lzma2Stream {
         out_pos: usize,
         stalled: &mut bool,
     ) -> crate::Result<Option<StreamResult>> {
+        self.lz.ensure_capacity_for(self.limits.remaining_size as usize)?;
         let compressed_left = self.limits.compressed_left.unwrap_or(0);
 
         // Nothing left to feed and the chunk is not over yet. A chunk whose
@@ -753,6 +752,7 @@ impl Lzma2Stream {
         out_pos: usize,
         remaining: usize,
     ) -> crate::Result<Option<StreamResult>> {
+        self.lz.ensure_capacity_for(remaining)?;
         let lz_space = self.lz.available_space();
         if lz_space == 0 {
             self.state = Lzma2State::DrainUncompressed { remaining };

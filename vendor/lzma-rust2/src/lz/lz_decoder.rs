@@ -73,12 +73,30 @@ impl LzDecoder {
         Ok(())
     }
 
+    /// Reserve the logical dictionary once, but initialize only the history
+    /// and output this pass can reach. Untouched pages need not become resident.
+    /// Ring positions and valid distances stay unchanged, including on reset.
+    pub(crate) fn ensure_capacity_for(&mut self, out_max: usize) -> crate::Result<()> {
+        let needed = self.pos.saturating_add(out_max).min(self.buf_size);
+        if needed > self.buf.len() {
+            let size = needed.max(65536).min(self.buf_size);
+            self.buf
+                .try_reserve_exact(self.buf_size - self.buf.len())
+                .map_err(|_| error_out_of_memory("dictionary allocation too large"))?;
+            self.buf.resize(size, 0);
+        }
+        self.allocated = self.buf.len() == self.buf_size;
+        Ok(())
+    }
+
     pub(crate) fn reset(&mut self) {
         self.start = 0;
         self.pos = 0;
         self.full = 0;
         self.limit = 0;
-        self.buf[self.buf_size - 1] = 0;
+        if let Some(last) = self.buf.get_mut(self.buf_size - 1) {
+            *last = 0;
+        }
     }
 
     pub(crate) fn set_limit(&mut self, out_max: usize) {
@@ -206,7 +224,7 @@ impl LzDecoder {
     }
 
     pub(crate) fn available_space(&self) -> usize {
-        self.spec_end.unwrap_or(self.buf_size) - self.pos
+        self.spec_end.unwrap_or(self.buf.len()) - self.pos
     }
 
     /// Starts a speculative decode pass that may write at most `max_output`
@@ -229,7 +247,7 @@ impl LzDecoder {
             self.full == self.pos || self.full == self.buf_size,
             "the dictionary is neither still filling nor full"
         );
-        let end = self.pos.saturating_add(max_output).min(self.buf_size);
+        let end = self.pos.saturating_add(max_output).min(self.buf.len());
 
         let mut saved = Vec::new();
         if self.full == self.buf_size {
@@ -317,5 +335,64 @@ mod tests {
     fn ensure_capacity_rejects_impossible_size() {
         let mut lz = LzDecoder::new(usize::MAX, None);
         assert!(lz.ensure_capacity().is_err());
+    }
+    #[test]
+    fn lazy_dictionary_matches_full_through_wrap_reset_and_pending() {
+        let size = 131072;
+        let mut lazy = LzDecoder::new(size, None);
+        let mut full = LzDecoder::new(size, None);
+        full.ensure_capacity().unwrap();
+        let mut seed = 19u32;
+        for round in 0..3 {
+            lazy.reset();
+            full.reset();
+            assert!(lazy.repeat(0, 1).is_err());
+            for i in 0..24000 {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                lazy.ensure_capacity_for(31).unwrap();
+                lazy.set_limit(31);
+                full.set_limit(31);
+                if lazy.has_pending() {
+                    lazy.repeat_pending().unwrap();
+                    full.repeat_pending().unwrap();
+                } else if lazy.full == 0 || i % 7 == 0 {
+                    lazy.put_byte(seed as u8);
+                    full.put_byte(seed as u8);
+                } else {
+                    let dist = seed as usize % lazy.full;
+                    let len = 1 + (seed as usize % 273);
+                    lazy.repeat(dist, len).unwrap();
+                    full.repeat(dist, len).unwrap();
+                }
+                let mut a = [0; 31];
+                let mut b = [0; 31];
+                assert_eq!(
+                    lazy.flush(&mut a, 0).unwrap(),
+                    full.flush(&mut b, 0).unwrap()
+                );
+                assert_eq!(a, b, "round {round}, step {i}");
+                assert_eq!(
+                    (lazy.pos, lazy.full, lazy.pending_len),
+                    (full.pos, full.full, full.pending_len)
+                );
+            }
+            assert_eq!(lazy.full, size);
+            while lazy.has_pending() {
+                lazy.ensure_capacity_for(273).unwrap();
+                lazy.set_limit(273);
+                full.set_limit(273);
+                lazy.repeat_pending().unwrap();
+                full.repeat_pending().unwrap();
+                let mut a = [0; 273];
+                let mut b = [0; 273];
+                assert_eq!(
+                    lazy.flush(&mut a, 0).unwrap(),
+                    full.flush(&mut b, 0).unwrap()
+                );
+                assert_eq!(a, b);
+            }
+        }
     }
 }
