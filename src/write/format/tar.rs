@@ -195,7 +195,7 @@ impl Format for Tar {
         if e.filetype() != 0o100000 || hard.is_some() || sym.is_some() {
             e.set_size(0);
         }
-        if e.filetype() == 0o040000 && !path.ends_with(b"/") {
+        if e.filetype() == 0o040000 && !path.is_empty() && !path.ends_with(b"/") {
             path.push(b'/');
             e.set_pathname(&path);
         }
@@ -228,8 +228,15 @@ impl Format for Tar {
         let link = hard.or(sym).unwrap_or_default();
         let uname = e.uname().map(|s| s.to_bytes().to_vec()).unwrap_or_default();
         let gname = e.gname().map(|s| s.to_bytes().to_vec()).unwrap_or_default();
+        if self.variant == 0x30000 && path.len() >= 100 {
+            return Err(Error::new(
+                ARCHIVE_FAILED,
+                libc::ENAMETOOLONG,
+                "Pathname too long",
+            ));
+        }
         let mut h = [0u8; 512];
-        for start in [100, 108, 116, 329, 337] {
+        for start in [100, 108, 116] {
             h[start..start + 6].fill(b'0');
             h[start + 6] = b' ';
         }
@@ -293,7 +300,11 @@ impl Format for Tar {
         }
         let n = link.len().min(100);
         h[157..157 + n].copy_from_slice(&link[..n]);
-        h[156] = ty;
+        h[156] = if self.variant == 0x30000 && matches!(ty, b'0' | b'5') {
+            0
+        } else {
+            ty
+        };
         for (val, start, digits, msg, key) in [
             (
                 i64::from(e.mode() & 0o7777),
@@ -339,6 +350,12 @@ impl Format for Tar {
                 }
                 let n = name.len().min(32);
                 h[start..start + n].copy_from_slice(&name[..n]);
+            }
+        }
+        if self.variant != 0x30000 {
+            for start in [329, 337] {
+                h[start..start + 6].fill(b'0');
+                h[start + 6] = b' ';
             }
         }
         if matches!(ty, b'3' | b'4') {
@@ -414,7 +431,11 @@ impl Tar {
         h[100..108].copy_from_slice(b"0000644\0");
         h[108..124].copy_from_slice(b"0000000\x000000000\0");
         h[257..265].copy_from_slice(b"ustar  \0");
-        h[156] = ty;
+        h[156] = if self.variant == 0x30000 && matches!(ty, b'0' | b'5') {
+            0
+        } else {
+            ty
+        };
         octal(&mut h[124..136], (value.len() + 1) as i64, 11, true, "")?;
         checksum(&mut h);
         sink.write(&h)?;

@@ -61,6 +61,10 @@ pub trait Filter {
 }
 
 pub trait Format {
+    fn needs_passphrase(&self) -> bool {
+        false
+    }
+    fn set_passphrase(&mut self, _: Option<&[u8]>) {}
     fn code(&self) -> c_int;
     fn name(&self) -> &'static CStr;
     fn module(&self) -> &'static [u8];
@@ -80,6 +84,7 @@ pub struct Write {
     pub filters: Vec<Box<dyn Filter>>,
     pub format: Option<Box<dyn Format>>,
     pub passphrase: Option<Vec<u8>>,
+    pub passphrase_callback: Option<Box<dyn FnMut() -> Option<Vec<u8>>>>,
     output: Option<Blocking>,
     bytes: Vec<i64>,
 }
@@ -93,6 +98,7 @@ impl Default for Write {
             filters: Vec::new(),
             format: None,
             passphrase: None,
+            passphrase_callback: None,
             output: None,
             bytes: Vec::new(),
         }
@@ -288,6 +294,16 @@ impl Write {
                 libc::EIO,
                 "Can't add archive to itself",
             ));
+        }
+        if self.format.as_ref().is_some_and(|f| f.needs_passphrase()) {
+            if self.passphrase.is_none()
+                && let Some(cb) = self.passphrase_callback.as_mut()
+            {
+                self.passphrase = cb();
+            }
+            if let Some(f) = self.format.as_mut() {
+                f.set_passphrase(self.passphrase.as_deref());
+            }
         }
         match self.run(a, |f, s| f.header(a, entry, s)) {
             Ok(ret) => {

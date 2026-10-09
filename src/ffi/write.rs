@@ -495,6 +495,86 @@ pub extern "C" fn archive_write_set_format_cpio_pwb(a: *mut Archive) -> c_int {
         w.set_format(b, Box::new(crate::write::format::cpio::Cpio::new(0x10006)))
     })
 }
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_zip(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::zip::Zip::default()))
+    })
+}
+fn zip_compression(a: *mut Archive, name: &[u8], function: &str) -> c_int {
+    with(a, ARCHIVE_FATAL, |h| {
+        if h.base.check_magic(
+            WRITE_MAGIC,
+            state::NEW | state::HEADER | state::DATA,
+            function,
+        ) == ARCHIVE_FATAL
+        {
+            return ARCHIVE_FATAL;
+        }
+        if h.base.format.get() != 0x50000 {
+            return h.base.raise(Error::fatal(
+                -1,
+                [
+                    b"Can only use ".as_slice(),
+                    function.as_bytes(),
+                    b" with zip format",
+                ]
+                .concat(),
+            ));
+        }
+        writer(h, ARCHIVE_FATAL, |w| {
+            w.option(
+                &h.base,
+                Some(b"zip"),
+                b"compression",
+                Some(name),
+                true,
+                false,
+            )
+        })
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_zip_set_compression_deflate(a: *mut Archive) -> c_int {
+    zip_compression(a, b"deflate", "archive_write_zip_set_compression_deflate")
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_zip_set_compression_store(a: *mut Archive) -> c_int {
+    zip_compression(a, b"store", "archive_write_zip_set_compression_store")
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_zip_set_compression_bzip2(a: *mut Archive) -> c_int {
+    zip_compression(a, b"bzip2", "archive_write_zip_set_compression_bzip2")
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_zip_set_compression_lzma(a: *mut Archive) -> c_int {
+    zip_compression(a, b"lzma", "archive_write_zip_set_compression_lzma")
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_zip_set_compression_xz(a: *mut Archive) -> c_int {
+    zip_compression(a, b"xz", "archive_write_zip_set_compression_xz")
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_zip_set_compression_zstd(a: *mut Archive) -> c_int {
+    zip_compression(a, b"zstd", "archive_write_zip_set_compression_zstd")
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_passphrase_callback(
+    a: *mut Archive,
+    data: *mut c_void,
+    cb: super::archive_passphrase_callback,
+) -> c_int {
+    with_writer(a, |_, w| {
+        w.passphrase_callback = cb.map(|cb| {
+            Box::new(move || {
+                // SAFETY: callback registered by caller owns a live NUL terminated return value for this call.
+                let p = unsafe { cb(a, data) };
+                cbytes(p).map(<[u8]>::to_vec)
+            }) as Box<dyn FnMut() -> Option<Vec<u8>>>
+        });
+        ARCHIVE_OK
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

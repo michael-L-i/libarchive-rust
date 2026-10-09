@@ -6,7 +6,6 @@ use super::{
     ARCHIVE_FATAL,
     Archive,
     ArchiveEntry,
-    archive_passphrase_callback,
 };
 use std::ffi::{c_char, c_int, c_long, c_void};
 
@@ -34,31 +33,6 @@ pub extern "C" fn archive_read_extract_set_progress_callback(
     _progress_func: Option<unsafe extern "C" fn(*mut c_void)>,
     _user_data: *mut c_void,
 ) {}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format(_a0: *mut Archive, _format_code: c_int) -> c_int {
@@ -114,11 +88,6 @@ pub extern "C" fn archive_write_set_format_xar(_a0: *mut Archive) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_zip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_filter_by_ext(
     _a: *mut Archive,
     _filename: *const c_char,
@@ -136,36 +105,6 @@ pub extern "C" fn archive_write_set_format_filter_by_ext_def(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_write_zip_set_compression_deflate(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_zip_set_compression_store(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_zip_set_compression_lzma(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_zip_set_compression_xz(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_zip_set_compression_bzip2(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_zip_set_compression_zstd(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_write_open_filename_w(
     _a0: *mut Archive,
     _file: *const libc::wchar_t,
@@ -175,15 +114,6 @@ pub extern "C" fn archive_write_open_filename_w(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_open_FILE(_a0: *mut Archive, _a1: *mut libc::FILE) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_passphrase_callback(
-    _a0: *mut Archive,
-    _client_data: *mut c_void,
-    _a2: archive_passphrase_callback,
-) -> c_int {
     ARCHIVE_FATAL
 }
 
