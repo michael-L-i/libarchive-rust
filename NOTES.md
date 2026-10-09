@@ -924,7 +924,7 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   happened to cut it. (7-Zip's Bra86.c turns the position into a distance
   before it saves it.) The other converters are position-independent. Only
   the converters upstream runs itself have this; the x86 filter of an LZMA2
-  coder is liblzma's here and upstream, and is correct.
+  coder is liblzma's upstream, and is correct (here lzma-rust2's).
 - A symlink entry's contents are read while the header is read. A bad CRC
   there only sets the error message; the status stays `ARCHIVE_OK`.
 - `read_Times` and kAttributes read the "external" byte and ignore it (only
@@ -938,8 +938,6 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - The `UMAX_ENTRY` limit of 100 million is the only limit on files,
   folders' substreams and sizes, as upstream. Memory for entries is about
   100 bytes each.
-- An archive with a bad CRC on a symlink or an entry continues: only
-  `archive_read_data` of the entry itself returns `ARCHIVE_WARN`.
 
 ### Differences
 
@@ -963,7 +961,9 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   decoder happily decodes garbage that lzma-rust2 rejects ("dist overflow",
   a missing final range coder byte), miniz_oxide accepts distances that
   zlib calls too far back, and a failed call outputs nothing from that call
-  (upstream delivers what the library had written). Error messages are
+  (upstream delivers what the library had written). lzma-rust2 also decodes
+  ahead into its dictionary, as far as the input it was given goes, so a
+  corrupt stream can fail a read long before the data it damages. Error messages are
   `Decompression failed (9)` for any lzma-rust2 failure (8 for options, 5 for
   memory), `File decompression failed (n)` with zlib's numbers for
   miniz_oxide, and libzstd's names for ruzstd's errors where there is a
