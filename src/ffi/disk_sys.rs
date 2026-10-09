@@ -240,8 +240,12 @@ use std::path::Component;
 pub struct Target {
     parent: File,
     name: CString,
+    live: Option<File>,
 }
 impl Target {
+    pub fn retain_file(&mut self, file: File) {
+        self.live = Some(file);
+    }
     pub fn prepare(
         path: &Path,
         secure: bool,
@@ -324,7 +328,11 @@ impl Target {
             // SAFETY: the new descriptor is uniquely owned by this File.
             parent = unsafe { File::from_raw_fd(fd) };
         }
-        Ok(Self { parent, name })
+        Ok(Self {
+            parent,
+            name,
+            live: None,
+        })
     }
     pub fn stat(&self) -> std::io::Result<libc::stat> {
         let mut st = super::entry::zeroed_stat();
@@ -597,6 +605,9 @@ pub fn pack_mac_metadata(_path: &Path, _entry: &mut Entry) -> std::io::Result<()
 impl Target {
     #[cfg(target_vendor = "apple")]
     pub fn metadata_file(&self) -> std::io::Result<File> {
+        if let Some(file) = &self.live {
+            return file.try_clone();
+        }
         // SAFETY: valid descriptor/name; O_SYMLINK opens link itself, never its target.
         let fd = unsafe {
             libc::openat(
@@ -634,6 +645,9 @@ impl Target {
     }
     #[cfg(target_vendor = "apple")]
     pub fn flags(&self, set: u32, clear: u32) -> std::io::Result<()> {
+        if set | clear == 0 {
+            return Ok(());
+        }
         let file = self.metadata_file()?;
         let st = self.stat()?;
         // SAFETY: live file descriptor; fchflags does not access borrowed memory.
@@ -685,6 +699,7 @@ impl Target {
         }
         Ok(Self {
             parent: self.parent.try_clone()?,
+            live: None,
             name: CString::new(name)
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?,
         })
@@ -754,7 +769,14 @@ impl Target {
                     return Err(e);
                 }
             };
-            return Ok((Self { parent, name }, file));
+            return Ok((
+                Self {
+                    parent,
+                    name,
+                    live: None,
+                },
+                file,
+            ));
         }
         Err(std::io::Error::from_raw_os_error(libc::EEXIST))
     }
