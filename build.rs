@@ -1,10 +1,10 @@
 /// Backend crates whose `Cargo.lock` version `archive_*_version` reports as
 /// "<crate> <version>", by the upstream key they stand for. A crate that is not
 /// in the lock file leaves its variable unset, so the backend reports NULL.
-/// (The bzip2 backend reports its own `BZ2_bzlibVersion` instead.)
 const BACKENDS: &[(&str, &str)] = &[
     ("ZLIB", "miniz_oxide"),
     ("LIBLZMA", "lzma-rust2"),
+    ("BZLIB", "crabz2"),
     ("LIBLZ4", "lz4_flex"),
     ("LIBZSTD", "ruzstd"),
 ];

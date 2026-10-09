@@ -18,9 +18,8 @@ Suspected upstream bugs ported as-is, and deliberate divergences, per unit.
   `libb2/bundled`, because BLAKE2 is built in. No C XML, regex or crypto
   library is linked, so those sections never appear. The compression
   backends are Rust crates, so each `archive_*_version` reports the crate,
-  not the C library: the backend's own version string where it has a
-  meaningful one (`BZ2_bzlibVersion`), otherwise `<crate> <version>` read
-  from `Cargo.lock` by `build.rs`, e.g. `zlib/miniz_oxide 0.9.1`. ACL
+  not the C library: `<crate> <version>` read from `Cargo.lock` by
+  `build.rs`, e.g. `zlib/miniz_oxide 0.9.1`. ACL
   backends are absent until phase 5 (archive_version_details.c).
 - NULL handles: upstream dereferences them and crashes (except
   `archive_free(NULL)`, which returns `ARCHIVE_OK`). Ours return a fallback
@@ -521,16 +520,12 @@ format, so that part would need our own encoder.
 
 Backends, and why:
 
-- bzip2 is `bzip2` 0.6.1 over libbz2-rs-sys 0.2.5. libbz2-rs-sys is a
-  c2rust translation (142 mentions of `unsafe` in 8 files) and is tracked for
-  replacement. The safe candidate, `bzip2-rs` 0.1.2 (`#![forbid(unsafe_code)]`),
-  was tested and rejected. Over our 726 bzip2 inputs it agrees with the
-  oracle on 504 and differs on 222: 144 of 150 mutated streams, 76 of 495
-  truncated prefixes, the concatenated pair (780 bytes against 1480, because
-  `DecoderReader` stops at the first stream), and empty input (upstream
-  outputs nothing; `bzip2-rs` errors). Its `Decoder` buffers a whole block
-  before decoding it. The `bzip2` wrapper has 18 mentions of `unsafe` of its
-  own (`mem.rs`).
+- bzip2 is `crabz2` 0.7.0, built without default features, parallel decoding,
+  or `unsafe-fast`; the crate enforces `forbid(unsafe_code)` and has no
+  runtime dependencies. Its `BlockDecoder` supplies bounded bzip2 blocks,
+  drained in 64 KiB output pieces. Compressed read-ahead is capped at 3 MiB
+  per block, including Huffman tables. Concatenated members and trailing
+  non-member bytes are supported. This replaces the c2rust libbz2 backend.
 - zstd is `ruzstd` 0.9.0, a safe decoder with 41 mentions of `unsafe` in its
   ring buffer and decode buffer, and no crate-level `forbid`. Its checksum
   comes from twox-hash (84 mentions). `libzstd-rs-sys` was tried and dropped:
@@ -539,8 +534,13 @@ Backends, and why:
 
 Differences:
 
-- `archive_bzlib_version` reports the backend's `BZ2_bzlibVersion` string
-  ("1.1.0-libbz2-rs-sys-<version>"), not "1.0.8, 13-Jul-2019".
+- `archive_bzlib_version` reports `crabz2 <version>`, not libbz2's version.
+- crabz2 checks a complete block's CRC before returning that block. A
+  damaged block therefore delivers no partial bytes, where libbz2 can
+  deliver some. The pinned `test_read_format_mtree_crash747.mtree.bz2`
+  fixture errors in both libraries, but upstream delivers 131072 bytes and
+  this port delivers none. Legacy randomized bzip2 blocks are rejected by
+  the safe backend. Valid ordinary and concatenated bzip2 fixtures match.
 - `archive_libzstd_version` reports `ruzstd <version>`. ruzstd has no libzstd
   version, so this is not a libzstd number.
 - zstd output on truncated or corrupt input. ruzstd keeps the last window of
@@ -589,5 +589,5 @@ Phase 5 needs:
 - zstd writing. ruzstd's encoder implements only the Uncompressed and Fastest
   levels. Default, Better and Best hit `unimplemented!()`, so phase 5 needs
   another encoder for the default levels.
-- bzip2 writing. The safe `bzip2-rs` has no encoder, so bzip2 writing stays on
-  `bzip2`'s encoder over libbz2-rs-sys unless a safe encoder is found.
+- bzip2 writing can use crabz2's safe encoder; level and streaming behavior
+  must be checked against the writer oracle when phase 5 lands.

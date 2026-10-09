@@ -28,13 +28,11 @@
 
 //! `archive_version_details`: the library version plus the version of every
 //! backend compiled in. Upstream links C libraries; the backends here are
-//! Rust crates. A backend reports its own version string when it has a
-//! meaningful one (bzip2); otherwise `build.rs` reads "<crate> <version>"
-//! from `Cargo.lock`. There are no C XML, regex or crypto backends, so those
+//! Rust crates. `build.rs` reads "<crate> <version>" from `Cargo.lock`.
+//! There are no C XML, regex or crypto backends, so those
 //! upstream sections (and their `archive_*_version` functions) are always
 //! absent.
 
-use crate::ffi::bzlib_version;
 use crate::util::VERSION_STRING;
 use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
@@ -58,9 +56,7 @@ lock_version!(liblzma, "LIBLZMA");
 lock_version!(liblz4, "LIBLZ4");
 lock_version!(libzstd, "LIBZSTD");
 
-pub fn bzlib() -> Option<&'static CStr> {
-    Some(bzlib_version())
-}
+lock_version!(bzlib, "BZLIB");
 
 pub const LIBLZO2: Option<&CStr> = None;
 pub const LIBRICHACL: Option<&CStr> = None;

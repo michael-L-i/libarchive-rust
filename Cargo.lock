@@ -18,15 +18,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bzip2"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
-dependencies = [
- "libbz2-rs-sys",
-]
-
-[[package]]
 name = "cc"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -56,6 +47,12 @@ checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "crabz2"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f77ccd2dfd6403f3ff2c5764e49471f390c2a3700777a15bebd88c9606292bd"
 
 [[package]]
 name = "crc32fast"
@@ -105,25 +102,15 @@ dependencies = [
 name = "libarchive-rust"
 version = "0.1.0"
 dependencies = [
- "bzip2",
  "cc",
+ "crabz2",
  "crc32fast",
- "libbz2-rs-sys",
  "libc",
  "lz4_flex",
  "lzma-rust2",
  "miniz_oxide",
  "ruzstd",
  "xxhash-rust",
-]
-
-[[package]]
-name = "libbz2-rs-sys"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
-dependencies = [
- "libc",
 ]
 
 [[package]]

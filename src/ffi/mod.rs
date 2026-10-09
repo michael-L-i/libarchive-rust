@@ -18,13 +18,6 @@ pub(crate) mod charset;
 pub(crate) mod filter_fork;
 pub(crate) mod sys;
 
-/// `BZ2_bzlibVersion()` of the bzip2 backend.
-pub(crate) fn bzlib_version() -> &'static std::ffi::CStr {
-    // SAFETY: the backend returns a pointer to a NUL-terminated string
-    // literal.
-    unsafe { std::ffi::CStr::from_ptr(libbz2_rs_sys::BZ2_bzlibVersion()) }
-}
-
 macro_rules! opaque {
     ($($name:ident),*) => {$(
         #[repr(C)]
