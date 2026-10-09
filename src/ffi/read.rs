@@ -1142,6 +1142,64 @@ pub(super) mod tests {
         (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
     }
 
+    /// Upstream's tests mostly enable formats and filters through the `all`
+    /// tables, so a per-format export that falls back to its stub goes
+    /// unnoticed there. Every ported table entry must have an export here
+    /// that registers it.
+    #[test]
+    fn every_ported_format_and_filter_has_a_working_export() {
+        use crate::read::{filter_code as filter, format_code as format};
+        type Export = extern "C" fn(*mut Archive) -> c_int;
+        let formats: &[(c_int, Export)] = &[
+            (format::AR, archive_read_support_format_ar),
+            (format::CPIO, archive_read_support_format_cpio),
+            (format::EMPTY, archive_read_support_format_empty),
+            (format::MTREE, archive_read_support_format_mtree),
+            (format::RAW, archive_read_support_format_raw),
+            (format::WARC, archive_read_support_format_warc),
+        ];
+        let filters: &[(c_int, Export)] = &[
+            (filter::BZIP2, archive_read_support_filter_bzip2),
+            (filter::COMPRESS, archive_read_support_filter_compress),
+            (filter::GRZIP, archive_read_support_filter_grzip),
+            (filter::GZIP, archive_read_support_filter_gzip),
+            (filter::LRZIP, archive_read_support_filter_lrzip),
+            (filter::LZ4, archive_read_support_filter_lz4),
+            (filter::LZIP, archive_read_support_filter_lzip),
+            (filter::LZMA, archive_read_support_filter_lzma),
+            (filter::LZOP, archive_read_support_filter_lzop),
+            (filter::RPM, archive_read_support_filter_rpm),
+            (filter::UU, archive_read_support_filter_uu),
+            (filter::XZ, archive_read_support_filter_xz),
+            (filter::ZSTD, archive_read_support_filter_zstd),
+        ];
+        let ported = format_all::FORMATS
+            .iter()
+            .map(|(c, s)| (c, s.is_some(), formats))
+            .chain(
+                filter_all::FILTERS
+                    .iter()
+                    .map(|(c, s)| (c, s.is_some(), filters)),
+            );
+        for (code, is_ported, exports) in ported {
+            let export = exports.iter().find(|(c, _)| c == code);
+            assert_eq!(
+                export.is_some(),
+                is_ported,
+                "code {code:#x}: list its export here iff its `all` table entry is Some"
+            );
+            if let Some((_, export)) = export {
+                let a = archive_read_new();
+                // An external-program filter warns that it will run one.
+                assert!(
+                    export(a) >= ARCHIVE_WARN,
+                    "code {code:#x}: export is a stub?"
+                );
+                assert_eq!(archive_free(a), ARCHIVE_OK);
+            }
+        }
+    }
+
     #[test]
     fn support_functions_check_the_state_and_enable_what_is_ported() {
         let a = archive_read_new();
@@ -1151,7 +1209,7 @@ pub(super) mod tests {
         assert_eq!(archive_read_support_compression_all(a), ARCHIVE_OK);
         assert_eq!(archive_read_support_format_all(a), ARCHIVE_OK);
         assert_eq!(error(a), None);
-        // Nothing is ported yet to register by code; a bad code is reported.
+        // A bad code is reported.
         assert_eq!(
             archive_read_support_format_by_code(a, 0x7777_0000),
             ARCHIVE_FATAL

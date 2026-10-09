@@ -124,6 +124,11 @@ per fixture and tags each with the filter it exercises, so a filter agent can fi
    internals and can't link against the public ABI; `build-port` detects them
    with `nm` and turns them into skips, and their checks are ported as Rust
    `#[test]`s next to the module they cover.
+   Upstream's tests reach most readers through the `all` tables, so a
+   per-format export that is still the stub goes unnoticed there. When a
+   unit registers a format or filter, add its export to
+   `every_ported_format_and_filter_has_a_working_export` in
+   `src/ffi/read.rs`.
 2. **Differential runs.** Build upstream `bsdtar` against upstream libarchive
    and against ours. Diff `bsdtar -tvf` output, extracted trees and exit codes
    over the corpus: upstream's `*.uu` test archives plus oss-fuzz corpora.
