@@ -53,11 +53,11 @@ const LZMA_BUF_ERROR: i32 = 10;
 
 /// The memory an xz stream may ask for, in KiB. Upstream has no limit; a
 /// header can ask for 4 GiB.
-const XZ_MEM_LIMIT_KIB: u32 = 1 << 20;
+const XZ_MEM_LIMIT_KIB: u32 = 256 * 1024;
 
-/// The memory the LZMA decoder may use, in bytes (`lzma_alone_decoder`'s
-/// limit in upstream).
-const LZMA_MEMLIMIT: u64 = 576 * (1 << 20);
+/// The memory the LZMA decoder may use, in bytes. Upstream allows 576 MiB;
+/// keep the same 256 MiB safety bound as the standalone filter.
+const LZMA_MEMLIMIT: u64 = 256 * (1 << 20);
 
 /// The state of the decompressors that aren't deflate. They are kept for the
 /// reader's lifetime: PPMd's escape estimate carries over between entries,

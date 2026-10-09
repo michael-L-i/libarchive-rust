@@ -2017,6 +2017,28 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn zip_rejects_oversized_lzma_dictionary_before_allocating() {
+        let mut payload = vec![9, 4, 5, 0, 0x5d];
+        payload.extend((u32::MAX).to_le_bytes());
+        payload.extend([0; 8]);
+        let mut file = zip_file(&[(b"a", &payload, false)]);
+        file[8..10].copy_from_slice(&14u16.to_le_bytes());
+        let central = 31 + payload.len();
+        file[central + 10..central + 12].copy_from_slice(&14u16.to_le_bytes());
+        for export in [
+            archive_read_support_format_zip_streamable,
+            archive_read_support_format_zip_seekable,
+        ] {
+            let got = read_zip(export, &file, 7);
+            assert_eq!(got.len(), 1);
+            assert_eq!(
+                got[0].as_ref().unwrap_err(),
+                "lzma stream requires too much memory"
+            );
+        }
+    }
+
+    #[test]
     fn zip_truncated_or_damaged_anywhere_fails_cleanly() {
         let text = b"hello, zip. ".repeat(50);
         let file = zip_file(&[(b"a.txt", b"hello", false), (b"b/c.txt", &text, true)]);
