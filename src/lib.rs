@@ -13,6 +13,7 @@ mod entry_stat;
 mod entry_strmode;
 mod entry_xattr;
 mod ffi;
+mod hmac;
 mod options;
 mod pack_dev;
 mod read;
