@@ -19,7 +19,7 @@ use crate::read::filter::{
     xz as filter_xz, zstd as filter_zstd,
 };
 use crate::read::format::{
-    all as format_all, ar, by_code as format_by_code, cpio, empty, mtree, raw, warc,
+    all as format_all, ar, by_code as format_by_code, cpio, empty, mtree, rar5, raw, warc,
 };
 use crate::read::{self, Read, Status};
 use crate::read_add_passphrase::PassphraseCallback;
@@ -1117,6 +1117,20 @@ pub extern "C" fn archive_read_support_format_empty(a: *mut Archive) -> c_int {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_rar5(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_rar5,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            rar5::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_warc(a: *mut Archive) -> c_int {
     checked!(
         archive_read_support_format_warc,
@@ -1155,6 +1169,7 @@ pub(super) mod tests {
             (format::CPIO, archive_read_support_format_cpio),
             (format::EMPTY, archive_read_support_format_empty),
             (format::MTREE, archive_read_support_format_mtree),
+            (format::RAR_V5, archive_read_support_format_rar5),
             (format::RAW, archive_read_support_format_raw),
             (format::WARC, archive_read_support_format_warc),
         ];
