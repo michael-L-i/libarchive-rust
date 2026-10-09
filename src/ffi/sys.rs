@@ -1,5 +1,5 @@
-//! Safe wrappers over the file-descriptor and `FILE *` calls the read
-//! clients make. All `unsafe` for that lives here.
+//! Safe wrappers over the file-descriptor, `FILE *` and local-time calls the
+//! read side makes. All `unsafe` for that lives here.
 
 use std::ffi::c_int;
 
@@ -125,6 +125,62 @@ impl CFile {
             Err(errno())
         }
     }
+}
+
+/// The broken-down local time fields `__archive_dos_to_unix` and
+/// `__archive_unix_to_dos` use, as in `struct tm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tm {
+    pub year: i32,
+    pub mon: i32,
+    pub mday: i32,
+    pub hour: i32,
+    pub min: i32,
+    pub sec: i32,
+}
+
+/// `mktime` of a local time with `tm_isdst = -1`, or `None` if it returns
+/// `(time_t)-1`.
+pub fn mktime(tm: Tm) -> Option<i64> {
+    // SAFETY: an all-zero `struct tm` is valid (a null `tm_zone` on the
+    // platforms that have one), and mktime only reads and normalizes the
+    // struct we own.
+    let t = unsafe {
+        let mut t = std::mem::zeroed::<libc::tm>();
+        t.tm_year = tm.year;
+        t.tm_mon = tm.mon;
+        t.tm_mday = tm.mday;
+        t.tm_hour = tm.hour;
+        t.tm_min = tm.min;
+        t.tm_sec = tm.sec;
+        t.tm_isdst = -1;
+        libc::mktime(&mut t)
+    };
+    (t != -1).then_some(t as i64)
+}
+
+/// `localtime_r`, or `None` if it fails. A `time_t` narrower than 64 bits
+/// clamps `secs` to the 32-bit range, as upstream does.
+pub fn localtime(secs: i64) -> Option<Tm> {
+    let secs = libc::time_t::try_from(secs)
+        .unwrap_or(if secs > 0 { i32::MAX } else { i32::MIN } as libc::time_t);
+    // SAFETY: `secs` and `t` are valid for the call; localtime_r writes
+    // only to `t`, and on success `t` is fully initialized.
+    let t = unsafe {
+        let mut t = std::mem::zeroed::<libc::tm>();
+        if libc::localtime_r(&secs, &mut t).is_null() {
+            return None;
+        }
+        t
+    };
+    Some(Tm {
+        year: t.tm_year,
+        mon: t.tm_mon,
+        mday: t.tm_mday,
+        hour: t.tm_hour,
+        min: t.tm_min,
+        sec: t.tm_sec,
+    })
 }
 
 #[cfg(test)]

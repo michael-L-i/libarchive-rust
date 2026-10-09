@@ -739,3 +739,21 @@ Phase 5 needs:
   1 MiB BSD name limit are the upstream ones.
 - The BSD name check's `SIZE_MAX - 1` bound is implied by the 1 MiB bound and
   is not repeated.
+
+## Time and CRC helpers (`src/time.rs`, `src/crc32.rs`)
+
+### Ported as-is
+
+- `__archive_unix_to_ntfs` passes a signed `secs` to `archive_ckd_add_u64`,
+  which takes `uint64_t`. A negative `secs` (pre-1970, down to the NTFS
+  epoch) becomes a huge unsigned value, the addition overflows and the result
+  is `UINT64_MAX`. Only `secs < -11644473600` returns 0 as intended
+  (archive_time.c).
+- `__archive_dos_to_unix` returns `INT32_MAX` when `mktime` fails, which also
+  swallows a genuine 1969-12-31 23:59:59 UTC result of `-1` (archive_time.c).
+
+### Differences
+
+- `__archive_crc32` is the table implementation upstream uses without zlib;
+  the result is identical to zlib's. There is no NULL-pointer case, as a
+  slice is never null.
