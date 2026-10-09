@@ -56,7 +56,7 @@ pub const FORMATS: &[(c_int, Option<Support>)] = &[
     (code::MTREE, None),
     (code::TAR, None),
     (code::XAR, None),
-    (code::WARC, None),
+    (code::WARC, Some(super::warc::support)),
     // Install expensive bidders last. By doing them last, we increase the
     // chance that a high bid from someone else will make it unnecessary for
     // these to do anything at all.

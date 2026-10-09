@@ -591,3 +591,35 @@ Phase 5 needs:
   another encoder for the default levels.
 - bzip2 writing can use crabz2's safe encoder; level and streaming behavior
   must be checked against the writer oracle when phase 5 lands.
+
+## warc reader (`src/read/format/warc.rs`)
+
+### Ported as-is
+
+- `time_t` -1 is the error value, so a time of exactly
+  1969-12-31T23:59:59Z is an error too: a WARC-Date of that value fails with
+  "Bad record time", and a Last-Modified of that value falls back to
+  WARC-Date (archive_read_support_format_warc.c).
+- The scheme is matched as a prefix: `filex:///p` is taken as `file`,
+  `httpsx://h/p` as `http` and `ftpx://h/p` as `ftp`. For http and ftp the
+  name is the path after the first slash following the host, so `ftp://host`
+  has no name and the record is skipped.
+- Field values are not trimmed at the end. `Content-Length: 12 ` (trailing
+  blank) is "Bad content length", and `WARC-Type: resource ` is not a resource
+  record. Leading blanks and tabs are accepted.
+- Dates are not validated beyond their ranges: day 31 in February becomes
+  March 3 and second 60 rolls into the next minute, as `timegm` does. Single
+  digits are accepted in every field (`2014-1-2T3:4:5Z`).
+- The four bytes after a record's content (its CRLFCRLF separator) are
+  consumed without checking them, so a corrupt separator is skipped silently
+  and the next header is read from wherever that lands.
+
+### Differences
+
+- `pver` and `sver` (the formatted WARC version) are set but never read
+  upstream, so they are not ported.
+- The `fname` scratch buffer is a per-entry `Vec` rather than state kept on
+  the reader.
+- The `time_from_tm` path for platforms without `timegm` (mktime and
+  `tm_yday`) is not ported. Days are computed from the civil date, which is
+  what `timegm` returns.
