@@ -231,9 +231,33 @@ impl SevenZip {
         Ok(())
     }
     fn start_coder(&mut self, input_size: Option<usize>) -> Result<(), Error> {
+        // Release staged input before allocating a full dictionary. This path
+        // uses at most 8 MiB of temporary storage; small streams stay in memory.
+        let mut staged = if !self.pending.is_empty()
+            && (input_size.is_none() || self.pending.len() >= 4 << 20)
+        {
+            let mut file = crate::write::temp_file()?;
+            file.write_all(&self.pending).map_err(io_error)?;
+            file.rewind().map_err(io_error)?;
+            self.pending = Vec::new();
+            Some(file)
+        } else {
+            None
+        };
         let (mut coder, props) = Coder::new(self.codec, self.level, input_size)?;
         if let Some(spool) = &mut self.spool {
-            coder.write(&self.pending, spool)?;
+            if let Some(file) = &mut staged {
+                let mut buffer = [0; 65536];
+                loop {
+                    let n = file.read(&mut buffer).map_err(io_error)?;
+                    if n == 0 {
+                        break;
+                    }
+                    coder.write(&buffer[..n], spool)?;
+                }
+            } else {
+                coder.write(&self.pending, spool)?;
+            }
         }
         self.pending = Vec::new();
         self.coder = Some(coder);
