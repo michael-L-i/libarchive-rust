@@ -1701,11 +1701,14 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - Lzip uses upstream's dictionary and nice-length preset table. The safe
   backend has HC4 rather than HC3 for levels 0 and 1; their compressed
   bytes and relative compression ratios can differ on some inputs.
-- lzma-rust2 0.21.0 is vendored with one binary-tree match-extension patch:
+- lzma-rust2 0.21.0 is vendored with a binary-tree match-extension patch:
   the skip path uses the backend's existing safe word-at-a-time comparison.
   Presets and parsing decisions are unchanged; differential streams remain
-  byte-identical. Provenance and validation are in
-  `vendor/lzma-rust2/PATCHES.md`; its unsafe `optimization` feature stays off.
+  byte-identical. The sans-I/O LZMA2 decoder also initializes dictionary
+  pages as chunks need them, reducing resident memory for short XZ streams.
+  Declared virtual capacity, logical history and memory limits are unchanged;
+  LZMA1 and pull readers retain full initialization. Provenance and validation
+  are in `vendor/lzma-rust2/PATCHES.md`; its unsafe `optimization` feature stays off.
 - XZ and Zstandard accept and validate `threads` but encode on one worker.
   XZ uses a single-thread stream header/index. LZ4 high compression levels
   use the safe block encoder, and linked blocks can be independently coded;
@@ -1715,9 +1718,12 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   Levels 2–3 use 96 KiB blocks and higher levels use 128 KiB blocks to
   amortize block headers and tables while retaining level-dependent output.
   It reuses a fixed hash table and a 1 MiB history window across blocks,
-  including with the `long` option. Matcher storage is bounded at about
-  1.75 MiB. A bounded encoder thread batches small writes and uses channel
-  notifications for backpressure, allowing the synchronous backend to
+  including with the `long` option. Five-byte hashing and adaptive skipping
+  reduce searches on incompressible input; skipping can miss short matches
+  and slightly enlarge some archives. History compaction is amortized over
+  1 MiB of new data, adding about 1 MiB of capacity. Matcher storage is bounded
+  at about 2.75 MiB. A bounded encoder thread batches small writes and uses
+  channel notifications for backpressure, allowing the synchronous backend to
   stream without buffering the archive or polling with sleeps.
   Frame sizes and frame-per-file flushing are honored at encoder block
   boundaries; compressed-output thresholds remain approximate and can be
@@ -1755,7 +1761,10 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - Directory metadata is deferred until close, with each entry's extraction
   options retained; data-less hardlinks leave the target's metadata alone.
   Short writes are extended to the entry size and block writes seek to their
-  explicit offsets. Ownership/permission failures are warnings.
+  explicit offsets. Cached physical position and length avoid seeks for
+  contiguous writes and resizing files already at their target length. Sparse
+  holes still require extension; write errors invalidate both cached values.
+  Ownership/permission failures are warnings.
 - Logical and hybrid disk walks fall back to the symlink for a broken target
   or a directory ancestor cycle. Matching queries use the live match handle
   so unmatched inclusion counts reflect the walk. Descend requests made from

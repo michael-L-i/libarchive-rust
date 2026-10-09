@@ -124,6 +124,47 @@ Results, remaining gaps, compiler settings and IO tradeoffs are recorded in
 `../diagnostics/results/REPORT.md`; raw measurements identify source runs and
 binary hashes. Code is committed locally; no tests or benchmarks remain running.
 
+## Optimization round 3 checkpoint
+
+Baseline `7139c72` to code `25ac9ea`: Zstandard uses five-byte hashing,
+adaptive search skipping and amortized history compaction. XZ/LZMA2 defers
+initialization of unused dictionary pages. Disk extraction omits redundant
+contiguous seeks and final file resizing while retaining sparse/error behavior.
+Independent Astra reviews passed for each change. No C codec, dependency or
+unsafe backend feature was added; original C and pinned upstream are unchanged.
+
+Same-profile release medians: 16 MiB random Zstd creation 72.0 -> 52.5 ms
+(27% less time), mixed 87.9 -> 76.2 ms (13% less). Source archives are 4.6%
+smaller. Matcher history capacity increases about 1 MiB; some archives grow
+slightly. Small-files XZ listing RSS falls 11.7 -> 4.3 MiB; 2 MiB input falls
+11.7 -> 5.7 MiB. Reserved virtual capacity is unchanged. Focused contiguous
+disk writes fall 50.7 -> 47.4 ms; small-file writes change little.
+
+Release and development comparisons are recorded separately. Current 16 MiB
+random 7zip creation is 2797 ms Rust versus 2952 ms C; the baseline release
+already had that advantage. Repetitive 16 MiB 7zip remains slower, 156 ms Rust
+versus 92 ms C. No new 7zip encoder algorithm or blanket C-parity claim is made.
+The normal release profile, not a Cargo profile change, is used for delivery.
+
+Validation: 379 native tests passed, 1 opt-in test ignored; strict all-target
+Clippy, rustfmt, diff and all 454 public symbols passed. Focused dev oracle:
+117 passed, 13 skipped. Final release full upstream/front-end run: 926 passed,
+184 skipped, zero failures, crashes, timeouts or ratchet regressions in 71s
+(one worker, 30-second per-test timeout). All 25 self-contained vendor tests
+pass; 6,790 decoder differential records match statuses, errors, consumption,
+output lengths and hashes across fragmented, damaged and large-dictionary input.
+
+Release benchmarks: 756 timed operations, 252 extraction manifest checks and
+168 cross-reader checks passed. Dev benchmarks: 540 operations, 180 manifests
+and 120 cross-reader checks passed. Five-repeat disk benchmarks completed 30
+API runs. Sequential execution avoids benchmark/build contention.
+
+The current absolute C/Rust tables, sizes, memory, compiler profiles, limitations
+and raw binary hashes are in `../diagnostics/results/REPORT.md`. The previous
+report is retained in `../diagnostics/results/before-round3/`. The current
+`diagnostics/bin/rust-bsdtar` alias is the verified release snapshot; named
+before/after snapshots preserve both profiles. Work is committed locally.
+
 ## Earlier checkpoints (historical)
 
 ### Phase 2 checkpoint
