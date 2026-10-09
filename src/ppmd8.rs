@@ -3,7 +3,7 @@
 This code is based on PPMd var.I (2002): Dmitry Shkarin : Public domain */
 
 // Ported from libarchive/archive_ppmd8.c (decoder side).
-#![allow(dead_code)] // used by the zip reader
+#![allow(dead_code)] // the zip reader leaves some of the API unused
 
 //! PPMd var. I decoder, with its carryless range decoder.
 //!

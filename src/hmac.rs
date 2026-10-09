@@ -27,8 +27,6 @@
 
 //! HMAC-SHA1, for the authentication code of WinZip AES entries.
 
-#![allow(dead_code)] // for the zip readers and writer (phases 4-5)
-
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 

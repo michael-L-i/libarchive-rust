@@ -19,7 +19,7 @@ use crate::read::filter::{
     xz as filter_xz, zstd as filter_zstd,
 };
 use crate::read::format::{
-    all as format_all, ar, by_code as format_by_code, cpio, empty, mtree, raw, warc,
+    all as format_all, ar, by_code as format_by_code, cpio, empty, mtree, raw, warc, zip,
 };
 use crate::read::{self, Read, Status};
 use crate::read_add_passphrase::PassphraseCallback;
@@ -1130,6 +1130,49 @@ pub extern "C" fn archive_read_support_format_warc(a: *mut Archive) -> c_int {
     )
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_zip(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_zip,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            zip::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_zip_streamable(a: *mut Archive) -> c_int {
+    // Upstream checks the state under the name of the combined export.
+    checked!(
+        archive_read_support_format_zip,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            zip::support_streamable(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_zip_seekable(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_zip_seekable,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            zip::support_seekable(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -1157,6 +1200,7 @@ pub(super) mod tests {
             (format::MTREE, archive_read_support_format_mtree),
             (format::RAW, archive_read_support_format_raw),
             (format::WARC, archive_read_support_format_warc),
+            (format::ZIP, archive_read_support_format_zip),
         ];
         let filters: &[(c_int, Export)] = &[
             (filter::BZIP2, archive_read_support_filter_bzip2),
@@ -1198,6 +1242,26 @@ pub(super) mod tests {
                 assert_eq!(archive_free(a), ARCHIVE_OK);
             }
         }
+    }
+
+    /// The zip reader registers in two modes, each with its own export.
+    #[test]
+    fn the_zip_modes_have_working_exports() {
+        for export in [
+            archive_read_support_format_zip_streamable,
+            archive_read_support_format_zip_seekable,
+        ] {
+            let a = archive_read_new();
+            assert_eq!(export(a), ARCHIVE_OK);
+            // A mode that is registered already is a warning.
+            assert_eq!(export(a), ARCHIVE_WARN);
+            assert_eq!(archive_free(a), ARCHIVE_OK);
+        }
+        let a = archive_read_new();
+        assert_eq!(archive_read_support_format_zip(a), ARCHIVE_OK);
+        assert_eq!(archive_read_support_format_zip_streamable(a), ARCHIVE_WARN);
+        assert_eq!(archive_read_support_format_zip_seekable(a), ARCHIVE_WARN);
+        assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 
     #[test]
