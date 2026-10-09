@@ -92,7 +92,6 @@ fn octal(
         out[0] |= 0x80;
         return Ok(());
     }
-    out[digits..].fill(0);
     for b in out[..digits].iter_mut().rev() {
         *b = b'0' + (value & 7) as u8;
         value >>= 3;
@@ -645,6 +644,8 @@ impl Format for Tar {
             let n = xp.len().min(99);
             x[..n].copy_from_slice(&xp[..n]);
             x[345..500].fill(0);
+            // The copied size may have used all 12 octal digits or base-256.
+            x[135] = b' ';
             octal(&mut x[124..136], pax.len() as i64, 11, true, "")?;
             checksum(&mut x);
             sink.write(&x)?;
