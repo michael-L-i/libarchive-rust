@@ -1172,7 +1172,7 @@ impl Format for Lha {
     fn read_header(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Result<Status, Error> {
         let a = r.base();
         a.format.set(format_code::LHA);
-        if a.format_name.get().is_none() {
+        if a.format_name.get().is_none() && a.format_name_buf.borrow().is_empty() {
             a.format_name.set(Some(c"lha"));
         }
 
