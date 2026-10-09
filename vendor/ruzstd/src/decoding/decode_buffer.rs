@@ -76,6 +76,7 @@ impl DecodeBuffer {
         self.total_output_counter += data.len() as u64;
     }
 
+    #[inline]
     pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
         if offset > self.buffer.len() {
             self.repeat_from_dict(offset, match_length)

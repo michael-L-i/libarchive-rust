@@ -187,3 +187,24 @@ allocation, window and error handling are unchanged; no unsafe code is added.
 - Profiles, ABI comparisons, rejected bit-reader/FSE batching trials and the
   standalone actual-module tests are in sibling `diagnostics/round5-zstd-read`.
   Final integration validation runs on the combined branch.
+
+## Inline match repetition into sequence execution
+
+`src/decoding/decode_buffer.rs` marks `DecodeBuffer::repeat` with `#[inline]`.
+A fresh profile attributes substantial source-data decoding time to calls from
+sequence execution into this helper. Inlining lets the caller retain buffer
+state across the per-match checks; the dictionary fallback stays cold. All
+arithmetic, allocation, copying, bounds, window and error handling are unchanged.
+
+- Seven alternating ABI runs improved 16 MiB source 23.092 -> 22.600 ms and
+  mixed 12.530 -> 12.064 ms. A separate 21-run confirmation yielded
+  22.967 -> 22.445 ms and 12.347 -> 12.034 ms (about 2.3-2.5%). Text, random,
+  small-file and two sparse cases were essentially unchanged.
+- All seven outputs match the baseline and independent C libarchive by
+  SHA-256. All 175 valid, truncated and mutated archives match baseline
+  status, errno, error text, header count, output length and SHA-256.
+- All six actual-module buffer tests pass with debug assertions, including
+  wrap boundaries and 768 overlap/growth reference cases.
+- Profiles, timings and the rejected packed length-code lookup experiment
+  are retained in sibling `diagnostics/round6-zstd-read`. Final integration
+  validation runs on the combined branch.
