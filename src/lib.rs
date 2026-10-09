@@ -14,6 +14,8 @@ mod entry_xattr;
 mod ffi;
 mod options;
 mod pack_dev;
+mod ppmd;
+mod ppmd7;
 mod read;
 mod read_add_passphrase;
 mod read_append_filter;
