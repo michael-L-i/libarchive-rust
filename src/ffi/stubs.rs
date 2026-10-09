@@ -35,56 +35,12 @@ pub extern "C" fn archive_read_extract_set_progress_callback(
 ) {}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format(_a0: *mut Archive, _format_code: c_int) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_by_name(
-    _a0: *mut Archive,
-    _name: *const c_char,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_iso9660(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_xar(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_filter_by_ext(
-    _a: *mut Archive,
-    _filename: *const c_char,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_filter_by_ext_def(
-    _a: *mut Archive,
-    _filename: *const c_char,
-    _def_ext: *const c_char,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_open_filename_w(
-    _a0: *mut Archive,
-    _file: *const libc::wchar_t,
-) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_open_FILE(_a0: *mut Archive, _a1: *mut libc::FILE) -> c_int {
     ARCHIVE_FATAL
 }
 

@@ -28,16 +28,19 @@
 // Ported from libarchive/archive_write_set_format_cpio_newc.c.
 use crate::archive::*;
 use crate::entry::Entry;
+use crate::string::StringConv;
 use crate::util::Error;
 use crate::write::{Format, Sink, zeros};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, c_int};
+use std::sync::Arc;
 pub struct Cpio {
     pub variant: c_int,
     remaining: u64,
     padding: u64,
     next: u32,
     inos: BTreeMap<(i32, i32, i64), u32>,
+    conv: Option<Arc<StringConv>>,
 }
 impl Cpio {
     pub fn new(variant: c_int) -> Self {
@@ -47,6 +50,7 @@ impl Cpio {
             padding: 0,
             next: 0,
             inos: BTreeMap::new(),
+            conv: None,
         }
     }
     fn inode(&mut self, e: &Entry) -> Result<u32, Error> {
@@ -69,14 +73,10 @@ impl Cpio {
         Ok(self.next)
     }
     fn write_header(&mut self, e: &mut Entry, sink: &mut dyn Sink) -> Result<(), Error> {
-        let path = e
-            .pathname()
-            .map(|s| s.to_bytes().to_vec())
-            .unwrap_or_default();
-        let sym = e
-            .symlink()
-            .map(|s| s.to_bytes().to_vec())
-            .unwrap_or_default();
+        let (path, _) = e.pathname_l(self.conv.as_deref());
+        let path = path.unwrap_or_default().to_vec();
+        let (sym, _) = e.symlink_l(self.conv.as_deref());
+        let sym = sym.unwrap_or_default().to_vec();
         if e.filetype() != 0o100000 {
             e.set_size(0);
         }
@@ -216,6 +216,27 @@ impl Format for Cpio {
     }
     fn module(&self) -> &'static [u8] {
         b"cpio"
+    }
+    fn options(&mut self, a: &Base, k: &[u8], v: Option<&[u8]>) -> Result<c_int, Error> {
+        if k != b"hdrcharset" {
+            return Ok(ARCHIVE_WARN);
+        }
+        let v = v.filter(|v| !v.is_empty()).ok_or_else(|| {
+            Error::new(
+                ARCHIVE_FAILED,
+                -1,
+                "cpio: hdrcharset option needs a character-set name",
+            )
+        })?;
+        let mut c = a
+            .conv
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.conv = Some(
+            crate::string::conversion_to_charset(Some(&mut c), v, false)
+                .map_err(|e| Error::fatal(e.errno, e.message))?,
+        );
+        Ok(ARCHIVE_OK)
     }
     fn header(&mut self, _: &Base, e: &mut Entry, sink: &mut dyn Sink) -> Result<c_int, Error> {
         if e.filetype() == 0 && e.hardlink().is_none() {
