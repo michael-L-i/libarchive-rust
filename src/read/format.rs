@@ -9,3 +9,4 @@ pub mod empty;
 pub mod mtree;
 pub mod raw;
 pub mod warc;
+pub mod xar;
