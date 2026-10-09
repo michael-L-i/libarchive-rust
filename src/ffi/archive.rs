@@ -204,6 +204,7 @@ pub extern "C" fn archive_free(a: *mut Archive) -> c_int {
         // Each kind supplies its virtual close and free operations.
         let states = state::ANY | state::FATAL;
         let (magic, name) = match &h.kind {
+            crate::archive::Kind::Match(_) => (crate::archive::MATCH_MAGIC, "archive_free"),
             crate::archive::Kind::Read(_) => (READ_MAGIC, "archive_read_free"),
             crate::archive::Kind::Write(_) => (WRITE_MAGIC, "archive_write_free"),
             crate::archive::Kind::WriteDisk(_) => {
@@ -253,6 +254,15 @@ pub extern "C" fn archive_write_finish(a: *mut Archive) -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_close(a: *mut Archive) -> c_int {
+    if let Some(ret) = with(a, None, |h| {
+        if matches!(h.kind, crate::archive::Kind::ReadDisk(_)) {
+            Some(h.close())
+        } else {
+            None
+        }
+    }) {
+        return ret;
+    }
     checked!(
         archive_read_close,
         a,

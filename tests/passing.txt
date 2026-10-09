@@ -38,6 +38,7 @@ test_archive_api_feature
 test_archive_clear_error
 test_archive_match_owner
 test_archive_match_path
+test_archive_match_time
 test_archive_parse_date
 test_archive_read_append_filter
 test_archive_read_close_twice
@@ -118,6 +119,8 @@ test_read_data_block_offset_at_eof
 test_read_data_into_fd_no_offset_reported
 test_read_data_into_fd_size_exceeds_declared_deflate
 test_read_data_into_fd_size_exceeds_declared_stored
+test_read_disk
+test_read_disk_entry_from_file
 test_read_file_nonexistent
 test_read_files_compressed
 test_read_filter_compress_empty2
@@ -511,6 +514,19 @@ test_read_set_wrong_format
 test_read_too_many_filters
 test_sparse_clear
 test_sparse_iterator
+test_write_disk
+test_write_disk_failures
+test_write_disk_fixup
+test_write_disk_hardlink
+test_write_disk_lookup
+test_write_disk_perms
+test_write_disk_secure
+test_write_disk_secure744
+test_write_disk_secure745
+test_write_disk_secure746a
+test_write_disk_secure746b
+test_write_disk_sparse
+test_write_disk_symlink
 test_xattr_clear
 unzip/test_0
 unzip/test_C

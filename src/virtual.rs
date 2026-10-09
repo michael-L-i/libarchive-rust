@@ -124,7 +124,7 @@ impl Handle {
             Kind::Write(w) => w.borrow_mut().close(&self.base),
             Kind::WriteDisk(w) => w.borrow_mut().close(&self.base),
             Kind::ReadDisk(r) => r.borrow_mut().close(&self.base),
-            Kind::Match(_)=>ARCHIVE_OK,
+            Kind::Match(_) => ARCHIVE_OK,
         }
     }
 
@@ -137,7 +137,7 @@ impl Handle {
             Kind::Write(w) => w.borrow_mut().free(&self.base),
             Kind::WriteDisk(w) => w.borrow_mut().close(&self.base),
             Kind::ReadDisk(r) => r.borrow_mut().close(&self.base),
-            Kind::Match(_)=>ARCHIVE_OK,
+            Kind::Match(_) => ARCHIVE_OK,
         }
     }
 
