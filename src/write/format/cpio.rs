@@ -247,6 +247,7 @@ impl Format for Cpio {
         let mut trailer = Entry::new(None);
         trailer.set_pathname(b"TRAILER!!!");
         trailer.set_size(0);
+        trailer.set_nlink(1);
         self.write_header(&mut trailer, sink)
     }
 }

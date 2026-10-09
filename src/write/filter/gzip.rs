@@ -36,6 +36,7 @@ pub struct Gzip {
     state: Option<Box<CompressorOxide>>,
     crc: u32,
     size: u32,
+    raw: bool,
 }
 impl Default for Gzip {
     fn default() -> Self {
@@ -46,10 +47,18 @@ impl Default for Gzip {
             state: None,
             crc: 0,
             size: 0,
+            raw: false,
         }
     }
 }
 impl Gzip {
+    pub(crate) fn raw(level: u8) -> Self {
+        Self {
+            level,
+            raw: true,
+            ..Self::default()
+        }
+    }
     fn start(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
         if self.state.is_some() {
             return Ok(());
@@ -76,7 +85,9 @@ impl Gzip {
             header.extend_from_slice(&self.filename);
             header.push(0)
         }
-        sink.write(&header)?;
+        if !self.raw {
+            sink.write(&header)?;
+        }
         self.state = Some(Box::new(CompressorOxide::new(
             create_comp_flags_from_zip_params(i32::from(self.level), -15, 0),
         )));
@@ -139,6 +150,9 @@ impl Filter for Gzip {
     }
     fn close(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
         self.encode(&[], true, sink)?;
+        if self.raw {
+            return Ok(());
+        }
         sink.write(&self.crc.to_le_bytes())?;
         sink.write(&self.size.to_le_bytes())
     }

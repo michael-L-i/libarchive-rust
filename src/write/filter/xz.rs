@@ -27,7 +27,9 @@
 // Ported from libarchive/archive_write_add_filter_xz.c.
 
 use super::*;
-use lzma_rust2::{LzipOptions, LzipWriter, LzmaOptions, LzmaWriter, XzOptions, XzWriter};
+use lzma_rust2::{
+    EncodeMode, LzipOptions, LzipWriter, LzmaOptions, LzmaWriter, MfType, XzOptions, XzWriter,
+};
 use std::io::Write as _;
 enum State {
     Xz(XzWriter<Vec<u8>>),
@@ -47,6 +49,35 @@ impl Encoder {
             state: None,
         }
     }
+    fn lzip_options(&self) -> LzipOptions {
+        let dictionaries = [
+            1 << 16,
+            1 << 20,
+            3 << 19,
+            1 << 21,
+            3 << 20,
+            1 << 22,
+            1 << 23,
+            1 << 24,
+            3 << 23,
+            1 << 25,
+        ];
+        let mut options = LzipOptions::with_preset(self.level.into());
+        options.lzma_options.dict_size = dictionaries[usize::from(self.level)];
+        options.lzma_options.nice_len = if self.level <= 5 { 32 } else { 64 };
+        options.lzma_options.mode = if self.level <= 2 {
+            EncodeMode::Fast
+        } else {
+            EncodeMode::Normal
+        };
+        options.lzma_options.mf = if self.level <= 2 {
+            MfType::Hc4
+        } else {
+            MfType::Bt4
+        };
+        options.lzma_options.depth_limit = 0;
+        options
+    }
     fn start(&mut self) -> Result<(), Error> {
         if self.state.is_none() {
             self.state = Some(match self.code {
@@ -62,10 +93,7 @@ impl Encoder {
                     )
                     .map_err(io_error)?,
                 ),
-                _ => State::Lzip(LzipWriter::new(
-                    Vec::new(),
-                    LzipOptions::with_preset(self.level.into()),
-                )),
+                _ => State::Lzip(LzipWriter::new(Vec::new(), self.lzip_options())),
             });
         }
         Ok(())

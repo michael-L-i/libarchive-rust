@@ -6,9 +6,8 @@ use super::{
     ARCHIVE_FATAL,
     Archive,
     ArchiveEntry,
-    archive_passphrase_callback,
 };
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_long, c_void};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_extract(
@@ -35,31 +34,6 @@ pub extern "C" fn archive_read_extract_set_progress_callback(
     _user_data: *mut c_void,
 ) {}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format(_a0: *mut Archive, _format_code: c_int) -> c_int {
     ARCHIVE_FATAL
@@ -73,45 +47,12 @@ pub extern "C" fn archive_write_set_format_by_name(
     ARCHIVE_FATAL
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_7zip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_iso9660(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_mtree(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_mtree_classic(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_shar(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_shar_dump(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_warc(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_zip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_filter_by_ext(
@@ -131,36 +72,6 @@ pub extern "C" fn archive_write_set_format_filter_by_ext_def(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_write_zip_set_compression_deflate(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_zip_set_compression_store(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_zip_set_compression_lzma(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_zip_set_compression_xz(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_zip_set_compression_bzip2(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_zip_set_compression_zstd(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_write_open_filename_w(
     _a0: *mut Archive,
     _file: *const libc::wchar_t,
@@ -170,15 +81,6 @@ pub extern "C" fn archive_write_open_filename_w(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_open_FILE(_a0: *mut Archive, _a1: *mut libc::FILE) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_passphrase_callback(
-    _a0: *mut Archive,
-    _client_data: *mut c_void,
-    _a2: archive_passphrase_callback,
-) -> c_int {
     ARCHIVE_FATAL
 }
 
@@ -357,6 +259,220 @@ pub extern "C" fn archive_read_disk_set_metadata_filter_callback(
     _a0: *mut Archive,
     _metadata_filter_func: Option<unsafe extern "C" fn(*mut Archive, *mut c_void, *mut ArchiveEntry) -> c_int>,
     _client_data: *mut c_void,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_parse_date(_now: libc::time_t, _datestr: *const c_char) -> libc::time_t {
+    ARCHIVE_FATAL as libc::time_t
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_new() -> *mut Archive {
+    std::ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_free(_a0: *mut Archive) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_excluded(_a0: *mut Archive, _a1: *mut ArchiveEntry) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_path_excluded(_a0: *mut Archive, _a1: *mut ArchiveEntry) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_set_inclusion_recursion(_a0: *mut Archive, _a1: c_int) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_exclude_pattern(_a0: *mut Archive, _a1: *const c_char) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_exclude_pattern_w(
+    _a0: *mut Archive,
+    _a1: *const libc::wchar_t,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_exclude_pattern_from_file(
+    _a0: *mut Archive,
+    _a1: *const c_char,
+    _null_separator: c_int,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_exclude_pattern_from_file_w(
+    _a0: *mut Archive,
+    _a1: *const libc::wchar_t,
+    _null_separator: c_int,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_pattern(_a0: *mut Archive, _a1: *const c_char) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_pattern_w(
+    _a0: *mut Archive,
+    _a1: *const libc::wchar_t,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_pattern_from_file(
+    _a0: *mut Archive,
+    _a1: *const c_char,
+    _null_separator: c_int,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_pattern_from_file_w(
+    _a0: *mut Archive,
+    _a1: *const libc::wchar_t,
+    _null_separator: c_int,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_path_unmatched_inclusions(_a0: *mut Archive) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_path_unmatched_inclusions_next(
+    _a0: *mut Archive,
+    _a1: *mut *const c_char,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_path_unmatched_inclusions_next_w(
+    _a0: *mut Archive,
+    _a1: *mut *const libc::wchar_t,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_time_excluded(_a0: *mut Archive, _a1: *mut ArchiveEntry) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_time(
+    _a0: *mut Archive,
+    _flag: c_int,
+    _sec: libc::time_t,
+    _nsec: c_long,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_date(
+    _a0: *mut Archive,
+    _flag: c_int,
+    _datestr: *const c_char,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_date_w(
+    _a0: *mut Archive,
+    _flag: c_int,
+    _datestr: *const libc::wchar_t,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_file_time(
+    _a0: *mut Archive,
+    _flag: c_int,
+    _pathname: *const c_char,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_file_time_w(
+    _a0: *mut Archive,
+    _flag: c_int,
+    _pathname: *const libc::wchar_t,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_exclude_entry(
+    _a0: *mut Archive,
+    _flag: c_int,
+    _a2: *mut ArchiveEntry,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_owner_excluded(_a0: *mut Archive, _a1: *mut ArchiveEntry) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_uid(_a0: *mut Archive, _a1: i64) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_gid(_a0: *mut Archive, _a1: i64) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_uname(_a0: *mut Archive, _a1: *const c_char) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_uname_w(
+    _a0: *mut Archive,
+    _a1: *const libc::wchar_t,
+) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_gname(_a0: *mut Archive, _a1: *const c_char) -> c_int {
+    ARCHIVE_FATAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_match_include_gname_w(
+    _a0: *mut Archive,
+    _a1: *const libc::wchar_t,
 ) -> c_int {
     ARCHIVE_FATAL
 }

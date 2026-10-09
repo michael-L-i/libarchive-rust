@@ -1023,6 +1023,10 @@ impl Entry {
         self.digest.get(digest_index(ty)?)?.get(..digest_len(ty)?)
     }
 
+    pub(crate) fn digest_is_set(&self, ty: c_int) -> bool {
+        digest_index(ty).is_some_and(|i| self.mset_digest & (1 << i) != 0)
+    }
+
     /// Copies a digest of the size `digest_len(ty)`.
     pub fn set_digest(&mut self, ty: c_int, digest: &[u8]) -> c_int {
         let slot = digest_index(ty)

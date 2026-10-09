@@ -233,6 +233,11 @@ pub(crate) fn date_clock(secs: i64, utc: bool) -> Option<(Tm, i64, bool)> {
     ))
 }
 
+/// UTC calendar fields for archive timestamps.
+pub fn gmtime(secs: i64) -> Option<Tm> {
+    date_clock(secs, true).map(|v| v.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

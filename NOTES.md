@@ -814,8 +814,9 @@ one; see the first entry.
 - `Ppmd7::alloc` and `Ppmd8::alloc` take the size as `u32` like upstream and
   fail the same way (`false`) if it is below `UNIT_SIZE` (PPMd7 only) or the
   memory is not available.
-- Only the decoding side is ported: `Ppmd7z_RangeEnc_*` and
-  `Ppmd7_EncodeSymbol` wait for the 7zip writer.
+- PPMd7 includes `Ppmd7z_RangeEnc_*` and `Ppmd7_EncodeSymbol` for the
+  7zip writer. Encoding shares the checked arena and model update paths
+  with decoding. PPMd8 encoding is not used by upstream writers.
 
 ## cab reader (src/read/format/cab.rs)
 
@@ -1701,6 +1702,9 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   decompresses to the same archive bytes but compressed bytes, ratios and
   timing differ from the upstream C libraries. Encoder features on existing
   dependencies are enabled; no C codec dependency is added.
+- Lzip uses upstream's dictionary and nice-length preset table. The safe
+  backend has HC4 rather than HC3 for levels 0 and 1; their compressed
+  bytes and relative compression ratios can differ on some inputs.
 - XZ and Zstandard accept and validate `threads` but encode on one worker.
   XZ uses a single-thread stream header/index. LZ4 high compression levels
   use the safe block encoder, and linked blocks can be independently coded;
@@ -1711,7 +1715,7 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   A bounded encoder thread allows a synchronous backend to stream to the
   caller's callbacks without buffering the archive. Frame sizes and
   frame-per-file flushing are honored at encoder block boundaries; an
-  output frame limit can be exceeded by one compressed block and trailer.
+  output frame limit can be exceeded by the bounded encoder pipeline and trailer.
 - grzip, lrzip and lzop use upstream's external-program fallback. Missing
   programs fail when the archive is opened. Explicit program filters parse
   argv using the existing command parser and never invoke a shell. Pipes
