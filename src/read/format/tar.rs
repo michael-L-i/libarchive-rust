@@ -32,6 +32,7 @@
 
 #![allow(dead_code)] // The pax and GNU sparse parts follow.
 
+mod pax;
 mod sparse;
 
 use crate::acl::{TYPE_ACCESS, TYPE_NFS4};
@@ -892,6 +893,15 @@ impl Tar {
                     a.set_format(FORMAT_TAR_PAX_INTERCHANGE, c"Solaris tar");
                     self.header_solaris_acl(r, entry, &h, unconsumed)
                 }
+                // POSIX-standard 'g' header.
+                b'g' => {
+                    if seen_headers & SEEN_G_HEADER != 0 {
+                        return fail(a, ARCHIVE_ERRNO_MISC, "Redundant 'g' header", ARCHIVE_FATAL);
+                    }
+                    seen_headers |= SEEN_G_HEADER;
+                    a.set_format(FORMAT_TAR_PAX_INTERCHANGE, c"POSIX pax interchange format");
+                    self.header_pax_records(r, entry, &h, unconsumed, true)
+                }
                 // Long link name (GNU tar, others).
                 b'K' => {
                     if seen_headers & SEEN_K_HEADER != 0 {
@@ -931,6 +941,31 @@ impl Tar {
                     seen_headers |= SEEN_V_HEADER;
                     a.set_format(FORMAT_TAR_GNUTAR, c"GNU tar format");
                     Self::header_volume(&h, unconsumed)
+                }
+                // Used by SUN tar; same as 'x'.
+                t @ (b'X' | b'x') => {
+                    if seen_headers & SEEN_X_HEADER != 0 {
+                        return fail(
+                            a,
+                            ARCHIVE_ERRNO_MISC,
+                            if t == b'X' {
+                                "Redundant 'X'/'x' header"
+                            } else {
+                                "Redundant 'x' header"
+                            },
+                            ARCHIVE_FATAL,
+                        );
+                    }
+                    seen_headers |= SEEN_X_HEADER;
+                    a.set_format(
+                        FORMAT_TAR_PAX_INTERCHANGE,
+                        if t == b'X' {
+                            c"POSIX pax interchange format (Sun variant)"
+                        } else {
+                            c"POSIX pax interchange format"
+                        },
+                    );
+                    self.header_pax_records(r, entry, &h, unconsumed, false)
                 }
                 // Regular header: Legacy tar, GNU tar, or ustar.
                 _ => {
