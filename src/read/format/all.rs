@@ -53,7 +53,7 @@ pub const FORMATS: &[(c_int, Option<Support>)] = &[
     (code::CPIO, None),
     (code::EMPTY, Some(super::empty::support)),
     (code::LHA, None),
-    (code::MTREE, None),
+    (code::MTREE, Some(super::mtree::support)),
     (code::TAR, None),
     (code::XAR, None),
     (code::WARC, None),

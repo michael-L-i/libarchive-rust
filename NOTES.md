@@ -591,3 +591,48 @@ Phase 5 needs:
   another encoder for the default levels.
 - bzip2 writing can use crabz2's safe encoder; level and streaming behavior
   must be checked against the writer oracle when phase 5 lands.
+
+## mtree reader (src/read/format/mtree.rs)
+
+### Ported as-is
+
+- A line with a non-printable character sets "Non-printable character
+  0x%02X", but the reader then gives up as it does for any line it can't
+  parse, and "Can't parse line N" replaces the message. Only the latter is
+  ever seen, so ours sets only that.
+- The printable check skips the last byte of the line, so a NUL or control
+  character right before the end of the file is accepted.
+- Read-ahead requests round up with `& ~1023U`, an `unsigned int` mask, so
+  they are also cut to 32 bits.
+- A read error while reading lines is the same as the end of the input
+  (`__archive_read_ahead` returns NULL for both). The error stays recorded
+  on the handle.
+- An escape `\0` that isn't followed by an octal digit ends the name, `link`
+  or `contents` value (the string is NUL-terminated there).
+- Options are kept in a list that new ones are prepended to, and an entry
+  starts with a copy of the `/set` options in the opposite order. Keywords
+  are parsed in list order, so the order (and which of two keywords that
+  set the same field wins) follows from that. Kept.
+- An entry skipped as optional (`use_next`) leaves its fields in the entry
+  for the next one, which resets only the file type and size, so a later
+  entry that doesn't set uid, mtime and so on inherits the skipped one's.
+- `mtree_atol` stops where an overflow is detected, so in `time=<huge>.5`
+  the fraction isn't parsed.
+- A file with no entries is parsed again, with a new link resolver, on
+  every `read_header`, because "entries is NULL" is what says the file has
+  not been read.
+- The type check against the file system compares `st_mode & S_IFSOCK`
+  bitwise for sockets. The mtree keywords can't name a socket, so it never
+  matches anything the plain comparison wouldn't.
+- The `time` clamp to `TIME_MAX`/`TIME_MIN` does nothing with a 64-bit
+  `time_t`; there it is omitted.
+
+### Differences
+
+- The bidder reads bytes past the end of the data it was given (`p[1]`
+  after a `\`, `p[len-nl-1]`, `pb[1]`) where upstream reads whatever is
+  next in the buffer, or outside of it. Ours reads NUL there.
+- The file system is reached with `std::fs` (`File::open`, `metadata`,
+  `symlink_metadata`), which opens with `O_CLOEXEC` like
+  `__archive_ensure_cloexec_flag`. A path is the bytes up to the first NUL,
+  which the entry's strings can't have anyway.

@@ -13,7 +13,6 @@ mod entry_strmode;
 mod entry_xattr;
 mod ffi;
 mod options;
-#[allow(dead_code)] // used by the mtree reader
 mod pack_dev;
 mod read;
 mod read_add_passphrase;
