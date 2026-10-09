@@ -1774,3 +1774,20 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   skip holes, while ordinary reads preserve zero bytes. Sparse maps are
   bounded to one million extents. Remote filesystem detection uses native
   `statfs`; synthetic status is unknown (-1) on macOS, as upstream's build.
+## Archive writers
+
+- Writer lifecycle, callback/file/fd/FILE/memory outputs, format/filter options,
+  selectors and passphrase callbacks are implemented at the public ABI boundary.
+  Caller-owned fds and FILE streams remain open. Callback close return values
+  are ignored, matching upstream; failed client opens release their free callback.
+- Tar variants stream data and preserve pax sparse maps, ACLs, flags, extended
+  attributes and AppleDouble metadata. GNU long names, charset conversion and
+  pax binary fallbacks follow upstream. Pax alignment is bounded to 1 MiB.
+- ar and cpio variants, raw, shar, mtree and WARC writers are native safe ports.
+  Mtree hashes are computed incrementally, including replacement of preset
+  entry digests when data is supplied. Its paths are capped at 1 MiB and its
+  directory hierarchy at 1000 levels rather than using unbounded recursion.
+- ZIP streams stored and compressed entries, ZIP64 records, traditional
+  encryption and WinZip AES. Compression uses the safe filter backends described
+  above; compressed bytes can differ from upstream. Passphrase copies are
+  cleared on writer destruction.

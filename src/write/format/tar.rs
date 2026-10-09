@@ -41,6 +41,8 @@ pub struct Tar {
     sparse: Vec<(u64, u64)>,
     logical: u64,
     xattr: u8,
+    align: u64,
+    binary: bool,
 }
 impl Tar {
     pub fn new(variant: c_int) -> Self {
@@ -52,6 +54,8 @@ impl Tar {
             sparse: Vec::new(),
             logical: 0,
             xattr: 3,
+            align: 0,
+            binary: false,
         }
     }
     fn extended(&self) -> bool {
@@ -88,6 +92,7 @@ fn octal(
         out[0] |= 0x80;
         return Ok(());
     }
+    out[digits..].fill(0);
     for b in out[..digits].iter_mut().rev() {
         *b = b'0' + (value & 7) as u8;
         value >>= 3;
@@ -161,7 +166,11 @@ impl Format for Tar {
                     .concat(),
                 ));
             };
-            if self.pax() && v == b"BINARY" {
+            if self.pax() && !matches!(v, b"BINARY" | b"binary" | b"UTF-8") {
+                return Err(Error::new(ARCHIVE_FAILED, -1, "pax: invalid charset name"));
+            }
+            if self.pax() && matches!(v, b"BINARY" | b"binary") {
+                self.binary = true;
                 self.conv = None;
                 return Ok(ARCHIVE_OK);
             }
@@ -175,11 +184,23 @@ impl Format for Tar {
             );
             return Ok(ARCHIVE_OK);
         }
+        if self.pax() && key == b"align" {
+            let Some(v) = value.filter(|v| !v.is_empty()) else {
+                return Err(Error::new(
+                    ARCHIVE_FAILED,
+                    -1,
+                    "pax: align option needs a value",
+                ));
+            };
+            let n=std::str::from_utf8(v).ok().and_then(|s|s.parse::<u64>().ok()).filter(|n|n.is_power_of_two()&&*n>=512&&*n<=1048576).ok_or_else(||Error::new(ARCHIVE_FAILED,-1,"pax: align must be a power of two, a multiple of 512, and no larger than 1 MiB"))?;
+            self.align = n;
+            return Ok(ARCHIVE_OK);
+        }
         if self.pax() && key == b"xattrheader" {
             self.xattr = match value {
-                Some(b"SCHILY") => 1,
-                Some(b"LIBARCHIVE") => 2,
-                Some(b"ALL") => 3,
+                Some(b"SCHILY" | b"schily") => 1,
+                Some(b"LIBARCHIVE" | b"libarchive") => 2,
+                Some(b"ALL" | b"all") => 3,
                 _ => {
                     return Err(Error::new(
                         ARCHIVE_FAILED,
@@ -196,6 +217,38 @@ impl Format for Tar {
         Ok(ARCHIVE_WARN)
     }
     fn header(&mut self, a: &Base, e: &mut Entry, sink: &mut dyn Sink) -> Result<c_int, Error> {
+        if self.pax() && self.conv.is_none() && !self.binary {
+            let mut c = a
+                .conv
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.conv = Some(
+                crate::string::conversion_to_charset(Some(&mut c), b"UTF-8", false)
+                    .map_err(|e| Error::fatal(e.errno, e.message))?,
+            );
+        }
+        if self.pax()
+            && let Some(metadata) = e.mac_metadata().map(<[u8]>::to_vec)
+        {
+            let mut extra = e.clone_entry();
+            extra.copy_mac_metadata(&[]);
+            extra.sparse_clear();
+            extra.acl.clear();
+            extra.xattrs.clear();
+            extra.set_filetype(0o100000);
+            extra.set_size(metadata.len() as i64);
+            let original = e
+                .pathname()
+                .map(|s| s.to_bytes().to_vec())
+                .unwrap_or_default();
+            let name = original.strip_suffix(b"/").unwrap_or(&original);
+            let split = name.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
+            extra.set_pathname(&[&name[..split], b"._", &name[split..]].concat());
+            self.header(a, &mut extra, sink)?;
+            self.data(&metadata, sink)?;
+            self.finish_entry(sink)?;
+        }
+        let original_path = e.pathname().map(|s| s.to_bytes().to_vec());
         let (path, converted) = e.pathname_l(self.conv.as_deref());
         let mut path = path
             .ok_or_else(|| {
@@ -207,12 +260,30 @@ impl Format for Tar {
             })?
             .to_vec();
         let mut ret = ARCHIVE_OK;
+        if self.pax()
+            && !converted
+            && let Some(original) = original_path
+        {
+            path = original;
+        }
         if !converted && self.conv.is_some() {
             a.set_error(-1, Some(b"Can't translate pathname"));
             ret = ARCHIVE_WARN;
         }
-        let hard = e.hardlink().map(|s| s.to_bytes().to_vec());
-        let sym = e.symlink().map(|s| s.to_bytes().to_vec());
+        let original_hard = e.hardlink().map(|s| s.to_bytes().to_vec());
+        let (hard, hard_ok) = e.hardlink_l(self.conv.as_deref());
+        let hard = if self.pax() && !hard_ok {
+            original_hard
+        } else {
+            hard.map(<[u8]>::to_vec)
+        };
+        let original_sym = e.symlink().map(|s| s.to_bytes().to_vec());
+        let (sym, sym_ok) = e.symlink_l(self.conv.as_deref());
+        let sym = if self.pax() && !sym_ok {
+            original_sym
+        } else {
+            sym.map(<[u8]>::to_vec)
+        };
         if e.filetype() != 0o100000 || hard.is_some() || sym.is_some() {
             e.set_size(0);
         }
@@ -231,24 +302,28 @@ impl Format for Tar {
                 0o040000 => b'5',
                 0o010000 => b'6',
                 _ => {
-                    return Err(Error::new(
-                        ARCHIVE_FAILED,
-                        -1,
-                        [self.module(), b": unsupported file type"].concat(),
-                    ));
+                    return Err(crate::write::unsupported(e, self.module()));
                 }
             }
         };
         if self.variant == 0x30000 && !matches!(ty, b'0' | b'1' | b'2' | b'5') {
-            return Err(Error::new(
-                ARCHIVE_FAILED,
-                -1,
-                "v7tar: unsupported file type",
-            ));
+            return Err(crate::write::unsupported(e, b"v7tar"));
         }
         let link = hard.or(sym).unwrap_or_default();
-        let uname = e.uname().map(|s| s.to_bytes().to_vec()).unwrap_or_default();
-        let gname = e.gname().map(|s| s.to_bytes().to_vec()).unwrap_or_default();
+        let original_uname = e.uname().map(|s| s.to_bytes().to_vec()).unwrap_or_default();
+        let (uname, uname_ok) = e.uname_l(self.conv.as_deref());
+        let uname = if self.pax() && !uname_ok {
+            original_uname
+        } else {
+            uname.unwrap_or_default().to_vec()
+        };
+        let original_gname = e.gname().map(|s| s.to_bytes().to_vec()).unwrap_or_default();
+        let (gname, gname_ok) = e.gname_l(self.conv.as_deref());
+        let gname = if self.pax() && !gname_ok {
+            original_gname
+        } else {
+            gname.unwrap_or_default().to_vec()
+        };
         if self.variant == 0x30000 && path.len() >= 100 {
             return Err(Error::new(
                 ARCHIVE_FAILED,
@@ -287,6 +362,14 @@ impl Format for Tar {
             None
         };
         let mut pax = Vec::new();
+        if self.pax() && (self.binary || !(converted && hard_ok && sym_ok && uname_ok && gname_ok))
+        {
+            attr(&mut pax, b"hdrcharset", b"BINARY");
+            if !self.binary {
+                ret = ARCHIVE_WARN;
+                a.set_error(-1, Some(b"Can't translate pathname to UTF-8"));
+            }
+        }
         let mut sparse_map = Vec::new();
         self.sparse.clear();
         self.logical = 0;
@@ -327,6 +410,20 @@ impl Format for Tar {
                 })
                 .ok_or_else(|| Error::fatal(libc::EFBIG, "Sparse file is too large"))?
         };
+        if self.pax() {
+            if path.iter().any(|&b| b >= 128) && path.len() <= 100 {
+                attr(&mut pax, b"path", &path);
+            }
+            if link.iter().any(|&b| b >= 128) && link.len() <= 100 {
+                attr(&mut pax, b"linkpath", &link);
+            }
+            if uname.iter().any(|&b| b >= 128) && uname.len() <= 32 {
+                attr(&mut pax, b"uname", &uname);
+            }
+            if gname.iter().any(|&b| b >= 128) && gname.len() <= 32 {
+                attr(&mut pax, b"gname", &gname);
+            }
+        }
         if path.len() <= 100 {
             h[..path.len()].copy_from_slice(&path);
         } else if let Some(i) = split {
@@ -456,7 +553,7 @@ impl Format for Tar {
                     attr(&mut pax, key, &text);
                 }
             }
-            for x in &e.xattrs {
+            for x in e.xattrs.iter().rev() {
                 if self.xattr & 1 != 0 {
                     attr(
                         &mut pax,
@@ -507,6 +604,36 @@ impl Format for Tar {
                 }
                 if e.ctime() != 0 || e.ctime_nsec() != 0 {
                     attr(&mut pax, b"ctime", &time_value(e.ctime(), e.ctime_nsec()));
+                }
+            }
+        }
+        sort_attrs(&mut pax);
+        if self.pax()
+            && self.align != 0
+            && ty == b'0'
+            && self.sparse.is_empty()
+            && e.size() as u64 >= self.align
+        {
+            let off = sink.position();
+            let natural = off
+                .checked_add(if pax.is_empty() {
+                    512
+                } else {
+                    1024 + (pax.len() as u64).div_ceil(512) * 512
+                })
+                .ok_or_else(|| Error::fatal(libc::EFBIG, "Archive is too large"))?;
+            if natural % self.align != 0 {
+                let base = off
+                    .checked_add(1024)
+                    .ok_or_else(|| Error::fatal(libc::EFBIG, "Archive is too large"))?;
+                let target =
+                    (base + pax.len() as u64 + 64).div_ceil(self.align) * self.align - base;
+                let n = target as usize - pax.len();
+                let prefix = format!("{n} LIBARCHIVE.pad=");
+                pax.extend(prefix.as_bytes());
+                pax.resize(target as usize, b'X');
+                if let Some(last) = pax.last_mut() {
+                    *last = b'\n';
                 }
             }
         }
@@ -573,7 +700,7 @@ impl Format for Tar {
 impl Tar {
     fn long(&mut self, sink: &mut dyn Sink, ty: u8, value: &[u8]) -> Result<(), Error> {
         let mut h = [0u8; 512];
-        h[..13].copy_from_slice(b"././@LongLink\0");
+        h[..14].copy_from_slice(b"././@LongLink\0");
         h[100..108].copy_from_slice(b"0000644\0");
         h[108..124].copy_from_slice(b"0000000\x000000000\0");
         h[257..265].copy_from_slice(b"ustar  \0");
@@ -608,4 +735,58 @@ fn base64(data: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+fn sort_attrs(data: &mut Vec<u8>) {
+    let mut records = Vec::new();
+    let mut rest = data.as_slice();
+    while !rest.is_empty() {
+        let Some(space) = rest.iter().position(|&b| b == b' ') else {
+            return;
+        };
+        let Some(n) = std::str::from_utf8(&rest[..space])
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > space && n <= rest.len())
+        else {
+            return;
+        };
+        let record = &rest[..n];
+        let key = record
+            .get(space + 1..)
+            .unwrap_or_default()
+            .split(|&b| b == b'=')
+            .next()
+            .unwrap_or_default();
+        let rank = match key {
+            b"hdrcharset" => 0,
+            b"ctime" => 1,
+            b"atime" => 2,
+            b"LIBARCHIVE.creationtime" => 3,
+            b"mtime" => 4,
+            _ => 5,
+        };
+        let xattr = key.starts_with(b"SCHILY.xattr.") || key.starts_with(b"LIBARCHIVE.xattr.");
+        records.push((if xattr { 6 } else { rank }, record.to_vec()));
+        rest = &rest[n..];
+    }
+    records.sort_by_key(|(rank, _)| *rank);
+    let mut i = 0;
+    while i + 1 < records.len() {
+        if records[i].1.windows(13).any(|s| s == b"SCHILY.xattr.")
+            && records[i + 1]
+                .1
+                .windows(17)
+                .any(|s| s == b"LIBARCHIVE.xattr.")
+        {
+            records.swap(i, i + 1);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    data.clear();
+    for (_, r) in records {
+        data.extend(r);
+    }
 }

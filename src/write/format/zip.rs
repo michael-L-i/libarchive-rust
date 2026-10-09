@@ -327,11 +327,7 @@ impl Format for Zip {
             })?;
         let ty = e.filetype();
         if !matches!(ty, 0o100000 | 0o040000 | 0o120000) {
-            return Err(Error::new(
-                ARCHIVE_FAILED,
-                -1,
-                "ZIP format only supports regular files, directories and symbolic links",
-            ));
+            return Err(crate::write::unsupported(e, b"zip"));
         }
         if ty == 0o040000 {
             if !name.ends_with(b"/") {
@@ -695,5 +691,13 @@ impl Format for Zip {
         sink.write(&end)?;
         self.written += end.len() as u64;
         Ok(())
+    }
+}
+
+impl Drop for Zip {
+    fn drop(&mut self) {
+        if let Some(p) = self.passphrase.as_mut() {
+            p.fill(0);
+        }
     }
 }

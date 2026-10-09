@@ -148,11 +148,7 @@ impl Format for Warc {
             .map(|s| s.to_bytes().to_vec())
             .ok_or_else(|| Error::new(ARCHIVE_WARN, libc::EINVAL, "Invalid filename"))?;
         if e.filetype() != 0o100000 {
-            return Err(Error::new(
-                ARCHIVE_FAILED,
-                -1,
-                "WARC: unsupported file type",
-            ));
+            return Err(crate::write::unsupported(e, b"WARC"));
         }
         if e.size_is_set() == 0 || e.size() < 0 {
             return Err(Error::new(ARCHIVE_FAILED, -1, "Size required"));

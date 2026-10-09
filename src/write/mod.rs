@@ -34,6 +34,9 @@ pub mod filter;
 pub mod format;
 
 pub trait Sink {
+    fn position(&self) -> u64 {
+        0
+    }
     fn write(&mut self, data: &[u8]) -> Result<(), Error>;
     fn open(&mut self) -> Result<c_int, Error> {
         Ok(ARCHIVE_OK)
@@ -113,6 +116,9 @@ struct Blocking {
     bytes: i64,
 }
 impl Sink for Blocking {
+    fn position(&self) -> u64 {
+        self.bytes.max(0) as u64
+    }
     fn write(&mut self, mut data: &[u8]) -> Result<(), Error> {
         self.bytes = self.bytes.saturating_add(data.len() as i64);
         if self.block == 0 {
@@ -163,6 +169,11 @@ struct Pipeline<'a> {
     output: &'a mut Blocking,
 }
 impl Sink for Pipeline<'_> {
+    fn position(&self) -> u64 {
+        self.bytes
+            .first()
+            .map_or(self.output.bytes.max(0) as u64, |n| (*n).max(0) as u64)
+    }
     fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         if let Some((first, rest)) = self.filters.split_first_mut() {
             let (count, counts) = self
@@ -348,6 +359,11 @@ impl Write {
                             bytes: counts,
                             output,
                         }) {
+                            a.state.set(if e.code == ARCHIVE_FATAL {
+                                state::FATAL
+                            } else {
+                                state::HEADER
+                            });
                             return a.raise(e);
                         }
                     }
@@ -355,7 +371,14 @@ impl Write {
                 a.state.set(state::HEADER);
                 ARCHIVE_OK
             }
-            Err(e) => a.raise(e),
+            Err(e) => {
+                a.state.set(if e.code == ARCHIVE_FATAL {
+                    state::FATAL
+                } else {
+                    state::HEADER
+                });
+                a.raise(e)
+            }
         }
     }
     pub fn close(&mut self, a: &Base) -> c_int {
@@ -533,4 +556,26 @@ pub(crate) fn temp_file() -> Result<std::fs::File, Error> {
         }
     }
     Err(Error::fatal(libc::EEXIST, "Couldn't create temporary file"))
+}
+
+pub fn unsupported(entry: &mut Entry, format: &[u8]) -> Error {
+    let description: Option<&[u8]> = match entry.filetype() {
+        0o040000 => Some(b"directories".as_slice()),
+        0o120000 => Some(b"symbolic links"),
+        0o020000 => Some(b"character devices"),
+        0o060000 => Some(b"block devices"),
+        0o010000 => Some(b"named pipes"),
+        0o140000 => Some(b"sockets"),
+        _ => None,
+    };
+    let mode = entry.mode();
+    let path = entry.pathname().map(|s| s.to_bytes()).unwrap_or(b"(null)");
+    let kind = description
+        .map(<[u8]>::to_vec)
+        .unwrap_or_else(|| format!("files with mode 0{mode:o}").into_bytes());
+    Error::new(
+        ARCHIVE_FAILED,
+        crate::read::ARCHIVE_ERRNO_FILE_FORMAT,
+        [path, b": ", format, b" format cannot archive ", &kind].concat(),
+    )
 }
