@@ -87,7 +87,7 @@ impl DecodeBuffer {
             self.buffer.reserve(match_length);
             if end_idx > buf_len {
                 // We need to copy in chunks.
-                self.repeat_in_chunks(offset, match_length, start_idx);
+                self.repeat_in_chunks(match_length, start_idx);
             } else {
                 // can just copy parts of the existing buffer
                 // SAFETY: Requirements checked:
@@ -110,33 +110,13 @@ impl DecodeBuffer {
         }
     }
 
-    fn repeat_in_chunks(&mut self, offset: usize, match_length: usize, start_idx: usize) {
-        // We have at max offset bytes in one chunk, the last one can be smaller
-        let mut start_idx = start_idx;
-        let mut copied_counter_left = match_length;
-        // TODO this can  be optimized further I think.
-        // Each time we copy a chunk we have a repetiton of length 'offset', so we can copy offset * iteration many bytes from start_idx
-        while copied_counter_left > 0 {
-            let chunksize = usize::min(offset, copied_counter_left);
-
-            // SAFETY: Requirements checked:
-            // 1. start_idx + chunksize must be <= self.buffer.len()
-            //      We know that:
-            //      1. start_idx starts at buffer.len() - offset
-            //      2. chunksize <= offset (== offset for each iteration but the last, and match_length modulo offset in the last iteration)
-            //      3. the buffer grows by offset many bytes each iteration but the last
-            //      4. start_idx is increased by the same amount as the buffer grows each iteration
-            //
-            //      Thus follows: start_idx + chunksize == self.buffer.len() in each iteration but the last, where match_length modulo offset == chunksize < offset
-            //          Meaning: start_idx + chunksize <= self.buffer.len()
-            //
-            // 2. explicitly reserved enough memory for the whole match_length
-            unsafe {
-                self.buffer
-                    .extend_from_within_unchecked(start_idx, chunksize)
-            };
-            copied_counter_left -= chunksize;
-            start_idx += chunksize;
+    fn repeat_in_chunks(&mut self, match_length: usize, start_idx: usize) {
+        let mut remaining = match_length;
+        while remaining > 0 {
+            // Each copy extends the initialized repetition, doubling the next available chunk.
+            let chunk = remaining.min(self.buffer.len() - start_idx);
+            self.buffer.extend_from_within(start_idx, chunk);
+            remaining -= chunk;
         }
     }
 
@@ -335,6 +315,31 @@ mod tests {
     extern crate std;
     use alloc::vec;
     use alloc::vec::Vec;
+
+    #[test]
+    fn overlapping_matches_wrap_and_grow() {
+        for offset in 1..=64 {
+            for length in [offset + 1, offset * 3 - 1, 131_072] {
+                let pattern: Vec<u8> = (0..offset).map(|i| (i * 37) as u8).collect();
+                for prefix in [0, 65, 125, 127] {
+                    let mut buffer = DecodeBuffer::new(128);
+                    buffer.reset(128);
+                    buffer.push(&vec![0; prefix]);
+                    buffer.push(&pattern);
+                    let mut discarded = vec![0; prefix];
+                    buffer.read_all(&mut discarded).unwrap();
+                    buffer.repeat(offset, length).unwrap();
+                    let expected: Vec<u8> = pattern
+                        .iter()
+                        .copied()
+                        .cycle()
+                        .take(offset + length)
+                        .collect();
+                    assert_eq!(buffer.drain(), expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn short_writer() {
