@@ -1857,7 +1857,7 @@ impl Read {
             if written == dest.len() {
                 break written as isize;
             }
-            if st.offset == st.output_offset && st.pending.is_empty() {
+            if st.offset == st.output_offset && st.pos == st.pending.len() {
                 let (mut out_off, mut blk_off) = (st.output_offset, st.offset);
                 let mut leftover = Vec::new();
                 let mut out_of_order = false;
@@ -1885,7 +1885,7 @@ impl Read {
                 if warned {
                     break 'read ARCHIVE_WARN as isize;
                 }
-                (st.output_offset, st.offset, st.pending) = (out_off, blk_off, leftover);
+                (st.output_offset, st.offset, st.pending, st.pos) = (out_off, blk_off, leftover, 0);
                 if eof && blk_off == out_off {
                     break 'read written as isize;
                 }
@@ -1910,9 +1910,9 @@ impl Read {
                 &mut written,
                 &mut st.output_offset,
                 &mut st.offset,
-                &st.pending,
+                st.pending.get(st.pos..).unwrap_or_default(),
             );
-            st.pending.drain(..n);
+            st.pos += n;
         };
         self.read_data = st;
         result
@@ -2039,9 +2039,12 @@ impl Read {
 struct ReadData {
     /// Offset in the entry of the next byte `read_data` hands out.
     output_offset: i64,
-    /// Offset in the entry of the first byte of `pending`.
+    /// Offset in the entry of the first byte of `pending` not handed out.
     offset: i64,
     pending: Vec<u8>,
+    /// How much of `pending` is handed out. A cursor rather than draining
+    /// the front, which made small reads of a large block quadratic.
+    pos: usize,
 }
 
 #[cfg(test)]
