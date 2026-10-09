@@ -20,7 +20,7 @@ use crate::read::filter::{
 };
 use crate::read::format::{
     all as format_all, ar, by_code as format_by_code, cab, cpio, empty, iso9660, lha, mtree, raw,
-    tar, warc,
+    tar, warc, xar,
 };
 use crate::read::{self, Read, Status};
 use crate::read_add_passphrase::PassphraseCallback;
@@ -1202,6 +1202,20 @@ pub extern "C" fn archive_read_support_format_warc(a: *mut Archive) -> c_int {
     )
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_xar(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_xar,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            xar::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -1233,6 +1247,7 @@ pub(super) mod tests {
             (format::RAW, archive_read_support_format_raw),
             (format::TAR, archive_read_support_format_tar),
             (format::WARC, archive_read_support_format_warc),
+            (format::XAR, archive_read_support_format_xar),
         ];
         let filters: &[(c_int, Export)] = &[
             (filter::BZIP2, archive_read_support_filter_bzip2),

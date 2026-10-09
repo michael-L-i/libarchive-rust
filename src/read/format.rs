@@ -13,3 +13,4 @@ pub mod mtree;
 pub mod raw;
 pub mod tar;
 pub mod warc;
+pub mod xar;

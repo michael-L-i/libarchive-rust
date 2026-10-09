@@ -30,11 +30,6 @@ pub extern "C" fn archive_read_support_format_rar5(_a0: *mut Archive) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_format_xar(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_zip(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }

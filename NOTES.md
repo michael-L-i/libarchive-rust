@@ -978,6 +978,167 @@ Differences:
   partial-block case). All 2,900 outputs matched. The probe is not in the
   repository.
 
+## xar reader (`src/read/format/xar.rs`, `xar/toc.rs`)
+
+### Ported as-is
+
+- The checksum algorithms of an extended attribute's `archived-checksum` and
+  `extracted-checksum` are never recorded (`xml_start` only changes state for
+  the `ea` children, unlike `data`), so only the digits are stored and an
+  xattr's data is never verified.
+- An xattr is decoded with the decoder that the entry's `entry_encoding`
+  picks (xz stream or lzma alone) and named in its errors, whatever the
+  xattr's own `encoding` says. The xattr is also decoded in one call: it must
+  fit what is buffered and the 64 KiB output buffer, or "Decompressed size
+  error".
+- `xar_read_header` returns a conversion warning (name, user, group or link
+  text that cannot be converted from UTF-8) before it moves to the file's
+  data, if the file has no xattrs (an xattr's own result replaces the
+  warning). The data then reads from wherever the previous entry left off.
+  Entries read in order hide it.
+- `xar_read_data_skip` adds the bytes of the last block to `xar->offset`
+  again (they were added when the block was read), so skipping the rest of
+  an entry that was read in part leaves `xar->offset` too far ahead and the
+  next move to a file's data comes up short.
+- The `Undelete` ext2 flag is `nouunlink`, the BSD user flag's name.
+- The header size field is checked by the bid and not when the TOC is read.
+- A checksum with a digit that is not hexadecimal has the length -1: it
+  never matches. An odd digit at the end is ignored, and more than 64 bytes
+  of digits are cut off.
+- Numbers stop at the first byte that is not a digit (`12ab` is 12); only an
+  overflow is an error, with no message. A time is 20 bytes exactly and its
+  last byte (the `Z`) is not checked. Seconds up to 60 and days up to 31 in
+  any month are accepted and normalized, like `timegm()`.
+- After the end of a zlib stream another call returns the end again without
+  progress, so a TOC or an entry whose packed length goes past the end of
+  its stream fails with "XAR decompressor made no progress"; after the end of
+  an xz or bzip2 stream, with "xz decompression failed (11)" or "bzip
+  decompression failed".
+- Hardlinks: a `type` element with more than one `link` attribute, or a file
+  that is already an original or a link, is "File with multiple link
+  attributes". Links are counted by the id in `link`, which must fit 32 bits,
+  and joined to the original with that id; a link 0 is no link.
+- A directory that has only a name and a type is not an entry. A name is
+  taken from the first `name` element only, and a nested file's pathname is
+  its parent's, a `/` and its own.
+- A directory's `nlink` is its subdirectories plus 2.
+- Only archived and extracted SHA-1, MD5, SHA-256 and SHA-512 checksums
+  exist (the style is read with the first three letters in any case); the
+  entry's checksums are checked when its last byte of packed data is read,
+  and a mismatch loses that last block.
+
+### Differences
+
+- The XML parser is the `xml` crate 1.4.0 (xml-rs, renamed), where upstream
+  uses libxml2's `xmlTextReader` (expat elsewhere). It has
+  `#![forbid(unsafe_code)]` and no dependencies, reads a stream, resolves
+  namespaces and checks well-formedness strictly. quick-xml (also
+  `forbid(unsafe_code)`, no dependencies) is a pull parser too, but checks
+  far less of the document (names, characters, prefixes) than libxml2 does;
+  roxmltree builds a whole tree, which would report a malformed ending
+  before any file. Upstream's callbacks are mapped onto its events: element
+  start with the local names and values of the attributes, element end, and
+  the text of a text node that is not blank, with the same states. Comments
+  and processing instructions split text as in libxml2; CDATA and blank text
+  are ignored, as upstream's reader ignores their node types.
+- Where the XML is malformed, both fail with `ARCHIVE_FATAL`, errno
+  `ARCHIVE_ERRNO_MISC`, and "XML Parsing error: " and a message, but the text
+  is the crate's, with a position (`1:61 Unexpected token: <`), not
+  libxml2's (`Extra content at the end of the document\n`). The depth limit is
+  libxml2's: 257 nested elements are accepted and the 258th is an error (the
+  message is its text). libxml2's limits on a text node, an attribute value
+  and a name are not mirrored.
+- What the two parsers accept differs, and the fixtures and a differential
+  run of 7,300 mutated archives found these (all else on the same path, in
+  error codes and entries, matched):
+  - Unbound namespace prefixes (`<x:file>`, `a:b="c"`) are a warning in
+    libxml2 (the message is left in the archive error and the read goes on)
+    and an error here. `xml` as an element prefix is accepted by libxml2 and
+    rejected here.
+  - Namespace declarations are not attributes here; libxml2's reader lists
+    `xmlns` and `xmlns:p` among them, so a declaration `xmlns:id="u"` on a
+    `file` would be its id attribute upstream.
+  - Internal entities of a DOCTYPE are expanded here; libxml2's reader
+    gives an entity reference node, which upstream ignores. An encoding
+    declaration that the bytes contradict (UTF-8 declared, UTF-16 found) is
+    an error here.
+  - libxml2's reader parses ahead (4096 bytes at a time) before it hands out
+    a node, so with an error in the XML and an error from a callback in a TOC
+    that small, upstream reports the XML error. This streams: the callback
+    error comes first, as it would for a longer TOC. Likewise a TOC that
+    cannot be read to the end (truncated file, data past a zlib stream) reports
+    the read error ("Truncated archive file", "XAR decompressor made no
+    progress") here, and libxml2's syntax error ("Extra content at the end of
+    the document") upstream when the XML is incomplete at that point. When
+    the XML was complete, upstream reports the read error too.
+- zlib is miniz_oxide's streaming inflater (zlib wrapper, Adler-32 checked).
+  The one difference is corrupt data: a back-reference reaching before the
+  start of the output is accepted (see the gzip filter), so an entry with
+  such data fails in the size or checksum check ("Decompressed size error",
+  "Checksum error") where upstream says "File decompression failed (-3)". The
+  zlib error numbers are mapped from the crate's errors (-3 data, -5 no
+  progress); xz and lzma failures have liblzma's numbers by kind (8 options,
+  10 no progress, 5 memory, 9 for the rest, 11 for a decoder already
+  ended). xz and lzma limit the decoder's memory to 256 MiB like the xz
+  filter (upstream has none).
+- bzip2 is the streaming `Decoder` of the bzip2 filter, with `last` set when
+  the packed size or the end of the file cut the read short. bzlib returns
+  empty blocks while it reads the start of a block; the decoder does not, so
+  the number and the sizes of the blocks that `archive_read_data_block`
+  returns differ from upstream for bzip2, xz, lzma and (a little) gzip
+  entries. The bytes and the sizes in total are the same.
+- lzma-rust2's streams can hold decoded bytes back after they have taken the
+  last of the packed bytes (liblzma decodes only as far as the output goes,
+  and zlib and libbz2 deliver everything they have decoded). Upstream would
+  stop when the packed bytes are used up, so here the held output is read out
+  and handed on first, by the entry or the TOC, before the end is decided.
+  With it gzip, bzip2 and xz entries are unchanged and lzma-alone entries
+  match upstream.
+- Corrupt xz and lzma data differs from liblzma, as in the xz filter. xz with 8
+  bytes of garbage after the stream succeeds upstream and fails here with
+  code 9, losing the entry's output. lzma with 2 bytes of garbage fails
+  upstream with code 11 after the data is delivered and succeeds here. An lzma
+  stream cut short by one byte or more delivers everything upstream and fails
+  here with "Decompressed size error". A cut xz stream delivers 1580 bytes
+  upstream and 1561 here in the case tried. A stream of the wrong format gives
+  code 9 or 5 here and 7 in liblzma. Dictionaries of 256 MiB or more decode
+  upstream (no limit) and fail here with code 5.
+- xml-rs accepts `<?xml version="1.1"?>`, which libxml2 rejects with
+  "Unsupported version '1.1'".
+- A read callback that returns no bytes but used some input is the end of the
+  TOC to libxml2, which stops reading it. The TOC is read on here until
+  bytes arrive.
+- Bounds (upstream has none): the TOC may be at most 1 GiB uncompressed
+  ("Rejecting malformed xar archive: TOC exceeds 1 gigabyte", `ARCHIVE_ERRNO_MISC`).
+  Its job is to bound what xml-rs buffers, which it does not limit itself (a
+  CDATA section, say); the memory for files and xattrs is in proportion to the
+  TOC bytes present, so it is bounded by this too. A pathname is at most 1 MiB
+  (`ENOMEM`). Each file keeps its own name and its parent, and the pathname is
+  put together when the entry is returned (and so is a hardlink's target), so
+  deep nesting does not copy a parent's pathname into every file; the length
+  check is made then, and not while the TOC is read. A checksum size over 64
+  in the TOC is a read of that length and "Checksum error". The declared
+  uncompressed size of the TOC is only compared with what was read, at the
+  end, as upstream.
+- Offsets: a seek back that the input cannot do is "Cannot seek"
+  (`ARCHIVE_FAILED`), as upstream; any other failure of the seek (upstream
+  goes on with the offset set to the error code) fails with it.
+- A file with no `name` element has no pathname in the entry (upstream's
+  string is NULL and the entry's is cleared); one whose name decodes to nothing
+  has the empty pathname, as upstream. Entry fields are set where upstream sets
+  them, and the format and its name only when the TOC has been read.
+- `xmlCleanupParser()` after every TOC has no counterpart.
+- The unsafe footprint of what the reader adds is nil: `xml` forbids
+  `unsafe` and has no dependencies. The digests are RustCrypto's (see Core).
+- The archives of the upstream tests and nine more files of the fixtures
+  (`test_read_format_xar*`) read the same entries, data and errors through
+  upstream and through this reader. The reader is also checked against
+  generated archives with the gzip, bzip2, xz, lzma and no encoding and files
+  of up to 300,000 bytes in blocks of 13, 4096 and 100,000 bytes (the data,
+  sizes and hashes are equal), and 7,300 mutated fixtures, each in two
+  block sizes (TOC XML edits with the archive repaired, header edits,
+  truncations, heap edits).
+
 ## tar reader (src/read/format/tar.rs)
 
 ### Ported as-is
