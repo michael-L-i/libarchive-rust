@@ -67,15 +67,21 @@ impl Error {
         Self::new(ARCHIVE_FATAL, errno, msg)
     }
 
-    /// An error of this `code` whose message was already recorded where it
-    /// happened: `raise` leaves the handle's error alone. Only the
-    /// `Reader`/`Client` machinery may use it, to pass a failure up that it
-    /// has already recorded; everyone else gives a message.
+    /// An error of this `code` whose message is already on the handle: the
+    /// failure came through `Reader`/`Client`, which recorded it where it
+    /// happened. Only that machinery may use it; `raise` leaves the handle's
+    /// error alone.
     pub(crate) fn recorded(code: c_int) -> Self {
         Error {
             recorded: true,
             ..Self::new(code, 0, Vec::new())
         }
+    }
+
+    /// The failure upstream returns without setting an error message: the
+    /// handle keeps whatever error it had.
+    pub(crate) fn silent(code: c_int) -> Self {
+        Self::recorded(code)
     }
 }
 

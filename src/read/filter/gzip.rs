@@ -193,7 +193,7 @@ impl Gzip {
     fn read_trailer(&mut self, up: &mut Reader<'_>) -> Result<(), Error> {
         // Upstream fails here with no message of its own.
         if up.read_ahead(8).ok().flatten().is_none() {
-            return Err(Error::recorded(ARCHIVE_FATAL));
+            return Err(Error::silent(ARCHIVE_FATAL));
         }
         up.consume(8)
     }

@@ -253,7 +253,7 @@ impl Proc {
                 Ok(0) | Err(ErrorKind::BrokenPipe) => return self.finish(up.base()),
                 Err(ErrorKind::Interrupted) => continue,
                 Err(ErrorKind::WouldBlock) => {}
-                Err(_) => return Err(Error::recorded(ARCHIVE_FATAL)),
+                Err(_) => return Err(Error::silent(ARCHIVE_FATAL)),
             }
 
             let Some(mut stdin) = self.child.stdin.take() else {
@@ -294,7 +294,7 @@ impl Proc {
                 failed => {
                     self.input_closed();
                     if failed.is_err_and(|kind| kind != ErrorKind::BrokenPipe) {
-                        return Err(Error::recorded(ARCHIVE_FATAL));
+                        return Err(Error::silent(ARCHIVE_FATAL));
                     }
                 }
             }

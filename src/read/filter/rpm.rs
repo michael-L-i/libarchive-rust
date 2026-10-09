@@ -112,7 +112,7 @@ fn skip_prologue(up: &mut Reader<'_>) -> Result<(), Error> {
             .read_ahead(MIN_HEADER_SIZE)?
             .and_then(|h| h.first_chunk::<MIN_HEADER_SIZE>().copied());
         let Some(head) = head else {
-            return Err(no_message());
+            return Err(Error::silent(ARCHIVE_FATAL));
         };
         if head.first_chunk::<4>() != Some(&[0x8E, 0xAD, 0xE8, 0x01]) {
             break;
@@ -137,7 +137,7 @@ fn skip_padding(up: &mut Reader<'_>) -> Result<(), Error> {
     loop {
         let data = up.peek_available(1)?;
         if data.is_empty() {
-            return Err(no_message());
+            return Err(Error::silent(ARCHIVE_FATAL));
         }
         let zeros = data.iter().take_while(|&&b| b == 0).count();
         let all = zeros == data.len();
@@ -146,12 +146,6 @@ fn skip_padding(up: &mut Reader<'_>) -> Result<(), Error> {
             return Ok(());
         }
     }
-}
-
-/// Upstream fails at the end of the input without setting a message, so the
-/// handle keeps whatever it had.
-fn no_message() -> Error {
-    Error::recorded(ARCHIVE_FATAL)
 }
 
 #[cfg(test)]

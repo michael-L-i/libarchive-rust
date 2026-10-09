@@ -192,7 +192,8 @@ pub trait Filter {
     /// Produces the next block, readable through `block`. An empty block is
     /// end of input. An error is fatal for the stage: the filter has its
     /// message set in the `Error` (or has already recorded it, for a bare
-    /// `Error::recorded`), and the stage reports `ARCHIVE_FATAL` from then on.
+    /// `Error::recorded`; or upstream sets none, for `Error::silent`), and the
+    /// stage reports `ARCHIVE_FATAL` from then on.
     ///
     /// `up` reads the stage below. Whatever `up` hands out is only valid
     /// until the next call on it, so a filter that passes bytes through

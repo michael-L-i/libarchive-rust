@@ -101,7 +101,7 @@ impl Format for Raw {
             None => {
                 avail = i64::MAX - offset;
                 if avail == 0 {
-                    return Err(Error::recorded(ARCHIVE_FATAL));
+                    return Err(Error::silent(ARCHIVE_FATAL));
                 }
                 self.offset = i64::MAX;
             }
