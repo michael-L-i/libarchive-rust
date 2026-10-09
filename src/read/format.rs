@@ -7,5 +7,6 @@ pub mod by_code;
 pub mod cpio;
 pub mod empty;
 pub mod mtree;
+pub mod rar5;
 pub mod raw;
 pub mod warc;
