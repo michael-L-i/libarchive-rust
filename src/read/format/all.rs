@@ -50,7 +50,7 @@ pub const FORMATS: &[(c_int, Option<Support>)] = &[
     // part of the archive. If one of these bids high, we can maybe avoid
     // running any of the more expensive bidders below.
     (code::AR, None),
-    (code::CPIO, None),
+    (code::CPIO, Some(super::cpio::support)),
     (code::EMPTY, Some(super::empty::support)),
     (code::LHA, None),
     (code::MTREE, None),

@@ -18,7 +18,7 @@ use crate::read::filter::{
     lrzip, lz4 as filter_lz4, lzop, none as filter_none, program, rpm, uu as filter_uu,
     xz as filter_xz, zstd as filter_zstd,
 };
-use crate::read::format::{all as format_all, by_code as format_by_code, empty, raw, warc};
+use crate::read::format::{all as format_all, by_code as format_by_code, cpio, empty, raw, warc};
 use crate::read::{self, Read, Status};
 use crate::read_add_passphrase::PassphraseCallback;
 use crate::util::Error;
@@ -1045,6 +1045,20 @@ pub extern "C" fn archive_read_next_header(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_cpio(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_cpio,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            cpio::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_raw(a: *mut Archive) -> c_int {
     checked!(
         archive_read_support_format_raw,
@@ -1574,6 +1588,52 @@ pub(super) mod tests {
             crate::archive::ARCHIVE_EOF
         );
         assert_eq!(crate::ffi::archive::archive_format(a), 0x90000);
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+    }
+
+    #[test]
+    fn cpio_symlink_body_is_exactly_its_size() {
+        // An odc symlink whose one-byte body is directly followed by the
+        // trailer, with no NUL after it.
+        fn oct(v: u64, width: usize) -> Vec<u8> {
+            format!("{v:0width$o}").into_bytes()
+        }
+        fn odc_record(name: &[u8], mode: u64, body: &[u8]) -> Vec<u8> {
+            let mut h = b"070707".to_vec();
+            for (v, w) in [(0, 6), (1, 6), (mode, 6), (0, 6), (0, 6), (1, 6), (0, 6)] {
+                h.extend(oct(v, w));
+            }
+            h.extend(oct(0, 11));
+            h.extend(oct(name.len() as u64 + 1, 6));
+            h.extend(oct(body.len() as u64, 11));
+            h.extend(name);
+            h.push(0);
+            h.extend(body);
+            h
+        }
+        let mut data = odc_record(b"sl", 0o120777, b"a");
+        data.extend(odc_record(b"TRAILER!!!", 0, b""));
+
+        let a = archive_read_new();
+        assert_eq!(archive_read_support_format_cpio(a), ARCHIVE_OK);
+        assert_eq!(
+            crate::ffi::read_open::archive_read_open_memory2(
+                a,
+                data.as_ptr().cast(),
+                data.len(),
+                7
+            ),
+            ARCHIVE_OK
+        );
+        let mut e: *mut ArchiveEntry = std::ptr::null_mut();
+        assert_eq!(archive_read_next_header(a, &mut e), ARCHIVE_OK);
+        let link = crate::ffi::entry::archive_entry_symlink(e);
+        // SAFETY: the library returns a NUL-terminated string.
+        assert_eq!(unsafe { CStr::from_ptr(link) }, c"a");
+        assert_eq!(
+            archive_read_next_header(a, &mut e),
+            crate::archive::ARCHIVE_EOF
+        );
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 

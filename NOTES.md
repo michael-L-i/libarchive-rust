@@ -623,3 +623,39 @@ Phase 5 needs:
 - The `time_from_tm` path for platforms without `timegm` (mktime and
   `tm_yday`) is not ported. Days are computed from the civil date, which is
   what `timegm` returns.
+
+## cpio reader (`src/read/format/cpio.rs`)
+
+### Ported as-is
+
+- The TRAILER check compares only the first 10 bytes of the name, so a name
+  of 11 bytes with any eleventh byte counts as the trailer
+  (`archive_read_support_format_cpio.c`, `read_header`).
+- `read_header` ignores the result of consuming the name's padding. A
+  truncated input that ends inside that padding is recorded as "Truncated
+  input file" but the header still returns `ARCHIVE_OK`; the next header read
+  fails.
+- The "Skipped N bytes before finding valid header" warning is not given when
+  the header is at the start of a later search pass: the usual-case check
+  returns `ARCHIVE_OK` before the skipped count is looked at. Bytes skipped
+  in earlier passes go unreported in that case.
+- afio large headers take the inode as `u & INT64_MAX`, because the code
+  tests `ARCHIVE_VERSION_NUMBER < 4000000` and this tree is 3.9.0dev. A 4.0
+  build keeps all 64 bits.
+- `bid` returns `ARCHIVE_WARN` (-20) for input it does not recognize, not 0.
+  The core only takes bids above the best so far, so this is harmless.
+
+### Differences
+
+- `compat-2x` is accepted and changes nothing. Upstream's default name
+  conversion is `NULL` outside Windows, so there is no conversion for
+  `compat-2x` to switch off.
+- Name and symlink conversion failures are always the "can't be converted"
+  warning. The string layer reports a failed conversion without an errno, so
+  the `ENOMEM` branch upstream takes for a failed allocation cannot be told
+  apart here.
+- Hard links are kept in a `HashMap` keyed by device and inode, not a list.
+  Upstream searches its list most-recent first, but each key is in the list
+  at most once, so the result is the same. An entry is kept until its last
+  link arrives, so the table holds one name per unfinished multiply-linked
+  file, each at most 1 MiB, and grows with the archive as upstream's does.
