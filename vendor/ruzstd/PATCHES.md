@@ -19,7 +19,7 @@ compression decisions remain identical. Returning no new table preserves
 exactly the old fallback's table-reuse state. The histogram replaces the one
 previously computed while building the new table, avoiding a second input scan.
 
-Local changes are confined to `src/encoding/blocks/compressed.rs` and
+The literal-size changes are confined to `src/encoding/blocks/compressed.rs` and
 `src/huff0/huff0_encoder.rs`. Compression levels and the archive matcher's
 leading-literal and maximum-match-length workarounds are unchanged.
 
@@ -41,3 +41,30 @@ Validation on Apple Silicon, 2026-10-09:
   FSE sequence encoding. Project integration checks run on the combined
   branch; the standalone experiment and profiles are retained in sibling
   `diagnostics/round4-zstd`.
+
+## Direct FSE encoder state lookup
+
+`src/fse/fse_encoder.rs` replaces the per-symbol estimated-position linear
+search with an exact range calculation. For a normalized symbol frequency,
+the builder creates short power-of-two spans followed by spans twice as long,
+then sorts them by baseline. In short-span units, the total covered range is
+`table_size >> shortest_bits`; subtracting it from twice the state count gives
+the number of short states. Indexing the short prefix and halving positions
+in the doubled suffix selects the same state without a search or division.
+No table layout, probability, public structure or encoded bit changes.
+
+- Exhaustive tests compare with the previous linear search for every state
+  index at every normalized frequency for accuracy logs 5 through 10,
+  including zero-bit spans, low-probability (-1) entries, absent symbols,
+  and the default literal-length, match-length and offset tables.
+- All 15 standalone FSE/bit-writer unit tests pass with optimization and debug
+  assertions enabled. The wrapper in `diagnostics/round4-zstd/fse-tests.rs`
+  allows running these self-contained tests without upstream's omitted
+  corpus fixtures and C-codec test dependency.
+- The same 533 corpus cases remain byte-identical to registry ruzstd, and C
+  zstd again decodes all five 16 MiB outputs. Nine alternating release-run
+  medians versus registry, with both patches: random 41.086 -> 13.143 ms,
+  source 79.961 -> 62.725, mixed 62.699 -> 39.255, periodic 2.738 -> 2.762,
+  repeated binary 2.849 -> 2.802. Relative to the literal-only patch, this
+  targets the previously sampled source/mixed FSE cost; tiny differences
+  on other workloads are noise.

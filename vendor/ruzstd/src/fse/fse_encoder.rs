@@ -197,11 +197,19 @@ pub(super) struct SymbolStates {
 
 impl SymbolStates {
     fn get(&self, idx: usize, max_idx: usize) -> &State {
-        let start_search_at = (idx * self.states.len()) / max_idx;
-        self.states[start_search_at..]
-            .iter()
-            .find(|state| state.contains(idx))
-            .unwrap()
+        // Sorted ranges start with equal short spans, followed by double
+        // spans. Measure the index in short spans to select a state directly.
+        let bits = self.states[0].num_bits;
+        let short_states = 2 * self.states.len() - (max_idx >> bits);
+        let slot = idx >> bits;
+        let slot = if slot < short_states {
+            slot
+        } else {
+            (slot + short_states) >> 1
+        };
+        let state = &self.states[slot];
+        debug_assert!(state.contains(idx));
+        state
     }
 }
 
@@ -442,4 +450,47 @@ pub(crate) fn default_ll_table() -> FSETable {
 
 pub(crate) fn default_of_table() -> FSETable {
     build_table_from_probabilities(OF_DIST, 5)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check_ranges(table: FSETable) {
+        for symbol in &table.states {
+            for expected in &symbol.states {
+                for idx in expected.baseline..=expected.last_index {
+                    let actual = symbol.get(idx, table.table_size);
+                    let start = idx * symbol.states.len() / table.table_size;
+                    let searched = symbol.states[start..]
+                        .iter()
+                        .find(|state| state.contains(idx))
+                        .unwrap();
+                    assert_eq!(actual.index, searched.index);
+                    assert_eq!(actual.index, expected.index);
+                    assert_eq!(actual.baseline, expected.baseline);
+                    assert_eq!(actual.num_bits, expected.num_bits);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_lookup_covers_every_normalized_frequency_and_state() {
+        // Include a fully occupied symbol (zero-bit spans), exact powers of
+        // two, mixed span sizes, and each boundary of every encoder state.
+        for log in 5..=10 {
+            let size = 1i32 << log;
+            for frequency in 1..=size {
+                check_ranges(build_table_from_probabilities(
+                    &[frequency, size - frequency],
+                    log,
+                ));
+            }
+            check_ranges(build_table_from_probabilities(&[-1, 0, size - 2, -1], log));
+        }
+        check_ranges(default_ll_table());
+        check_ranges(default_ml_table());
+        check_ranges(default_of_table());
+    }
 }
