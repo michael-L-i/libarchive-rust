@@ -30,7 +30,7 @@
 use crate::archive::*;
 use crate::read::{Filter, FilterBidder, Read, Reader, Status, filter_code};
 use crate::util::Error;
-use crabz2::{BlockDecoder, Step};
+use crabz2::BlockDecoder;
 use std::ffi::{CStr, c_int};
 
 /// The output block size, as upstream's.
@@ -61,6 +61,171 @@ fn signature(buf: &[u8]) -> bool {
         && (block == b"\x31\x41\x59\x26\x53\x59" || block == b"\x17\x72\x45\x38\x50\x90")
 }
 
+/// Bound on the compressed bytes held for one block: a block has at most
+/// 900,000 Huffman symbols, each at most 23 bits, plus tables.
+const MAX_INPUT: usize = 3 * 1024 * 1024;
+
+/// What one `Decoder::decompress` call did, as `BZ2_bzDecompress` reports it
+/// through `avail_in`, `avail_out` and `BZ_STREAM_END`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Progress {
+    /// Bytes of `input` consumed. Input that is not used is not held, so the
+    /// caller presents it again; at the end of the stream, whatever follows
+    /// the end marker is not used.
+    pub used: usize,
+    /// Bytes written to the start of `output`.
+    pub produced: usize,
+    /// The end of the stream was reached and all of it has been produced.
+    pub end: bool,
+}
+
+/// A streaming decoder of one bzip2 stream with the interface of
+/// `BZ2_bzDecompress`: it takes whatever input and output space the caller
+/// has. The end of the input in the middle of a stream is not an error here;
+/// the caller sees it as no `end` and no more input.
+///
+/// crabz2 decodes whole blocks, so the compressed bytes of an unfinished block
+/// are kept (at most 3 MiB) and decoded again when more arrive.
+pub(crate) struct Decoder {
+    dec: BlockDecoder,
+    /// Input taken but not yet part of a decoded block.
+    inbuf: Vec<u8>,
+    /// The decoded block being handed out from `next`.
+    pending: Vec<u8>,
+    next: usize,
+    /// The stream header has been read.
+    started: bool,
+    /// The next item is known to be a block, not the end marker.
+    in_block: bool,
+    done: bool,
+}
+
+/// How `Decoder::step` left the input.
+enum Next {
+    NeedInput,
+    /// A block was decoded into `pending`, ending in byte `.0` of `inbuf`.
+    Block(usize),
+    /// The end marker ended in byte `.0` of `inbuf`.
+    End(usize),
+}
+
+impl Decoder {
+    pub(crate) fn new() -> Decoder {
+        Decoder {
+            dec: BlockDecoder::new(),
+            inbuf: Vec::new(),
+            pending: Vec::new(),
+            next: 0,
+            started: false,
+            in_block: false,
+            done: false,
+        }
+    }
+
+    /// How much input is worth presenting now: a retry decodes the unfinished
+    /// block again, so feeding it in doubling pieces keeps the work linear.
+    pub(crate) fn wanted(&self) -> usize {
+        self.inbuf.len().max(4096)
+    }
+
+    /// `BZ2_bzDecompress`: consumes some of `input` and fills some of
+    /// `output`. Any error is the stream being corrupt.
+    pub(crate) fn decompress(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<Progress, crabz2::Error> {
+        let mut p = Progress {
+            end: self.done,
+            ..Progress::default()
+        };
+        while !self.done {
+            let held = self.pending.get(self.next..).unwrap_or_default();
+            let n = held.len().min(output.len() - p.produced);
+            let (now, _) = held.split_at(n);
+            output[p.produced..p.produced + n].copy_from_slice(now);
+            p.produced += n;
+            self.next += n;
+            if self.next < self.pending.len() || p.produced == output.len() {
+                return Ok(p);
+            }
+            self.pending.clear();
+            self.next = 0;
+
+            let rest = input.get(p.used..).unwrap_or_default();
+            let take = rest.len().min(MAX_INPUT - self.inbuf.len());
+            if take == 0 {
+                return if rest.is_empty() {
+                    Ok(p)
+                } else {
+                    Err(crabz2::Error::BlockOverflow)
+                };
+            }
+            self.inbuf
+                .extend_from_slice(rest.get(..take).unwrap_or_default());
+            let next = self.step()?;
+            match next {
+                Next::NeedInput => p.used += take,
+                Next::Block(at) | Next::End(at) => {
+                    p.used += take - (self.inbuf.len() - at);
+                    self.inbuf.clear();
+                    self.dec.rebase(at);
+                    self.done = matches!(next, Next::End(_));
+                }
+            }
+        }
+        p.end = true;
+        Ok(p)
+    }
+
+    /// Looks at the held input for the stream header, the end marker, or a
+    /// whole block.
+    fn step(&mut self) -> Result<Next, crabz2::Error> {
+        if !self.started {
+            let Some(header) = self.inbuf.get(..4) else {
+                return Ok(Next::NeedInput);
+            };
+            // The header commits; the block magic after it is not there yet.
+            match self.dec.next_block(header, &mut self.pending) {
+                Err(crabz2::Error::Truncated) => {}
+                Err(e) => return Err(e),
+                Ok(_) => return Err(crabz2::Error::InvalidBlock),
+            }
+            self.started = true;
+            let at = self.dec.consumed();
+            self.inbuf.drain(..at);
+            self.dec.rebase(at);
+        }
+        if !self.in_block {
+            // The end marker is 10 bytes (48 bits of magic, 32 of CRC),
+            // starting at some bit of the next byte: the decoder only
+            // reaches the clean end of its input once it is byte aligned,
+            // which a 10 or an 11 byte view of it shows. A block needs more.
+            for len in [10, 11] {
+                let Some(head) = self.inbuf.get(..len) else {
+                    return Ok(Next::NeedInput);
+                };
+                match self.dec.next_block(head, &mut self.pending) {
+                    Ok(crabz2::Step::Eof) => return Ok(Next::End(self.dec.consumed())),
+                    Err(crabz2::Error::Truncated) => {}
+                    Err(e) => return Err(e),
+                    Ok(crabz2::Step::Block) => return Err(crabz2::Error::InvalidBlock),
+                }
+            }
+            self.in_block = true;
+        }
+        match self.dec.next_block(&self.inbuf, &mut self.pending) {
+            Ok(crabz2::Step::Block) => {
+                self.in_block = false;
+                Ok(Next::Block(self.dec.consumed()))
+            }
+            Err(crabz2::Error::Truncated) => Ok(Next::NeedInput),
+            Err(e) => Err(e),
+            Ok(crabz2::Step::Eof) => Err(crabz2::Error::InvalidBlock),
+        }
+    }
+}
+
 struct Bidder;
 
 impl FilterBidder for Bidder {
@@ -75,9 +240,7 @@ impl FilterBidder for Bidder {
         })?;
         out.resize(BLOCK, 0);
         Ok(Box::new(Bzip2 {
-            decoder: BlockDecoder::new(),
-            pending: Vec::new(),
-            next: 0,
+            decoder: None,
             eof: false,
             out,
             len: 0,
@@ -86,10 +249,8 @@ impl FilterBidder for Bidder {
 }
 
 struct Bzip2 {
-    decoder: BlockDecoder,
-    /// One decoded bzip2 block, drained in 64 KiB pieces.
-    pending: Vec<u8>,
-    next: usize,
+    /// The stream being decoded; `None` between streams.
+    decoder: Option<Decoder>,
     eof: bool,
     /// The output block; its first `len` bytes are the current block.
     out: Vec<u8>,
@@ -110,98 +271,25 @@ impl Filter for Bzip2 {
     fn read(&mut self, up: &mut Reader<'_>) -> Result<(), Error> {
         self.len = 0;
         while !self.eof && self.len < self.out.len() {
-            if self.next < self.pending.len() {
-                let n = (self.pending.len() - self.next).min(self.out.len() - self.len);
-                self.out[self.len..self.len + n]
-                    .copy_from_slice(&self.pending[self.next..self.next + n]);
-                self.next += n;
-                self.len += n;
-                continue;
-            }
-            self.pending.clear();
-            self.next = 0;
-            // A block has at most 900,000 Huffman symbols, each at most
-            // 23 bits, plus tables. Bound compressed read-ahead to 3 MiB.
-            const MAX_INPUT: usize = 3 * 1024 * 1024;
-            let mut want = 4096;
-            loop {
-                let input = up.peek_available(want)?;
-                let short = input.len() < want;
-                let before = self.decoder.consumed();
-                let decoded = self.decoder.next_block(input, &mut self.pending);
-                let committed = self.decoder.consumed();
-                // Advancing past the previous block by more than a header
-                // means the end marker and CRC were checked. Upstream ignores
-                // a following tail that does not bid as another member.
-                let ended = committed.saturating_sub(before) > 4;
-                let next_member =
-                    signature(input.get(committed.saturating_sub(4)..).unwrap_or_default());
-                match decoded {
-                    Ok(step) => {
-                        let used = self.decoder.consumed();
-                        self.decoder.rebase(used);
-                        up.consume(used)?;
-                        if step == Step::Eof {
-                            // The library stops at a clean boundary; another
-                            // member may follow once more input is available.
-                            if up.read_ahead(1)?.is_none() {
-                                self.eof = true;
-                            } else {
-                                continue;
-                            }
-                        }
-                        break;
-                    }
-                    Err(error)
-                        if ended
-                            && (error == crabz2::Error::InvalidMagic
-                                || (error == crabz2::Error::Truncated
-                                    && short
-                                    && !next_member)) =>
-                    {
-                        // The last committed boundary is either the end
-                        // marker or a following four-byte member header.
-                        // Locate the checked marker at its bit alignment;
-                        // consumed() counts only whole bytes.
-                        let mut end = None;
-                        for byte in [
-                            committed,
-                            committed.saturating_sub(4),
-                            committed.saturating_sub(5),
-                        ] {
-                            let Some(start) = byte.checked_sub(10) else {
-                                continue;
-                            };
-                            let Some(magic) = input.get(start..start + 7) else {
-                                continue;
-                            };
-                            let word = magic.iter().fold(0u64, |n, b| (n << 8) | u64::from(*b));
-                            for bit in 0..8 {
-                                if (word >> (8 - bit)) & 0xffff_ffff_ffff == 0x1772_4538_5090 {
-                                    end = Some(byte + usize::from(bit != 0));
-                                }
-                            }
-                        }
-                        let used = end.ok_or_else(|| {
-                            Error::fatal(ARCHIVE_ERRNO_MISC, "bzip decompression failed")
-                        })?;
-                        up.consume(used)?;
-                        self.eof = true;
-                        break;
-                    }
-                    Err(crabz2::Error::Truncated) if !short && want < MAX_INPUT => {
-                        want = (want * 2).min(MAX_INPUT);
-                    }
-                    Err(crabz2::Error::Truncated) if short => {
-                        return Err(Error::fatal(ARCHIVE_ERRNO_MISC, "truncated bzip2 input"));
-                    }
-                    Err(_) => {
-                        return Err(Error::fatal(
-                            ARCHIVE_ERRNO_MISC,
-                            "bzip decompression failed",
-                        ));
-                    }
+            let dec = match &mut self.decoder {
+                Some(dec) => dec,
+                None if bid(up) == 0 => {
+                    self.eof = true;
+                    break;
                 }
+                None => self.decoder.insert(Decoder::new()),
+            };
+            let input = up.peek_available(dec.wanted())?;
+            if input.is_empty() {
+                return Err(Error::fatal(ARCHIVE_ERRNO_MISC, "truncated bzip2 input"));
+            }
+            let p = dec
+                .decompress(input, self.out.get_mut(self.len..).unwrap_or_default())
+                .map_err(|_| Error::fatal(ARCHIVE_ERRNO_MISC, "bzip decompression failed"))?;
+            up.consume(p.used)?;
+            self.len += p.produced;
+            if p.end {
+                self.decoder = None;
             }
         }
         Ok(())
@@ -223,6 +311,92 @@ mod tests {
 
     fn decode_bz(data: &[u8], block: usize) -> Result<Vec<u8>, String> {
         decode(support, data, block)
+    }
+
+    /// Drives a `Decoder` as the zip, 7zip and xar readers do: `input_step`
+    /// bytes of what is left each call, `output_step` bytes of room.
+    fn drive(
+        stream: &[u8],
+        input_step: usize,
+        output_step: usize,
+    ) -> Result<(Vec<u8>, usize, bool), crabz2::Error> {
+        let mut dec = Decoder::new();
+        let (mut out, mut pos) = (Vec::new(), 0);
+        loop {
+            let input = &stream[pos..stream.len().min(pos + input_step)];
+            let mut room = vec![0; output_step];
+            let p = dec.decompress(input, &mut room)?;
+            out.extend_from_slice(&room[..p.produced]);
+            pos += p.used;
+            if p.end {
+                return Ok((out, pos, true));
+            }
+            if p.used == 0 && p.produced == 0 {
+                return Ok((out, pos, false));
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_stops_exactly_at_the_end_of_the_stream() {
+        let data = noise(30_000);
+        let stream = encode(&data);
+        let tail = b"BZh9 not part of it, and neither is this";
+        let all = [stream.as_slice(), tail].concat();
+        for (i, o) in [
+            (1, 1),
+            (7, 5),
+            (100, 4096),
+            (1 << 20, 1 << 20),
+            (13, 1 << 20),
+        ] {
+            assert_eq!(
+                drive(&all, i, o).unwrap(),
+                (data.clone(), stream.len(), true),
+                "steps {i} {o}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_ends_an_empty_stream_and_the_next_one_starts_fresh() {
+        let empty = encode(b"");
+        let second = encode(b"after");
+        let all = [empty.as_slice(), second.as_slice()].concat();
+        for i in [1, 3, 14, 1000] {
+            let (out, used, end) = drive(&all, i, 64).unwrap();
+            assert_eq!((out.len(), used, end), (0, empty.len(), true), "step {i}");
+            let (out, used, end) = drive(&all[used..], i, 64).unwrap();
+            assert_eq!((out, used, end), (b"after".to_vec(), second.len(), true));
+        }
+    }
+
+    #[test]
+    fn decoder_waits_for_input_and_reports_corruption() {
+        let stream = encode(&noise(3000));
+        for n in (0..stream.len()).step_by(11) {
+            let (_, used, end) = drive(&stream[..n], 97, 100).unwrap();
+            assert!(!end && used == n, "cut at {n}");
+        }
+        let mut bad = stream.clone();
+        bad[0] = b'X';
+        assert_eq!(drive(&bad, 100, 100), Err(crabz2::Error::InvalidMagic));
+        let mut bad = stream.clone();
+        let mid = bad.len() / 2;
+        bad[mid] ^= 0x10;
+        assert!(drive(&bad, 100, 100).is_err());
+        // Past the 3 MiB a block can need.
+        let mut dec = Decoder::new();
+        let mut junk = b"BZh9\x31\x41\x59\x26\x53\x59".to_vec();
+        junk.resize(MAX_INPUT + 10, 0xff);
+        let mut out = [0; 16];
+        let mut result = Ok(Progress::default());
+        let mut pos = 0;
+        while pos < junk.len() && result.is_ok() {
+            result = dec.decompress(&junk[pos..], &mut out);
+            pos += result.as_ref().map_or(0, |p| p.used);
+        }
+        assert!(result.is_err());
     }
 
     #[test]

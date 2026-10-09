@@ -526,6 +526,12 @@ Backends, and why:
   drained in 64 KiB output pieces. Compressed read-ahead is capped at 3 MiB
   per block, including Huffman tables. Concatenated members and trailing
   non-member bytes are supported. This replaces the c2rust libbz2 backend.
+- `bzip2::Decoder` gives the zip, 7zip and xar readers a `BZ2_bzDecompress`
+  step over crabz2's whole-block decoder. It holds the compressed bytes of an
+  unfinished block (at most 3 MiB) and decodes that block again when more
+  input arrives, so a caller that feeds a block in many small pieces does
+  quadratic work; `wanted()` says how much to present to keep it linear.
+  It consumes input only up to the end marker, as libbz2's `total_in` does.
 - zstd is `ruzstd` 0.9.0, a safe decoder with 41 mentions of `unsafe` in its
   ring buffer and decode buffer, and no crate-level `forbid`. Its checksum
   comes from twox-hash (84 mentions). `libzstd-rs-sys` was tried and dropped:
