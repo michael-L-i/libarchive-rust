@@ -18,3 +18,12 @@ xxhash-rust = { version = "0.8.19", default-features = false, features = ["xxh32
 
 [build-dependencies]
 cc = "1"
+
+# The oracle runs upstream's tests against the dev build; unoptimized, the
+# fuzz tests take ~25x upstream's time. Keep debug assertions and overflow
+# checks, but optimize.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
