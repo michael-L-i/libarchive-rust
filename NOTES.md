@@ -973,7 +973,9 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   that the range coder can still decode. lzma-rust2 keeps the last bytes back
   until it knows the stream is over, so it is given the folder's size (the
   main stream's, for BCJ2). It is always called with `Action::Run`, and the
-  stream is finished by the reader's counts. LZMA2 with a missing end
+  stream is finished by the reader's counts: once an LZMA1 stream has all its
+  data the rest of its packed stream counts as used, because liblzma would
+  decode it as output that the reader then clips. LZMA2 with a missing end
   marker is therefore accepted, as upstream does. A decoder that has taken
   all its input but still holds output (`pending_output`) is called with no
   input to get it, where liblzma leaves the input it doesn't need.

@@ -253,12 +253,25 @@ impl Coders {
                 };
                 match res {
                     Ok(sr) => {
-                        let eof = sr.status == LzStatus::StreamEnd;
-                        if eof {
+                        let ended = sr.status == LzStatus::StreamEnd;
+                        let mut used = sr.bytes_consumed;
+                        let mut eof = ended;
+                        if matches!(self.backend, Backend::Lzma(_)) {
+                            // A stream that has all its data takes no more
+                            // input, but liblzma, without a size, goes on
+                            // reading (and decoding) it, and can't tell the
+                            // end of a stream with no end marker.
+                            if ended
+                                || (used == 0 && sr.bytes_produced == 0 && !self.pending_output())
+                            {
+                                used = bytes_in;
+                            }
+                            eof = false;
+                        } else if ended {
                             self.backend = Backend::None;
                         }
                         Ok(Step {
-                            used: sr.bytes_consumed,
+                            used,
                             produced: sr.bytes_produced,
                             eof,
                         })
