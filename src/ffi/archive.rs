@@ -206,6 +206,12 @@ pub extern "C" fn archive_free(a: *mut Archive) -> c_int {
         let (magic, name) = match &h.kind {
             crate::archive::Kind::Read(_) => (READ_MAGIC, "archive_read_free"),
             crate::archive::Kind::Write(_) => (WRITE_MAGIC, "archive_write_free"),
+            crate::archive::Kind::WriteDisk(_) => {
+                (crate::archive::WRITE_DISK_MAGIC, "archive_write_free")
+            }
+            crate::archive::Kind::ReadDisk(_) => {
+                (crate::archive::READ_DISK_MAGIC, "archive_read_free")
+            }
         };
         if h.base.check_magic(magic, states, name) == ARCHIVE_FATAL {
             return ARCHIVE_FATAL;
