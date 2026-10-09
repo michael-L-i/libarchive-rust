@@ -575,6 +575,36 @@ pub extern "C" fn archive_write_set_passphrase_callback(
         ARCHIVE_OK
     })
 }
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_warc(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::warc::Warc::default()))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_shar(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::shar::Shar::new(false)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_shar_dump(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::shar::Shar::new(true)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_mtree(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::mtree::Mtree::new(false)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_mtree_classic(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::mtree::Mtree::new(true)))
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

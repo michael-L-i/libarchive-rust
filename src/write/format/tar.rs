@@ -38,6 +38,9 @@ pub struct Tar {
     remaining: u64,
     padding: u64,
     conv: Option<Arc<StringConv>>,
+    sparse: Vec<(u64, u64)>,
+    logical: u64,
+    xattr: u8,
 }
 impl Tar {
     pub fn new(variant: c_int) -> Self {
@@ -46,6 +49,9 @@ impl Tar {
             remaining: 0,
             padding: 0,
             conv: None,
+            sparse: Vec::new(),
+            logical: 0,
+            xattr: 3,
         }
     }
     fn extended(&self) -> bool {
@@ -169,7 +175,22 @@ impl Format for Tar {
             );
             return Ok(ARCHIVE_OK);
         }
-        if self.pax() && matches!(key, b"xattrheader" | b"pax-pad" | b"mac-ext") {
+        if self.pax() && key == b"xattrheader" {
+            self.xattr = match value {
+                Some(b"SCHILY") => 1,
+                Some(b"LIBARCHIVE") => 2,
+                Some(b"ALL") => 3,
+                _ => {
+                    return Err(Error::new(
+                        ARCHIVE_FAILED,
+                        -1,
+                        "pax: invalid xattr header name",
+                    ));
+                }
+            };
+            return Ok(ARCHIVE_OK);
+        }
+        if self.pax() && key == b"mac-ext" {
             return Ok(ARCHIVE_OK);
         }
         Ok(ARCHIVE_WARN)
@@ -266,6 +287,46 @@ impl Format for Tar {
             None
         };
         let mut pax = Vec::new();
+        let mut sparse_map = Vec::new();
+        self.sparse.clear();
+        self.logical = 0;
+        if self.pax() && e.sparse_count() > 0 && ty == b'0' {
+            self.sparse = e
+                .sparse
+                .iter()
+                .map(|s| (s.offset as u64, s.length as u64))
+                .collect();
+            if self
+                .sparse
+                .last()
+                .is_some_and(|&(o, n)| o + n < e.size() as u64)
+            {
+                self.sparse.push((e.size() as u64, 0));
+            }
+            attr(&mut pax, b"GNU.sparse.major", b"1");
+            attr(&mut pax, b"GNU.sparse.minor", b"0");
+            attr(&mut pax, b"GNU.sparse.name", &path);
+            attr(
+                &mut pax,
+                b"GNU.sparse.realsize",
+                e.size().to_string().as_bytes(),
+            );
+            sparse_map.extend(format!("{}\n", self.sparse.len()).as_bytes());
+            for (off, n) in &self.sparse {
+                sparse_map.extend(format!("{off}\n{n}\n").as_bytes());
+            }
+            sparse_map.resize(sparse_map.len().div_ceil(512) * 512, 0);
+        }
+        let stored_size = if self.sparse.is_empty() {
+            e.size()
+        } else {
+            self.sparse
+                .iter()
+                .try_fold(sparse_map.len() as i64, |n, (_, len)| {
+                    n.checked_add(*len as i64)
+                })
+                .ok_or_else(|| Error::fatal(libc::EFBIG, "Sparse file is too large"))?
+        };
         if path.len() <= 100 {
             h[..path.len()].copy_from_slice(&path);
         } else if let Some(i) = split {
@@ -315,7 +376,7 @@ impl Format for Tar {
             ),
             (e.uid(), 108, 6, "Numeric user ID too large", b"uid"),
             (e.gid(), 116, 6, "Numeric group ID too large", b"gid"),
-            (e.size(), 124, 11, "File size out of range", b"size"),
+            (stored_size, 124, 11, "File size out of range", b"size"),
             (
                 e.mtime(),
                 136,
@@ -375,14 +436,76 @@ impl Format for Tar {
             )?;
         }
         if self.pax() {
-            if e.mtime_nsec() != 0 {
+            if let Some(flags) = e.fflags_text().filter(|s| !s.to_bytes().is_empty()) {
+                attr(&mut pax, b"SCHILY.fflags", flags.to_bytes());
+            }
+            for (ty, key, style) in [
+                (crate::acl::TYPE_ACCESS, b"SCHILY.acl.access".as_slice(), 0),
+                (crate::acl::TYPE_DEFAULT, b"SCHILY.acl.default", 0),
+                (
+                    crate::acl::TYPE_NFS4,
+                    b"SCHILY.acl.ace",
+                    crate::acl::STYLE_COMPACT,
+                ),
+            ] {
+                if e.acl.count(ty) > 0
+                    && let Some(text) = e.acl_to_text(
+                        ty | crate::acl::STYLE_EXTRA_ID | crate::acl::STYLE_SEPARATOR_COMMA | style,
+                    )
+                {
+                    attr(&mut pax, key, &text);
+                }
+            }
+            for x in &e.xattrs {
+                if self.xattr & 1 != 0 {
+                    attr(
+                        &mut pax,
+                        &[b"SCHILY.xattr.".as_slice(), x.name.as_bytes()].concat(),
+                        &x.value,
+                    );
+                }
+                if self.xattr & 2 != 0 {
+                    let mut name = Vec::new();
+                    for &b in x.name.as_bytes() {
+                        if !(33..=126).contains(&b) || matches!(b, b'%' | b'=') {
+                            name.extend(format!("%{b:02X}").as_bytes());
+                        } else {
+                            name.push(b);
+                        }
+                    }
+                    attr(
+                        &mut pax,
+                        &[b"LIBARCHIVE.xattr.".as_slice(), &name].concat(),
+                        &base64(&x.value),
+                    );
+                }
+            }
+            if e.symlink_type() != 0 {
+                attr(
+                    &mut pax,
+                    b"LIBARCHIVE.symlinktype",
+                    if e.symlink_type() == 1 {
+                        b"file"
+                    } else {
+                        b"dir"
+                    },
+                );
+            }
+            if e.mtime_nsec() != 0 && (self.variant == 0x30002 || !pax.is_empty()) {
                 attr(&mut pax, b"mtime", &time_value(e.mtime(), e.mtime_nsec()));
             }
+            if self.variant == 0x30002 && e.birthtime_is_set() != 0 && e.birthtime() < e.mtime() {
+                attr(
+                    &mut pax,
+                    b"LIBARCHIVE.creationtime",
+                    &time_value(e.birthtime(), e.birthtime_nsec()),
+                );
+            }
             if self.variant == 0x30002 {
-                if e.atime_is_set() != 0 {
+                if e.atime() != 0 || e.atime_nsec() != 0 {
                     attr(&mut pax, b"atime", &time_value(e.atime(), e.atime_nsec()));
                 }
-                if e.ctime_is_set() != 0 {
+                if e.ctime() != 0 || e.ctime_nsec() != 0 {
                     attr(&mut pax, b"ctime", &time_value(e.ctime(), e.ctime_nsec()));
                 }
             }
@@ -404,17 +527,40 @@ impl Format for Tar {
         checksum(&mut h);
         sink.write(&h)?;
         self.remaining = u64::try_from(e.size()).unwrap_or(0);
-        self.padding = (512 - self.remaining % 512) % 512;
+        self.padding = (512 - stored_size.max(0) as u64 % 512) % 512;
+        sink.write(&sparse_map)?;
         Ok(ret)
     }
     fn data(&mut self, data: &[u8], sink: &mut dyn Sink) -> Result<usize, Error> {
         let n = data.len().min(self.remaining as usize);
-        sink.write(&data[..n])?;
+        if self.sparse.is_empty() {
+            sink.write(&data[..n])?;
+        } else {
+            let end = self.logical + n as u64;
+            for &(off, len) in &self.sparse {
+                let start = off.max(self.logical);
+                let stop = (off + len).min(end);
+                if stop > start {
+                    sink.write(
+                        &data[(start - self.logical) as usize..(stop - self.logical) as usize],
+                    )?;
+                }
+            }
+            self.logical = end;
+        }
         self.remaining -= n as u64;
         Ok(n)
     }
     fn finish_entry(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
-        zeros(sink, self.remaining)?;
+        let missing = if self.sparse.is_empty() {
+            self.remaining
+        } else {
+            self.sparse
+                .iter()
+                .map(|&(off, len)| (off + len).saturating_sub(self.logical.max(off)))
+                .sum()
+        };
+        zeros(sink, missing)?;
         zeros(sink, self.padding)?;
         self.remaining = 0;
         self.padding = 0;
@@ -443,4 +589,23 @@ impl Tar {
         sink.write(&[0])?;
         zeros(sink, ((512 - (value.len() + 1) % 512) % 512) as u64)
     }
+}
+
+fn base64(data: &[u8]) -> Vec<u8> {
+    let digits = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    for c in data.chunks(3) {
+        let a = c[0];
+        let b = c.get(1).copied().unwrap_or(0);
+        let d = c.get(2).copied().unwrap_or(0);
+        out.push(digits[(a >> 2) as usize]);
+        out.push(digits[((a << 4 | b >> 4) & 63) as usize]);
+        if c.len() > 1 {
+            out.push(digits[((b << 2 | d >> 6) & 63) as usize]);
+        }
+        if c.len() > 2 {
+            out.push(digits[(d & 63) as usize]);
+        }
+    }
+    out
 }

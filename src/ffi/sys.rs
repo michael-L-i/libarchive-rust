@@ -203,6 +203,27 @@ pub fn try_zeroed_vec(len: usize) -> Option<Vec<u8>> {
     Some(unsafe { Vec::from_raw_parts(p, len, len) })
 }
 
+/// UTC calendar fields for archive timestamps.
+pub fn gmtime(secs: i64) -> Option<Tm> {
+    let secs = libc::time_t::try_from(secs).ok()?;
+    // SAFETY: gmtime_r reads secs and initializes the owned tm on success.
+    let t = unsafe {
+        let mut t = std::mem::zeroed::<libc::tm>();
+        if libc::gmtime_r(&secs, &mut t).is_null() {
+            return None;
+        }
+        t
+    };
+    Some(Tm {
+        year: t.tm_year,
+        mon: t.tm_mon,
+        mday: t.tm_mday,
+        hour: t.tm_hour,
+        min: t.tm_min,
+        sec: t.tm_sec,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
