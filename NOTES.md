@@ -309,31 +309,44 @@ Differences:
   `archive_zlib_version()` returns NULL and `archive_version_details()` has no
   `zlib/` entry, where upstream reports `zlib/<ZLIB_VERSION>`. Handled
   centrally later.
-- Decompression is flate2's `rust_backend`, miniz_oxide, in raw mode. It
-  replaces zlib-rs, which has internal `unsafe`; miniz_oxide's crate root has
-  `#![forbid(unsafe_code)]`. On valid input the output is byte-identical:
-  `diff-cat '*.gz*' '*tgz*'` shows 12 same, 0 differ, and the one timeout
-  (`test_read_filter_gzip_recursive.gz`) is the oracle's timeout too.
-- On corrupt deflate data the two backends can disagree. Differential run
-  over 969 inputs (639 truncations, 330 files with 1-3 random byte changes),
-  comparing oracle and port `bsdcat` stdout, stderr and status:
-  - Truncations: 639 of 639 identical.
-  - Mutations: 270 of 330 identical. The other 60 are all corrupt input the
-    oracle rejects:
-    - 58: upstream fails with "gzip decompression failed" and no output
-      (status 1); the port exits 0 with bytes. 50 of these are zlib's
-      "invalid distance too far back". miniz_oxide checks a back-reference's
-      distance against its 32 KiB window, not against the bytes output so
-      far, so a reference before the start of the stream is accepted.
-      Example: a one-member gzip file of 300 bytes at level 1 with a few
-      bytes of its deflate data changed gives 324 bytes here and "gzip
-      decompression failed" upstream. The other 8 are rejected by zlib for a
-      reason not isolated.
-    - 2: both fail with status 1. Upstream says "gzip decompression failed";
-      the port fails with no message.
+- Decompression is miniz_oxide's streaming inflater in raw mode, called
+  directly; flate2 is not a dependency. flate2 always enables miniz_oxide's
+  `simd` feature, which pulls in simd-adler32 (SIMD intrinsics, `unsafe`).
+  Raw deflate needs no Adler-32, and the gzip trailer's CRC32 is not checked,
+  as upstream. miniz_oxide has `#![forbid(unsafe_code)]`, and its one other
+  dependency, adler2, forbids `unsafe` too. On valid input the output is
+  byte-identical: `diff-cat '*.gz*' '*tgz*'` shows 12 same, 0 differ, and the
+  one timeout (`test_read_filter_gzip_recursive.gz`) is the oracle's too.
+- Corrupt deflate data is the one place the output can differ. Every
+  difference found has one cause: a back-reference whose distance reaches
+  before the start of the member's output. zlib rejects it ("invalid distance
+  too far back"). miniz_oxide's streaming decoder checks the distance only
+  against its 32 KiB window, which starts zeroed, so the copy yields zero
+  bytes and decoding goes on. Its strict check runs only on a first call with
+  `MZFlush::Finish` that gets the whole member at once, which a streaming
+  reader can't use. This accepts corrupt input, never unsafe, and only that
+  input; the cost is the fidelity of this one class, traded for the safe
+  backend under the safe-dependency rule.
+- Differential run: 969 inputs, oracle vs port `bsdcat` on stdout, stderr and
+  status. 639 truncations of 11 base streams (8 one-member, 3 two-member),
+  all identical. 330 files with 1-3 random byte changes: 270
+  identical, 60 differ, all on corrupt input the oracle rejects:
+  - 58: upstream fails with "gzip decompression failed" and no output (status
+    1); the port exits 0 with output. 50 are in the first member of a file
+    and 8 in the second member of a two-member file. zlib (checked with
+    Python's zlib on the same deflate data) reports "invalid distance too far
+    back" for all 58. Example: a one-member file of 300 bytes at level 1 with
+    a few bytes of its deflate data changed gives 324 bytes here and no output
+    upstream.
+  - 2: both fail with status 1. The port accepts the invalid back-reference,
+    so its data ends before the 8-byte trailer and the trailer read fails with
+    no message. Upstream says "gzip decompression failed". Minimized example,
+    a 20-byte member, with the deflate data `03 61`, then eight zero trailer
+    bytes:
+    `1f 8b 08 00 00 00 00 00 00 03 03 61 00 00 00 00 00 00 00 00`.
+    Upstream reports "gzip decompression failed"; here the error has no
+    message. Test: `a_back_reference_before_the_start_is_accepted`.
   - No case where the port fails and upstream succeeds.
-  The accepted streams are checked only through these runs and the tests in
-  the module.
 - The `inflateInit2` and `inflateEnd` failures upstream reports ("Internal
   error initializing compression library", "Failed to clean up gzip
   decompressor") cannot happen with miniz_oxide, so they are not ported.

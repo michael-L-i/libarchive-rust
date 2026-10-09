@@ -26,14 +26,14 @@
 // Ported from libarchive/archive_read_support_filter_gzip.c.
 
 //! `archive_read_support_filter_gzip`: the gzip filter. The header and trailer
-//! are parsed here; the deflate data is inflated by miniz_oxide (`flate2`'s
-//! `rust_backend`), in raw mode.
+//! are parsed here; the deflate data is inflated by miniz_oxide, in raw mode.
 
 use crate::archive::{ARCHIVE_ERRNO_MISC, ARCHIVE_FATAL, Base};
 use crate::entry::Entry;
 use crate::read::{Filter, FilterBidder, Read, Reader, Status, filter_code};
 use crate::util::Error;
-use flate2::{Decompress, FlushDecompress, Status as ZStatus};
+use miniz_oxide::inflate::stream::{InflateState, inflate as mz_inflate};
+use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 use std::ffi::{CStr, c_int};
 
 /// The decompressed bytes one `read` produces at most, as upstream's buffer.
@@ -64,7 +64,7 @@ struct Meta {
 struct Gzip {
     meta: Meta,
     /// The decompressor of the member being read; `None` between members.
-    stream: Option<Decompress>,
+    stream: Option<Box<InflateState>>,
     out: Box<[u8]>,
     filled: usize,
     eof: bool,
@@ -137,7 +137,7 @@ impl Filter for Gzip {
 impl Gzip {
     /// The decompressor of the member being read, or of the next member once
     /// the last one has ended. `None` at the end of the stream.
-    fn next_stream(&mut self, up: &mut Reader<'_>) -> Result<Option<Decompress>, Error> {
+    fn next_stream(&mut self, up: &mut Reader<'_>) -> Result<Option<Box<InflateState>>, Error> {
         match self.stream.take() {
             Some(stream) => Ok(Some(stream)),
             None => self.start_member(up),
@@ -147,7 +147,7 @@ impl Gzip {
     /// Reads the header of the next member and starts its decompressor. Input
     /// that is not a gzip header (including trailing garbage) ends the stream
     /// without an error.
-    fn start_member(&mut self, up: &mut Reader<'_>) -> Result<Option<Decompress>, Error> {
+    fn start_member(&mut self, up: &mut Reader<'_>) -> Result<Option<Box<InflateState>>, Error> {
         let Some(len) = peek_header(up, Some(&mut self.meta)) else {
             return Ok(None);
         };
@@ -160,32 +160,32 @@ impl Gzip {
                 "Failed to read gzip input",
             ));
         }
-        Ok(Some(Decompress::new(false)))
+        Ok(Some(InflateState::new_boxed(DataFormat::Raw)))
     }
 
     /// Inflates the input into the rest of the output block, consuming what
     /// the decoder used. Returns whether the member ended.
-    fn inflate(&mut self, stream: &mut Decompress, up: &mut Reader<'_>) -> Result<bool, Error> {
+    fn inflate(&mut self, stream: &mut InflateState, up: &mut Reader<'_>) -> Result<bool, Error> {
         let input = up
             .read_ahead(1)
             .ok()
             .flatten()
             .ok_or_else(|| Error::fatal(ARCHIVE_ERRNO_MISC, "truncated gzip input"))?;
-        let (in_before, out_before) = (stream.total_in(), stream.total_out());
         let output = self.out.get_mut(self.filled..).unwrap_or_default();
-        let ended = match stream.decompress(input, output, FlushDecompress::None) {
-            Ok(ZStatus::Ok) => false,
-            Ok(ZStatus::StreamEnd) => true,
-            _ => {
+        let res = mz_inflate(stream, input, output, MZFlush::None);
+        let ended = match res.status {
+            Ok(MZStatus::Ok) => false,
+            Ok(MZStatus::StreamEnd) => true,
+            // NeedDict is a zlib preset dictionary, which raw deflate never uses.
+            Ok(MZStatus::NeedDict) | Err(_) => {
                 return Err(Error::fatal(
                     ARCHIVE_ERRNO_MISC,
                     "gzip decompression failed",
                 ));
             }
         };
-        let produced = stream.total_out().saturating_sub(out_before);
-        self.filled += usize::try_from(produced).unwrap_or_default();
-        up.consume(stream.total_in().saturating_sub(in_before))?;
+        self.filled += res.bytes_written;
+        up.consume(res.bytes_consumed)?;
         Ok(ended)
     }
 
@@ -268,9 +268,6 @@ mod tests {
     use crate::archive::{ARCHIVE_FATAL, ARCHIVE_OK, Base, READ_MAGIC};
     use crate::read::Client;
     use crate::read::format::raw;
-    use flate2::write::DeflateEncoder;
-    use flate2::{Compression, GzBuilder};
-    use std::io::Write;
 
     /// A client that hands out `block` bytes per read, and fails once `pos`
     /// reaches `fail_at`.
@@ -355,14 +352,19 @@ mod tests {
             .collect()
     }
 
+    /// A gzip member with a fixed header, raw deflate data and a CRC32 trailer.
     fn member(data: &[u8], name: Option<&str>, mtime: u32) -> Vec<u8> {
-        let mut builder = GzBuilder::new().mtime(mtime);
+        let mut out = vec![0x1f, 0x8b, 8, if name.is_some() { FNAME } else { 0 }];
+        out.extend_from_slice(&mtime.to_le_bytes());
+        out.extend_from_slice(&[0, 3]);
         if let Some(name) = name {
-            builder = builder.filename(name);
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
         }
-        let mut enc = builder.write(Vec::new(), Compression::default());
-        enc.write_all(data).unwrap();
-        enc.finish().unwrap()
+        out.extend(miniz_oxide::deflate::compress_to_vec(data, 6));
+        out.extend_from_slice(&crc32fast::hash(data).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out
     }
 
     /// A header with every optional field, then raw deflate data and a
@@ -372,9 +374,7 @@ mod tests {
         let mut out = vec![0x1f, 0x8b, 0x08, flags, 1, 0, 0, 0, 0, 3];
         out.extend_from_slice(&[3, 0, b'x', b'y', b'z']);
         out.extend_from_slice(b"name.txt\0comment\0\x00\x00");
-        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(data).unwrap();
-        out.extend(enc.finish().unwrap());
+        out.extend(miniz_oxide::deflate::compress_to_vec(data, 6));
         out.extend_from_slice(&[0; 8]);
         out
     }
@@ -512,6 +512,17 @@ mod tests {
                 "cut {cut}: {status}"
             );
         }
+    }
+
+    /// The deflate data is a length-4 match with nothing before it, which
+    /// zlib rejects ("invalid distance too far back"). miniz_oxide accepts it,
+    /// so the input ends before the trailer and the failure has no message.
+    /// NOTES.md, gzip Differences.
+    #[test]
+    fn a_back_reference_before_the_start_is_accepted() {
+        let gz = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 0x03, 0x61, 0, 0, 0, 0, 0, 0, 0, 0];
+        let (out, status, error) = decode(&gz, 64);
+        assert_eq!((out.len(), status, error.as_str()), (0, ARCHIVE_FATAL, ""));
     }
 
     #[test]
