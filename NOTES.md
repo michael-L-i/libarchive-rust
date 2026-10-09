@@ -851,3 +851,50 @@ Phase 5 needs:
   and AES-CTR in all three key sizes updated in pieces of 0 to 70 bytes (every
   partial-block case). All 2,900 outputs matched. The probe is not in the
   repository.
+
+## PPMd decoders (`src/ppmd7.rs`, `src/ppmd8.rs`, shared `src/ppmd.rs`)
+
+The readers keep one long-lived `Ppmd7` / `Ppmd8` and call `free` where
+upstream calls `Ppmd*_Free` and `Ppmd*_Construct`, instead of making a new
+one; see the first entry.
+
+### Ported as-is
+
+- `InitEsc` survives `Free` and `Construct`. The RAR reader stores the
+  block header's escape byte in `ppmd7_context.InitEsc` before it frees and
+  re-creates the model, and the model reads it when a one-state context
+  grows. The zip reader's `ppmd8` is part of the `calloc`ed `struct zip`, so
+  the second PPMd8 entry of an archive starts with the escape estimate the
+  first one ended with. `Ppmd7::init_esc` is public for RAR; the readers
+  must not replace the `Ppmd7` / `Ppmd8` between streams.
+- `Ppmd8_Init` accepts restore method 2 (upstream's FREEZE, which is not
+  compiled in) and treats it like method 1, cut-off. The zip reader allows
+  it.
+- The PPMd7 range decoder in RAR mode never checks `Code` at the end, and
+  the 7z one doesn't need to: `is_finished_ok` is only meaningful for 7z.
+
+### Differences
+
+- The arena is zeroed. Upstream leaves the `malloc`ed memory uninitialized,
+  so any read of it (for example the stamp of a block the model never
+  wrote) is undefined; zero is one of the values it can read as. The
+  decoders match upstream byte for byte over all the streams we tried,
+  including corrupt ones. Zeroing touches the whole arena, where `malloc`
+  commits lazily, so a PPMd7 model of a few GiB costs real memory and time
+  at `alloc`.
+- Anything upstream would do outside the arena (a read, a write, a search
+  for a symbol that is not there, a free list that loops) marks the model
+  bad, and `decode_symbol` returns -2 ("invalid data") from then on. A model
+  the decoder built itself never does this; it is a guard, not a code path.
+- The range decoders would divide by zero (`Range /= total` giving 0) or
+  spin forever in `Normalize` (`Range == 0`) on some corrupt streams, and
+  upstream crashes or hangs. We return -2 instead.
+- `Ppmd8` `RestoreModel` in cut-off mode loops `CutOff` and `ExpandTextArea`
+  until enough memory is free. With a tiny arena (a few KiB; the zip reader
+  allocates at least 1 MiB) upstream can loop forever; ours gives up after
+  1000 rounds and restarts the model.
+- `Ppmd7::alloc` and `Ppmd8::alloc` take the size as `u32` like upstream and
+  fail the same way (`false`) if it is below `UNIT_SIZE` (PPMd7 only) or the
+  memory is not available (`try_reserve`).
+- Only the decoding side is ported: `Ppmd7z_RangeEnc_*` and
+  `Ppmd7_EncodeSymbol` wait for the 7zip writer.
