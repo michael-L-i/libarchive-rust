@@ -58,9 +58,9 @@ impl Matches {
     }
     fn key(data: &[u8]) -> usize {
         // A fifth byte separates common four-byte text prefixes.
-        let word = u64::from_le_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ]);
+        let word = data
+            .first_chunk::<8>()
+            .map_or(0, |bytes| u64::from_le_bytes(*bytes));
         ((word << 24).wrapping_mul(0xcf1bbcdcb7a56463) >> (64 - HASH_BITS)) as usize
     }
     fn remember(&mut self, at: usize) {

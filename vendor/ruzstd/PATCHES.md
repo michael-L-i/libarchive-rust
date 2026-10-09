@@ -114,3 +114,25 @@ error handling and decoded bytes are unchanged. No extra buffer is allocated.
   The published crate omits assets/dev dependencies used by its full vendor
   suite; the standalone harness tests the real modules without replacing the
   algorithm. Full project oracle validation uses the combined final build.
+
+## Bound the archive matcher's hash load once
+
+The archive integration's `src/write/filter/zstd.rs` now loads the hash word
+through `first_chunk::<8>()` instead of eight separately indexed bytes. All
+callers already require eight available bytes. This makes the bounds check
+explicit once and exposes one little-endian word load to the optimizer. The
+five-byte hash, probe order, match lengths, compression settings and bytes
+are unchanged. No vendor codec algorithm changes or unsafe code are needed.
+
+- A fresh profile of the accepted c1dc8b7 baseline attributes about 55% of
+  source encoding CPU to matching, including out-of-line hash loads.
+- Nine alternating release-run medians on 16 MiB inputs, in milliseconds:
+  random 13.01 -> 11.39, source 68.01 -> 58.71, mixed 40.34 -> 36.97,
+  periodic 2.71 -> 2.70, repeated binary 2.83 -> 2.88. Tiny differences
+  on the latter cases are noise. A plain inline hint was measured first
+  and rejected because it did not improve performance.
+- All 545 inputs match the frozen accepted baseline byte for byte and
+  decode with ruzstd: five 16 MiB workloads, 528 length/alphabet/block
+  cases, and 12 compaction/RLE/history cases exceeding 2 MiB. Independent
+  C zstd validates all five 16 MiB streams. The new harness and profiles
+  are in sibling `diagnostics/round5-zstd`; prior artifacts are unchanged.
