@@ -86,7 +86,12 @@ pub struct Base {
     pub magic: u32,
     pub state: Cell<u32>,
     pub format: Cell<c_int>,
+    /// `archive_format_name`, as most formats set it.
     pub format_name: Cell<Option<&'static CStr>>,
+    /// A formatted name (a cab's, lha's or zip's version and method) and a
+    /// NUL, rewritten in place like `error`, so a pointer to it stays valid
+    /// until the buffer has to grow. Reported while `format_name` is `None`.
+    pub(crate) format_name_buf: RefCell<Vec<u8>>,
     /// Number of file entries processed.
     pub file_count: Cell<c_int>,
     pub errno: Cell<c_int>,
@@ -109,6 +114,7 @@ impl Base {
             state: Cell::new(state::NEW),
             format: Cell::new(0),
             format_name: Cell::new(None),
+            format_name_buf: RefCell::new(Vec::new()),
             file_count: Cell::new(0),
             errno: Cell::new(0),
             error: RefCell::new(Vec::new()),

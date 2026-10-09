@@ -233,7 +233,7 @@ impl Format for Mtree {
             Ok(n) => n,
             Err(e) => {
                 let _ = a.warn(e.raw_os_error().unwrap_or(0), "Can't read");
-                return Ok(Data::Warn);
+                return Ok(Data::Warn { offset: 0 });
             }
         };
         if bytes_read == 0 {
