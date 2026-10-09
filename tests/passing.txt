@@ -733,6 +733,7 @@ test_tar_filenames
 test_tar_large
 test_ustar_filename_encoding_UTF8_CP866
 test_ustar_filenames
+test_warn_missing_hardlink_target
 test_write_disk
 test_write_disk_appledouble
 test_write_disk_appledouble_zip

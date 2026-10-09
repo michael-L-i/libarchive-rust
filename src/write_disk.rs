@@ -54,6 +54,7 @@ pub const SECURE_NOABSOLUTEPATHS: c_int = 0x10000;
 #[derive(Default)]
 pub struct WriteDisk {
     pub options: c_int,
+    pub bytes: i64,
     pub skip_file: Option<(i64, i64)>,
     pub user: crate::ffi::disk::IdLookup,
     pub group: crate::ffi::disk::IdLookup,
@@ -154,7 +155,9 @@ impl WriteDisk {
             && self.options & UNLINK == 0
             && entry.filetype() == libc::S_IFDIR
             && std::fs::metadata(&path).is_ok_and(|m| m.is_dir())
-            && std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink())
+            && target
+                .stat()
+                .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFLNK)
             && let Ok(real) = std::fs::canonicalize(&path)
         {
             match Target::prepare(&real, false, false, false) {
@@ -176,7 +179,10 @@ impl WriteDisk {
                 ));
             }
             if self.options & NO_OVERWRITE != 0
-                || (self.options & NO_OVERWRITE_NEWER != 0 && existing.st_mtime > entry.mtime())
+                || (self.options & NO_OVERWRITE_NEWER != 0
+                    && !directory
+                    && (existing.st_mtime, existing.st_mtime_nsec)
+                        >= (entry.mtime(), entry.mtime_nsec()))
             {
                 self.skipped = true;
             } else if !(directory && entry.filetype() == libc::S_IFDIR)
@@ -185,7 +191,8 @@ impl WriteDisk {
                     || directory
                     || entry.filetype() == libc::S_IFDIR
                     || hardlink.is_some()
-                    || link.is_some())
+                    || link.is_some()
+                    || (existing.st_nlink > 1 && self.options & 0x40000 == 0))
                 && let Err(e) = target.remove(directory)
             {
                 return failure(a, e, "Can't unlink", &path);
@@ -198,6 +205,7 @@ impl WriteDisk {
             self.limit = Some(0);
         }
         if !self.skipped {
+            let hardlink_name = hardlink.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
             let result = if let Some(source) = hardlink {
                 Target::prepare(&source, secure, false, false)
                     .and_then(|source| target.hardlink(&source, secure))
@@ -237,6 +245,15 @@ impl WriteDisk {
                 target.special(entry.mode() as u32, entry.rdev() as u64)
             };
             if let Err(e) = result {
+                if e.raw_os_error() == Some(libc::ENOENT)
+                    && let Some(name) = hardlink_name
+                {
+                    return a.raise(Error::new(
+                        ARCHIVE_FAILED,
+                        libc::ENOENT,
+                        [b"Hard-link target '".as_slice(), &name, b"' does not exist"].concat(),
+                    ));
+                }
                 return failure(a, e, "Can't create", &path);
             }
             if self.file.is_none() && entry.hardlink_is_set() != 0 && self.limit != Some(0) {
@@ -289,6 +306,7 @@ impl WriteDisk {
             Ok(()) => {
                 self.offset += len as u64;
                 self.max_offset = self.max_offset.max(self.offset);
+                self.bytes = self.bytes.saturating_add(len as i64);
                 len as isize
             }
             Err(e) => a
