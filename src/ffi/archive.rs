@@ -287,27 +287,27 @@ pub extern "C" fn archive_version_details() -> *const c_char {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_zlib_version() -> *const c_char {
-    cptr(vd::ZLIB)
+    cptr(vd::zlib())
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_liblzma_version() -> *const c_char {
-    cptr(vd::LIBLZMA)
+    cptr(vd::liblzma())
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_bzlib_version() -> *const c_char {
-    cptr(vd::BZLIB)
+    cptr(vd::bzlib())
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_liblz4_version() -> *const c_char {
-    cptr(vd::LIBLZ4)
+    cptr(vd::liblz4())
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_libzstd_version() -> *const c_char {
-    cptr(vd::LIBZSTD)
+    cptr(vd::libzstd())
 }
 
 #[unsafe(no_mangle)]
@@ -505,7 +505,16 @@ mod tests {
         assert_eq!(archive_version_number(), 3009000);
         let s = string(archive_version_string()).unwrap_or_default();
         assert!(string(archive_version_details()).is_some_and(|d| d.starts_with(&s)));
-        assert_eq!(string(archive_zlib_version()), None);
+        for v in [
+            archive_zlib_version(),
+            archive_liblzma_version(),
+            archive_bzlib_version(),
+            archive_liblz4_version(),
+            archive_libzstd_version(),
+        ] {
+            assert!(string(v).is_some());
+        }
+        assert_eq!(string(archive_liblzo2_version()), None);
     }
 
     #[test]

@@ -28,25 +28,40 @@
 
 //! `archive_version_details`: the library version plus the version of every
 //! backend compiled in. Upstream links C libraries; the backends here are
-//! Rust crates, which phase 2 reports by replacing the `None`s below.
-//! There are no C XML, regex or crypto backends, so those upstream sections
-//! (and their `archive_*_version` functions) are always absent.
+//! Rust crates. A backend reports its own version string when it has a
+//! meaningful one (bzip2); otherwise `build.rs` reads "<crate> <version>"
+//! from `Cargo.lock`. There are no C XML, regex or crypto backends, so those
+//! upstream sections (and their `archive_*_version` functions) are always
+//! absent.
 
+use crate::ffi::bzlib_version;
 use crate::util::VERSION_STRING;
 use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
 
-pub const ZLIB: Option<&CStr> = None;
-/// The liblzma version the `xz` crate is a port of.
-pub const LIBLZMA: Option<&CStr> = Some(c"5.8.3");
-/// Like `BZ2_bzlibVersion()`: "1.0.8, 13-Jul-2019".
-/// What `BZ2_bzlibVersion()` returns in libbz2-rs-sys 0.2.5, the backend
-/// (upstream reports "1.0.8, 13-Jul-2019"). Update with the crate.
-pub const BZLIB: Option<&CStr> = Some(c"1.1.0-libbz2-rs-sys-0.2.5");
-pub const LIBLZ4: Option<&CStr> = Some(c"lz4_flex 0.14.0");
-/// The ruzstd 0.9.0 backend, which has no libzstd version (upstream reports
-/// "1.5.x"). Update with the crate.
-pub const LIBZSTD: Option<&CStr> = Some(c"0.9.0-ruzstd");
+/// A backend's version from `build.rs`, NULL if its crate is not compiled in.
+macro_rules! lock_version {
+    ($name:ident, $key:literal) => {
+        pub fn $name() -> Option<&'static CStr> {
+            static VERSION: OnceLock<Option<CString>> = OnceLock::new();
+            VERSION
+                .get_or_init(|| {
+                    CString::new(option_env!(concat!("ARCHIVE_", $key, "_VERSION"))?).ok()
+                })
+                .as_deref()
+        }
+    };
+}
+
+lock_version!(zlib, "ZLIB");
+lock_version!(liblzma, "LIBLZMA");
+lock_version!(liblz4, "LIBLZ4");
+lock_version!(libzstd, "LIBZSTD");
+
+pub fn bzlib() -> Option<&'static CStr> {
+    Some(bzlib_version())
+}
+
 pub const LIBLZO2: Option<&CStr> = None;
 pub const LIBRICHACL: Option<&CStr> = None;
 pub const LIBACL: Option<&CStr> = None;
@@ -67,18 +82,18 @@ fn compose(libs: &[(&str, Option<&[u8]>)]) -> CString {
 pub fn details() -> &'static CStr {
     static DETAILS: OnceLock<CString> = OnceLock::new();
     DETAILS.get_or_init(|| {
-        let bz2 = BZLIB.map(|v| {
+        let bz2 = bzlib().map(|v| {
             v.to_bytes()
                 .split(|&b| b == b',')
                 .next()
                 .unwrap_or_default()
         });
         compose(&[
-            ("zlib", ZLIB.map(CStr::to_bytes)),
-            ("liblzma", LIBLZMA.map(CStr::to_bytes)),
+            ("zlib", zlib().map(CStr::to_bytes)),
+            ("liblzma", liblzma().map(CStr::to_bytes)),
             ("bz2lib", bz2),
-            ("liblz4", LIBLZ4.map(CStr::to_bytes)),
-            ("libzstd", LIBZSTD.map(CStr::to_bytes)),
+            ("liblz4", liblz4().map(CStr::to_bytes)),
+            ("libzstd", libzstd().map(CStr::to_bytes)),
             ("liblzo2", LIBLZO2.map(CStr::to_bytes)),
             // BLAKE2 is built in, as upstream's bundled copy is.
             ("libb2", Some(b"bundled")),
@@ -94,12 +109,38 @@ pub fn details() -> &'static CStr {
 mod tests {
     use super::*;
 
+    /// "<crate> <version>", as `build.rs` reports a backend from `Cargo.lock`.
+    fn is_lock_version(v: Option<&CStr>) -> bool {
+        let v = v.and_then(|v| v.to_str().ok());
+        v.and_then(|v| v.split_once(' '))
+            .is_some_and(|(krate, version)| {
+                !krate.is_empty() && version.starts_with(|c: char| c.is_ascii_digit())
+            })
+    }
+
     #[test]
-    fn only_the_ported_backends() {
-        assert_eq!(
-            details(),
-            c"libarchive 3.9.0dev liblzma/5.8.3 bz2lib/1.1.0-libbz2-rs-sys-0.2.5 liblz4/lz4_flex 0.14.0 libzstd/0.9.0-ruzstd libb2/bundled"
-        );
+    fn backends_report_a_version() {
+        for v in [zlib(), liblzma(), liblz4(), libzstd()] {
+            assert!(is_lock_version(v), "{v:?}");
+        }
+        assert!(bzlib().is_some_and(|v| !v.is_empty()));
+    }
+
+    #[test]
+    fn details_lists_the_backends_under_upstreams_keys() {
+        let d = details().to_str().unwrap_or_default();
+        let mut rest = d;
+        for key in [
+            " zlib/",
+            " liblzma/",
+            " bz2lib/",
+            " liblz4/",
+            " libzstd/",
+            " libb2/",
+        ] {
+            rest = rest.split_once(key).map_or("", |(_, r)| r);
+            assert!(!rest.is_empty(), "{key} missing from {d}");
+        }
     }
 
     #[test]

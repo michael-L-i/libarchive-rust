@@ -16,6 +16,7 @@ xz = "=0.4.6-rc.0"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "safe-encode"] }
 xxhash-rust = { version = "0.8.19", default-features = false, features = ["xxh32"] }
 bzip2 = "0.6.1"
+libbz2-rs-sys = "0.2.5"
 ruzstd = "0.9.0"
 
 [build-dependencies]

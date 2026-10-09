@@ -55,6 +55,7 @@ dependencies = [
  "bzip2",
  "cc",
  "crc32fast",
+ "libbz2-rs-sys",
  "libc",
  "lz4_flex",
  "miniz_oxide",
@@ -68,6 +69,9 @@ name = "libbz2-rs-sys"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "libc"

@@ -16,8 +16,12 @@ Suspected upstream bugs ported as-is, and deliberate divergences, per unit.
 
 - `archive_version_details` always ends its backend list with
   `libb2/bundled`, because BLAKE2 is built in. No C XML, regex or crypto
-  library is linked, so those sections never appear. Compression and ACL
-  backends are absent until phase 2 reports them (archive_version_details.c).
+  library is linked, so those sections never appear. The compression
+  backends are Rust crates, so each `archive_*_version` reports the crate,
+  not the C library: the backend's own version string where it has a
+  meaningful one (`BZ2_bzlibVersion`), otherwise `<crate> <version>` read
+  from `Cargo.lock` by `build.rs`, e.g. `zlib/miniz_oxide 0.9.1`. ACL
+  backends are absent until phase 5 (archive_version_details.c).
 - NULL handles: upstream dereferences them and crashes (except
   `archive_free(NULL)`, which returns `ARCHIVE_OK`). Ours return a fallback
   (`ARCHIVE_FATAL`, 0 or NULL) without touching anything.
@@ -305,10 +309,8 @@ Differences:
 
 ### Differences
 
-- No zlib version is reported. miniz_oxide exposes no version string here, so
-  `archive_zlib_version()` returns NULL and `archive_version_details()` has no
-  `zlib/` entry, where upstream reports `zlib/<ZLIB_VERSION>`. Handled
-  centrally later.
+- `archive_zlib_version()` reports `miniz_oxide <version>`, not
+  `ZLIB_VERSION` (see Core).
 - Decompression is miniz_oxide's streaming inflater in raw mode, called
   directly; flate2 is not a dependency. flate2 always enables miniz_oxide's
   `simd` feature, which pulls in simd-adler32 (SIMD intrinsics, `unsafe`).
@@ -356,8 +358,8 @@ Differences:
 ### Differences
 
 - liblzma is replaced by the pure Rust `xz` crate (a port of liblzma
-  5.8.3, which `archive_liblzma_version` and `archive_version_details`
-  report; the oracle links 5.8.4). The crate has the same stream API, so
+  5.8.3; the oracle links 5.8.4; `archive_liblzma_version` reports
+  `xz <version>`, see Core). The crate has the same stream API, so
   the error messages and which input is rejected match; a bug fix between
   5.8.3 and 5.8.4 could differ on unusual damaged input. `LZMA_MEMLIMIT` is
   disabled as upstream does for liblzma 5.
@@ -473,9 +475,9 @@ crate.
 
 ### Differences
 
-- `archive_liblz4_version` reports `lz4_flex 0.14.0`, not the LZ4 library
+- `archive_liblz4_version` reports `lz4_flex <version>`, not the LZ4 library
   version: the oracle links Homebrew liblz4 1.10.0, and the backend here is a
-  Rust crate, so `archive_version_details` reads `liblz4/lz4_flex 0.14.0`.
+  Rust crate (see Core).
 - `lz4_flex` is more lenient than liblz4 1.10 on hostile or non-conforming
   blocks. For example, a block that breaks LZ4's end-of-block rule (fewer than
   five final literal bytes) fails upstream with `lz4 decompression failed`, but
@@ -520,9 +522,9 @@ Backends, and why:
 
 Differences:
 
-- `archive_bzlib_version` reports the backend's `BZ2_bzlibVersion` string,
-  "1.1.0-libbz2-rs-sys-0.2.5", not "1.0.8, 13-Jul-2019".
-- `archive_libzstd_version` reports "0.9.0-ruzstd". ruzstd has no libzstd
+- `archive_bzlib_version` reports the backend's `BZ2_bzlibVersion` string
+  ("1.1.0-libbz2-rs-sys-<version>"), not "1.0.8, 13-Jul-2019".
+- `archive_libzstd_version` reports `ruzstd <version>`. ruzstd has no libzstd
   version, so this is not a libzstd number.
 - zstd output on truncated or corrupt input. ruzstd keeps the last window of
   decoded output inside the frame until the frame finishes
