@@ -64,7 +64,7 @@ pub const FORMATS: &[(c_int, Option<Support>)] = &[
     // These have potentially large look-ahead.
     (code::SEVENZIP, None),
     (code::CAB, None),
-    (code::RAR, None),
+    (code::RAR, Some(super::rar::support)),
     (code::RAR_V5, None),
     (code::ISO9660, None),
     // Seek is really bad, since it forces the read-ahead logic to discard
