@@ -208,3 +208,26 @@ arithmetic, allocation, copying, bounds, window and error handling are unchanged
 - Profiles, timings and the rejected packed length-code lookup experiment
   are retained in sibling `diagnostics/round6-zstd-read`. Final integration
   validation runs on the combined branch.
+
+## Batch the three sequence-state fields into one write
+
+`src/encoding/blocks/compressed.rs` computes the independent offset,
+match-length and literal-length FSE transitions before writing their bits.
+Their table accuracy logs bound the combined fields to 8 + 9 + 9 bits, so
+one `u64` carries all three in the original low-bit-first order. This replaces
+three bit-writer buffer/flush checks with one. Extra bits, table construction,
+state transitions, match choices, compression settings and output are unchanged.
+
+- A fresh a0fbedb source profile still identifies sequence encoding and the
+  bit writer's cold flush path as substantial costs after matcher improvements.
+- Nine alternating release-run medians on 16 MiB inputs, milliseconds:
+  source 55.50 -> 51.77, mixed 34.21 -> 32.56; random, periodic and repeated
+  binary are essentially unchanged. A second nine-run confirmation gives
+  source 55.11 -> 52.03 and mixed 34.29 -> 32.77 (about 6% and 4.5%).
+- All 545 corpus, alphabet, block-boundary, compaction and RLE-history cases
+  remain byte-identical to the frozen a0fbedb baseline and decode with ruzstd.
+  Independent C zstd validates all five 16 MiB streams. All 15 standalone
+  FSE/bit-writer tests pass with optimization and debug assertions enabled.
+- Raw profiles and measurements are in sibling `diagnostics/round6-zstd`.
+  A separate matcher slice-bounding trial regressed mixed data and was
+  discarded. Full integration validation runs on the combined branch.

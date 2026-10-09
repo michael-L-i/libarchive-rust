@@ -184,24 +184,19 @@ fn encode_sequences(
             let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
             let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
 
-            {
-                let next = of_table.next_state(of_code, of_state.index);
-                let diff = of_state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
-                of_state = next;
-            }
-            {
-                let next = ml_table.next_state(ml_code, ml_state.index);
-                let diff = ml_state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
-                ml_state = next;
-            }
-            {
-                let next = ll_table.next_state(ll_code, ll_state.index);
-                let diff = ll_state.index - next.baseline;
-                writer.write_bits(diff as u64, next.num_bits as usize);
-                ll_state = next;
-            }
+            let of_next = of_table.next_state(of_code, of_state.index);
+            let ml_next = ml_table.next_state(ml_code, ml_state.index);
+            let ll_next = ll_table.next_state(ll_code, ll_state.index);
+            let of_bits = of_next.num_bits as usize;
+            let ml_bits = ml_next.num_bits as usize;
+            // Table accuracy logs bound the combined fields to 8 + 9 + 9 bits.
+            let bits = (of_state.index - of_next.baseline) as u64
+                | ((ml_state.index - ml_next.baseline) as u64) << of_bits
+                | ((ll_state.index - ll_next.baseline) as u64) << (of_bits + ml_bits);
+            writer.write_bits(bits, of_bits + ml_bits + ll_next.num_bits as usize);
+            of_state = of_next;
+            ml_state = ml_next;
+            ll_state = ll_next;
 
             writer.write_bits(ll_add_bits, ll_num_bits);
             writer.write_bits(ml_add_bits, ml_num_bits);
