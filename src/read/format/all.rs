@@ -49,7 +49,7 @@ pub const FORMATS: &[(c_int, Option<Support>)] = &[
     // These bidders are all pretty cheap; they just examine a small initial
     // part of the archive. If one of these bids high, we can maybe avoid
     // running any of the more expensive bidders below.
-    (code::AR, None),
+    (code::AR, Some(super::ar::support)),
     (code::CPIO, None),
     (code::EMPTY, Some(super::empty::support)),
     (code::LHA, None),

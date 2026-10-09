@@ -84,7 +84,7 @@ mod tests {
         assert_eq!(a.errno.get(), ARCHIVE_ERRNO_PROGRAMMER);
         // Valid, but nothing is ported yet to register.
         a.clear_error();
-        assert_eq!(set_format(&mut r, &a, code::AR | 1), ARCHIVE_FATAL);
+        assert_eq!(set_format(&mut r, &a, code::CPIO), ARCHIVE_FATAL);
         assert_eq!(r.format, None);
     }
 }
