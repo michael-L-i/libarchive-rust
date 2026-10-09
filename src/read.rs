@@ -193,7 +193,6 @@ impl Base {
 
     /// Sets a formatted `archive_format_name`, such as "CAB 1.3 (LZX)", in
     /// place of a static one. The name ends at a NUL, as a C string would.
-    #[allow(dead_code)] // used by the cab, lha and zip readers (phase 4)
     pub fn set_format_name(&self, name: &[u8]) {
         let mut buf = self.format_name_buf.borrow_mut();
         buf.clear();

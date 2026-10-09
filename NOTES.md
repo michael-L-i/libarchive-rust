@@ -769,6 +769,45 @@ Phase 5 needs:
 - The BSD name check's `SIZE_MAX - 1` bound is implied by the 1 MiB bound and
   is not repeated.
 
+## cab reader (src/read/format/cab.rs)
+
+Suspected upstream bugs, ported as-is:
+
+- `read_data_invoked` is set by the first `read_data` and never cleared, so
+  once any entry has been read, skipping a later entry decompresses it
+  (`cab_consume_cfdata`) instead of just counting `bytes_skipped`
+  (archive_read_support_format_cab.c).
+- A name longer than 255 bytes is "Invalid CAB header": the name is read
+  with `cab_read_ahead_remaining(a, 256)` and must end inside that window.
+- `cab_dos_time` hands the CFFILE date and time to `mktime` unchecked in the
+  local time zone, so a month or day of 0 is normalized (month 0 is
+  December of the year before) and the result depends on `TZ`.
+- A failed CFDATA checksum is `ARCHIVE_FAILED` in `cab_checksum_finish`, but
+  every caller turns any negative result into `ARCHIVE_FATAL`.
+- `cab_read_data` returns `ARCHIVE_OK` with no data when the read-ahead of a
+  non-empty CFDATA is empty, instead of an error.
+- `lzx_decode_init` keeps the old window size in a `uint16_t`, so windows of
+  64 KiB and more are reallocated for every folder. Here each folder gets a
+  fresh decoder, which is the same thing.
+
+Differences:
+
+- `archive_format_name` is formatted ("CAB 1.3 (LZX)"), kept with
+  `Base::set_format_name` in a buffer that is rewritten in place.
+- MSZIP is inflated with miniz_oxide instead of zlib. `inflateSetDictionary`
+  after each block is reproduced by decoding into a contiguous buffer that
+  holds the previous block (the dictionary) in front of the new output, in
+  non-wrapping mode, so valid data decodes identically. On corrupt data the
+  `(%d)` in "Deflate decompression failed (%d)" is -3 (Z_DATA_ERROR) for
+  any invalid data and -5 (Z_BUF_ERROR) when the CFDATA's compressed bytes
+  run out; the exact point where a corrupt stream is noticed can differ
+  from zlib's, as with the gzip filter.
+- Every LZX table, window and position-slot access is bounds-checked; where
+  upstream's invariants would be broken by corrupt input (a position slot
+  or a table index out of range) the decoder fails with "LZX decompression
+  failed (-25)". Huffman table writes that would leave the table fail the
+  same way.
+
 ## iso9660 reader (src/read/format/iso9660.rs)
 
 ### Scope

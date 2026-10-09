@@ -4,6 +4,7 @@
 pub mod all;
 pub mod ar;
 pub mod by_code;
+pub mod cab;
 pub mod cpio;
 pub mod empty;
 pub mod iso9660;
