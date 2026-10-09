@@ -30,8 +30,6 @@
 //! The tar formats: v7, ustar, GNU tar, star and pax interchange, with GNU
 //! long names and sparse files, Solaris ACLs and AppleDouble metadata.
 
-#![allow(dead_code)] // The registration follows.
-
 mod pax;
 mod sparse;
 
