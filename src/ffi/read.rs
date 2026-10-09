@@ -19,7 +19,7 @@ use crate::read::filter::{
     xz as filter_xz, zstd as filter_zstd,
 };
 use crate::read::format::{
-    all as format_all, ar, by_code as format_by_code, cpio, empty, iso9660, mtree, raw, warc,
+    all as format_all, ar, by_code as format_by_code, cpio, empty, iso9660, mtree, raw, tar, warc,
 };
 use crate::read::{self, Read, Status};
 use crate::read_add_passphrase::PassphraseCallback;
@@ -1075,6 +1075,35 @@ pub extern "C" fn archive_read_support_format_cpio(a: *mut Archive) -> c_int {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_tar(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_tar,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            tar::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+/// An alias of `archive_read_support_format_tar`.
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_gnutar(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_gnutar,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            tar::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_raw(a: *mut Archive) -> c_int {
     checked!(
         archive_read_support_format_raw,
@@ -1171,6 +1200,7 @@ pub(super) mod tests {
             (format::ISO9660, archive_read_support_format_iso9660),
             (format::MTREE, archive_read_support_format_mtree),
             (format::RAW, archive_read_support_format_raw),
+            (format::TAR, archive_read_support_format_tar),
             (format::WARC, archive_read_support_format_warc),
         ];
         let filters: &[(c_int, Export)] = &[
@@ -1213,6 +1243,10 @@ pub(super) mod tests {
                 assert_eq!(archive_free(a), ARCHIVE_OK);
             }
         }
+        // The alias of the tar export, which has no table entry of its own.
+        let a = archive_read_new();
+        assert_eq!(archive_read_support_format_gnutar(a), ARCHIVE_OK);
+        assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 
     #[test]

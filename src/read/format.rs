@@ -9,4 +9,5 @@ pub mod empty;
 pub mod iso9660;
 pub mod mtree;
 pub mod raw;
+pub mod tar;
 pub mod warc;
