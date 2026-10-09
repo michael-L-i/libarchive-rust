@@ -48,7 +48,7 @@ fn status(r: c_int) -> Result<(), Error> {
     if r == ARCHIVE_OK {
         Ok(())
     } else {
-        Err(failure(r.into()))
+        Err(Error::recorded(r))
     }
 }
 

@@ -1755,3 +1755,10 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   Extended attribute lists are bounded to 1 MiB and individual values to
   16 MiB before allocating. Platform-specific ACL/Mac metadata restoration
   and AppleDouble/HFS handling are still being completed.
+
+- Bare `HHMM` date tokens set hour/minute fields without incrementing
+  upstream's `HaveTime`: alone they resolve to midnight; with a date they
+  supply its time, and a following explicit time can override them.
+- ZIP LZMA properties use the safe encoder's actual preset dictionary size.
+  Encryption covers the ZIP-LZMA prefix as well as compressed bytes, including
+  the AES authentication checksum.
