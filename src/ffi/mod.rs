@@ -13,6 +13,7 @@ mod entry_link_resolver;
 mod read;
 mod read_open;
 pub(crate) mod write;
+mod write_filter;
 #[rustfmt::skip]
 mod stubs;
 pub(crate) mod charset;

@@ -30,6 +30,7 @@ use crate::entry::Entry;
 use crate::util::Error;
 use std::ffi::{CStr, c_int};
 
+pub mod filter;
 pub mod format;
 
 pub trait Sink {

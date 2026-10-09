@@ -35,139 +35,30 @@ pub extern "C" fn archive_read_extract_set_progress_callback(
     _user_data: *mut c_void,
 ) {}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_compression_bzip2(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_compression_compress(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_compression_gzip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_compression_lzip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_compression_lzma(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_compression_none(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_compression_program(
-    _a0: *mut Archive,
-    _cmd: *const c_char,
-) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_compression_xz(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter(_a0: *mut Archive, _filter_code: c_int) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_by_name(
-    _a0: *mut Archive,
-    _name: *const c_char,
-) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_b64encode(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_bzip2(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_compress(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_grzip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_gzip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_lrzip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_lz4(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_lzip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_lzma(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_lzop(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_none(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_program(
-    _a0: *mut Archive,
-    _cmd: *const c_char,
-) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_uuencode(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_xz(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_zstd(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format(_a0: *mut Archive, _format_code: c_int) -> c_int {
