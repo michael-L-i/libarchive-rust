@@ -53,7 +53,10 @@ Validation on Apple Silicon, 2026-10-09:
   the encoder corpus above, input/output chunks (1,31), (17,97), and
   (8192,65536), five truncations and six byte mutations per stream. Records
   include returned errors, consumed/produced counts and output hashes.
-  The 64 KiB dictionaries wrap on the larger cases.
+  The 64 KiB dictionaries wrap on the larger cases. Another 70 records
+  match across the small-files, 2 MiB text/random, and 16 MiB text/random
+  C-produced XZ archives with larger dictionaries; these exercise partial
+  initialization, growth between chunks and eventual dictionary wrap.
 - A decoder unit test compares lazy and fully initialized dictionaries
   through 72,000 match/literal/pending operations, dictionary wrap and resets.
   All 25 self-contained vendor unit tests pass. Eight upstream BCJ fixture
