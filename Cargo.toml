@@ -16,6 +16,14 @@ lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-dec
 xxhash-rust = { version = "0.8.19", default-features = false, features = ["xxh32"] }
 crabz2 = { version = "0.7.0", default-features = false }
 ruzstd = "0.9.0"
+md-5 = { version = "0.11", default-features = false, features = ["alloc"] }
+ripemd = { version = "0.2", default-features = false, features = ["alloc"] }
+sha1 = { version = "0.11", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.11", default-features = false, features = ["alloc"] }
+hmac = { version = "0.13", default-features = false }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+aes = { version = "0.9", default-features = false }
+xml = { version = "1.4.0", default-features = false }
 
 [build-dependencies]
 cc = "1"

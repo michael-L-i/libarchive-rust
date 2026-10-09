@@ -31,6 +31,7 @@
 //! `XzStream` and `LzmaStream` take the place of liblzma's `lzma_code`.
 
 use crate::archive::*;
+use crate::crc32::crc32;
 use crate::read::{Filter, FilterBidder, Read, Reader, Status, filter_code};
 use crate::util::Error;
 use lzma_rust2::{Action, LzmaStream, Status as Code, StreamResult, XzStream};
@@ -84,7 +85,7 @@ pub fn support_lzip(r: &mut Read, _: &Base) -> Result<Status, Error> {
 
 const OUT_BLOCK_SIZE: usize = 64 * 1024;
 /// Maximum decoder memory, including the dictionary.
-const MEM_LIMIT_KIB: u32 = 256 * 1024;
+pub(crate) const MEM_LIMIT_KIB: u32 = 256 * 1024;
 
 fn misc(msg: &str) -> Error {
     Error::fatal(ARCHIVE_ERRNO_MISC, msg)
@@ -99,35 +100,6 @@ fn failure(e: &io::Error) -> Error {
             return Error::fatal(libc::ENOMEM, "Lzma library error: Out of memory");
         }
         _ => "Lzma library error: Corrupted input data",
-    })
-}
-
-const CRC_TABLE: [u32; 256] = {
-    let mut table = [0; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xEDB8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-};
-
-/// The CRC-32 of lzip, continued from `crc` over `data`.
-fn crc32(crc: u32, data: &[u8]) -> u32 {
-    !data.iter().fold(!crc, |c, &b| {
-        CRC_TABLE
-            .get(usize::from((c as u8) ^ b))
-            .map_or(0, |t| t ^ (c >> 8))
     })
 }
 
@@ -255,13 +227,13 @@ fn lzip_has_member(up: &mut Reader<'_>) -> Result<c_int, Error> {
 
 /// The library's decoder: xz streams, or LZMA1 with a .lzma header, or the
 /// raw LZMA1 of a lzip member.
-enum Stream {
+pub(crate) enum Stream {
     Xz(Box<XzStream>),
     Lzma(Box<LzmaStream>),
 }
 
 impl Stream {
-    fn process(
+    pub(crate) fn process(
         &mut self,
         input: &[u8],
         out: &mut [u8],
