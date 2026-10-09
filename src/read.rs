@@ -164,7 +164,6 @@ impl Base {
     /// Records a warning, as `archive_set_error` before `return
     /// ARCHIVE_WARN`, and gives the status to return.
     #[must_use = "return the status so the warning reaches the caller"]
-    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn warn(&self, errno: c_int, msg: impl AsRef<[u8]>) -> Status {
         self.set_error(errno, Some(msg.as_ref()));
         Status::Warn
@@ -912,7 +911,6 @@ impl<'a> Reader<'a> {
     /// The handle, to record warnings and set the format. The reference does
     /// not borrow the reader, so it can be used while a `read_ahead` slice is
     /// held: take it first, `let a = r.base();`.
-    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn base(&self) -> &'a Base {
         self.a
     }
@@ -999,7 +997,6 @@ impl<'a> Reader<'a> {
     /// `__archive_read_consume`: moves the file pointer forward by `n`, which
     /// the reader should have looked at (or not) first. It is a fatal error
     /// for the stream to end first, or for `n` to be negative.
-    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn consume(&mut self, n: impl TryInto<i64>) -> Result<(), Error> {
         self.flush()?;
         self.consume_now(n)
@@ -1055,7 +1052,6 @@ impl<'a> Reader<'a> {
     /// skip where it has one, and returns how far it moved: less than `n`
     /// only at the end of the stream. `consume` is this with the end of the
     /// stream being an error.
-    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn skip(&mut self, n: i64) -> Result<i64, Error> {
         self.flush()?;
         if n < 0 {

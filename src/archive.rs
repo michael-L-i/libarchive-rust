@@ -33,14 +33,10 @@ use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, c_int};
 use std::sync::{Arc, Mutex};
 
-#[allow(dead_code)] // reported by the readers (phase 1d)
 pub const ARCHIVE_EOF: c_int = 1;
 pub const ARCHIVE_OK: c_int = 0;
-#[allow(dead_code)] // reported by the readers (phase 1d)
 pub const ARCHIVE_RETRY: c_int = -10;
-#[allow(dead_code)] // reported by the readers (phase 1d)
 pub const ARCHIVE_WARN: c_int = -20;
-#[allow(dead_code)] // reported by the readers (phase 1d)
 pub const ARCHIVE_FAILED: c_int = -25;
 pub const ARCHIVE_FATAL: c_int = -30;
 
