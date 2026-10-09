@@ -127,9 +127,12 @@ def compare(path):
 
 def main():
     ap = argparse.ArgumentParser(description="Compare upstream and port bsdcat on upstream's fixtures.")
+    ap.add_argument("-j", type=int, default=os.cpu_count() or 1, help="parallel jobs")
     ap.add_argument("-v", "--verbose", action="store_true", help="list every non-same fixture")
     ap.add_argument("globs", nargs="*", metavar="GLOB", help="fnmatch globs on fixture filenames")
     a = ap.parse_args()
+    if a.j < 1:
+        die("-j must be at least 1")
     for prog in (ORACLE, PORT):
         if not os.access(prog, os.X_OK):
             die(f"missing {prog}; run scripts/build-oracle and scripts/build-port")
@@ -138,7 +141,7 @@ def main():
     if not fixtures:
         die("no fixtures match " + " ".join(a.globs))
     fixtures.sort()
-    with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as ex:
+    with ThreadPoolExecutor(max_workers=a.j) as ex:
         verdicts = list(ex.map(lambda f: compare(f[2]), fixtures))
     filters = [detect(path) for _, _, path in fixtures]
     results = [(label, cls, why, filt) for (label, _, _), (cls, why), filt in zip(fixtures, verdicts, filters)]
