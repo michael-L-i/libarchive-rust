@@ -13,6 +13,7 @@ mod entry_strmode;
 mod entry_xattr;
 mod ffi;
 mod options;
+mod pack_dev;
 mod read;
 mod read_add_passphrase;
 mod read_append_filter;
