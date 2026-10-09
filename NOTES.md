@@ -1045,8 +1045,9 @@ Differences:
   `ARCHIVE_ERRNO_MISC`, and "XML Parsing error: " and a message, but the text
   is the crate's, with a position (`1:61 Unexpected token: <`), not
   libxml2's (`Extra content at the end of the document\n`). The depth limit is
-  libxml2's 256 (the message is its text), and so are its limits on a text node
-  or attribute value (10,000,000 bytes) and a name (50,000).
+  libxml2's: 257 nested elements are accepted and the 258th is an error (the
+  message is its text). libxml2's limits on a text node, an attribute value
+  and a name are not mirrored.
 - What the two parsers accept differs, and the fixtures and a differential
   run of 7,300 mutated archives found these (all else on the same path, in
   error codes and entries, matched):
@@ -1086,29 +1087,45 @@ Differences:
   the number and the sizes of the blocks that `archive_read_data_block`
   returns differ from upstream for bzip2, xz, lzma and (a little) gzip
   entries. The bytes and the sizes in total are the same.
-- A decoder can hold output back after it has taken the last of the packed
-  bytes: bzlib decodes a whole block before it returns any, and miniz_oxide's
-  window fills before it is flushed. Upstream stops when the packed bytes
-  are used up, so output held back is lost ("Decompressed size error" for an
-  entry larger than the 64 KiB output buffer). Here the held output is read
-  out and handed on first, by the entry or the TOC, before the end is
-  decided. When no output is held back (zlib and liblzma decode only as far
-  as the output goes) this changes nothing.
+- lzma-rust2's streams can hold decoded bytes back after they have taken the
+  last of the packed bytes (liblzma decodes only as far as the output goes,
+  and zlib and libbz2 deliver everything they have decoded). Upstream would
+  stop when the packed bytes are used up, so here the held output is read out
+  and handed on first, by the entry or the TOC, before the end is decided.
+  With it gzip, bzip2 and xz entries are unchanged and lzma-alone entries
+  match upstream.
+- Corrupt xz and lzma data differs from liblzma, as in the xz filter. xz with 8
+  bytes of garbage after the stream succeeds upstream and fails here with
+  code 9, losing the entry's output. lzma with 2 bytes of garbage fails
+  upstream with code 11 after the data is delivered and succeeds here. An lzma
+  stream cut short by one byte or more delivers everything upstream and fails
+  here with "Decompressed size error". A cut xz stream delivers 1580 bytes
+  upstream and 1561 here in the case tried. A stream of the wrong format gives
+  code 9 or 5 here and 7 in liblzma. Dictionaries of 256 MiB or more decode
+  upstream (no limit) and fail here with code 5.
+- xml-rs accepts `<?xml version="1.1"?>`, which libxml2 rejects with
+  "Unsupported version '1.1'".
 - A read callback that returns no bytes but used some input is the end of the
   TOC to libxml2, which stops reading it. The TOC is read on here until
   bytes arrive.
-- Bounds (upstream has none): the TOC may be at most 256 MiB uncompressed
-  ("Rejecting malformed xar archive: TOC exceeds 256 megabytes"), have at most
-  2^20 files and extended attributes together, and a pathname at most 1 MiB;
-  all of these are `ENOMEM` errors. The depth is 256. A checksum size over 64
+- Bounds (upstream has none): the TOC may be at most 1 GiB uncompressed
+  ("Rejecting malformed xar archive: TOC exceeds 1 gigabyte", `ARCHIVE_ERRNO_MISC`).
+  Its job is to bound what xml-rs buffers, which it does not limit itself (a
+  CDATA section, say); the memory for files and xattrs is in proportion to the
+  TOC bytes present, so it is bounded by this too. A pathname is at most 1 MiB
+  (`ENOMEM`). Each file keeps its own name and its parent, and the pathname is
+  put together when the entry is returned (and so is a hardlink's target), so
+  deep nesting does not copy a parent's pathname into every file; the length
+  check is made then, and not while the TOC is read. A checksum size over 64
   in the TOC is a read of that length and "Checksum error". The declared
   uncompressed size of the TOC is only compared with what was read, at the
-  end, as upstream; a TOC beyond the 256 MiB cap fails before that.
+  end, as upstream.
 - Offsets: a seek back that the input cannot do is "Cannot seek"
   (`ARCHIVE_FAILED`), as upstream; any other failure of the seek (upstream
   goes on with the offset set to the error code) fails with it.
-- A file with no name has no pathname in the entry (upstream's string is
-  NULL and the entry's is cleared). Entry fields are set where upstream sets
+- A file with no `name` element has no pathname in the entry (upstream's
+  string is NULL and the entry's is cleared); one whose name decodes to nothing
+  has the empty pathname, as upstream. Entry fields are set where upstream sets
   them, and the format and its name only when the TOC has been read.
 - `xmlCleanupParser()` after every TOC has no counterpart.
 - The unsafe footprint of what the reader adds is nil: `xml` forbids

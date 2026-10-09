@@ -59,8 +59,10 @@ const CKSUM_SHA512: u32 = 4;
 const MAX_SUM_SIZE: usize = 64;
 const OUTBUFF_SIZE: usize = 1024 * 64;
 
-/// The largest TOC (decompressed) that is read. Upstream has no limit.
-const MAX_TOC_SIZE: u64 = 256 << 20;
+/// The largest TOC (decompressed) that is read. Upstream has no limit; this
+/// bounds what the XML parser buffers, which it does not limit itself (a CDATA
+/// section, say).
+const MAX_TOC_SIZE: u64 = 1 << 30;
 
 #[derive(Clone, Copy, Default, PartialEq)]
 enum Enc {
@@ -270,12 +272,12 @@ impl Codec {
         }
     }
 
-    /// Drains what the decoder holds back once all the input is used: zlib
-    /// and liblzma decode only as far as the output goes, but these
-    /// decoders may take input ahead of the output they have room for.
-    fn drain(&mut self, into: &mut Vec<u8>) {
-        let mut scratch = vec![0; OUTBUFF_SIZE];
-        while let Ok((_, produced)) = self.decompress(&[], &mut scratch, true) {
+    /// Drains what the decoder holds back once all the input is used:
+    /// lzma-rust2's streams keep decoded bytes that did not fit the output,
+    /// which liblzma does not.
+    fn drain(&mut self, into: &mut Vec<u8>, scratch: &mut Vec<u8>) {
+        scratch.resize(OUTBUFF_SIZE, 0);
+        while let Ok((_, produced)) = self.decompress(&[], scratch, true) {
             if produced == 0 {
                 break;
             }
@@ -316,6 +318,7 @@ struct Contents {
     /// Decoded data that did not fit the output, from `pending_pos` on.
     pending: Vec<u8>,
     pending_pos: usize,
+    scratch: Vec<u8>,
 }
 
 impl Contents {
@@ -347,6 +350,7 @@ impl Contents {
             outbuff,
             pending,
             pending_pos,
+            scratch,
         } = self;
         let internal = out.is_none();
         let out: &'x mut [u8] = match out {
@@ -406,7 +410,7 @@ impl Contents {
 
         // The decoder may hold output back when its input is all used.
         if used == bytes && size == out.len() {
-            codec.drain(pending);
+            codec.drain(pending, scratch);
         }
         Ok((used, data, *pending_pos < pending.len()))
     }
@@ -443,7 +447,7 @@ impl io::Read for TocSource<'_, '_> {
             *self.offset = self.offset.wrapping_add(used as u64);
             *self.total += size as u64;
             if *self.total > MAX_TOC_SIZE {
-                let msg = "Rejecting malformed xar archive: TOC exceeds 256 megabytes";
+                let msg = "Rejecting malformed xar archive: TOC exceeds 1 gigabyte";
                 return Err(self.fail(Error::fatal(ARCHIVE_ERRNO_MISC, msg)));
             }
             // A decoder that only took the start of the input would look
@@ -558,7 +562,7 @@ impl Format for Xar {
         }
 
         let file = loop {
-            let Some(file) = self.toc.next_file() else {
+            let Some(file) = self.toc.next_file()? else {
                 self.end_of_file = true;
                 return Ok(Status::Eof);
             };
@@ -611,7 +615,7 @@ impl Format for Xar {
             );
         }
         entry.set_mode(file.mode);
-        if !file.pathname.is_empty() {
+        if file.has & toc::HAS_PATHNAME != 0 {
             let failed = entry.copy_pathname_l(&file.pathname, sconv).is_err();
             convert("Pathname", &mut status, failed);
         }

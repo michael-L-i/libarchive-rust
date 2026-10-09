@@ -32,15 +32,9 @@ pub(super) const HAS_CTIME: u32 = 0x08000;
 pub(super) const HAS_MTIME: u32 = 0x10000;
 pub(super) const HAS_ATIME: u32 = 0x20000;
 
-/// The deepest nesting of elements libxml2 parses without its huge option.
-const MAX_DEPTH: usize = 256;
-/// libxml2's limits on a text node or attribute value, and on a name, without
-/// its huge option.
-const MAX_TEXT: usize = 10_000_000;
-const MAX_NAME: usize = 50_000;
-/// The most files and extended attributes a TOC may have. Upstream has no
-/// limit.
-const MAX_ITEMS: usize = 1 << 20;
+/// The deepest nesting of elements libxml2 accepts without its huge option
+/// (it rejects the 258th level).
+const MAX_DEPTH: usize = 257;
 /// The longest pathname that is built. Upstream has no limit.
 const MAX_PATHNAME: usize = 1 << 20;
 
@@ -87,6 +81,8 @@ pub(super) struct XarFile {
     link: u32,
     pub nlink: u32,
     pub hardlink: Vec<u8>,
+    /// The original that this file is a hardlink to.
+    hardlink_of: Option<usize>,
     pub xattrs: Vec<Xattr>,
 }
 
@@ -122,9 +118,22 @@ impl XarFile {
             link: 0,
             nlink: 1,
             hardlink: Vec::new(),
+            hardlink_of: None,
             xattrs: Vec::new(),
         }
     }
+}
+
+/// The pathname of a file is built when its entry is made: its parent's
+/// pathname as it was when the name was read, a `/`, and its own name. Copying
+/// the parent's pathname into each file would cost memory in proportion to
+/// depth times files.
+#[derive(Default)]
+struct Name {
+    own: Vec<u8>,
+    /// `Some` if the parent's pathname and a `/` come first: the parent, if
+    /// it had a name by then.
+    prefix: Option<Option<usize>>,
 }
 
 /// Hardlinked files that name a link id.
@@ -304,14 +313,14 @@ pub(super) struct Toc {
     pub chksum_size: u64,
 
     files: Vec<XarFile>,
+    /// The pathname of each file, in `files` order, as parts.
+    names: Vec<Name>,
     /// A heap of files by id.
     queue: Vec<usize>,
     /// The file being read.
     file: Option<usize>,
     /// The extended attribute being read, of `file`.
     xattr: Option<usize>,
-    /// The number of files and extended attributes.
-    items: usize,
     /// The originals of hardlinks, as a list linked by `hdnext`.
     hdlink_orgs: Option<usize>,
     hdlinks: HashMap<u32, Hdlink>,
@@ -323,9 +332,6 @@ impl Toc {
         let mut reader = ParserConfig::new()
             .ignore_comments(false)
             .allow_multiple_root_elements(false)
-            .max_data_length(MAX_TEXT)
-            .max_attribute_length(MAX_TEXT)
-            .max_name_length(MAX_NAME)
             .create_reader(BufReader::new(source));
         let mut depth = 0usize;
         loop {
@@ -417,13 +423,25 @@ impl Toc {
         }
     }
 
-    /// The next file by id.
-    pub fn next_file(&mut self) -> Option<XarFile> {
-        let idx = self.heap_get()?;
-        Some(std::mem::replace(
-            self.files.get_mut(idx)?,
-            XarFile::new(0, None),
-        ))
+    /// The next file by id, with its pathname and the pathname of the
+    /// original if it is a hardlink.
+    pub fn next_file(&mut self) -> Result<Option<XarFile>, Error> {
+        let Some(idx) = self.heap_get() else {
+            return Ok(None);
+        };
+        let pathname = self.full_path(idx)?;
+        let original = self.files.get(idx).and_then(|f| f.hardlink_of);
+        let hardlink = match original {
+            Some(i) => self.full_path(i)?,
+            None => Vec::new(),
+        };
+        let Some(slot) = self.files.get_mut(idx) else {
+            return Ok(None);
+        };
+        let mut file = std::mem::replace(slot, XarFile::new(0, None));
+        file.pathname = pathname;
+        file.hardlink = hardlink;
+        Ok(Some(file))
     }
 
     /// Connect hardlinked files.
@@ -444,7 +462,6 @@ impl Toc {
             else {
                 continue;
             };
-            let pathname = file.pathname.clone();
             let nlink = hdlink.cnt + 1;
             if let Some(f) = self.files.get_mut(i) {
                 f.nlink = nlink as u32;
@@ -456,7 +473,7 @@ impl Toc {
                 .filter(|_| left > 0)
             {
                 f2.nlink = nlink as u32;
-                f2.hardlink.clone_from(&pathname);
+                f2.hardlink_of = Some(i);
                 next = f2.hdnext;
                 left -= 1;
             }
@@ -480,17 +497,6 @@ impl Toc {
         }
     }
 
-    fn count_item(&mut self) -> Result<(), Error> {
-        self.items += 1;
-        if self.items > MAX_ITEMS {
-            return Err(Error::fatal(
-                libc::ENOMEM,
-                "Rejecting malformed xar archive: too many files",
-            ));
-        }
-        Ok(())
-    }
-
     /// `file_new`.
     fn file_new(&mut self, attrs: &[(&str, &str)]) -> Result<(), Error> {
         self.xattr = None;
@@ -500,8 +506,8 @@ impl Toc {
                 id = atou64(value.as_bytes(), 10).ok_or_else(failed)?;
             }
         }
-        self.count_item()?;
         self.files.push(XarFile::new(id, self.file));
+        self.names.push(Name::default());
         self.file = self.files.len().checked_sub(1);
         if let Some(idx) = self.file {
             self.heap_add(idx);
@@ -517,7 +523,6 @@ impl Toc {
                 id = atou64(value.as_bytes(), 10).ok_or_else(failed)?;
             }
         }
-        self.count_item()?;
         let Some(file) = self.cur() else {
             return Ok(());
         };
@@ -721,6 +726,63 @@ impl Toc {
         }
     }
 
+    /// Sets the name of a file, once.
+    fn set_name(&mut self, idx: usize, s: &[u8], base64: bool) -> Result<(), Error> {
+        let Some(file) = self.files.get_mut(idx) else {
+            return Ok(());
+        };
+        if file.has & HAS_PATHNAME != 0 {
+            return Ok(());
+        }
+        file.has |= HAS_PATHNAME;
+        let parent = file.parent;
+        let prefix = parent.map(|p| {
+            Some(p).filter(|&p| self.files.get(p).is_some_and(|f| f.has & HAS_PATHNAME != 0))
+        });
+        let Some(name) = self.names.get_mut(idx) else {
+            return Ok(());
+        };
+        name.prefix = prefix;
+        if base64 {
+            strappend_base64(&mut name.own, s);
+        } else {
+            strncat(&mut name.own, s);
+        }
+        Ok(())
+    }
+
+    /// The pathname of a file, or an error if it is too long.
+    fn full_path(&self, idx: usize) -> Result<Vec<u8>, Error> {
+        let mut chain = Vec::new();
+        let mut next = Some(idx);
+        let mut len = 0usize;
+        while let Some(name) = next.and_then(|i| self.names.get(i)) {
+            chain.push(name);
+            len = len.saturating_add(name.own.len());
+            next = match name.prefix {
+                Some(parent) => {
+                    len = len.saturating_add(1);
+                    parent
+                }
+                None => None,
+            };
+            if len > MAX_PATHNAME {
+                return Err(Error::fatal(
+                    libc::ENOMEM,
+                    "Rejecting malformed xar archive: pathname exceeds 1 megabyte",
+                ));
+            }
+        }
+        let mut path = Vec::with_capacity(len);
+        for name in chain.iter().rev() {
+            if name.prefix.is_some() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(&name.own);
+        }
+        Ok(path)
+    }
+
     /// `xml_data`: the text of an element.
     #[allow(clippy::unnecessary_cast)] // dev_t and mode_t vary by platform
     fn data(&mut self, s: &[u8]) -> Result<(), Error> {
@@ -734,43 +796,16 @@ impl Toc {
         let Some(idx) = self.file else {
             return Ok(());
         };
-        let parent_path = match sts {
-            FileName => self
-                .files
-                .get(idx)
-                .and_then(|f| f.parent)
-                .and_then(|p| self.files.get(p))
-                .map(|p| p.pathname.clone()),
-            _ => None,
-        };
         // The extended attribute of the file, for the states inside one.
         let xattr = self.xattr;
+        if sts == FileName {
+            return self.set_name(idx, s, base64);
+        }
         let Some(file) = self.files.get_mut(idx) else {
             return Ok(());
         };
         let num = |base| atou64(s, base).ok_or_else(failed);
         match sts {
-            FileName => {
-                if file.has & HAS_PATHNAME != 0 {
-                    return Ok(());
-                }
-                if let Some(parent) = parent_path {
-                    file.pathname.extend_from_slice(&parent);
-                    file.pathname.push(b'/');
-                }
-                file.has |= HAS_PATHNAME;
-                if base64 {
-                    strappend_base64(&mut file.pathname, s);
-                } else {
-                    strncat(&mut file.pathname, s);
-                }
-                if file.pathname.len() > MAX_PATHNAME {
-                    return Err(Error::fatal(
-                        libc::ENOMEM,
-                        "Rejecting malformed xar archive: pathname exceeds 1 megabyte",
-                    ));
-                }
-            }
             FileLink => {
                 file.has |= HAS_SYMLINK;
                 strncpy(&mut file.symlink, s);
@@ -1151,7 +1186,7 @@ mod tests {
             </toc></xar>")
         .unwrap();
         let mut names = Vec::new();
-        while let Some(f) = toc.next_file() {
+        while let Some(f) = toc.next_file().unwrap() {
             names.push((f.pathname, f.subdirs, f.nlink, f.hardlink));
         }
         assert_eq!(
@@ -1167,12 +1202,31 @@ mod tests {
     }
 
     #[test]
+    fn a_name_that_decodes_to_nothing_is_still_a_name() {
+        let mut toc = toc(
+            "<xar><toc><file id='1'><name enctype='base64'>AAAA</name></file>\
+            <file id='2'><type>file</type></file></toc></xar>",
+        )
+        .unwrap();
+        let (a, b) = (
+            toc.next_file().unwrap().unwrap(),
+            toc.next_file().unwrap().unwrap(),
+        );
+        assert_eq!(
+            (a.has & HAS_PATHNAME, &a.pathname[..]),
+            (HAS_PATHNAME, &b""[..])
+        );
+        assert_eq!(b.has & HAS_PATHNAME, 0);
+    }
+
+    #[test]
     fn xml_errors_and_limits() {
         assert!(toc("<xar><toc></xar>").is_err());
         assert!(toc("").is_err());
         assert!(toc("<xar/><xar/>").is_err());
-        let deep = "<a>".repeat(257);
-        let e = toc(&deep).err().map(|e| e.msg);
+        let nested = |n: usize| format!("{}{}", "<a>".repeat(n), "</a>".repeat(n));
+        assert!(toc(&nested(257)).is_ok());
+        let e = toc(&nested(258)).err().map(|e| e.msg);
         assert_eq!(
             e.as_deref(),
             Some(
