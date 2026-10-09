@@ -168,7 +168,7 @@ impl Crypto {
 
     /// Decrypts bytes that are consumed as they are read, with no
     /// buffering, and updates the HMAC (zstd).
-    pub fn decrypt_in_place_of(&mut self, raw: &[u8], out: &mut [u8]) -> usize {
+    pub fn decrypt_into(&mut self, raw: &[u8], out: &mut [u8]) -> usize {
         if self.hmac_valid
             && let Some(h) = &mut self.hmac
         {

@@ -1743,6 +1743,209 @@ pub(super) mod tests {
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 
+    /// A zip file of the given entries: a stored and a deflated one, the
+    /// second with its sizes after the data, as streaming writers do. The
+    /// central directory has the real values.
+    fn zip_file(entries: &[(&[u8], &[u8], bool)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for &(name, plain, deflate) in entries {
+            let packed = if deflate {
+                miniz_oxide::deflate::compress_to_vec(plain, 6)
+            } else {
+                plain.to_vec()
+            };
+            let crc = crate::crc32::crc32(0, plain);
+            let (method, flags) = (
+                if deflate { 8u16 } else { 0 },
+                if deflate { 8u16 } else { 0 },
+            );
+            let offset = out.len() as u32;
+            let mut local = b"PK\x03\x04".to_vec();
+            local.extend([20, 0]);
+            local.extend(flags.to_le_bytes());
+            local.extend(method.to_le_bytes());
+            local.extend([0, 0, 0x21, 0]);
+            if deflate {
+                local.extend([0; 12]);
+            } else {
+                local.extend(crc.to_le_bytes());
+                local.extend((packed.len() as u32).to_le_bytes());
+                local.extend((plain.len() as u32).to_le_bytes());
+            }
+            local.extend((name.len() as u16).to_le_bytes());
+            local.extend([0, 0]);
+            local.extend(name);
+            out.extend(local);
+            out.extend(&packed);
+            if deflate {
+                out.extend(b"PK\x07\x08");
+                out.extend(crc.to_le_bytes());
+                out.extend((packed.len() as u32).to_le_bytes());
+                out.extend((plain.len() as u32).to_le_bytes());
+            }
+            central.extend(b"PK\x01\x02");
+            central.extend([20, 3, 20, 0]);
+            central.extend(flags.to_le_bytes());
+            central.extend(method.to_le_bytes());
+            central.extend([0, 0, 0x21, 0]);
+            central.extend(crc.to_le_bytes());
+            central.extend((packed.len() as u32).to_le_bytes());
+            central.extend((plain.len() as u32).to_le_bytes());
+            central.extend((name.len() as u16).to_le_bytes());
+            central.extend([0; 8]);
+            central.extend((0o100644u32 << 16).to_le_bytes());
+            central.extend(offset.to_le_bytes());
+            central.extend(name);
+        }
+        let cd_offset = out.len() as u32;
+        out.extend(&central);
+        out.extend(b"PK\x05\x06");
+        out.extend([0; 4]);
+        out.extend((entries.len() as u16).to_le_bytes().repeat(2));
+        out.extend((central.len() as u32).to_le_bytes());
+        out.extend(cd_offset.to_le_bytes());
+        out.extend([0, 0]);
+        out
+    }
+
+    /// An entry of a zip file as read: its name, size, format name and data,
+    /// or the error of the failed read.
+    type ZipEntryRead = Result<(String, i64, String, Vec<u8>), String>;
+
+    /// Reads every entry of a zip file the way an application would, as
+    /// (name, size, format name, data) or the error of the failed read.
+    fn read_zip(
+        export: extern "C" fn(*mut Archive) -> c_int,
+        data: &[u8],
+        block: usize,
+    ) -> Vec<ZipEntryRead> {
+        let a = archive_read_new();
+        assert_eq!(export(a), ARCHIVE_OK);
+        assert_eq!(
+            crate::ffi::read_open::archive_read_open_memory2(
+                a,
+                data.as_ptr().cast(),
+                data.len(),
+                block
+            ),
+            ARCHIVE_OK
+        );
+        let mut seen = Vec::new();
+        let mut e: *mut ArchiveEntry = std::ptr::null_mut();
+        while archive_read_next_header(a, &mut e) == ARCHIVE_OK {
+            // SAFETY: the library returns NUL-terminated strings.
+            let name = unsafe { CStr::from_ptr(crate::ffi::entry::archive_entry_pathname(e)) };
+            let format = unsafe { CStr::from_ptr(crate::ffi::archive::archive_format_name(a)) };
+            let size = crate::ffi::entry::archive_entry_size(e);
+            let (name, format) = (
+                name.to_string_lossy().into_owned(),
+                format.to_string_lossy().into_owned(),
+            );
+            let mut body = vec![0u8; 100_000];
+            let n = archive_read_data(a, body.as_mut_ptr().cast(), body.len());
+            seen.push(if n < 0 {
+                Err(error(a).unwrap_or_default())
+            } else {
+                body.truncate(n as usize);
+                Ok((name, size, format, body))
+            });
+        }
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+        seen
+    }
+
+    /// Reads what there is of a damaged zip file, ignoring every failure.
+    fn read_zip_unchecked(export: extern "C" fn(*mut Archive) -> c_int, data: &[u8]) {
+        let a = archive_read_new();
+        export(a);
+        let _ = crate::ffi::read_open::archive_read_open_memory2(
+            a,
+            data.as_ptr().cast(),
+            data.len(),
+            100,
+        );
+        let mut e: *mut ArchiveEntry = std::ptr::null_mut();
+        let mut body = vec![0u8; 1000];
+        while archive_read_next_header(a, &mut e) == ARCHIVE_OK {
+            while archive_read_data(a, body.as_mut_ptr().cast(), body.len()) > 0 {}
+        }
+        let _ = archive_free(a);
+    }
+
+    #[test]
+    fn zip_reads_stored_and_deflated_entries_in_both_modes() {
+        let text = b"hello, zip. ".repeat(50);
+        let file = zip_file(&[(b"a.txt", b"hello", false), (b"dir/b.txt", &text, true)]);
+        let want: Vec<(&str, &str, &[u8])> = vec![
+            ("a.txt", "ZIP 2.0 (uncompressed)", b"hello"),
+            ("dir/b.txt", "ZIP 2.0 (deflation)", &text),
+        ];
+        for export in [
+            archive_read_support_format_zip_streamable,
+            archive_read_support_format_zip_seekable,
+            archive_read_support_format_zip,
+            archive_read_support_format_all,
+        ] {
+            for block in [7, 10240] {
+                let got = read_zip(export, &file, block);
+                let got: Vec<_> = got
+                    .iter()
+                    .map(|g| {
+                        let (name, _, format, body) = g.as_ref().unwrap();
+                        (name.as_str(), format.as_str(), body.as_slice())
+                    })
+                    .collect();
+                assert_eq!(got, want);
+            }
+        }
+    }
+
+    #[test]
+    fn zip_reports_a_bad_crc_and_goes_on() {
+        let mut file = zip_file(&[(b"a.txt", b"hello", false), (b"b.txt", b"world", false)]);
+        // The first entry's data is the first thing after its 35 byte header.
+        file[35] ^= 1;
+        for export in [
+            archive_read_support_format_zip_streamable,
+            archive_read_support_format_zip_seekable,
+        ] {
+            let got = read_zip(export, &file, 10240);
+            assert_eq!(got.len(), 2);
+            assert!(
+                got[0]
+                    .as_ref()
+                    .is_err_and(|e| e.starts_with("ZIP bad CRC: 0x"))
+            );
+            assert_eq!(got[1].as_ref().unwrap().3, b"world");
+        }
+    }
+
+    #[test]
+    fn zip_truncated_or_damaged_anywhere_fails_cleanly() {
+        let text = b"hello, zip. ".repeat(50);
+        let file = zip_file(&[(b"a.txt", b"hello", false), (b"b/c.txt", &text, true)]);
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for cut in 0..file.len() {
+            let mut damaged = file[..cut].to_vec();
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if !damaged.is_empty() {
+                let at = (x as usize) % damaged.len();
+                damaged[at] = (x >> 32) as u8;
+            }
+            for data in [&file[..cut], &damaged[..]] {
+                for export in [
+                    archive_read_support_format_zip_streamable,
+                    archive_read_support_format_zip_seekable,
+                ] {
+                    read_zip_unchecked(export, data);
+                }
+            }
+        }
+    }
+
     #[test]
     fn cpio_symlink_body_is_exactly_its_size() {
         // An odc symlink whose one-byte body is directly followed by the

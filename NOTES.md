@@ -898,3 +898,122 @@ one; see the first entry.
   memory is not available (`try_reserve`).
 - Only the decoding side is ported: `Ppmd7z_RangeEnc_*` and
   `Ppmd7_EncodeSymbol` wait for the 7zip writer.
+
+## zip reader (`src/read/format/zip.rs`)
+
+The streamable and seekable readers are one type, `Zip<SEEKABLE>`, so both
+register (`register_format` tells formats apart by type). `zip/extra.rs` has
+the entry record and the extra fields, `zip/crypto.rs` the decryption, and
+`zip/zipx.rs` the compression methods other than stored and deflate.
+
+### Ported as-is
+
+- `process_extra` compares the central directory's `local_header_offset`
+  with 0xffffffff after `slurp_central_directory` has added the correction for
+  data before the archive. With such data a zip64 offset is never read from
+  the extra field.
+- The extra fields of the central directory are given the archive entry, so
+  an Info-ZIP Unicode Path field there sets its pathname (the next local
+  header sets it again). With several entries the CRC check of the field is
+  made against the name the previous one left.
+- `consume_end_of_file_marker` tests the second word of the descriptor for
+  zero (AE-1 may write a zero CRC32) in the two layouts that have no PK78
+  marker, where that word is not the CRC32.
+- A compressed symlink target is read by the deflate or lzma reader, which
+  consumes its data, and then `zip_read_local_file_header` consumes
+  `compressed_size` bytes again. The streamable reader then skips that much
+  of what follows.
+- A zstd entry whose frame ends with the 128 KiB output buffer exactly full
+  does not end: the next read finds no input left and fails with "Truncated
+  zstd file body".
+- PPMd's entry bytes remaining do not count the 2 header bytes and what the
+  range decoder reads at the start, so skipping a half-read streamed PPMd
+  entry consumes that much too few.
+- Strong encryption: `read_decryption_header` masks the flags with 0xf000 and
+  compares them with 1, 2 and 3, so every entry fails with "Unknown
+  encryption flag". The rest of that function never runs and is not ported.
+- An archive with no entries has no `zip_entries`, so the seekable reader
+  reads the central directory again at each header.
+- `mac-ext` is on by default only where upstream has `copyfile.h` (Apple);
+  the streamable reader ignores it.
+- The version byte in the format name ("ZIP 2.0 (deflation)") is a `char`:
+  signed here, as on x86 and Apple arm.
+- A mac metadata entry whose local header can't be sized passes the failure
+  code to `__archive_read_consume`, which fails and is ignored; the data is
+  then read from the wrong place.
+
+### Differences
+
+- Deflate is miniz_oxide in raw mode (see the gzip filter). Corrupt data it
+  accepts and zlib rejects ("invalid distance too far back") is read as zeros
+  instead of "ZIP decompression failed (-3)"; the entry then fails its CRC or
+  size check, or its AES authentication code. zlib's `Z_BUF_ERROR` (no
+  progress possible) is rebuilt from the byte counts. This is the cause of
+  almost all differences found on damaged archives.
+- Differential run against upstream (`bsdcat`-style probe, entries, data
+  hashes, return codes and messages, streamable, seekable and `all`, block
+  sizes 7 and 10240, right and wrong passphrases): all 72 zip fixtures of the
+  test suite, then 2232 mutated or truncated copies. Valid archives are
+  identical except the two noted below. On damaged ones, the differences
+  found are all in the decompressors:
+  - deflate, as above;
+  - bzip2: upstream hands out the part of a corrupt block that it has
+    decoded before failing; the block decoder here fails the whole block;
+  - zstd: libzstd fails after the blocks before the damage were handed out,
+    and sometimes has the CRC check find damage that ruzstd's parser rejects
+    (or the other way round);
+  - lzma and xz: with damaged data the decoders stop at different places
+    (see below).
+- Of the valid archives, `test_read_format_zip_lzma_alone_leak.zipx`, a fuzzed
+  file, differs: the LZMA data is 12 bytes that liblzma decodes to 57
+  bytes of garbage with no end marker, and lzma-rust2 produces none because
+  it holds back the end of the input.
+- LZMA (method 14) is lzma-rust2's `LzmaStream`, which needs the input after
+  the last symbol to decode it. Given the uncompressed size liblzma never
+  gets, it stops there. So when the compressed size is known the decoder is
+  told the declared uncompressed size, an end marker is not read, and after
+  all the entry's data has been taken the decoder is called once with no
+  input to drain what it holds. With the size unknown (length at end), the
+  stream needs its end marker. The `avail_out` cap upstream computes as
+  `uncompressed_size - read` can be negative (after a size error) and is
+  then cast to a huge `size_t`, which writes past the buffer; here it is
+  zero. liblzma's `LZMA_BUF_ERROR` (a second call with no progress) is
+  rebuilt, and the memory limit (576 MiB) is checked on the dictionary size
+  from the header, plus 32 KiB for the tables.
+- xz (method 95): the limit is 1 GiB instead of none, so that a block header
+  can't ask for 4 GiB. A stream over it fails with "xz unknown error (6)".
+- zstd (method 93): ruzstd pulls the compressed bytes it needs through the
+  decryption and the entry's limit, instead of being pushed a buffer. It
+  consumes whole blocks, so the data may all be consumed while output is
+  still held, which upstream's checks for an empty input have to allow. A
+  skippable frame inside the entry is an error here, which libzstd skips,
+  and a frame header with the reserved bit set is accepted, which libzstd
+  rejects. The window limit is libzstd's 128 MiB.
+- bzip2 (method 12) is `crabz2` through the shared streaming decoder, which
+  asks for more input than the stream has when it is cut short; the
+  decryption buffer grows to hold what it asks for (3 MiB at most), and
+  `last` is given when the entry's data or the file ends.
+- PPMd: one `Ppmd8` lives as long as the reader, as upstream's `struct zip`
+  does, so the escape estimate carries from entry to entry. The memory
+  (up to 256 MiB) is allocated fallibly.
+- `archive_read_data_block` sets `size` to the data of a failed block
+  (a wrong CRC, a size over the declared one) upstream, and 0 here; the
+  data is not returned with the error.
+- A negative number of compressed bytes left (a PPMd entry, say) makes
+  upstream's stored reader compute a negative length; here the read fails
+  with "Truncated ZIP file data". The decryption buffer is allocated
+  fallibly.
+- `compat-2x` does nothing: upstream only sets a flag that, off Windows,
+  changes nothing (there is no default name conversion to switch).
+- Not ported: the `DEBUG` prints, the `#if 0` key derivation, and
+  `zip_read_decryption_header`'s tail (see above). The cryptor errors "lack
+  of crypto library" cannot happen, and the messages for the `None` cases
+  are kept.
+- The tests that need the zip writer or `archive_read_extract` (phase 5)
+  can't pass yet: `test_read_format_zip` (2 assertions on extraction),
+  `test_compat_zip_3`, `test_read_format_zip_high_compression2`,
+  `test_zip_filename_encoding_UTF8`, `test_read_format_zip_traditional_
+  encryption_data`, `test_read_format_zip_winzip_aes{128,256,256_stored,
+  256_large*}`, and the `zipx_*_encrypted` and `deflate_encrypted` tests with
+  their `_streaming` forms, `ppmd8_aes256_streaming`. The probe covers
+  their fixtures (and the unzip suite passes in full).

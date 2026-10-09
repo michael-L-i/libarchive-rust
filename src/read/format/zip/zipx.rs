@@ -45,11 +45,15 @@ use std::io::{self, ErrorKind};
 /// liblzma's return codes, which its messages print.
 const LZMA_OK: i32 = 0;
 const LZMA_STREAM_END: i32 = 1;
-const LZMA_MEM_ERROR: i32 = 5;
+const LZMA_MEMLIMIT_ERROR: i32 = 6;
 const LZMA_FORMAT_ERROR: i32 = 7;
 const LZMA_OPTIONS_ERROR: i32 = 8;
 const LZMA_DATA_ERROR: i32 = 9;
 const LZMA_BUF_ERROR: i32 = 10;
+
+/// The memory an xz stream may ask for, in KiB. Upstream has no limit; a
+/// header can ask for 4 GiB.
+const XZ_MEM_LIMIT_KIB: u32 = 1 << 20;
 
 /// The memory the LZMA decoder may use, in bytes (`lzma_alone_decoder`'s
 /// limit in upstream).
@@ -90,7 +94,7 @@ struct Step {
 
 fn lz_error_code(e: &io::Error) -> i32 {
     match e.kind() {
-        ErrorKind::OutOfMemory => LZMA_MEM_ERROR,
+        ErrorKind::OutOfMemory => LZMA_MEMLIMIT_ERROR,
         ErrorKind::Unsupported => LZMA_OPTIONS_ERROR,
         ErrorKind::InvalidInput => LZMA_FORMAT_ERROR,
         _ => LZMA_DATA_ERROR,
@@ -420,7 +424,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
 
     fn xz_init(&mut self) -> Result<(), Error> {
         self.zipx.lzma = None;
-        self.zipx.xz = Some(XzStream::new_mem_limit(false, u32::MAX));
+        self.zipx.xz = Some(XzStream::new_mem_limit(false, XZ_MEM_LIMIT_KIB));
         self.zipx.lz_allow_buf_error = false;
         self.alloc_buffer(BUFFER_SIZE, "No memory for xz decompression")?;
         self.decompress_init = true;
@@ -894,7 +898,7 @@ impl io::Read for ZipInput<'_, '_> {
                 let n = data.len().min(buf.len()).min(limit);
                 let out = buf.get_mut(..n).unwrap_or_default();
                 self.crypto
-                    .decrypt_in_place_of(data.get(..n).unwrap_or_default(), out);
+                    .decrypt_into(data.get(..n).unwrap_or_default(), out);
                 n
             }
             Ok(None) => {
@@ -936,7 +940,7 @@ impl ByteIn for PpmdIn<'_, '_> {
         };
         let mut val = [byte];
         if self.crypto.active() {
-            self.crypto.decrypt_in_place_of(&[byte], &mut val);
+            self.crypto.decrypt_into(&[byte], &mut val);
         }
         if self.r.consume(1).is_err() {
             *self.failed = true;
