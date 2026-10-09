@@ -213,8 +213,18 @@ impl Worker {
         Ok(())
     }
 }
-// Dropping both channels lets a worker blocked on either one finish; do not
-// wait on it while its output receiver is still live.
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // Disconnect both directions before joining: the worker can be
+        // blocked receiving input or sending compressed output.
+        self.tx = None;
+        let replacement = mpsc::channel().1;
+        drop(std::mem::replace(&mut self.rx, replacement));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 pub struct Zstd {
     level: i64,
@@ -381,5 +391,58 @@ impl Filter for Zstd {
     fn close(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
         self.start()?;
         self.finish(sink)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn dropping_worker_disconnects_blocked_output_and_joins_thread() {
+        let (tx, _input) = mpsc::sync_channel(1);
+        let (output, rx) = mpsc::sync_channel(1);
+        let ready = Arc::new(Barrier::new(2));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let barrier = ready.clone();
+        let completed = stopped.clone();
+        let thread = std::thread::spawn(move || {
+            output.send(vec![0]).unwrap();
+            barrier.wait();
+            let _ = output.send(vec![1]);
+            completed.store(true, Ordering::Release);
+            true
+        });
+        let worker = Worker {
+            tx: Some(tx),
+            rx,
+            thread: Some(thread),
+        };
+        ready.wait();
+        drop(worker);
+        assert!(stopped.load(Ordering::Acquire));
+    }
+
+    struct FailedSink;
+    impl Sink for FailedSink {
+        fn write(&mut self, _: &[u8]) -> Result<(), Error> {
+            Err(Error::fatal(libc::EIO, "test sink failed"))
+        }
+    }
+    #[test]
+    fn sink_failure_is_preserved_while_worker_is_reaped() {
+        let mut filter = Zstd::default();
+        let data: Vec<_> = (0..262144usize)
+            .map(|n| (n.wrapping_mul(37) >> 5) as u8)
+            .collect();
+        let error = filter
+            .write(&data, &mut FailedSink)
+            .and_then(|()| filter.close(&mut FailedSink))
+            .unwrap_err();
+        assert_eq!(error.errno, libc::EIO);
+        assert_eq!(error.msg, b"test sink failed");
+        drop(filter);
     }
 }
