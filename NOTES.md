@@ -1719,3 +1719,16 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   dropping a filter kills and reaps its child.
 - Unix compress, uuencode and base64 encoding are native ports. Base64
   reports the UU filter code, as upstream does; it has its own filter name.
+
+## XAR writing and attribute streaming
+
+- XAR data and attributes are spooled in private, immediately unlinked files;
+  the compressed XML table is emitted at close. SHA-1, MD5, SHA-256 and SHA-512
+  checksums and none/zlib/bzip2/LZMA/XZ data encodings are supported. Safe codec
+  output is valid but need not match the C encoders byte for byte.
+- Upstream checks an attribute's entire decompressed size after one decoder
+  call, so small input blocks can fail even for a valid archive. The Rust
+  reader collects incremental attribute output, checks both sizes and sums,
+  and bounds each owned attribute at 64 MiB before allocating. This permits
+  writer round trips through small callback blocks without uncontrolled
+  allocation from the XML size field.

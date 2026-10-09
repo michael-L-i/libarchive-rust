@@ -495,6 +495,13 @@ pub extern "C" fn archive_write_set_format_cpio_pwb(a: *mut Archive) -> c_int {
         w.set_format(b, Box::new(crate::write::format::cpio::Cpio::new(0x10006)))
     })
 }
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_xar(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::xar::Xar::default()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

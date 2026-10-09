@@ -511,6 +511,10 @@ test_read_set_wrong_format
 test_read_too_many_filters
 test_sparse_clear
 test_sparse_iterator
+test_write_format_xar_empty
+test_write_format_xar_fflags
+test_write_format_xar_strcpy_overlap
+test_write_format_xar_underflow
 test_xattr_clear
 unzip/test_0
 unzip/test_C
