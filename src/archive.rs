@@ -105,6 +105,13 @@ pub struct Base {
     /// The string conversions made for this handle (`a->sconv`). Entries made
     /// for the handle share it, so it outlives the handle while one does.
     pub(crate) conv: Arc<Mutex<ConvCache>>,
+    /// `read_data_is_posix_read` and `read_data_requested`: the size of the
+    /// `archive_read_data` request being served, for a format that limits
+    /// the block it hands out to it. `None` outside such a request.
+    pub(crate) read_data_requested: Cell<Option<usize>>,
+    /// Set by a format's `seek_data` that restarts the entry's data
+    /// (`__archive_reset_read_data`); the core clears it after the call.
+    pub(crate) read_data_reset: Cell<bool>,
 }
 
 impl Base {
@@ -120,6 +127,8 @@ impl Base {
             error: RefCell::new(Vec::new()),
             error_shown: Cell::new(false),
             conv: Arc::default(),
+            read_data_requested: Cell::new(None),
+            read_data_reset: Cell::new(false),
         }
     }
 }

@@ -239,9 +239,11 @@ Differences:
   `archive_read_data_block`; upstream leaves whatever the format stored in the
   out parameters (no in-library caller looks at it).
 - `data_start_node` and `data_end_node` are not kept; nothing reads them.
-  `read_data_is_posix_read` and `read_data_requested` are not kept either;
-  only the rar reader uses them, and it will get them through `Reader` when
-  it is ported.
+  `read_data_is_posix_read` and `read_data_requested` are one `Option` in
+  `Base` (`Reader::read_data_requested`), set while `archive_read_data` asks
+  the format for a block; only the rar reader looks at it. Its `seek_data`
+  asks for `__archive_reset_read_data` with `Reader::reset_read_data`, which
+  the core does after the call returns.
 - Disk-like device detection for FreeBSD, NetBSD, OpenBSD and DragonFly
   ioctls (archive_read_open_filename.c) is not ported; only regular files
   and, on Linux, block devices count.
@@ -1194,6 +1196,30 @@ the entry record and the extra fields, `zip/crypto.rs` the decryption, and
 
 ### Differences
 
+- The arena is zeroed. Upstream leaves the `malloc`ed memory uninitialized,
+  so any read of it (for example the stamp of a block the model never
+  wrote) is undefined; zero is one of the values it can read as. The
+  decoders match upstream byte for byte over all the streams we tried,
+  including corrupt ones. Zeroing touches the whole arena, where `malloc`
+  commits lazily, so a PPMd7 model of a few GiB costs real memory and time
+  at `alloc`.
+- Anything upstream would do outside the arena (a read, a write, a search
+  for a symbol that is not there, a free list that loops) marks the model
+  bad, and `decode_symbol` returns -2 ("invalid data") from then on. A model
+  the decoder built itself never does this; it is a guard, not a code path.
+- The range decoders would divide by zero (`Range /= total` giving 0) or
+  spin forever in `Normalize` (`Range == 0`) on some corrupt streams, and
+  upstream crashes or hangs. We return -2 instead.
+- `Ppmd8` `RestoreModel` in cut-off mode loops `CutOff` and `ExpandTextArea`
+  until enough memory is free. With a tiny arena (a few KiB; the zip reader
+  allocates at least 1 MiB) upstream can loop forever; ours gives up after
+  1000 rounds and restarts the model.
+- `Ppmd7::alloc` and `Ppmd8::alloc` take the size as `u32` like upstream and
+  fail the same way (`false`) if it is below `UNIT_SIZE` (PPMd7 only) or the
+  memory is not available (`try_reserve`).
+- Only the decoding side is ported: `Ppmd7z_RangeEnc_*` and
+  `Ppmd7_EncodeSymbol` wait for the 7zip writer.
+
 - The XML parser is the `xml` crate 1.4.0 (xml-rs, renamed), where upstream
   uses libxml2's `xmlTextReader` (expat elsewhere). It has
   `#![forbid(unsafe_code)]` and no dependencies, reads a stream, resolves
@@ -1303,6 +1329,95 @@ the entry record and the extra fields, `zip/crypto.rs` the decryption, and
   sizes and hashes are equal), and 7,300 mutated fixtures, each in two
   block sizes (TOC XML edits with the archive repaired, header edits,
   truncations, heap edits).
+
+## rar reader (src/read/format/rar.rs)
+
+RAR 1.5 to 4.x. `rar/huffman.rs` and `rar/filters.rs` hold the Huffman codes
+and the filters. The PPMd model is `ppmd7`, reached through `Ppmd7` and
+`Ppmd7RangeDec`; everything else of it the 7zip reader needs too.
+
+### Ported as-is
+
+- Every solid file is refused: a file header with `FHD_SOLID` fails with
+  "RAR solid archive support unavailable" (the pinned source clears the
+  per-file state in the other branch and gives up in this one).
+- `read_exttime` sets the nanoseconds to the broken-down time's *seconds*
+  plus `rem / 10000000` (`nsec = tm->tm_sec + rem / NS_UNIT`).
+- A file header with `FHD_PASSWORD` sets "RAR encryption support
+  unavailable" and goes on, so a successful header can leave that message on
+  the handle; the entry is flagged as having encrypted data. The same goes
+  for the sub-block (`NEWSUB_HEAD`) variant, which flags the entry the
+  reader is not even filling in.
+- The parts of a split file are matched by name alone; the part's own header
+  replaces the sizes, flags, method and CRC, so the CRC checked at the end is
+  the last part's, and its `unp_size` ends the file.
+- `parse_filter` copies `globaldatalen` bytes from the start of a buffer
+  whose first 0x40 bytes were never written (the data is stored after
+  them), and `compile_program` reads the program's static data into memory
+  nothing uses. We read both for their length and EOF checks only.
+- A PPMd escape followed by a code other than 0, 2, 3, 4 or 5 (so 1, and 6
+  to 255) emits the escape byte itself as a literal.
+- `filters.lastend`, the filter stack, the programs and `lastfilternum` are
+  not reset by a new file header; only `filterstart` is. The PPMd model is
+  freed (and `start_new_table` set) every time `read_data` fails *or hits the
+  end of the file*.
+- An incomplete Huffman code (a node with an unset branch) fails
+  `make_table` for the whole table, so none of its symbols can be read, even
+  though the table is kept for the next lookup.
+- Reading the four parts of `test_read_format_rar_multivolume` with
+  `archive_read_support_filter_all` (the uu bidder alone is enough:
+  `archive_read_support_filter_uu`) and no zip bidder returns wrong data at
+  the 128 KiB boundary of the filter's buffer, so the rar reader fails with
+  "Invalid symbol". The corruption is upstream's own and the port reproduces
+  it byte for byte: the raw format over the same four parts gives 320323
+  bytes of a 189201-byte stream in both. The suspect is the roll-back in
+  `__archive_read_filter_ahead` (archive_read.c, "Roll back to client
+  buffer"), which assumes the copy-buffer bytes precede `client_next` in the
+  current block. Upstream's zip bidder masks it for rar, so
+  `test_read_format_rar_multivolume` and `_multivolume_skip` should pass here
+  once zip is merged, but that is unproven. It is not a bug in the rar read
+  path.
+
+### Differences
+
+- The bit reader consumes the bytes it takes into its cache as it takes them.
+  Upstream keeps a pointer into the read-ahead buffer and consumes what it
+  used at the next call; nothing can tell the two apart.
+- The header reads upstream makes with `a->entry` in the middle of reading
+  data (the next part of a multivolume file, `read_data_skip`, `seek_data`)
+  get the handle's own entry through `Reader::with_entry`, which the ffi
+  layer fills for `archive_read_data*`, `archive_read_data_skip`,
+  `archive_seek_data` and `archive_read_data_into_fd`. When
+  `archive_read_next_header2` skips the rest of the previous entry the entry
+  is the one it was given (cleared first, as upstream does); upstream passes
+  `a->entry`, so with a caller-owned entry that is not the handle's own,
+  upstream fills the handle's entry and we fill the caller's.
+- `read_data_skip` ending at the end of the archive in the middle of a
+  multivolume file returns `ARCHIVE_OK`; upstream passes `ARCHIVE_EOF` on to
+  `archive_read_data_skip`.
+- `read_exttime` fails the header ("Invalid header size") when `localtime`
+  fails; upstream dereferences NULL.
+- The window, the output buffer and the VM's memory are allocated with
+  `try_reserve_exact`; a failure is `ARCHIVE_FATAL` "Unable to allocate
+  memory for uncompressed data". The PPMd model is allocated by `Ppmd7::alloc`
+  ("Out of memory", also fatal), which can ask for up to 256 MiB.
+- Names are decoded into a buffer of the exact size; the "Invalid filename"
+  check of the Unicode decoder (the decoded name longer than twice the
+  stored one) can't fail and is not ported, nor can the `src >= dst` checks
+  of the delta, RGB and audio filters, which count the same bytes as the
+  loops. Out-of-range window offsets, Huffman nodes, the data-block table
+  `dbo` in `seek_data` ("Invalid RAR seek cursor state"), and filter output
+  ranges fail instead of reading outside the buffers. The "Invalid zero
+  dictionary size" check in `parse_codes` is not ported either: flag 0x20
+  always sets a dictionary of at least 1 MiB just before it.
+- The filter stack finds its first filter again after `expand` by a serial
+  number; upstream compares pointers after freeing it.
+- `read_data_compressed`'s recursion on PPMd code 0 is a loop with the same
+  limit (`MAX_COMPRESS_DEPTH`, "failed" without a message).
+- `salt`, `encryptver`, `reserved1/2` and `arctime`, which upstream stores
+  and never reads, are not kept; the header size checks on them are.
+- Only the filters upstream recognizes run: delta, E8, E8E9, RGB and audio.
+  (There is no Itanium filter in the pinned source.)
 
 ## tar reader (src/read/format/tar.rs)
 

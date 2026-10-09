@@ -323,7 +323,7 @@ mod tests {
         let mut out = Vec::new();
         let mut buf = [0u8; 1000];
         while status == ARCHIVE_OK {
-            match usize::try_from(r.read_data(&a, &mut buf)) {
+            match usize::try_from(r.read_data(&a, None, &mut buf)) {
                 Ok(0) => break,
                 Ok(n) => out.extend_from_slice(buf.get(..n).unwrap_or_default()),
                 Err(_) => status = ARCHIVE_FATAL,

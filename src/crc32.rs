@@ -28,8 +28,10 @@
 //! CRC-32 (the zlib/IEEE polynomial), continued from a previous value.
 //! Upstream uses zlib, or a 256-entry table without it; this is the table.
 
-const TABLE: [u32; 256] = {
-    let mut table = [0; 256];
+/// `TABLES[0]` is the usual byte-at-a-time table; `TABLES[k]` is the CRC of
+/// a byte followed by `k` zero bytes, which lets eight bytes go at once.
+const TABLES: [[u32; 256]; 8] = {
+    let mut tables = [[0; 256]; 8];
     let mut i = 0;
     while i < 256 {
         let mut c = i as u32;
@@ -42,19 +44,44 @@ const TABLE: [u32; 256] = {
             };
             k += 1;
         }
-        table[i] = c;
+        tables[0][i] = c;
         i += 1;
     }
-    table
+    let mut i = 0;
+    while i < 256 {
+        let mut k = 1;
+        while k < 8 {
+            let prev = tables[k - 1][i];
+            tables[k][i] = tables[0][(prev & 0xFF) as usize] ^ (prev >> 8);
+            k += 1;
+        }
+        i += 1;
+    }
+    tables
 };
 
 /// The CRC-32 of `data`, continued from `crc` (0 to start).
 pub(crate) fn crc32(crc: u32, data: &[u8]) -> u32 {
-    !data.iter().fold(!crc, |c, &b| {
-        TABLE
-            .get(usize::from((c as u8) ^ b))
-            .map_or(0, |t| t ^ (c >> 8))
-    })
+    let at = |k: usize, x: u32| TABLES[k][usize::from(x as u8)];
+    let mut c = !crc;
+    let mut chunks = data.chunks_exact(8);
+    for chunk in &mut chunks {
+        let (lo, hi) = chunk.split_at(4);
+        let lo = u32::from_le_bytes(lo.try_into().unwrap_or_default()) ^ c;
+        let hi = u32::from_le_bytes(hi.try_into().unwrap_or_default());
+        c = at(7, lo)
+            ^ at(6, lo >> 8)
+            ^ at(5, lo >> 16)
+            ^ at(4, lo >> 24)
+            ^ at(3, hi)
+            ^ at(2, hi >> 8)
+            ^ at(1, hi >> 16)
+            ^ at(0, hi >> 24);
+    }
+    for &b in chunks.remainder() {
+        c = at(0, c ^ u32::from(b)) ^ (c >> 8);
+    }
+    !c
 }
 
 #[cfg(test)]
