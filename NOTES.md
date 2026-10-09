@@ -526,6 +526,17 @@ Backends, and why:
   drained in 64 KiB output pieces. Compressed read-ahead is capped at 3 MiB
   per block, including Huffman tables. Concatenated members and trailing
   non-member bytes are supported. This replaces the c2rust libbz2 backend.
+- `bzip2::Decoder` gives the zip, 7zip and xar readers a `BZ2_bzDecompress`
+  step over crabz2's whole-block decoder: `decompress(input, output, last)`.
+  It holds the compressed bytes of an unfinished block (at most 3 MiB) and
+  decodes that block again when more input arrives. To keep that linear it
+  enforces the input size: unless `last`, a call with fewer than `wanted()`
+  bytes of input (the held bytes, at least 4096) consumes nothing and
+  returns `Progress::default()`. Callers present `peek_available(wanted())`
+  and set `last` when the read comes back short, from EOF or the packed-size
+  limit. It consumes input only up to the end marker, as libbz2's
+  `total_in` does, so `used` is exact and a zip data descriptor is not
+  swallowed.
 - zstd is `ruzstd` 0.9.0, a safe decoder with 41 mentions of `unsafe` in its
   ring buffer and decode buffer, and no crate-level `forbid`. Its checksum
   comes from twox-hash (84 mentions). `libzstd-rs-sys` was tried and dropped:
@@ -534,6 +545,15 @@ Backends, and why:
 
 Differences:
 
+- libbz2 accepts some corrupt streams that crabz2 rejects. In 100k fuzz
+  cases every divergence was a single-bit flip in a tiny stream where libbz2
+  returned `BZ_STREAM_END` with the right output length and this port
+  returned an error (`InvalidHuffman`, `InvalidMagic`, ...).
+- A truncated multi-block stream can deliver a different number of bytes
+  before the error than libbz2 does: a reviewer saw `bsdcat` print 0 bytes
+  for the oracle and 196608 for this port when a stream was cut at byte
+  201578. The previous filter (main) behaves the same, so this predates the
+  `Decoder`; truncations of two fixtures built here agree with the oracle.
 - `archive_bzlib_version` reports `crabz2 <version>`, not libbz2's version.
 - crabz2 checks a complete block's CRC before returning that block. A
   damaged block therefore delivers no partial bytes, where libbz2 can
@@ -739,6 +759,24 @@ Phase 5 needs:
   1 MiB BSD name limit are the upstream ones.
 - The BSD name check's `SIZE_MAX - 1` bound is implied by the 1 MiB bound and
   is not repeated.
+
+## Time and CRC helpers (`src/time.rs`, `src/crc32.rs`)
+
+### Ported as-is
+
+- `__archive_unix_to_ntfs` passes a signed `secs` to `archive_ckd_add_u64`,
+  which takes `uint64_t`. A negative `secs` (pre-1970, down to the NTFS
+  epoch) becomes a huge unsigned value, the addition overflows and the result
+  is `UINT64_MAX`. Only `secs < -11644473600` returns 0 as intended
+  (archive_time.c).
+- `__archive_dos_to_unix` returns `INT32_MAX` when `mktime` fails, which also
+  swallows a genuine 1969-12-31 23:59:59 UTC result of `-1` (archive_time.c).
+
+### Differences
+
+- `__archive_crc32` is the table implementation upstream uses without zlib;
+  the result is identical to zlib's. There is no NULL-pointer case, as a
+  slice is never null.
 
 ## Crypto (`src/digest.rs`, `src/hmac.rs`, `src/cryptor.rs`)
 
