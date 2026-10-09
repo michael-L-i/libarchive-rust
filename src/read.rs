@@ -1115,6 +1115,19 @@ impl<'a> Reader<'a> {
         self.a.set_format(code, name);
     }
 
+    /// The size of the `archive_read_data` request being served
+    /// (`read_data_is_posix_read` with `read_data_requested`), `None` for
+    /// `archive_read_data_block`. A format may hand out less than it has.
+    pub fn read_data_requested(&self) -> Option<usize> {
+        self.a.read_data_requested.get()
+    }
+
+    /// `__archive_reset_read_data`, for a `seek_data` that restarts the
+    /// entry's data; the core does it when the call returns.
+    pub fn reset_read_data(&self) {
+        self.a.read_data_reset.set(true);
+    }
+
     /// Records a warning; return the `Status` it gives to say so.
     #[must_use = "return the status so the warning reaches the caller"]
     #[allow(dead_code)] // used by the format readers (phases 3-4)
@@ -1823,7 +1836,11 @@ impl Read {
                 ))
                 .into();
         };
-        match format.seek_data(&mut rd, offset, whence) {
+        let result = format.seek_data(&mut rd, offset, whence);
+        if a.read_data_reset.take() {
+            self.reset_read_data(a);
+        }
+        match result {
             Ok(r) => r,
             Err(e) => Self::fail(a, e).into(),
         }
@@ -1831,8 +1848,9 @@ impl Read {
 
     /// `__archive_reset_read_data`: forgets the state of `read_data`, for a
     /// new entry.
-    fn reset_read_data(&mut self) {
+    fn reset_read_data(&mut self, a: &Base) {
         self.read_data = ReadData::default();
+        a.read_data_requested.set(None);
     }
 
     /// `archive_read_data`, after the caller has checked the state: a
@@ -1844,10 +1862,12 @@ impl Read {
         let mut written = 0;
         let result = 'read: loop {
             if written == dest.len() {
+                a.read_data_requested.set(None);
                 break written as isize;
             }
             if st.offset == st.output_offset && st.pending.is_empty() {
                 let (mut out_off, mut blk_off) = (st.output_offset, st.offset);
+                a.read_data_requested.set(Some(dest.len() - written));
                 let mut leftover = Vec::new();
                 let mut out_of_order = false;
                 let mut eof = false;
@@ -2015,7 +2035,7 @@ impl Read {
         self.entry_bytes_declared = (matches!(r2, ARCHIVE_OK | ARCHIVE_WARN)
             && entry.size_is_set() != 0)
             .then(|| entry.size());
-        self.reset_read_data();
+        self.reset_read_data(a);
 
         // EOF always wins; otherwise return the worst error.
         if r2 < r1 || r2 == ARCHIVE_EOF { r2 } else { r1 }
