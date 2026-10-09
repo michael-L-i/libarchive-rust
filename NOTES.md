@@ -480,13 +480,11 @@ crate.
 - `archive_liblz4_version` reports `lz4_flex <version>`, not the LZ4 library
   version: the oracle links Homebrew liblz4 1.10.0, and the backend here is a
   Rust crate (see Core).
-- `lz4_flex` is more lenient than liblz4 1.10 on hostile or non-conforming
-  blocks. For example, a block that breaks LZ4's end-of-block rule (fewer than
-  five final literal bytes) fails upstream with `lz4 decompression failed`, but
-  `lz4_flex` decodes it. Taking the reviewer's example, after a block of
-  `hello`, the block `10 'x' 05 00 | 20 'zz'` is decoded here and rejected
-  upstream. Such blocks are accepted where upstream rejects them; they never
-  cause unsafe access, because the decoder is `safe-decode`.
+- The adapter enforces liblz4's block-ending rules (five final literal
+  bytes and twelve decoded bytes after the last match starts), which
+  lz4_flex does not enforce. The malformed `hello` / `10 x 05 00 20 zz`
+  linked-block example now fails with `lz4 decompression failed` as upstream
+  does. The dependency remains built with `safe-decode` and `safe-encode`.
 - Frame and block parsing and every checksum follow upstream
   (`DONT_FAIL_ON_CRC_ERROR` is not defined there, so checksum errors fail).
 

@@ -60,6 +60,57 @@ fn decompression_failed() -> Error {
     Error::fatal(ARCHIVE_ERRNO_MISC, "lz4 decompression failed")
 }
 
+/// liblz4 requires five final literals and the last match to start at
+/// least twelve output bytes before the end. lz4_flex does not enforce it.
+fn valid_block_end(mut input: &[u8]) -> bool {
+    fn length(input: &mut &[u8], base: u8) -> Option<usize> {
+        let mut len = usize::from(base);
+        if base == 15 {
+            loop {
+                let (&byte, rest) = input.split_first()?;
+                *input = rest;
+                len = len.checked_add(usize::from(byte))?;
+                if byte != 255 {
+                    break;
+                }
+            }
+        }
+        Some(len)
+    }
+    let mut output = 0usize;
+    let mut last_match = None;
+    while let Some((&token, rest)) = input.split_first() {
+        input = rest;
+        let Some(literals) = length(&mut input, token >> 4) else {
+            return false;
+        };
+        let Some(rest) = input.get(literals..) else {
+            return false;
+        };
+        input = rest;
+        let Some(end) = output.checked_add(literals) else {
+            return false;
+        };
+        output = end;
+        if input.is_empty() {
+            return last_match.is_none_or(|start| literals >= 5 && output - start >= 12);
+        }
+        let Some(rest) = input.get(2..) else {
+            return false;
+        };
+        input = rest;
+        last_match = Some(output);
+        let Some(matched) = length(&mut input, token & 15).and_then(|n| n.checked_add(4)) else {
+            return false;
+        };
+        let Some(end) = output.checked_add(matched) else {
+            return false;
+        };
+        output = end;
+    }
+    false
+}
+
 /// The little-endian word at the start of `b`. Every caller has read ahead
 /// the four bytes, so a shorter slice never happens; it reads as zero.
 fn le32(b: &[u8]) -> u32 {
@@ -300,6 +351,8 @@ impl Lz4 {
                 .ok_or_else(malformed)?
                 .copy_from_slice(data);
             size
+        } else if !valid_block_end(data) {
+            return Err(decompression_failed());
         } else if frame.linked {
             decompress_into_with_dict(data, &mut out.buf, &out.window)
                 .map_err(|_| decompression_failed())?
@@ -332,6 +385,9 @@ impl Lz4 {
         let total = 4 + usize::try_from(size).unwrap_or(usize::MAX);
         let body = up.read_ahead(total)?.ok_or_else(truncated)?;
         let data = body.get(4..total).unwrap_or_default();
+        if !valid_block_end(data) {
+            return Err(decompression_failed());
+        }
         let n = decompress_into(data, &mut out.buf).map_err(|_| decompression_failed())?;
         out.len = n;
         up.consume(total)?;
@@ -389,6 +445,24 @@ pub fn support(r: &mut Read, _: &Base) -> Result<Status, Error> {
 mod tests {
     use super::*;
     use crate::read::filter::testing::decode;
+
+    #[test]
+    fn rejects_matches_without_the_required_final_literals() {
+        let desc = [0x40, 0x40];
+        let mut frame = LZ4_MAGIC.to_le_bytes().to_vec();
+        frame.extend_from_slice(&desc);
+        frame.push((xxh32(&desc, 0) >> 8) as u8);
+        frame.extend_from_slice(&0x8000_0005u32.to_le_bytes());
+        frame.extend_from_slice(b"hello");
+        let bad = b"\x10x\x05\x00\x20zz";
+        frame.extend_from_slice(&(bad.len() as u32).to_le_bytes());
+        frame.extend_from_slice(bad);
+        frame.extend_from_slice(&[0; 4]);
+        assert_eq!(
+            decode(support, &frame, 7).unwrap_err(),
+            "lz4 decompression failed"
+        );
+    }
 
     // `lz4 a.txt`, `lz4 b.txt`, `lz4 -l a.txt` (legacy) and `lz4` of an empty file.
     const A: &[u8] = &[
