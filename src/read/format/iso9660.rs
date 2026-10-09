@@ -2400,3 +2400,83 @@ impl Format for Iso9660 {
         Ok(Status::Ok)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heap_returns_the_smallest_key_and_keeps_upstreams_order_for_ties() {
+        let mut h = Heap::default();
+        for (i, key) in [5u64, 1, 5, 3, 1, 5, 2].into_iter().enumerate() {
+            h.add(key, i);
+        }
+        let order: Vec<_> = std::iter::from_fn(|| h.pop()).collect();
+        // Upstream's sift order for these keys, which BinaryHeap would not
+        // give for the equal ones.
+        assert_eq!(order, [1, 4, 6, 3, 0, 5, 2]);
+    }
+
+    #[test]
+    fn dates() {
+        // 2005-11-07 12:00:00 +0 (7-byte form, years since 1900).
+        assert_eq!(isodate7(&[105, 11, 7, 12, 0, 0, 0]), Some(1131364800));
+        // The offset is in quarter hours east of UTC.
+        assert_eq!(
+            isodate7(&[105, 11, 7, 12, 0, 0, 4]),
+            Some(1131364800 - 3600)
+        );
+        assert_eq!(isodate7(&[0; 7]), None);
+        assert_eq!(isodate7(&[105, 13, 7, 12, 0, 0, 0]), None);
+        assert_eq!(isodate17(b"2005110712000000\0"), Some(1131364800));
+        assert_eq!(isodate17(b"0000000000000000\0"), None);
+        assert_eq!(isodate17(b"2005110712000x00\0"), None);
+        // The second before the epoch is what timegm reports failure with.
+        assert_eq!(time_from_tm(69, 11, 31, 23, 59, 59), 0);
+        // A 31st of a 30-day month carries into the next.
+        assert_eq!(
+            time_from_tm(100, 3, 31, 0, 0, 0),
+            time_from_tm(100, 4, 1, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn rock_ridge_names_and_links() {
+        let mut f = FileInfo::default();
+        parse_rockridge_nm1(&mut f, b"\x01ab");
+        parse_rockridge_nm1(&mut f, b"\x00cd");
+        assert_eq!(f.name.bytes(), b"abcd");
+        parse_rockridge_nm1(&mut f, b"\x04");
+        assert_eq!(f.name.bytes(), b"..");
+
+        // The root, "usr", and "a" that continues the text.
+        parse_rockridge_sl1(&mut f, b"\x00\x08\x00\x00\x03usr\x01\x01a");
+        assert_eq!(f.symlink.bytes(), b"/usr/a");
+        assert!(!f.symlink_continues);
+        // A record that only has the flag byte leaves no target at all.
+        let mut g = FileInfo::default();
+        parse_rockridge_sl1(&mut g, b"\x00");
+        assert!(g.symlink.0.is_none());
+    }
+
+    #[test]
+    fn rock_ridge_times_and_zisofs() {
+        let mut f = FileInfo::default();
+        // Modify and attribute-change times in the 7-byte form.
+        let mut tf = vec![2 | 8];
+        tf.extend_from_slice(&[105, 11, 7, 12, 0, 0, 0]);
+        tf.extend_from_slice(&[105, 11, 8, 12, 0, 0, 0]);
+        parse_rockridge_tf1(&mut f, &tf);
+        assert_eq!(f.time_is_set, MTIME_IS_SET | CTIME_IS_SET);
+        assert_eq!((f.mtime, f.ctime), (1131364800, 1131364800 + 86400));
+
+        let zf = [0x70, 0x7a, b'Z', 15, 0x10, 0, 0, 0, 0, 0, 0, 0];
+        parse_rockridge_zf1(&mut f, &zf);
+        assert!(f.pz);
+        assert_eq!((f.pz_log2_bs, f.pz_uncompressed_size), (15, 16));
+        // A block size out of range turns zisofs off.
+        let bad = [0x70, 0x7a, b'Z', 14, 0x10, 0, 0, 0, 0, 0, 0, 0];
+        parse_rockridge_zf1(&mut f, &bad);
+        assert!(!f.pz);
+    }
+}
