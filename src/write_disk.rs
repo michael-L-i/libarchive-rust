@@ -465,7 +465,9 @@ impl WriteDisk {
             } else {
                 entry.mode() as u32 & 0o777 & !crate::ffi::disk_sys::umask()
             };
-            if let Ok(st) = target.stat() {
+            if mode & 0o6000 != 0
+                && let Ok(st) = target.stat()
+            {
                 if st.st_uid as i64 != entry.uid() {
                     mode &= !0o4000;
                 }
