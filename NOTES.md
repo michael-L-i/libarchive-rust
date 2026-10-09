@@ -424,14 +424,16 @@ Differences:
 
 - The child is started with `std::process::Command` (`posix_spawn` or
   `fork`+`exec`, as std chooses). A program that cannot be found fails at
-  open with "unable to run program" on every platform; upstream's `fork`
-  path would start the child and see it exit with status 254 instead.
+  open with "unable to run program". That matches upstream on macOS, which
+  uses `posix_spawnp`; upstream's Linux `fork` path instead starts the child
+  and sees exit status 254 on the first read.
   Descriptors the application left inheritable are not closed in the child
   (upstream closes all above 2 on the `fork` path); std's own pipes are
   close-on-exec.
 - A NULL command, which crashes upstream, fails with `ARCHIVE_FATAL`. A
-  signature of more than `isize::MAX` bytes is ignored instead of reported as
-  "Signature too large".
+  signature longer than `INT_MAX/8` fails with FATAL "Signature too large", as
+  upstream does; only a length above `isize::MAX`, which no slice can have,
+  is ignored.
 
 ## grzip, lrzip and lzop filters
 
