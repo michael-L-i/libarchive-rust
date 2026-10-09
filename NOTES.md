@@ -526,6 +526,17 @@ Backends, and why:
   drained in 64 KiB output pieces. Compressed read-ahead is capped at 3 MiB
   per block, including Huffman tables. Concatenated members and trailing
   non-member bytes are supported. This replaces the c2rust libbz2 backend.
+- `bzip2::Decoder` gives the zip, 7zip and xar readers a `BZ2_bzDecompress`
+  step over crabz2's whole-block decoder: `decompress(input, output, last)`.
+  It holds the compressed bytes of an unfinished block (at most 3 MiB) and
+  decodes that block again when more input arrives. To keep that linear it
+  enforces the input size: unless `last`, a call with fewer than `wanted()`
+  bytes of input (the held bytes, at least 4096) consumes nothing and
+  returns `Progress::default()`. Callers present `peek_available(wanted())`
+  and set `last` when the read comes back short, from EOF or the packed-size
+  limit. It consumes input only up to the end marker, as libbz2's
+  `total_in` does, so `used` is exact and a zip data descriptor is not
+  swallowed.
 - zstd is `ruzstd` 0.9.0, a safe decoder with 41 mentions of `unsafe` in its
   ring buffer and decode buffer, and no crate-level `forbid`. Its checksum
   comes from twox-hash (84 mentions). `libzstd-rs-sys` was tried and dropped:
@@ -534,6 +545,15 @@ Backends, and why:
 
 Differences:
 
+- libbz2 accepts some corrupt streams that crabz2 rejects. In 100k fuzz
+  cases every divergence was a single-bit flip in a tiny stream where libbz2
+  returned `BZ_STREAM_END` with the right output length and this port
+  returned an error (`InvalidHuffman`, `InvalidMagic`, ...).
+- A truncated multi-block stream can deliver a different number of bytes
+  before the error than libbz2 does: a reviewer saw `bsdcat` print 0 bytes
+  for the oracle and 196608 for this port when a stream was cut at byte
+  201578. The previous filter (main) behaves the same, so this predates the
+  `Decoder`; truncations of two fixtures built here agree with the oracle.
 - `archive_bzlib_version` reports `crabz2 <version>`, not libbz2's version.
 - crabz2 checks a complete block's CRC before returning that block. A
   damaged block therefore delivers no partial bytes, where libbz2 can
@@ -763,8 +783,8 @@ Suspected upstream bugs, ported as-is:
 
 Differences:
 
-- `archive_format_name` is formatted ("CAB 1.3 (LZX)"), so `Base` holds the
-  name as a `Cow<'static, CStr>` and has `set_format_name`.
+- `archive_format_name` is formatted ("CAB 1.3 (LZX)"), kept with
+  `Base::set_format_name` in a buffer that is rewritten in place.
 - MSZIP is inflated with miniz_oxide instead of zlib. `inflateSetDictionary`
   after each block is reproduced by decoding into a contiguous buffer that
   holds the previous block (the dictionary) in front of the new output, in
@@ -778,3 +798,95 @@ Differences:
   or a table index out of range) the decoder fails with "LZX decompression
   failed (-25)". Huffman table writes that would leave the table fail the
   same way.
+
+## Time and CRC helpers (`src/time.rs`, `src/crc32.rs`)
+
+### Ported as-is
+
+- `__archive_unix_to_ntfs` passes a signed `secs` to `archive_ckd_add_u64`,
+  which takes `uint64_t`. A negative `secs` (pre-1970, down to the NTFS
+  epoch) becomes a huge unsigned value, the addition overflows and the result
+  is `UINT64_MAX`. Only `secs < -11644473600` returns 0 as intended
+  (archive_time.c).
+- `__archive_dos_to_unix` returns `INT32_MAX` when `mktime` fails, which also
+  swallows a genuine 1969-12-31 23:59:59 UTC result of `-1` (archive_time.c).
+
+### Differences
+
+- `__archive_crc32` is the table implementation upstream uses without zlib;
+  the result is identical to zlib's. There is no NULL-pointer case, as a
+  slice is never null.
+
+## Crypto (`src/digest.rs`, `src/hmac.rs`, `src/cryptor.rs`)
+
+### Differences
+
+- One backend replaces upstream's CommonCrypto, CNG, mbed TLS, Nettle, OpenSSL,
+  libmd and libc glue, and the "unsupported" stubs: RustCrypto `md-5` 0.11,
+  `ripemd` 0.2, `sha1` 0.11, `sha2` 0.11, `hmac` 0.13, `pbkdf2` 0.13 and `aes`
+  0.9, all with default features off (`alloc` on for the hashes, so a `Digest`
+  can hold any of them). Nothing is ever "unsupported": MD5, RIPEMD-160,
+  SHA-1/256/384/512, HMAC-SHA1, PBKDF2 and AES-CTR always exist. The oracle
+  here (macOS) has no RIPEMD-160 at all (`archive_rmd160_init` fails), so that
+  one is checked against the paper's vectors only. The readers' "Decryption is
+  unsupported due to lack of crypto library" paths can only be reached by an
+  AES key of a wrong length, which they never pass.
+- AES-CTR is ported from upstream, not taken from the `ctr` crate (one fewer
+  dependency, and the counter handling is exactly upstream's). The counter is
+  the low 8 bytes of a block that starts at zero, little-endian, incremented
+  before each block is encrypted, so the first block of key stream is for
+  counter 1; it wraps within those 8 bytes and never carries into the rest.
+  A partial block's key stream carries over to the next `update`, which
+  processes the shorter of the input and output lengths. Encrypt and decrypt
+  are the same operation. Upstream's doubled function groups (`decrypto_*` and
+  `encrypto_*`) are one `AesCtr`.
+- `AesCtr::new` fails only for a key that is not 16, 24 or 32 bytes (the
+  OpenSSL and CNG backends fail the same way). `HmacSha1::new` takes any key and returns `Option` only to keep
+  the callers' error path. `pbkdf2_sha1` cannot fail, so it returns nothing
+  where upstream returns 0 or -1. A digest, HMAC or AES context is consumed by
+  `finalize` or dropped; there are no `release`/`cleanup` calls. Keys are not
+  zeroed on drop (the `zeroize` features are off), where the C backends
+  clear theirs in `release`.
+- `archive_version_details` has no crypto section. Upstream names one
+  platform library (`CommonCrypto/system`, `openssl/3.x`, ...); the port has
+  seven crates and none of the upstream keys, so there is nothing honest to
+  put under them. The compression backends keep upstream's key because each
+  replaces exactly one library (see Core).
+
+### Backend choice and unsafe footprint
+
+- Candidates were these crates against hand-rolled hashes (rejected: the
+  hashes are the hot path of the mtree and xar writers, and hand-rolled
+  crypto is the wrong thing to maintain) and `openssl` or `ring` (C or
+  assembly, ruled out). RustCrypto is pure Rust with a portable fallback in
+  every crate.
+- `unsafe` is only in the CPU-intrinsic backends, chosen at run time by
+  `cpufeatures`, with the portable code as the fallback: `sha1` (x86 SHA-NI,
+  aarch64 SHA-2), `sha2` (the same, plus AVX2 and aarch64 SHA-3), `aes` (AES-NI
+  and aarch64), `cpufeatures`, and `md-5` only on loongarch64 (an assembly
+  block). `ripemd`, `hmac`, `pbkdf2`, `digest`, `cipher`, `crypto-common` and
+  `ctutils` forbid `unsafe` or have none. `inout` (via `cipher`) and `cmov`
+  (constant-time moves, via `ctutils`) carry a few `unsafe` blocks, and so
+  do `block-buffer` and `hybrid-array`. `sha2` and `cpufeatures` were already
+  in the tree through `lzma-rust2`'s xz SHA-256 check.
+- These crates pick their backend with `--cfg` flags (`sha1_backend="soft"`,
+  `sha2_backend="soft"`, `aes_backend="soft"`), not Cargo features, so the
+  intrinsics cannot be turned off from `Cargo.toml`. Forcing them through
+  `.cargo/config.toml` was rejected: `RUSTFLAGS` in the environment replaces
+  it, and the portable code is slower than the intrinsics on the mtree, xar and
+  zip paths (not measured). The footprint is accepted; set those cfgs to remove it.
+
+### Verification
+
+- Vectors: RFC 1321 (MD5), the RIPEMD-160 paper, FIPS 180 (SHA-1, 256, 384,
+  512, and a million `a`), RFC 2202 (HMAC-SHA1), RFC 6070 (PBKDF2-HMAC-SHA1),
+  and NIST SP 800-38A F.5 (the first block of AES-128, 192 and 256 CTR key
+  stream, which is the encrypted counter block).
+- Against upstream: a C probe linked against `build/oracle/libarchive.a`
+  (`__archive_digest`, `__archive_hmac`, `__archive_cryptor`; CommonCrypto and
+  libSystem here) generated 400 random cases of 0 to 4000 bytes with random
+  chunking: MD5 and SHA-1/256/384/512, HMAC-SHA1 with keys of 0 to 150 bytes,
+  PBKDF2 with 100 random passwords, salts, round counts and output lengths,
+  and AES-CTR in all three key sizes updated in pieces of 0 to 70 bytes (every
+  partial-block case). All 2,900 outputs matched. The probe is not in the
+  repository.

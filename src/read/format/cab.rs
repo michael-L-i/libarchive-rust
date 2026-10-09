@@ -33,7 +33,7 @@ mod lzx;
 
 use crate::archive::*;
 use crate::entry::{AE_IFREG, Entry, Mode};
-use crate::ffi::sys::mktime_local;
+use crate::ffi::sys::{Tm, mktime};
 use crate::read::{ARCHIVE_ERRNO_FILE_FORMAT, Data, Format, Read, Reader, Status, format_code};
 use crate::string::{StringConv, conversion_charset_name, conversion_from_charset};
 use crate::util::Error;
@@ -355,14 +355,15 @@ fn convert_path_separator_2(entry: &mut Entry) {
 fn dos_time(p: &[u8]) -> i64 {
     let ms_date = i32::from(le16(p, 0));
     let ms_time = i32::from(le16(p, 2));
-    mktime_local(
-        ((ms_date >> 9) & 0x7f) + 80, // Years since 1900.
-        ((ms_date >> 5) & 0x0f) - 1,  // Month number.
-        ms_date & 0x1f,               // Day of month.
-        (ms_time >> 11) & 0x1f,
-        (ms_time >> 5) & 0x3f,
-        (ms_time << 1) & 0x3e,
-    )
+    mktime(Tm {
+        year: ((ms_date >> 9) & 0x7f) + 80, // Years since 1900.
+        mon: ((ms_date >> 5) & 0x0f) - 1,   // Month number.
+        mday: ms_date & 0x1f,               // Day of month.
+        hour: (ms_time >> 11) & 0x1f,
+        min: (ms_time >> 5) & 0x3f,
+        sec: (ms_time << 1) & 0x3e,
+    })
+    .unwrap_or(-1)
 }
 
 fn checksum_cfdata_4(p: &[u8], seed: u32) -> u32 {
@@ -589,7 +590,7 @@ impl Format for Cab {
 
         // Set up a more descriptive format name.
         let compname = hd.folders.get(folder).map_or("", |f| f.compname);
-        a.set_format_name(format!("CAB {}.{} ({compname})", hd.major, hd.minor).into_bytes());
+        a.set_format_name(format!("CAB {}.{} ({compname})", hd.major, hd.minor).as_bytes());
 
         Ok(status)
     }
@@ -710,7 +711,7 @@ impl Cab {
     fn read_cab_header(&mut self, r: &mut Reader<'_>) -> Result<Status, Error> {
         let a = r.base();
         a.format.set(format_code::CAB);
-        if a.format_name.borrow().is_none() {
+        if a.format_name.get().is_none() && a.format_name_buf.borrow().is_empty() {
             a.set_format(format_code::CAB, c"CAB");
         }
 
@@ -1634,21 +1635,27 @@ mod tests {
         let mut p = [0; 4];
         p[..2].copy_from_slice(&(date as u16).to_le_bytes());
         p[2..].copy_from_slice(&(time as u16).to_le_bytes());
+        let tm = |year, mon| Tm {
+            year,
+            mon,
+            mday: 18,
+            hour: 5,
+            min: 42,
+            sec: 12,
+        };
         let t = dos_time(&p);
         assert_eq!(dos_time(&p), t);
-        assert_eq!(
-            mktime_local(110, 12, 18, 5, 42, 12),
-            mktime_local(111, 0, 18, 5, 42, 12)
-        );
-        assert_eq!(t, mktime_local(110, 11, 18, 5, 42, 12));
+        assert_eq!(mktime(tm(110, 12)), mktime(tm(111, 0)));
+        assert_eq!(t, mktime(tm(110, 11)).unwrap_or(-1));
     }
 
     #[test]
     fn format_name_can_be_formatted() {
         let a = Base::new(READ_MAGIC);
         a.set_format(format_code::CAB, c"CAB");
-        assert_eq!(a.format_name.borrow().as_deref(), Some(c"CAB"));
-        a.set_format_name(b"CAB 1.3 (LZX)".to_vec());
-        assert_eq!(a.format_name.borrow().as_deref(), Some(c"CAB 1.3 (LZX)"));
+        assert_eq!(a.format_name.get(), Some(c"CAB"));
+        a.set_format_name(b"CAB 1.3 (LZX)");
+        assert_eq!(a.format_name.get(), None);
+        assert_eq!(&*a.format_name_buf.borrow(), b"CAB 1.3 (LZX)\0");
     }
 }

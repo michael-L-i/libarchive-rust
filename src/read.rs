@@ -48,9 +48,8 @@ use crate::entry::Entry;
 use crate::read_add_passphrase::Passphrases;
 use crate::util::Error;
 use std::any::Any;
-use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::ffi::{CStr, CString, c_int};
+use std::ffi::{CStr, c_int};
 use std::rc::Rc;
 
 /// `ARCHIVE_ERRNO_FILE_FORMAT`: unrecognized or invalid file format.
@@ -189,14 +188,17 @@ impl Base {
     /// Sets the format code and name `archive_format` reports.
     pub fn set_format(&self, code: c_int, name: &'static CStr) {
         self.format.set(code);
-        *self.format_name.borrow_mut() = Some(Cow::Borrowed(name));
+        self.format_name.set(Some(name));
     }
 
-    /// Sets a formatted name for `archive_format_name` to report, such as
-    /// "CAB 1.3 (LZX)". The name has no NUL.
-    pub fn set_format_name(&self, name: Vec<u8>) {
-        let name = CString::new(name).unwrap_or_default();
-        *self.format_name.borrow_mut() = Some(Cow::Owned(name));
+    /// Sets a formatted `archive_format_name`, such as "CAB 1.3 (LZX)", in
+    /// place of a static one. The name ends at a NUL, as a C string would.
+    pub fn set_format_name(&self, name: &[u8]) {
+        let mut buf = self.format_name_buf.borrow_mut();
+        buf.clear();
+        buf.extend_from_slice(crate::string::until_nul(name));
+        buf.push(0);
+        self.format_name.set(None);
     }
 }
 
