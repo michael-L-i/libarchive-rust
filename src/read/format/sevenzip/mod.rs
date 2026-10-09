@@ -365,7 +365,9 @@ impl Format for SevenZip {
         // carry a status, and `Data::Warn` carries no block.
         if let Some(msg) = self.crc_warning.take() {
             let _ = r.warn(ARCHIVE_ERRNO_MISC, msg);
-            return Ok(Data::Warn);
+            return Ok(Data::Warn {
+                offset: self.entry_offset,
+            });
         }
         let offset = self.entry_offset;
         let Some(block) = self.read_entry_block(r)? else {
