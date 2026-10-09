@@ -35,11 +35,6 @@ pub extern "C" fn archive_read_support_format_iso9660(_a0: *mut Archive) -> c_in
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_format_lha(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_rar(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
