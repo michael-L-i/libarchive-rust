@@ -291,8 +291,9 @@ impl Ppmd8 {
         let mut head = 0;
         // Where the next kept node gets linked: the head, or a node's Next.
         let mut prev: Option<u32> = None;
-        // Every node is visited at most once in a sound model.
-        let mut budget = self.size / UNIT_SIZE + 2;
+        // A sound model has at most `size / UNIT_SIZE` free blocks, and each
+        // of the three passes takes at most one step per block.
+        let mut budget = self.size / UNIT_SIZE * 3 + 2;
 
         self.glue_count = 1 << 13;
         self.stamps = [0; PPMD_NUM_INDEXES];
@@ -465,7 +466,7 @@ impl Ppmd8 {
 
     fn expand_text_area(&mut self) {
         let mut count = [0u32; PPMD_NUM_INDEXES];
-        let mut budget = self.size / UNIT_SIZE + 2;
+        let mut budget = self.size / UNIT_SIZE * 3 + 2;
         if self.lo_unit != self.hi_unit {
             self.a.w32(self.lo_unit, 0);
         }
@@ -1263,10 +1264,6 @@ impl Ppmd8 {
         self.code < 0xFFFF_FFFF
     }
 
-    fn get_threshold(&mut self, total: u32) -> u32 {
-        self.divide_range(total)
-    }
-
     /// `Code / (Range /= total)`, or a failure where upstream divides by
     /// zero.
     fn divide_range(&mut self, total: u32) -> u32 {
@@ -1330,7 +1327,7 @@ impl Ppmd8 {
         if ns != 0 {
             let mut s = self.stats(min);
             let summ = self.summ_freq(min);
-            let count = self.get_threshold(summ);
+            let count = self.divide_range(summ);
             let mut hi_cnt = u32::from(self.a.freq(s));
             if count < hi_cnt {
                 self.range_decode(src, 0, hi_cnt);
@@ -1433,7 +1430,7 @@ impl Ppmd8 {
 
             let (see, esc_freq) = self.make_esc_freq(num_masked);
             let freq_sum = esc_freq + hi_cnt;
-            let count = self.get_threshold(freq_sum);
+            let count = self.divide_range(freq_sum);
 
             if count < hi_cnt {
                 let mut hi = 0;
@@ -1593,6 +1590,24 @@ a16ff1a1bbdc2ad258e52eba9d7fc0bffa78b26caac24eb8e205f5e00b8d3d07\
             let (out, last) = decode(&unhex(hex), order, mem, restore, n + 10);
             assert_eq!((out, last), (text(n), -1));
         }
+    }
+
+    /// Gluing a long run of one-unit blocks takes about two steps per
+    /// block; a budget of one step per block would fail a sound model.
+    #[test]
+    fn glue_free_blocks_handles_a_long_run_of_free_units() {
+        let mut p = Ppmd8::new();
+        assert!(p.alloc(1200));
+        p.hi_unit = p.align_offset;
+        p.lo_unit = p.hi_unit;
+        for i in 0..98 {
+            p.insert_node(p.align_offset + i * UNIT_SIZE, 0);
+        }
+        p.glue_free_blocks();
+        assert!(!p.a.is_bad());
+        assert_eq!(p.glue_count, 1 << 13);
+        let total: u32 = (0..NI).map(|i| p.stamps[i as usize] * p.i2u(i)).sum();
+        assert_eq!(total, 98);
     }
 
     #[test]
