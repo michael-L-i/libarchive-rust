@@ -1676,7 +1676,9 @@ impl Read {
         // Open data source.
         if let Err(e) = self.open_client(a, client) {
             a.state.set(state::FATAL);
-            return a.raise(e);
+            // The opener's literal status is returned even for ARCHIVE_WARN.
+            // Its error is already recorded by the callback.
+            return if e.recorded { e.code } else { a.raise(e) };
         }
         if !self.bypass_filter_bidding {
             // Build out the input pipeline.
