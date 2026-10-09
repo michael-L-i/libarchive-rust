@@ -697,6 +697,136 @@ impl Tar {
         if key == b"GNU.sparse" {
             self.sparse_gnu_attributes_seen = true;
         }
+        // GNU.sparse.* extensions.
+        else if let Some(key) = key
+            .strip_prefix(b"GNU.sparse.")
+            .filter(|key| !key.is_empty())
+        {
+            self.sparse_gnu_attributes_seen = true;
+            match key {
+                // GNU "0.0" sparse pax format.
+                b"numblocks" => {
+                    self.sparse_offset = -1;
+                    self.sparse_numbytes = -1;
+                    self.sparse_gnu_major = 0;
+                    self.sparse_gnu_minor = 0;
+                }
+                b"offset" => {
+                    let (err, t) = read_number(r, value_length);
+                    if err == ARCHIVE_OK {
+                        self.sparse_offset = t;
+                        if self.sparse_numbytes != -1 {
+                            if self.add_sparse_entry(a, self.sparse_offset, self.sparse_numbytes)
+                                != ARCHIVE_OK
+                            {
+                                return Some(ARCHIVE_FATAL);
+                            }
+                            self.sparse_offset = -1;
+                            self.sparse_numbytes = -1;
+                        }
+                    }
+                    return Some(err);
+                }
+                b"numbytes" => {
+                    let (err, t) = read_number(r, value_length);
+                    if err == ARCHIVE_OK {
+                        self.sparse_numbytes = t;
+                        if self.sparse_offset != -1 {
+                            if self.add_sparse_entry(a, self.sparse_offset, self.sparse_numbytes)
+                                != ARCHIVE_OK
+                            {
+                                return Some(ARCHIVE_FATAL);
+                            }
+                            self.sparse_offset = -1;
+                            self.sparse_numbytes = -1;
+                        }
+                    }
+                    return Some(err);
+                }
+                // This is either the size of stored entry OR the size of
+                // data on disk, depending on which GNU sparse format
+                // version is in use. Since pax attributes can be in any
+                // order, we may not actually know at this point how to
+                // interpret this.
+                b"size" => {
+                    let (err, t) = read_number(r, value_length);
+                    if err == ARCHIVE_OK {
+                        self.gnu_sparse_size = t;
+                        self.size_fields |= TAR_SIZE_GNU_SPARSE_SIZE;
+                    }
+                    return Some(err);
+                }
+
+                // GNU "0.1" sparse pax format.
+                b"map" => {
+                    self.sparse_gnu_major = 0;
+                    self.sparse_gnu_minor = 1;
+                    if value_length > SPARSE_MAP_LIMIT {
+                        err = fail(
+                            a,
+                            ARCHIVE_ERRNO_MISC,
+                            format!(
+                                "Unreasonably large sparse map: {value_length} > {SPARSE_MAP_LIMIT}"
+                            ),
+                            ARCHIVE_FAILED,
+                        );
+                    } else {
+                        let Some(p) = ahead(r, value_length).and_then(|p| p.get(..value_length))
+                        else {
+                            return Some(fail(
+                                a,
+                                libc::EINVAL,
+                                "Truncated archive detected while reading GNU sparse data",
+                                ARCHIVE_FATAL,
+                            ));
+                        };
+                        if self.sparse_01_parse(a, p) != ARCHIVE_OK {
+                            err = ARCHIVE_WARN;
+                        }
+                    }
+                    let _ = r.consume(value_length);
+                    return Some(err);
+                }
+
+                // GNU "1.0" sparse pax format.
+                b"major" => {
+                    let (err, t) = read_number(r, value_length);
+                    if err == ARCHIVE_OK && (0..=10).contains(&t) {
+                        self.sparse_gnu_major = t as i32;
+                    }
+                    return Some(err);
+                }
+                b"minor" => {
+                    let (err, t) = read_number(r, value_length);
+                    if err == ARCHIVE_OK && (0..=10).contains(&t) {
+                        self.sparse_gnu_minor = t as i32;
+                    }
+                    return Some(err);
+                }
+                // The real filename; when storing sparse files, GNU tar
+                // puts a synthesized name into the regular 'path' attribute
+                // in an attempt to limit confusion. ;-)
+                b"name" => {
+                    return Some(self.pax_string(
+                        r,
+                        value_length,
+                        PATHNAME_LIMIT,
+                        unconsumed,
+                        |tar| &mut tar.entry_pathname_override,
+                    ));
+                }
+                // GNU.sparse.realsize = size of file on disk.
+                b"realsize" => {
+                    let (err, t) = read_number(r, value_length);
+                    if err == ARCHIVE_OK {
+                        self.gnu_sparse_realsize = t;
+                        self.size_fields |= TAR_SIZE_GNU_SPARSE_REALSIZE;
+                    }
+                    return Some(err);
+                }
+                _ => {}
+            }
+        }
         // LIBARCHIVE extensions.
         else if let Some(key) = key
             .strip_prefix(b"LIBARCHIVE.")
@@ -901,6 +1031,32 @@ impl Tar {
                     }
                 }
             }
+        }
+        // SUN.* extensions from Solaris tar.
+        else if key == b"SUN.holesdata" {
+            if value_length < SPARSE_MAP_LIMIT {
+                let Some(p) = ahead(r, value_length).and_then(|p| p.get(..value_length)) else {
+                    return Some(fail(
+                        a,
+                        libc::EINVAL,
+                        "Truncated archive detected while reading SUN.holesdata",
+                        ARCHIVE_FATAL,
+                    ));
+                };
+                err = self.sun_holesdata(a, p);
+                if err < ARCHIVE_OK {
+                    a.set_error(ARCHIVE_ERRNO_MISC, Some(b"Parse error: SUN.holesdata"));
+                }
+            } else {
+                err = fail(
+                    a,
+                    ARCHIVE_ERRNO_MISC,
+                    format!("Unreasonably large sparse map: {value_length} > {SPARSE_MAP_LIMIT}"),
+                    ARCHIVE_FAILED,
+                );
+            }
+            let _ = r.consume(value_length);
+            return Some(err);
         } else if key == b"atime" {
             let (err, sec, n) = read_time(r, value_length, unconsumed);
             if err == ARCHIVE_OK {

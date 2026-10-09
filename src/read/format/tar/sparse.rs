@@ -128,4 +128,206 @@ impl Tar {
         }
         ARCHIVE_OK
     }
+
+    /// GNU tar sparse format 0.0
+    ///
+    /// Beginning with GNU tar 1.15, sparse files are stored using
+    /// information in the pax extended header. The GNU tar maintainers have
+    /// gone through a number of variations in the process of working out
+    /// this scheme; fortunately, they're all numbered.
+    ///
+    /// Sparse format 0.0 uses attribute GNU.sparse.numblocks to store the
+    /// number of blocks, and GNU.sparse.offset/GNU.sparse.numbytes to store
+    /// offset/size for each block. The repeated instances of these latter
+    /// fields violate the pax specification (which frowns on duplicate
+    /// keys), so this format was quickly replaced.
+    ///
+    /// GNU tar sparse format 0.1
+    ///
+    /// This version replaced the offset/numbytes attributes with a single
+    /// "map" attribute that stored a list of integers. This format had two
+    /// problems: First, the "map" attribute could be very long, which
+    /// caused problems for some implementations. More importantly, the
+    /// sparse data was lost when extracted by archivers that didn't
+    /// recognize this extension.
+    pub(super) fn sparse_01_parse(&mut self, a: &Base, p: &[u8]) -> c_int {
+        let mut offset = -1;
+        for field in p.split(|&c| c == b',') {
+            if !field.iter().all(u8::is_ascii_digit) {
+                return ARCHIVE_WARN;
+            }
+            if offset < 0 {
+                offset = tar_atol10(field);
+                if offset < 0 {
+                    return ARCHIVE_WARN;
+                }
+            } else {
+                let size = tar_atol10(field);
+                if size < 0 {
+                    return ARCHIVE_WARN;
+                }
+                if self.add_sparse_entry(a, offset, size) != ARCHIVE_OK {
+                    return ARCHIVE_FATAL;
+                }
+                offset = -1;
+            }
+        }
+        ARCHIVE_OK
+    }
+
+    /// GNU tar sparse format 1.0
+    ///
+    /// The idea: The offset/size data is stored as a series of base-10
+    /// ASCII numbers prepended to the file data, so that dearchivers that
+    /// don't support this format will extract the block map along with the
+    /// data and a separate post-process can restore the sparseness.
+    ///
+    /// Unfortunately, GNU tar 1.16 had a bug that added unnecessary
+    /// padding to the body of the file when using this format. GNU tar 1.17
+    /// corrected this bug without bumping the version number, so it's not
+    /// possible to support both variants. This code supports the later
+    /// variant at the expense of not supporting the former.
+    ///
+    /// This variant also introduced the GNU.sparse.major/GNU.sparse.minor
+    /// attributes.
+    ///
+    /// Read the next line from the input, and parse it as a decimal integer
+    /// followed by '\n'. Returns positive integer value or negative on
+    /// error.
+    fn sparse_10_atol(r: &mut Reader<'_>, remaining: &mut i64, unconsumed: &mut i64) -> i64 {
+        // Skip any lines starting with '#'; GNU tar specs don't require
+        // this, but they should.
+        let line = loop {
+            let Some(line) = readline(r, (*remaining).min(100), unconsumed) else {
+                return i64::from(ARCHIVE_FATAL);
+            };
+            *remaining -= line.len() as i64;
+            if line.first() != Some(&b'#') {
+                break line;
+            }
+        };
+
+        let mut l: i64 = 0;
+        for &c in &line {
+            if c == b'\n' {
+                return l;
+            }
+            if !c.is_ascii_digit() {
+                return i64::from(ARCHIVE_WARN);
+            }
+            // Truncate on overflow.
+            l = l
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(i64::from(c - b'0')))
+                .unwrap_or(i64::MAX);
+        }
+        // TODO: Error message.
+        i64::from(ARCHIVE_WARN)
+    }
+
+    /// Returns length (in bytes) of the sparse data description that was
+    /// read, or an `ARCHIVE_*` failure.
+    pub(super) fn sparse_10_read(&mut self, r: &mut Reader<'_>, unconsumed: &mut i64) -> i64 {
+        let a = r.base();
+        let fatal = i64::from(ARCHIVE_FATAL);
+
+        // Clear out the existing sparse list.
+        self.sparse_list.clear();
+
+        let mut remaining = self.entry_bytes_remaining;
+
+        // Parse entries.
+        let mut entries = Self::sparse_10_atol(r, &mut remaining, unconsumed);
+        if entries < 0 {
+            return fatal;
+        }
+        // Parse the individual entries.
+        while entries > 0 {
+            entries -= 1;
+            // Parse offset/size.
+            let offset = Self::sparse_10_atol(r, &mut remaining, unconsumed);
+            if offset < 0 {
+                return fatal;
+            }
+            let size = Self::sparse_10_atol(r, &mut remaining, unconsumed);
+            if size < 0 {
+                return fatal;
+            }
+            // Add a new sparse entry.
+            if self.add_sparse_entry(a, offset, size) != ARCHIVE_OK {
+                return fatal;
+            }
+        }
+        // Skip rest of block...
+        if flush(r, unconsumed) != ARCHIVE_OK {
+            return fatal;
+        }
+        let bytes_read = self.entry_bytes_remaining - remaining;
+        let to_skip = padding(bytes_read);
+        // Fail if tar->entry_bytes_remaing would get negative.
+        if to_skip > remaining || r.consume(to_skip).is_err() {
+            return fatal;
+        }
+        bytes_read + to_skip
+    }
+
+    /// Solaris pax extension for a sparse file. This is recorded with the
+    /// data and hole pairs. The way recording sparse information by
+    /// Solaris' pax simply indicates where data and sparse are, so the
+    /// stored contents consist of both data and hole.
+    pub(super) fn sun_holesdata(&mut self, a: &Base, p: &[u8]) -> c_int {
+        let mut end = 0;
+        let mut hole = true;
+        let Some(p) = p.strip_prefix(b" ") else {
+            return ARCHIVE_WARN;
+        };
+        for field in p.split(|&c| c == b' ') {
+            if !field.iter().all(u8::is_ascii_digit) {
+                return ARCHIVE_WARN;
+            }
+            let start = end;
+            end = tar_atol10(field);
+            if end < 0 {
+                return ARCHIVE_WARN;
+            }
+            if start < end {
+                if self.add_sparse_entry(a, start, end - start) != ARCHIVE_OK {
+                    return ARCHIVE_FATAL;
+                }
+                if let Some(last) = self.sparse_list.back_mut() {
+                    last.hole = hole;
+                }
+            }
+            hole = !hole;
+        }
+        ARCHIVE_OK
+    }
+}
+
+/// Returns the next line, including its trailing newline, or `None` on
+/// error: a line longer than `limit`, or the end of the input.
+fn readline(r: &mut Reader<'_>, limit: i64, unconsumed: &mut i64) -> Option<Vec<u8>> {
+    let a = r.base();
+    if flush(r, unconsumed) != ARCHIVE_OK {
+        return None;
+    }
+
+    let limit = usize::try_from(limit).unwrap_or(0);
+    let mut line = Vec::new();
+    loop {
+        let t = r.peek_available(1).ok().filter(|t| !t.is_empty())?;
+        // If we found '\n' in the read buffer, take the line up to it;
+        // otherwise, accumulate what is there.
+        let found = t.iter().position(|&c| c == b'\n');
+        let n = found.map_or(t.len(), |i| i + 1);
+        if line.len() + n > limit {
+            a.set_error(ARCHIVE_ERRNO_FILE_FORMAT, Some(b"Line too long"));
+            return None;
+        }
+        line.extend_from_slice(t.get(..n)?);
+        r.consume(n).ok()?;
+        if found.is_some() {
+            return Some(line);
+        }
+    }
 }

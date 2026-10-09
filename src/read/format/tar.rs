@@ -30,7 +30,7 @@
 //! The tar formats: v7, ustar, GNU tar, star and pax interchange, with GNU
 //! long names and sparse files, Solaris ACLs and AppleDouble metadata.
 
-#![allow(dead_code)] // The pax and GNU sparse parts follow.
+#![allow(dead_code)] // The registration follows.
 
 mod pax;
 mod sparse;
@@ -1004,7 +1004,7 @@ impl Tar {
                         && seen_headers & SEEN_MAC_METADATA == 0
                         && is_mac_metadata_entry(entry))
                     {
-                        return err;
+                        return self.reconcile_sparse(r, err, unconsumed);
                     }
                     let err2 = Self::read_mac_metadata_blob(r, entry, unconsumed);
                     if err2 < ARCHIVE_WARN {
@@ -1031,6 +1031,44 @@ impl Tar {
                 eof_fatal = true;
             }
         }
+    }
+
+    /// Reconcile GNU sparse attributes once the entry's header is read.
+    fn reconcile_sparse(&mut self, r: &mut Reader<'_>, err: c_int, unconsumed: &mut i64) -> c_int {
+        let a = r.base();
+        if !self.sparse_gnu_attributes_seen {
+            return err;
+        }
+        // Only 'S' (GNU sparse) and ustar '0' regular files can be sparse.
+        if self.filetype != b'S' && self.filetype != b'0' {
+            return fail(
+                a,
+                ARCHIVE_ERRNO_MISC,
+                "Non-regular file cannot be sparse",
+                ARCHIVE_WARN,
+            );
+        }
+        match (self.sparse_gnu_major, self.sparse_gnu_minor) {
+            // Sparse map already parsed from 'x' header.
+            (0, 0) | (0, 1) => {}
+            // Sparse map is prepended to file contents.
+            (1, 0) => {
+                let bytes_read = self.sparse_10_read(r, unconsumed);
+                if bytes_read < 0 {
+                    return bytes_read as c_int;
+                }
+                self.entry_bytes_remaining -= bytes_read;
+            }
+            _ => {
+                return fail(
+                    a,
+                    ARCHIVE_ERRNO_MISC,
+                    "Unrecognized GNU sparse file format",
+                    ARCHIVE_WARN,
+                );
+            }
+        }
+        err
     }
 
     /// The conversion for ACL text, made on first use.
