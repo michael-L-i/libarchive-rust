@@ -851,3 +851,58 @@ Phase 5 needs:
   and AES-CTR in all three key sizes updated in pieces of 0 to 70 bytes (every
   partial-block case). All 2,900 outputs matched. The probe is not in the
   repository.
+
+## tar reader (src/read/format/tar.rs)
+
+### Ported as-is
+
+- The hard link size heuristic calls `archive_read_format_tar_bid(a, 50)`,
+  which looks at the stream position. The record of the hard link entry itself
+  has not been consumed yet at that point (`unconsumed`), so it bids on the
+  entry's own header, not on the one that follows as the comment says. The
+  port bids on the entry's own header too.
+- `header_gnutar` assigns the result of `header_common` to `err`, which drops
+  the warnings of the name conversions before it (their messages stay).
+- `gnu_add_sparse_entry` links the new block before checking it, so a
+  rejected block stays in the list as an empty one. `GNU.sparse.map` turns the
+  resulting `ARCHIVE_FATAL` into `ARCHIVE_WARN`, and the entry then carries
+  that empty block.
+- A sparse entry whose only data block covers the whole file is
+  `ARCHIVE_FATAL` ("Malformed sparse map data"): `archive_entry_sparse_count`
+  drops such a block, so its count differs from the number added. Adjacent
+  blocks merged by `archive_entry_sparse_add_entry` and blocks past the end
+  of the file are fatal for the same reason.
+- `sparse_offset`, `sparse_numbytes` and the GNU sparse major/minor numbers
+  are not reset between entries.
+- `pax_attribute_read_number` returns `ARCHIVE_FATAL` without a message for a
+  value over 64 bytes, and `ARCHIVE_WARN` without a message for a negative or
+  overflowing number. A malformed time sets "Ignoring malformed pax X" even
+  when the call failed fatally.
+- `SCHILY.xattr.` takes values below 16 MiB but `LIBARCHIVE.xattr.` and
+  `RHT.security.selinux` take values up to it. `LIBARCHIVE.xattr.` skips an
+  oversized value with a warning and no message. `SCHILY.xattr.` and
+  `LIBARCHIVE.xattr.` names end at their first NUL, which `%00` can produce.
+- `pax_attribute_SUN_holesdata` tests for a `\n` at the end of a field, which
+  cannot be there (the value excludes the newline), so the test is dead.
+- `read_body_to_string` and `header_pax_records` consume an oversized body
+  before the pending record of the header has been consumed. The total is the
+  same.
+- The `X` header is the Sun variant of `x` and is refused when repeated with
+  either, but a repeated `K`, `L` or `V` only warns.
+- `process_mac_extensions` defaults to on only where upstream was built with
+  `copyfile.h` (macOS); here that is Apple targets.
+
+### Differences
+
+- `entry_offset` is not kept: upstream sets it and never reads it.
+- `compat-2x` only passes `SCONV_SET_OPT_UTF8_LIBARCHIVE2X` to the
+  conversion, which does nothing on this platform (see archive_string).
+- The sparse list is a `VecDeque`, and the 1.0 map's lines are read one at a
+  time (at most 100 bytes each, as upstream limits them) instead of through
+  the shared `line` buffer.
+- No allocation is bounded beyond upstream's limits: names and values are
+  copied from bytes the archive holds, so memory use is at most the size of the
+  input, as upstream's is. An attribute name can be as long as the buffered
+  part of its line (up to 100 million characters).
+- A failed `read_ahead` (not only a short archive) is reported with the
+  "Truncated ..." message of the call site, as upstream does for its `NULL`.
