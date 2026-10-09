@@ -1578,6 +1578,52 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn cpio_symlink_body_is_exactly_its_size() {
+        // An odc symlink whose one-byte body is directly followed by the
+        // trailer, with no NUL after it.
+        fn oct(v: u64, width: usize) -> Vec<u8> {
+            format!("{v:0width$o}").into_bytes()
+        }
+        fn odc_record(name: &[u8], mode: u64, body: &[u8]) -> Vec<u8> {
+            let mut h = b"070707".to_vec();
+            for (v, w) in [(0, 6), (1, 6), (mode, 6), (0, 6), (0, 6), (1, 6), (0, 6)] {
+                h.extend(oct(v, w));
+            }
+            h.extend(oct(0, 11));
+            h.extend(oct(name.len() as u64 + 1, 6));
+            h.extend(oct(body.len() as u64, 11));
+            h.extend(name);
+            h.push(0);
+            h.extend(body);
+            h
+        }
+        let mut data = odc_record(b"sl", 0o120777, b"a");
+        data.extend(odc_record(b"TRAILER!!!", 0, b""));
+
+        let a = archive_read_new();
+        assert_eq!(archive_read_support_format_cpio(a), ARCHIVE_OK);
+        assert_eq!(
+            crate::ffi::read_open::archive_read_open_memory2(
+                a,
+                data.as_ptr().cast(),
+                data.len(),
+                7
+            ),
+            ARCHIVE_OK
+        );
+        let mut e: *mut ArchiveEntry = std::ptr::null_mut();
+        assert_eq!(archive_read_next_header(a, &mut e), ARCHIVE_OK);
+        let link = crate::ffi::entry::archive_entry_symlink(e);
+        // SAFETY: the library returns a NUL-terminated string.
+        assert_eq!(unsafe { CStr::from_ptr(link) }, c"a");
+        assert_eq!(
+            archive_read_next_header(a, &mut e),
+            crate::archive::ARCHIVE_EOF
+        );
+        assert_eq!(archive_free(a), ARCHIVE_OK);
+    }
+
+    #[test]
     fn empty_input_has_no_entries() {
         let a = archive_read_new();
         assert_eq!(archive_read_support_format_all(a), ARCHIVE_OK);

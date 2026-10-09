@@ -544,7 +544,22 @@ impl Format for Cpio {
             // Upstream sets up a default name conversion only on Windows; on
             // this platform there is none to switch off.
             b"compat-2x" => Ok(Status::Ok),
-            b"hdrcharset" => self.hdrcharset(a, value),
+            b"hdrcharset" => {
+                let Some(name) = value.filter(|v| !v.is_empty()) else {
+                    return Some(Err(Error::new(
+                        ARCHIVE_FAILED,
+                        ARCHIVE_ERRNO_MISC,
+                        "cpio: hdrcharset option needs a character-set name",
+                    )));
+                };
+                let mut cache = a.conv.lock().unwrap_or_else(PoisonError::into_inner);
+                conversion_from_charset(Some(&mut *cache), name, false)
+                    .map(|sc| {
+                        self.opt_sconv = Some(sc);
+                        Status::Ok
+                    })
+                    .map_err(|e| Error::fatal(e.errno, e.message))
+            }
             b"pwb" => {
                 if value.is_some_and(|v| !v.is_empty()) {
                     self.option_pwb = true;
@@ -566,7 +581,7 @@ impl Format for Cpio {
             ));
         }
 
-        let Some(h) = r.read_ahead(namelength)? else {
+        let Some(h) = r.read_ahead(namelength)?.and_then(|h| h.get(..namelength)) else {
             return Err(Error::silent(ARCHIVE_FATAL));
         };
         let charset = conversion_charset_name(sconv.as_deref());
@@ -598,7 +613,7 @@ impl Format for Cpio {
             let Ok(n) = usize::try_from(self.entry_bytes_remaining) else {
                 return Err(Error::silent(ARCHIVE_FATAL));
             };
-            let Some(hl) = r.read_ahead(n)? else {
+            let Some(hl) = r.read_ahead(n)?.and_then(|hl| hl.get(..n)) else {
                 return Err(Error::silent(ARCHIVE_FATAL));
             };
             if entry.copy_symlink_l(hl, sconv.as_deref()).is_err() {
@@ -657,25 +672,6 @@ impl Format for Cpio {
         )?;
         self.entry_bytes_remaining = 0;
         self.entry_padding = 0;
-        Ok(Status::Ok)
-    }
-}
-
-impl Cpio {
-    /// `hdrcharset`: the charset the names are in. A failed conversion is
-    /// fatal, as upstream's is.
-    fn hdrcharset(&mut self, a: &Base, value: Option<&[u8]>) -> Result<Status, Error> {
-        let Some(name) = value.filter(|v| !v.is_empty()) else {
-            return Err(Error::new(
-                ARCHIVE_FAILED,
-                ARCHIVE_ERRNO_MISC,
-                "cpio: hdrcharset option needs a character-set name",
-            ));
-        };
-        let mut cache = a.conv.lock().unwrap_or_else(PoisonError::into_inner);
-        let sc = conversion_from_charset(Some(&mut *cache), name, false)
-            .map_err(|e| Error::fatal(e.errno, e.message))?;
-        self.opt_sconv = Some(sc);
         Ok(Status::Ok)
     }
 }
