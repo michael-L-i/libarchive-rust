@@ -671,24 +671,6 @@ impl Tar {
         value_length: usize,
         unconsumed: &mut i64,
     ) -> c_int {
-        if let Some(code) = self.pax_known_attribute(r, entry, key, value_length, unconsumed) {
-            return code;
-        }
-        // Unrecognized key, just skip the entire value.
-        let _ = r.consume(value_length);
-        ARCHIVE_OK
-    }
-
-    /// The part of `pax_attribute` for the keys it knows, which also deal
-    /// with their values. `None` for the others.
-    fn pax_known_attribute(
-        &mut self,
-        r: &mut Reader<'_>,
-        entry: &mut Entry,
-        key: &[u8],
-        value_length: usize,
-        unconsumed: &mut i64,
-    ) -> Option<c_int> {
         let a = r.base();
         let mut err = ARCHIVE_OK;
 
@@ -719,13 +701,13 @@ impl Tar {
                             if self.add_sparse_entry(a, self.sparse_offset, self.sparse_numbytes)
                                 != ARCHIVE_OK
                             {
-                                return Some(ARCHIVE_FATAL);
+                                return ARCHIVE_FATAL;
                             }
                             self.sparse_offset = -1;
                             self.sparse_numbytes = -1;
                         }
                     }
-                    return Some(err);
+                    return err;
                 }
                 b"numbytes" => {
                     let (err, t) = read_number(r, value_length);
@@ -735,13 +717,13 @@ impl Tar {
                             if self.add_sparse_entry(a, self.sparse_offset, self.sparse_numbytes)
                                 != ARCHIVE_OK
                             {
-                                return Some(ARCHIVE_FATAL);
+                                return ARCHIVE_FATAL;
                             }
                             self.sparse_offset = -1;
                             self.sparse_numbytes = -1;
                         }
                     }
-                    return Some(err);
+                    return err;
                 }
                 // This is either the size of stored entry OR the size of
                 // data on disk, depending on which GNU sparse format
@@ -754,7 +736,7 @@ impl Tar {
                         self.gnu_sparse_size = t;
                         self.size_fields |= TAR_SIZE_GNU_SPARSE_SIZE;
                     }
-                    return Some(err);
+                    return err;
                 }
 
                 // GNU "0.1" sparse pax format.
@@ -773,19 +755,19 @@ impl Tar {
                     } else {
                         let Some(p) = ahead(r, value_length).and_then(|p| p.get(..value_length))
                         else {
-                            return Some(fail(
+                            return fail(
                                 a,
                                 libc::EINVAL,
                                 "Truncated archive detected while reading GNU sparse data",
                                 ARCHIVE_FATAL,
-                            ));
+                            );
                         };
                         if self.sparse_01_parse(a, p) != ARCHIVE_OK {
                             err = ARCHIVE_WARN;
                         }
                     }
                     let _ = r.consume(value_length);
-                    return Some(err);
+                    return err;
                 }
 
                 // GNU "1.0" sparse pax format.
@@ -794,26 +776,22 @@ impl Tar {
                     if err == ARCHIVE_OK && (0..=10).contains(&t) {
                         self.sparse_gnu_major = t as i32;
                     }
-                    return Some(err);
+                    return err;
                 }
                 b"minor" => {
                     let (err, t) = read_number(r, value_length);
                     if err == ARCHIVE_OK && (0..=10).contains(&t) {
                         self.sparse_gnu_minor = t as i32;
                     }
-                    return Some(err);
+                    return err;
                 }
                 // The real filename; when storing sparse files, GNU tar
                 // puts a synthesized name into the regular 'path' attribute
                 // in an attempt to limit confusion. ;-)
                 b"name" => {
-                    return Some(self.pax_string(
-                        r,
-                        value_length,
-                        PATHNAME_LIMIT,
-                        unconsumed,
-                        |tar| &mut tar.entry_pathname_override,
-                    ));
+                    return self.pax_string(r, value_length, PATHNAME_LIMIT, unconsumed, |tar| {
+                        &mut tar.entry_pathname_override
+                    });
                 }
                 // GNU.sparse.realsize = size of file on disk.
                 b"realsize" => {
@@ -822,7 +800,7 @@ impl Tar {
                         self.gnu_sparse_realsize = t;
                         self.size_fields |= TAR_SIZE_GNU_SPARSE_REALSIZE;
                     }
-                    return Some(err);
+                    return err;
                 }
                 _ => {}
             }
@@ -843,16 +821,16 @@ impl Tar {
                         Some(b"Ignoring malformed pax creationtime"),
                     );
                 }
-                return Some(err);
+                return err;
             } else if key == b"symlinktype" {
                 if value_length < 16 {
                     let Some(p) = ahead(r, value_length).and_then(|p| p.get(..value_length)) else {
-                        return Some(fail(
+                        return fail(
                             a,
                             ARCHIVE_ERRNO_FILE_FORMAT,
                             "Truncated tar archive detected while reading `symlinktype` attribute",
                             ARCHIVE_FATAL,
-                        ));
+                        );
                     };
                     if p == b"file" {
                         entry.set_symlink_type(SYMLINK_TYPE_FILE);
@@ -877,23 +855,23 @@ impl Tar {
                     );
                 }
                 let _ = r.consume(value_length);
-                return Some(err);
+                return err;
             } else if let Some(name) = key.strip_prefix(b"xattr.").filter(|n| !n.is_empty()) {
                 if value_length > XATTR_LIMIT {
                     err = ARCHIVE_WARN;
                 } else {
                     let Some(p) = ahead(r, value_length).and_then(|p| p.get(..value_length)) else {
-                        return Some(fail(
+                        return fail(
                             a,
                             libc::EINVAL,
                             "Truncated archive detected while reading xattr information",
                             ARCHIVE_FATAL,
-                        ));
+                        );
                     };
                     libarchive_xattr(entry, name, p);
                 }
                 let _ = r.consume(value_length);
-                return Some(err);
+                return err;
             }
         }
         // GNU tar uses RHT.security header to store SELinux xattrs
@@ -911,30 +889,30 @@ impl Tar {
                 );
             } else {
                 let Some(p) = ahead(r, value_length).and_then(|p| p.get(..value_length)) else {
-                    return Some(fail(
+                    return fail(
                         a,
                         libc::EINVAL,
                         "Truncated archive detected while reading selinux data",
                         ARCHIVE_FATAL,
-                    ));
+                    );
                 };
                 entry.xattr_add(c"security.selinux", p);
             }
             let _ = r.consume(value_length);
-            return Some(err);
+            return err;
         }
         // SCHILY.* extensions used by "star" archiver.
         else if let Some(key) = key.strip_prefix(b"SCHILY.").filter(|key| !key.is_empty()) {
             match key {
                 b"acl.access" => {
-                    return Some(self.schily_acl(r, entry, value_length, TYPE_ACCESS));
+                    return self.schily_acl(r, entry, value_length, TYPE_ACCESS);
                     // TODO: Mark mode as set.
                 }
                 b"acl.default" => {
-                    return Some(self.schily_acl(r, entry, value_length, TYPE_DEFAULT));
+                    return self.schily_acl(r, entry, value_length, TYPE_DEFAULT);
                 }
                 b"acl.ace" => {
-                    return Some(self.schily_acl(r, entry, value_length, TYPE_NFS4));
+                    return self.schily_acl(r, entry, value_length, TYPE_NFS4);
                     // TODO: Mark mode as set.
                 }
                 b"devmajor" => {
@@ -942,25 +920,25 @@ impl Tar {
                     if err == ARCHIVE_OK {
                         entry.set_rdevmajor(t as Dev);
                     }
-                    return Some(err);
+                    return err;
                 }
                 b"devminor" => {
                     let (err, t) = read_number(r, value_length);
                     if err == ARCHIVE_OK {
                         entry.set_rdevminor(t as Dev);
                     }
-                    return Some(err);
+                    return err;
                 }
                 b"fflags" => {
                     if value_length < FFLAGS_LIMIT {
                         let Some(p) = ahead(r, value_length).and_then(|p| p.get(..value_length))
                         else {
-                            return Some(fail(
+                            return fail(
                                 a,
                                 libc::EINVAL,
                                 "Truncated archive detected while reading SCHILY.fflags",
                                 ARCHIVE_FATAL,
-                            ));
+                            );
                         };
                         entry.copy_fflags_text(p);
                     } else {
@@ -968,28 +946,28 @@ impl Tar {
                         err = ARCHIVE_WARN;
                     }
                     let _ = r.consume(value_length);
-                    return Some(err);
+                    return err;
                 }
                 b"dev" => {
                     let (err, t) = read_number(r, value_length);
                     if err == ARCHIVE_OK {
                         entry.set_dev(t as Dev);
                     }
-                    return Some(err);
+                    return err;
                 }
                 b"ino" => {
                     let (err, t) = read_number(r, value_length);
                     if err == ARCHIVE_OK {
                         entry.set_ino(t);
                     }
-                    return Some(err);
+                    return err;
                 }
                 b"nlink" => {
                     let (err, t) = read_number(r, value_length);
                     if err == ARCHIVE_OK {
                         entry.set_nlink(t as u32);
                     }
-                    return Some(err);
+                    return err;
                 }
                 b"realsize" => {
                     let (err, t) = read_number(r, value_length);
@@ -997,7 +975,7 @@ impl Tar {
                         self.schily_sparse_realsize = t;
                         self.size_fields |= TAR_SIZE_SCHILY_SPARSE_REALSIZE;
                     }
-                    return Some(err);
+                    return err;
                 }
                 // TODO: Is there a SCHILY.sparse.size similar to
                 // GNU.sparse.size ?
@@ -1007,12 +985,12 @@ impl Tar {
                             let Some(p) =
                                 ahead(r, value_length).and_then(|p| p.get(..value_length))
                             else {
-                                return Some(fail(
+                                return fail(
                                     a,
                                     libc::EINVAL,
                                     "Truncated archive detected while reading SCHILY.xattr",
                                     ARCHIVE_FATAL,
-                                ));
+                                );
                             };
                             if schily_xattr(entry, name, p) {
                                 // TODO: Unable to parse xattr.
@@ -1027,7 +1005,7 @@ impl Tar {
                             );
                         }
                         let _ = r.consume(value_length);
-                        return Some(err);
+                        return err;
                     }
                 }
             }
@@ -1036,12 +1014,12 @@ impl Tar {
         else if key == b"SUN.holesdata" {
             if value_length < SPARSE_MAP_LIMIT {
                 let Some(p) = ahead(r, value_length).and_then(|p| p.get(..value_length)) else {
-                    return Some(fail(
+                    return fail(
                         a,
                         libc::EINVAL,
                         "Truncated archive detected while reading SUN.holesdata",
                         ARCHIVE_FATAL,
-                    ));
+                    );
                 };
                 err = self.sun_holesdata(a, p);
                 if err < ARCHIVE_OK {
@@ -1056,7 +1034,7 @@ impl Tar {
                 );
             }
             let _ = r.consume(value_length);
-            return Some(err);
+            return err;
         } else if key == b"atime" {
             let (err, sec, n) = read_time(r, value_length, unconsumed);
             if err == ARCHIVE_OK {
@@ -1064,7 +1042,7 @@ impl Tar {
             } else {
                 a.set_error(ARCHIVE_ERRNO_MISC, Some(b"Ignoring malformed pax atime"));
             }
-            return Some(err);
+            return err;
         } else if key == b"ctime" {
             let (err, sec, n) = read_time(r, value_length, unconsumed);
             if err == ARCHIVE_OK {
@@ -1072,7 +1050,7 @@ impl Tar {
             } else {
                 a.set_error(ARCHIVE_ERRNO_MISC, Some(b"Ignoring malformed pax ctime"));
             }
-            return Some(err);
+            return err;
         }
         // TODO: Publish charset information in entry.
         // TODO: Publish comment in entry.
@@ -1081,22 +1059,20 @@ impl Tar {
             if err == ARCHIVE_OK {
                 entry.set_gid(t);
             }
-            return Some(err);
+            return err;
         } else if key == b"gname" {
-            return Some(
-                self.pax_string(r, value_length, GUNAME_LIMIT, unconsumed, |tar| {
-                    &mut tar.entry_gname
-                }),
-            );
+            return self.pax_string(r, value_length, GUNAME_LIMIT, unconsumed, |tar| {
+                &mut tar.entry_gname
+            });
         } else if key == b"hdrcharset" {
             if value_length < 64 {
                 let Some(p) = ahead(r, value_length).and_then(|p| p.get(..value_length)) else {
-                    return Some(fail(
+                    return fail(
                         a,
                         ARCHIVE_ERRNO_FILE_FORMAT,
                         "Truncated tar archive detected while reading hdrcharset attribute",
                         ARCHIVE_FATAL,
-                    ));
+                    );
                 };
                 if p == b"BINARY" {
                     // Binary mode.
@@ -1116,15 +1092,13 @@ impl Tar {
                 );
             }
             let _ = r.consume(value_length);
-            return Some(err);
+            return err;
         }
         // pax interchange doesn't distinguish hardlink vs. symlink.
         else if key == b"linkpath" {
-            return Some(
-                self.pax_string(r, value_length, PATHNAME_LIMIT, unconsumed, |tar| {
-                    &mut tar.entry_linkpath
-                }),
-            );
+            return self.pax_string(r, value_length, PATHNAME_LIMIT, unconsumed, |tar| {
+                &mut tar.entry_linkpath
+            });
         } else if key == b"mtime" {
             let (err, sec, n) = read_time(r, value_length, unconsumed);
             if err == ARCHIVE_OK {
@@ -1132,13 +1106,11 @@ impl Tar {
             } else {
                 a.set_error(ARCHIVE_ERRNO_MISC, Some(b"Ignoring malformed pax mtime"));
             }
-            return Some(err);
+            return err;
         } else if key == b"path" {
-            return Some(
-                self.pax_string(r, value_length, PATHNAME_LIMIT, unconsumed, |tar| {
-                    &mut tar.entry_pathname
-                }),
-            );
+            return self.pax_string(r, value_length, PATHNAME_LIMIT, unconsumed, |tar| {
+                &mut tar.entry_pathname
+            });
         }
         // POSIX has reserved 'realtime.*'.
         // POSIX has reserved 'security.*'.
@@ -1153,29 +1125,29 @@ impl Tar {
                 // Note: pax_attr_read_number returns INT64_MAX on overflow
                 // or < 0.
                 self.entry_bytes_remaining = 0;
-                return Some(fail(
+                return fail(
                     a,
                     ARCHIVE_ERRNO_MISC,
                     "Tar size attribute overflow",
                     ARCHIVE_FATAL,
-                ));
+                );
             }
-            return Some(err);
+            return err;
         } else if key == b"uid" {
             let (err, t) = read_number(r, value_length);
             if err == ARCHIVE_OK {
                 entry.set_uid(t);
             }
-            return Some(err);
+            return err;
         } else if key == b"uname" {
-            return Some(
-                self.pax_string(r, value_length, GUNAME_LIMIT, unconsumed, |tar| {
-                    &mut tar.entry_uname
-                }),
-            );
+            return self.pax_string(r, value_length, GUNAME_LIMIT, unconsumed, |tar| {
+                &mut tar.entry_uname
+            });
         }
 
-        None
+        // Unrecognized key, just skip the entire value.
+        let _ = r.consume(value_length);
+        ARCHIVE_OK
     }
 
     /// A value that is kept for after all the attributes are read. A value

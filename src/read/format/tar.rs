@@ -743,11 +743,6 @@ fn is_mac_metadata_entry(entry: &mut Entry) -> bool {
     }
 }
 
-/// Returns the zero-padded, NUL-terminated name field up to its NUL.
-fn name_field(h: &Block, f: Range<usize>) -> &[u8] {
-    until_nul(&h[f])
-}
-
 impl Tar {
     /// This function resets the accumulated state while reading a header.
     fn reset_header_state(&mut self) {
@@ -1339,7 +1334,7 @@ impl Tar {
                     .hardlink_w()
                     .is_none_or(|w| w.first().is_none_or(|&c| c == 0));
                 if mbs_unset && wcs_unset {
-                    let linkname = name_field(h, LINKNAME);
+                    let linkname = until_nul(&h[LINKNAME]);
                     if entry
                         .copy_hardlink_l(linkname, self.sconv.as_deref())
                         .is_err()
@@ -1404,7 +1399,7 @@ impl Tar {
                     .symlink_w()
                     .is_none_or(|w| w.first().is_none_or(|&c| c == 0));
                 if mbs_unset && wcs_unset {
-                    let linkname = name_field(h, LINKNAME);
+                    let linkname = until_nul(&h[LINKNAME]);
                     if entry
                         .copy_symlink_l(linkname, self.sconv.as_deref())
                         .is_err()
