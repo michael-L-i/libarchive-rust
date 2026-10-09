@@ -30,8 +30,6 @@
 //! Nettle, OpenSSL) and its "unsupported" stub are replaced by the `aes`,
 //! `pbkdf2` and `hmac` crates, so nothing here is ever unsupported.
 
-#![allow(dead_code)] // for the zip reader and writer (phases 4-5)
-
 use aes::cipher::{Block, BlockCipherEncrypt, KeyInit};
 use aes::{Aes128, Aes192, Aes256};
 use sha1::Sha1;
