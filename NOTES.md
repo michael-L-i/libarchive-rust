@@ -792,13 +792,12 @@ one; see the first entry.
 
 ### Differences
 
-- The arena is zeroed. Upstream leaves the `malloc`ed memory uninitialized,
-  so any read of it (for example the stamp of a block the model never
-  wrote) is undefined; zero is one of the values it can read as. The
-  decoders match upstream byte for byte over all the streams we tried,
-  including corrupt ones. Zeroing touches the whole arena, where `malloc`
-  commits lazily, so a PPMd7 model of a few GiB costs real memory and time
-  at `alloc`.
+- The arena reads as zero. Upstream leaves the `malloc`ed memory
+  uninitialized, so a read of it (for example the stamp of a block the model
+  never wrote) is undefined. The decoders never depend on the initial
+  contents: upstream's C decodes the same symbols with the arena filled with
+  0x00, 0xFF, 0xA5 or 0x01. The memory comes from `alloc_zeroed`, so large
+  models commit pages lazily, like `malloc`.
 - Anything upstream would do outside the arena (a read, a write, a search
   for a symbol that is not there, a free list that loops) marks the model
   bad, and `decode_symbol` returns -2 ("invalid data") from then on. A model
