@@ -16,5 +16,10 @@ Check, in order:
    match upstream. No upstream branch silently dropped.
 3. **Concision.** Dead code, needless abstraction, comments that restate code.
 
+Don't stop at reading: build a small C probe against `build/oracle` and
+`build/port` and compare both libraries on the fixtures and on mutated,
+truncated and hand-made inputs (entry fields, data bytes, return codes,
+errno and error strings). That found the real bugs in earlier units.
+
 Reply `PASS` or `STOP`, then one finding per line as
 `file:line: problem; fix`. Any memory-safety or fidelity finding is a `STOP`.
