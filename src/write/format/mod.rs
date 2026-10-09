@@ -1,5 +1,6 @@
 pub mod ar;
 pub mod cpio;
+pub mod iso9660;
 pub mod mtree;
 pub mod raw;
 pub mod sevenzip;

@@ -1782,3 +1782,23 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - ZIP LZMA properties use the safe encoder's actual preset dictionary size.
   Encryption covers the ZIP-LZMA prefix as well as compressed bytes, including
   the AES authentication checksum.
+## 7zip and ISO9660 writers
+
+- The 7zip writer uses a seekable anonymous temporary file for encoded data
+  and native solid stream headers. Copy, deflate, BZip2, LZMA1, LZMA2,
+  Zstandard and the native PPMd7 encoder are supported. Safe codec output
+  differs from C codec bytes. PPMd has checked model accesses and a bounded
+  model arena; its encoded bytes follow the upstream range coder.
+- ISO9660 implements levels 1–4, Joliet and Rock Ridge, deep-directory
+  relocation, hardlinks, multi-extent records, zisofs and El Torito boot
+  images. File data and compressed data use anonymous temporary files;
+  metadata stays in memory and size-derived temporary buffers allocate
+  fallibly. Zisofs boot-image restoration caps compressed and uncompressed
+  blocks at 256 MiB; unusually large valid blocks fail with ENOMEM.
+- Boot information-table checksum tails are zero padded. Upstream reads
+  uninitialized bytes after a partial final word; this port never does.
+  Sizes exceeding the boot table's 32-bit fields are rejected.
+- ISO9660 retains upstream's unwritten-entry behavior: an entry with a
+  declared body but no bytes written is not zero-filled or registered as
+  file content. An unwritten boot image therefore fails while emitting
+  the image, after the volume descriptors.

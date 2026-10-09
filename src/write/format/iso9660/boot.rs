@@ -73,7 +73,11 @@ pub(super) fn catalog(
         Media::HardDisk => 4,
     };
     let no_emulation = options.media == Media::NoEmulation;
-    let segment = if no_emulation { options.load_segment } else { 0 };
+    let segment = if no_emulation {
+        options.load_segment
+    } else {
+        0
+    };
     bytes[34..36].copy_from_slice(&segment.to_le_bytes());
     bytes[36] = options.system_type;
     let sectors = if no_emulation { options.load_size } else { 1 };
@@ -90,13 +94,19 @@ pub(super) fn patch_info_table(
     recorded_size: u64,
 ) -> Result<(), Error> {
     if size <= 64 {
-        return Err(Error::fatal(libc::EINVAL, format!("Boot file({size}) is too small")));
+        return Err(Error::fatal(
+            libc::EINVAL,
+            format!("Boot file({size}) is too small"),
+        ));
     }
-    let end = offset.checked_add(size).ok_or_else(|| {
-        Error::fatal(libc::EOVERFLOW, "Boot image offset overflow")
-    })?;
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| Error::fatal(libc::EOVERFLOW, "Boot image offset overflow"))?;
     let recorded_size = u32::try_from(recorded_size).map_err(|_| {
-        Error::fatal(libc::EOVERFLOW, "Boot image size exceeds its information table")
+        Error::fatal(
+            libc::EOVERFLOW,
+            "Boot image size exceeds its information table",
+        )
     })?;
     if file.metadata().map_err(io)?.len() < end {
         return Err(Error::fatal(libc::EINVAL, "Truncated boot image"));
@@ -132,20 +142,36 @@ mod tests {
     #[test]
     fn validation_checksum_and_initial_entry() {
         let mut b = Boot {
-            filename: b"boot.img".to_vec(), catalog: b"boot.catalog".to_vec(),
-            info_table: true, load_segment: 0x7c0, load_size: 4,
-            media: Media::NoEmulation, system_type: 0, platform_id: 0,
+            filename: b"boot.img".to_vec(),
+            catalog: b"boot.catalog".to_vec(),
+            info_table: true,
+            load_segment: 0x7c0,
+            load_size: 4,
+            media: Media::NoEmulation,
+            system_type: 0,
+            platform_id: 0,
             identifier: b"publisher".to_vec(),
         };
-        for (media, code) in [(Media::NoEmulation, 0), (Media::Floppy1200, 1),
-            (Media::Floppy1440, 2), (Media::Floppy2880, 3), (Media::HardDisk, 4)] {
+        for (media, code) in [
+            (Media::NoEmulation, 0),
+            (Media::Floppy1200, 1),
+            (Media::Floppy1440, 2),
+            (Media::Floppy2880, 3),
+            (Media::HardDisk, 4),
+        ] {
             b.media = media;
             let c = catalog(123, 128, &b).unwrap();
-            assert_eq!(c[..32].chunks_exact(2).fold(0u16, |s, v|
-                s.wrapping_add(u16::from_le_bytes([v[0], v[1]]))), 0);
+            assert_eq!(
+                c[..32].chunks_exact(2).fold(0u16, |s, v| s
+                    .wrapping_add(u16::from_le_bytes([v[0], v[1]]))),
+                0
+            );
             assert_eq!(&c[30..34], &[0x55, 0xaa, 0x88, code]);
             assert_eq!(&c[40..44], &123u32.to_le_bytes());
-            assert_eq!(u16::from_le_bytes([c[38], c[39]]), if code == 0 { 4 } else { 1 });
+            assert_eq!(
+                u16::from_le_bytes([c[38], c[39]]),
+                if code == 0 { 4 } else { 1 }
+            );
         }
     }
     #[test]

@@ -10,6 +10,16 @@ pub extern "C" fn archive_write_set_format_7zip(a: *mut Archive) -> i32 {
     })
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_iso9660(a: *mut Archive) -> i32 {
+    with_writer(a, |base, w| {
+        w.set_format(
+            base,
+            Box::new(crate::write::format::iso9660::Iso9660::default()),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

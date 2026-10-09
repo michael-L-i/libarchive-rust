@@ -2,13 +2,3 @@
 // Every stub returns an error. Delete a stub when its function is ported;
 // rerunning the script skips functions already defined elsewhere in src/ffi/.
 
-use super::{
-    ARCHIVE_FATAL,
-    Archive,
-};
-use std::ffi::c_int;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_iso9660(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
