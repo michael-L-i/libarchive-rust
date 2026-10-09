@@ -73,6 +73,27 @@ mode-000 file/directory ACL restoration and Zstd worker cleanup. Encoder output
 differences and memory limits are documented in NOTES.md. Work is committed
 locally; no test or encoder process remains running.
 
+## Zstandard performance checkpoint
+
+The write adapter batches small input writes and uses channel notifications
+instead of 1 ms polling. The matcher reuses a fixed hash table, input buffers
+and a bounded 1 MiB history across blocks. No dependency or C backend was added.
+
+Five-run creation medians on the retained diagnostic corpus improved 18.3x
+for 256 small files and 4.4x for 2 MiB text and random data. Text archives are
+74% smaller; small-file archives are 38% smaller. Random-data peak RSS fell
+from 9.0 to 6.3 MiB; repetitive-data RSS increased by about 1 MiB. The original
+C implementation remains faster and compresses repetitive inputs better.
+Measurements and limitations are in `../diagnostics/results/ZSTD.md`.
+
+Verification: 371 native Rust tests passed; the opt-in independent C decoder
+test also passed, including 128 KiB blocks with long periodic matches. Strict
+all-target Clippy, rustfmt, diff and all 454 public-symbol checks passed.
+The full upstream/front-end suite passed 926 tests, skipped 184, and had zero
+failures, crashes, timeouts or ratchet regressions in 100 seconds with one
+worker and 30-second timeouts. All 60 benchmark commands and 24 content-manifest
+cross-reader checks passed. No build, test or benchmark process remains running.
+
 ## Earlier checkpoints (historical)
 
 ### Phase 2 checkpoint
