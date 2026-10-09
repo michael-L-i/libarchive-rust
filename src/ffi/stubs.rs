@@ -47,10 +47,6 @@ pub extern "C" fn archive_write_set_format_by_name(
     ARCHIVE_FATAL
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_7zip(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_iso9660(_a0: *mut Archive) -> c_int {

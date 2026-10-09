@@ -493,3 +493,47 @@ pub fn zeros(sink: &mut dyn Sink, mut count: u64) -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// A private seekable spool, unlinked immediately so errors cannot leave it behind.
+#[allow(dead_code)] // Shared by XAR, ISO9660 and 7zip writers as they land.
+pub(crate) fn temp_file() -> Result<std::fs::File, Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0..32 {
+        let path = std::env::temp_dir().join(format!(
+            "libarchive-rust-{}-{stamp:x}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                std::fs::remove_file(&path).map_err(|e| {
+                    Error::fatal(
+                        e.raw_os_error().unwrap_or(libc::EIO),
+                        "Couldn't unlink temporary file",
+                    )
+                })?;
+                return Ok(file);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(Error::fatal(
+                    e.raw_os_error().unwrap_or(libc::EIO),
+                    "Couldn't create temporary file",
+                ));
+            }
+        }
+    }
+    Err(Error::fatal(libc::EEXIST, "Couldn't create temporary file"))
+}

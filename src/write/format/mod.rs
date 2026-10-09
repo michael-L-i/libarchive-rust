@@ -6,3 +6,5 @@ pub mod shar;
 pub mod tar;
 pub mod warc;
 pub mod zip;
+
+pub mod sevenzip;

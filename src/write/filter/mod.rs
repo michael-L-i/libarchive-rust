@@ -6,7 +6,7 @@ use crate::util::Error;
 use std::ffi::CStr;
 mod bzip2;
 mod compress;
-mod gzip;
+pub(crate) mod gzip;
 mod lz4;
 mod program;
 mod uuencode;
