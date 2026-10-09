@@ -1135,28 +1135,34 @@ and the filters. The PPMd model is `ppmd7`, reached through `Ppmd7` and
 - An incomplete Huffman code (a node with an unset branch) fails
   `make_table` for the whole table, so none of its symbols can be read, even
   though the table is kept for the next lookup.
-- In a multivolume set read with every filter registered
-  (`archive_read_support_filter_all`) and no format whose bidder reads far
-  ahead (zip's), `archive_read_open_filenames` hands out wrong data at the
-  128 KiB boundary of the filter's buffer: reading the four parts of
-  `test_read_format_rar_multivolume` with the raw format and all filters
-  returns 320323 bytes of a 189201-byte stream, in upstream and here, and
-  the rar reader then fails with "Invalid symbol". `test_read_format_rar_multivolume`
-  and `_multivolume_skip` pass in upstream only because the zip bidder is
-  registered by `archive_read_support_format_all`; they will pass here once
-  zip is ported.
+- Reading the four parts of `test_read_format_rar_multivolume` with
+  `archive_read_support_filter_all` (the uu bidder alone is enough:
+  `archive_read_support_filter_uu`) and no zip bidder returns wrong data at
+  the 128 KiB boundary of the filter's buffer, so the rar reader fails with
+  "Invalid symbol". The corruption is upstream's own and the port reproduces
+  it byte for byte: the raw format over the same four parts gives 320323
+  bytes of a 189201-byte stream in both. The suspect is the roll-back in
+  `__archive_read_filter_ahead` (archive_read.c, "Roll back to client
+  buffer"), which assumes the copy-buffer bytes precede `client_next` in the
+  current block. Upstream's zip bidder masks it for rar, so
+  `test_read_format_rar_multivolume` and `_multivolume_skip` should pass here
+  once zip is merged, but that is unproven. It is not a bug in the rar read
+  path.
 
 ### Differences
 
 - The bit reader consumes the bytes it takes into its cache as it takes them.
   Upstream keeps a pointer into the read-ahead buffer and consumes what it
   used at the next call; nothing can tell the two apart.
-- The calls upstream makes with `a->entry` in the middle of reading data
-  (the next part of a multivolume file, `read_data_skip`, `seek_data`) pass
-  no entry here, because `Format::read_data` has none. Only a part with
-  `FHD_PASSWORD` (the entry's data-encrypted flag) and, in a corrupt set, a
-  part with another name during a seek (the entry is overwritten upstream)
-  differ.
+- The header reads upstream makes with `a->entry` in the middle of reading
+  data (the next part of a multivolume file, `read_data_skip`, `seek_data`)
+  get the handle's own entry through `Reader::with_entry`, which the ffi
+  layer fills for `archive_read_data*`, `archive_read_data_skip`,
+  `archive_seek_data` and `archive_read_data_into_fd`. When
+  `archive_read_next_header2` skips the rest of the previous entry the entry
+  is the one it was given (cleared first, as upstream does); upstream passes
+  `a->entry`, so with a caller-owned entry that is not the handle's own,
+  upstream fills the handle's entry and we fill the caller's.
 - `read_data_skip` ending at the end of the archive in the middle of a
   multivolume file returns `ARCHIVE_OK`; upstream passes `ARCHIVE_EOF` on to
   `archive_read_data_skip`.
@@ -1172,7 +1178,9 @@ and the filters. The PPMd model is `ppmd7`, reached through `Ppmd7` and
   of the delta, RGB and audio filters, which count the same bytes as the
   loops. Out-of-range window offsets, Huffman nodes, the data-block table
   `dbo` in `seek_data` ("Invalid RAR seek cursor state"), and filter output
-  ranges fail instead of reading outside the buffers.
+  ranges fail instead of reading outside the buffers. The "Invalid zero
+  dictionary size" check in `parse_codes` is not ported either: flag 0x20
+  always sets a dictionary of at least 1 MiB just before it.
 - The filter stack finds its first filter again after `expand` by a serial
   number; upstream compares pointers after freeing it.
 - `read_data_compressed`'s recursion on PPMd code 0 is a loop with the same
