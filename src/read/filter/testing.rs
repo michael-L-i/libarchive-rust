@@ -4,8 +4,10 @@
 use crate::archive::{ARCHIVE_OK, Base, READ_MAGIC};
 use crate::entry::Entry;
 use crate::read::format::raw;
-use crate::read::{Client, Read, Status};
+use crate::read::{Client, FilterBidder, Read, Status};
+use crate::read_open_memory::Memory;
 use crate::util::Error;
+use std::ffi::c_int;
 
 /// A client over `data` that hands out `block` bytes per read.
 struct Blocks {
@@ -100,4 +102,15 @@ pub fn noise(n: usize) -> Vec<u8> {
             x as u8
         })
         .collect()
+}
+
+/// What `bidder` bids on a stream of `data`.
+pub fn bid(bidder: &mut dyn FilterBidder, data: &[u8]) -> c_int {
+    let (mut r, a) = (Read::default(), Base::new(READ_MAGIC));
+    assert_eq!(raw::support(&mut r), Ok(Status::Ok));
+    assert_eq!(
+        r.open(&a, Box::new(Memory::new(data.to_vec(), 4096))),
+        ARCHIVE_OK
+    );
+    bidder.bid(&mut r.reader(&a)).unwrap()
 }

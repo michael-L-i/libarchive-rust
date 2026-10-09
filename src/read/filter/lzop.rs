@@ -71,9 +71,9 @@ impl FilterBidder for Bidder {
 
 #[cfg(test)]
 mod tests {
-    use super::super::bid;
     use super::*;
     use crate::archive::READ_MAGIC;
+    use crate::read::filter::testing::bid;
 
     #[test]
     fn bids_on_the_signature() {
