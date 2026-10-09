@@ -189,7 +189,7 @@ pub struct SevenZip {
     codec: u32,
     level: i64,
     coder: Option<Coder>,
-    pending: Vec<u8>,
+    pending: Option<Spool>,
     properties: Vec<u8>,
     spool: Option<Spool>,
 }
@@ -202,7 +202,7 @@ impl Default for SevenZip {
             codec: LZMA,
             level: 6,
             coder: None,
-            pending: Vec::new(),
+            pending: None,
             properties: Vec::new(),
             spool: None,
         }
@@ -220,7 +220,12 @@ impl SevenZip {
                     ),
                 ));
             }
-            if self.codec != LZMA && self.codec != LZMA2 {
+            if self.codec == LZMA || self.codec == LZMA2 {
+                self.pending = Some(Spool {
+                    file: crate::write::temp_file()?,
+                    len: 0,
+                });
+            } else {
                 self.start_coder(None)?;
             }
             self.spool = Some(Spool {
@@ -231,35 +236,18 @@ impl SevenZip {
         Ok(())
     }
     fn start_coder(&mut self, input_size: Option<usize>) -> Result<(), Error> {
-        // Release staged input before allocating a full dictionary. This path
-        // uses at most 8 MiB of temporary storage; small streams stay in memory.
-        let mut staged = if !self.pending.is_empty()
-            && (input_size.is_none() || self.pending.len() >= 4 << 20)
-        {
-            let mut file = crate::write::temp_file()?;
-            file.write_all(&self.pending).map_err(io_error)?;
-            file.rewind().map_err(io_error)?;
-            self.pending = Vec::new();
-            Some(file)
-        } else {
-            None
-        };
         let (mut coder, props) = Coder::new(self.codec, self.level, input_size)?;
-        if let Some(spool) = &mut self.spool {
-            if let Some(file) = &mut staged {
-                let mut buffer = [0; 65536];
-                loop {
-                    let n = file.read(&mut buffer).map_err(io_error)?;
-                    if n == 0 {
-                        break;
-                    }
-                    coder.write(&buffer[..n], spool)?;
+        if let (Some(mut pending), Some(spool)) = (self.pending.take(), &mut self.spool) {
+            pending.file.rewind().map_err(io_error)?;
+            let mut buffer = [0; 65536];
+            loop {
+                let n = pending.file.read(&mut buffer).map_err(io_error)?;
+                if n == 0 {
+                    break;
                 }
-            } else {
-                coder.write(&self.pending, spool)?;
+                coder.write(&buffer[..n], spool)?;
             }
         }
-        self.pending = Vec::new();
         self.coder = Some(coder);
         self.properties = props;
         Ok(())
@@ -271,17 +259,12 @@ impl SevenZip {
             let limit = LzmaOptions::with_preset(self.level.clamp(0, 9) as u32)
                 .dict_size
                 .min(8 << 20) as usize;
-            if data.len() <= limit.saturating_sub(self.pending.len()) {
-                let needed = self.pending.len() + data.len();
-                if needed > self.pending.capacity() {
-                    let capacity = needed
-                        .max(self.pending.capacity().saturating_mul(2))
-                        .min(limit);
-                    self.pending
-                        .try_reserve_exact(capacity - self.pending.len())
-                        .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate 7-Zip input"))?;
-                }
-                self.pending.extend_from_slice(data);
+            let pending = self
+                .pending
+                .as_mut()
+                .ok_or_else(|| Error::fatal(libc::EIO, "Missing 7-Zip input spool"))?;
+            if data.len() <= limit.saturating_sub(pending.len as usize) {
+                pending.write(data)?;
             } else {
                 self.start_coder(None)?;
                 if let (Some(coder), Some(spool)) = (&mut self.coder, &mut self.spool) {
@@ -640,7 +623,7 @@ impl Format for SevenZip {
     }
     fn close(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
         if self.coder.is_none() && self.spool.is_some() {
-            self.start_coder(Some(self.pending.len()))?;
+            self.start_coder(Some(self.pending.as_ref().map_or(0, |p| p.len as usize)))?;
         }
         if let (Some(coder), Some(spool)) = (self.coder.take(), self.spool.as_mut()) {
             coder.finish(spool)?;
@@ -803,7 +786,7 @@ mod tests {
             }
             assert!(archive.coder.is_none());
             archive.close(&mut output).unwrap();
-            assert_eq!(archive.pending.capacity(), 0);
+            assert!(archive.pending.is_none());
             let packed = archive.spool.as_ref().unwrap().len as usize;
             assert_eq!(
                 decode(
@@ -833,11 +816,10 @@ mod tests {
             archive.append(&data[limit / 3..2 * limit / 3]).unwrap();
             archive.append(&data[2 * limit / 3..]).unwrap();
             assert!(archive.coder.is_none());
-            assert_eq!(archive.pending.len(), limit);
-            assert_eq!(archive.pending.capacity(), limit);
+            assert_eq!(archive.pending.as_ref().unwrap().len, limit as u64);
             archive.append(&data).unwrap();
             assert!(archive.coder.is_some());
-            assert_eq!(archive.pending.capacity(), 0);
+            assert!(archive.pending.is_none());
             archive
                 .coder
                 .take()
