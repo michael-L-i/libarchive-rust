@@ -1295,7 +1295,7 @@ impl Format for Lha {
         }
 
         // When a header level is 0, there is a possibility that a pathname
-        // and a symlink has '' character, a directory separator in
+        // and a symlink has '\' character, a directory separator in
         // DOS/Windows. So we should convert it to '/'.
         if self.level == 0 {
             replace_path_separator(&mut pathname);
