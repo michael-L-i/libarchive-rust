@@ -82,9 +82,14 @@ mod tests {
         assert_eq!(set_format(&mut r, &a, 0x7777_0000), ARCHIVE_FATAL);
         assert_eq!(error(&a), "Invalid format code specified");
         assert_eq!(a.errno.get(), ARCHIVE_ERRNO_PROGRAMMER);
-        // Valid, but nothing is ported yet to register.
+        // Valid, but not ported yet: nothing to register.
         a.clear_error();
-        assert_eq!(set_format(&mut r, &a, code::AR | 1), ARCHIVE_FATAL);
-        assert_eq!(r.format, None);
+        let unported = crate::read::format::all::FORMATS
+            .iter()
+            .find(|(_, s)| s.is_none());
+        if let Some((code, _)) = unported {
+            assert_eq!(set_format(&mut r, &a, *code), ARCHIVE_FATAL);
+            assert_eq!(r.format, None);
+        }
     }
 }
