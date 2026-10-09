@@ -291,6 +291,12 @@ struct SevenZip {
     entry_encrypted: bool,
 }
 
+/// A block of an entry's data, and the warning that goes with it.
+struct EntryBlock {
+    chunk: stream::Chunk,
+    crc_warning: Option<Vec<u8>>,
+}
+
 /// `archive_read_support_format_7zip`.
 pub fn support(r: &mut Read) -> Result<Status, Error> {
     // Until enough data has been read, we cannot tell about any encrypted
@@ -362,12 +368,12 @@ impl Format for SevenZip {
             return Ok(Data::Warn);
         }
         let offset = self.entry_offset;
-        let Some((chunk, crc_warning)) = self.read_entry_block(r)? else {
+        let Some(block) = self.read_entry_block(r)? else {
             return Ok(Data::Eof { offset });
         };
-        self.crc_warning = crc_warning;
+        self.crc_warning = block.crc_warning;
         Ok(Data::Block {
-            data: self.chunk_bytes(r, chunk),
+            data: self.chunk_bytes(r, block.chunk),
             offset,
         })
     }
@@ -531,10 +537,10 @@ impl SevenZip {
             // the contents at this time.
             let mut symname = Vec::new();
             while self.entry_bytes_remaining > 0 {
-                let Some((chunk, _)) = self.read_entry_block(r)? else {
+                let Some(entry_block) = self.read_entry_block(r)? else {
                     break;
                 };
-                let block = self.chunk_bytes(r, chunk);
+                let block = self.chunk_bytes(r, entry_block.chunk);
                 symname
                     .try_reserve(block.len())
                     .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate memory for Symname"))?;
@@ -565,10 +571,7 @@ impl SevenZip {
     /// The body of `archive_read_format_7zip_read_data`, up to the block:
     /// `None` at the end of the entry. The block's bad CRC is reported along
     /// with it, as upstream's `ARCHIVE_WARN`, and its message is already set.
-    fn read_entry_block(
-        &mut self,
-        r: &mut Reader<'_>,
-    ) -> Result<Option<(stream::Chunk, Option<Vec<u8>>)>, Error> {
+    fn read_entry_block(&mut self, r: &mut Reader<'_>) -> Result<Option<EntryBlock>, Error> {
         if self.pack_stream_bytes_unconsumed != 0 {
             let _ = self.read_consume(r);
         }
@@ -619,6 +622,9 @@ impl SevenZip {
         }
 
         self.entry_offset += chunk.len as i64;
-        Ok(Some((chunk, warning)))
+        Ok(Some(EntryBlock {
+            chunk,
+            crc_warning: warning,
+        }))
     }
 }

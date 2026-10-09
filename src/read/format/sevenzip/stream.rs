@@ -727,7 +727,11 @@ impl SevenZip {
 
             // Extract a sub stream. The decoded size is the stream's own,
             // whatever the header claims, so the buffer grows with the data.
-            while self.pack_stream_inbytes_remaining > 0 {
+            // Decoders that take all the input before they have output all
+            // of it (liblzma leaves input behind) are asked for the rest.
+            while self.pack_stream_inbytes_remaining > 0
+                || (self.folder_outbytes_remaining > 0 && self.coders.pending_output())
+            {
                 self.extract_pack_stream(r, 0)?;
                 let n = self.ubuf_bytes_remaining;
                 let chunk = self.get_uncompressed_data(r, n, 0)?;
@@ -735,8 +739,12 @@ impl SevenZip {
                 b[i].try_reserve(bytes.len())
                     .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for 7-Zip decompression"))?;
                 b[i].extend_from_slice(bytes);
+                let progress = !bytes.is_empty();
                 if self.pack_stream_bytes_unconsumed != 0 {
                     let _ = self.read_consume(r);
+                }
+                if !progress && self.pack_stream_inbytes_remaining <= 0 {
+                    break;
                 }
             }
         }

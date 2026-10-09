@@ -35,9 +35,12 @@ enum Backend {
     None,
     Lzma(Box<LzmaStream>),
     Lzma2(Box<Lzma2Stream>),
-    /// The state, and whether the stream has ended.
+    /// The state, and whether the last call filled the output (so the
+    /// decoder may hold more).
     Deflate(Box<InflateState>, bool),
-    Bzip2(Box<Bz2Decoder>),
+
+    /// The decoder, and whether the last call filled the output.
+    Bzip2(Box<Bz2Decoder>, bool),
     Zstd(Box<Zstd>),
     Ppmd,
 }
@@ -48,6 +51,10 @@ struct Zstd {
     in_frame: bool,
     /// The packed stream ended in the middle of a frame.
     stalled: bool,
+    /// Bytes output for the frame so far, and whether its header declares
+    /// its content size, which libzstd checks and ruzstd does not.
+    frame_out: u64,
+    fcs_present: bool,
 }
 
 /// What one `step` did.
@@ -187,7 +194,7 @@ impl Coders {
     /// for the bzip2 decoder, which wants a whole piece of a block.
     pub(super) fn wanted_input(&self) -> usize {
         match &self.backend {
-            Backend::Bzip2(d) => d.wanted(),
+            Backend::Bzip2(d, _) => d.wanted(),
             _ => 1,
         }
     }
@@ -196,12 +203,11 @@ impl Coders {
     /// the input it was given. liblzma and zlib leave unused input behind
     /// when the output is full; these decoders take all of it, and the
     /// bytes come out of later calls, which may have no input.
-    fn pending_output(&self) -> bool {
+    pub(super) fn pending_output(&self) -> bool {
         match &self.backend {
             Backend::Lzma(s) => s.has_output(),
             Backend::Lzma2(s) => s.has_output(),
-            Backend::Deflate(_, ended) => !ended,
-            Backend::Bzip2(_) => true,
+            Backend::Deflate(_, full) | Backend::Bzip2(_, full) => *full,
             Backend::Zstd(z) => z.decoder.can_collect() > 0,
             Backend::None | Backend::Ppmd => false,
         }
@@ -239,16 +245,9 @@ impl Coders {
             CODEC_LZMA | CODEC_LZMA2 => {
                 let src = r.peek_available(1).ok().and_then(|d| d.get(..bytes_in));
                 let src = src.unwrap_or_default();
-                // The decoder holds back the last bytes of a stream with no
-                // end marker until it knows that no more input follows.
-                let action = if bytes_in as i64 == inbytes_remaining {
-                    Action::Finish
-                } else {
-                    Action::Run
-                };
                 let res = match &mut self.backend {
-                    Backend::Lzma(s) => s.process(src, out, action),
-                    Backend::Lzma2(s) => s.process(src, out, action),
+                    Backend::Lzma(s) => s.process(src, out, Action::Run),
+                    Backend::Lzma2(s) => s.process(src, out, Action::Run),
                     // liblzma's LZMA_PROG_ERROR, for a stream that has ended.
                     _ => return Err(failed("Decompression failed (11)")),
                 };
@@ -277,12 +276,13 @@ impl Coders {
             CODEC_BZ2 => {
                 let src = r.peek_available(self.wanted_input()).ok();
                 let src = src.and_then(|d| d.get(..bytes_in)).unwrap_or_default();
-                let Backend::Bzip2(d) = &mut self.backend else {
+                let Backend::Bzip2(d, full) = &mut self.backend else {
                     return Err(failed("bzip decompression failed"));
                 };
                 let last = src.len() < d.wanted();
                 match d.decompress(src, out, last) {
                     Ok(p) => {
+                        *full = p.produced == out.len();
                         if p.end {
                             self.backend = Backend::None;
                         }
@@ -298,7 +298,7 @@ impl Coders {
             CODEC_DEFLATE => {
                 let src = r.peek_available(1).ok().and_then(|d| d.get(..bytes_in));
                 let src = src.unwrap_or_default();
-                let Backend::Deflate(state, ended) = &mut self.backend else {
+                let Backend::Deflate(state, full) = &mut self.backend else {
                     return Err(failed("File decompression failed (-2)"));
                 };
                 let res = inflate(state, src, out, MZFlush::None);
@@ -306,11 +306,12 @@ impl Coders {
                     // Found end of stream, or the decompressor made some
                     // progress.
                     Ok(MZStatus::Ok) | Ok(MZStatus::StreamEnd) => {
-                        *ended = matches!(res.status, Ok(MZStatus::StreamEnd));
+                        let eof = matches!(res.status, Ok(MZStatus::StreamEnd));
+                        *full = !eof && res.bytes_written == out.len();
                         Ok(Step {
                             used: res.bytes_consumed,
                             produced: res.bytes_written,
-                            eof: *ended,
+                            eof,
                         })
                     }
                     Ok(MZStatus::NeedDict) => Err(failed("File decompression failed (2)")),
@@ -436,9 +437,13 @@ fn zstd_step(
             let room = out.get_mut(produced..).unwrap_or_default();
             let n = io::Read::read(&mut z.decoder, room).map_err(|_| zstd_failure(None))?;
             produced += n;
+            z.frame_out += n as u64;
             continue;
         }
         if z.in_frame && z.decoder.is_finished() {
+            if z.fcs_present && z.decoder.content_size() != z.frame_out {
+                return Err(zstd_failure(None));
+            }
             if let Some(stored) = z.decoder.get_checksum_from_data()
                 && z.decoder.get_calculated_checksum() != Some(stored)
             {
@@ -485,9 +490,8 @@ fn zstd_step(
                 .peek_available(at + 5)?
                 .get(at..)
                 .unwrap_or_default();
-            if head.get(..4) == Some(&ZSTD_MAGIC[..])
-                && head.get(4).is_some_and(|d| d & ZSTD_RESERVED_BIT != 0)
-            {
+            let descriptor = head.get(4).copied().unwrap_or(0);
+            if head.get(..4) == Some(&ZSTD_MAGIC[..]) && descriptor & ZSTD_RESERVED_BIT != 0 {
                 return Err(failed(
                     "Zstd decompression failed: Unsupported frame parameter",
                 ));
@@ -500,6 +504,8 @@ fn zstd_step(
                 return Err(input.error.take().unwrap_or_else(|| zstd_failure(Some(&e))));
             }
             z.in_frame = true;
+            z.frame_out = 0;
+            z.fcs_present = descriptor >> 6 != 0 || descriptor & 0x20 != 0;
             continue;
         }
         if let Err(e) = z
@@ -531,6 +537,7 @@ impl SevenZip {
     ) -> Result<(), Error> {
         self.codec = coder1.codec;
         self.codec2 = -1;
+        self.filters.set_lzma2_filter(None);
 
         if matches!(
             self.codec,
@@ -563,7 +570,7 @@ impl SevenZip {
         match self.codec {
             CODEC_COPY => {}
             CODEC_LZMA | CODEC_LZMA2 => self.init_lzma(coder1, coder2)?,
-            CODEC_BZ2 => self.coders.backend = Backend::Bzip2(Box::new(Bz2Decoder::new())),
+            CODEC_BZ2 => self.coders.backend = Backend::Bzip2(Box::new(Bz2Decoder::new()), false),
             CODEC_ZSTD => {
                 let mut decoder = FrameDecoder::new();
                 decoder.set_max_window_size(ZSTD_MAX_WINDOW);
@@ -571,6 +578,8 @@ impl SevenZip {
                     decoder,
                     in_frame: false,
                     stalled: false,
+                    frame_out: 0,
+                    fcs_present: false,
                 }));
             }
             CODEC_DEFLATE => {
@@ -637,6 +646,10 @@ impl SevenZip {
             match c2.codec {
                 CODEC_X86_BCJ2 => self.bcj2.reset(),
                 CODEC_DELTA => self.init_filter(c2)?,
+                c if bcj_lookahead(c) != 0 && self.codec == CODEC_LZMA2 => {
+                    // liblzma runs the branch filters of LZMA2 upstream.
+                    self.filters.set_lzma2_filter(Some(c));
+                }
                 c if bcj_lookahead(c) != 0 => self.init_filter(c2)?,
                 c => return Err(failed(format!("Unexpected codec ID: {c:X}"))),
             }

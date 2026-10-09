@@ -6,9 +6,14 @@
 //! over the decoder's output a buffer at a time. A converter returns how
 //! many bytes it finished; the caller keeps the rest, which it could not
 //! convert without more data, for the next call.
+//!
+//! Upstream gives the branch filters of an LZMA2 coder to liblzma instead;
+//! `lzma-rust2`'s stream filters are used for that, with the same protocol.
 
 use super::{CODEC_ARM, CODEC_ARM64, CODEC_ARMTHUMB, CODEC_IA64};
 use super::{CODEC_POWERPC, CODEC_RISCV, CODEC_SPARC, CODEC_X86};
+use lzma_rust2::filter::StreamFilter;
+use lzma_rust2::{FilterConfig, FilterType};
 
 /// The widest instruction the BCJ filters rewrite, and the smallest output
 /// buffer that those filters can make progress with. Filters leave up to one
@@ -39,6 +44,8 @@ pub(super) struct Filters {
     pub odd_bcj: [u8; 16],
     /// Number of bytes currently stashed in `odd_bcj`.
     pub odd_bcj_size: usize,
+    /// The branch filter of an LZMA2 coder, which liblzma runs upstream.
+    xz: Option<StreamFilter>,
 }
 
 impl Default for Filters {
@@ -52,6 +59,7 @@ impl Default for Filters {
             delta_history: [0; 256],
             odd_bcj: [0; 16],
             odd_bcj_size: 0,
+            xz: None,
         }
     }
 }
@@ -89,9 +97,38 @@ impl Filters {
         self.delta_history = [0; 256];
     }
 
+    /// Sets up (`lzma2`) or drops the branch filter that goes with an LZMA2
+    /// coder. `None` if there is no such filter for `codec2`.
+    pub fn set_lzma2_filter(&mut self, codec2: Option<i64>) -> Option<()> {
+        let cfg = match codec2 {
+            None => {
+                self.xz = None;
+                return Some(());
+            }
+            Some(CODEC_X86) => FilterType::BcjX86,
+            Some(CODEC_ARM) => FilterType::BcjArm,
+            Some(CODEC_ARMTHUMB) => FilterType::BcjArmThumb,
+            Some(CODEC_ARM64) => FilterType::BcjArm64,
+            Some(CODEC_SPARC) => FilterType::BcjSparc,
+            Some(CODEC_POWERPC) => FilterType::BcjPpc,
+            Some(CODEC_RISCV) => FilterType::BcjRiscv,
+            Some(CODEC_IA64) => FilterType::BcjIa64,
+            Some(_) => return None,
+        };
+        let cfg = FilterConfig {
+            filter_type: cfg,
+            property: 0,
+        };
+        self.xz = Some(StreamFilter::new(&cfg).ok()?);
+        Some(())
+    }
+
     /// Runs the converter for `codec2` over `buf`; returns how many bytes it
     /// converted.
     pub fn convert(&mut self, codec2: i64, buf: &mut [u8]) -> Option<usize> {
+        if let Some(xz) = &mut self.xz {
+            return Some(xz.decode(buf));
+        }
         Some(match codec2 {
             CODEC_X86 => self.x86_convert(buf),
             CODEC_ARM => self.arm_convert(buf),
@@ -657,5 +694,118 @@ impl Bcj2 {
         self.out_pos += out_pos;
 
         Ok(out_pos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CODECS: [i64; 8] = [
+        CODEC_X86,
+        CODEC_ARM,
+        CODEC_ARMTHUMB,
+        CODEC_ARM64,
+        CODEC_SPARC,
+        CODEC_POWERPC,
+        CODEC_RISCV,
+        CODEC_IA64,
+    ];
+
+    /// Runs the converter for `codec` over `data` in pieces cut at `cuts`,
+    /// carrying the bytes it did not convert to the next piece, as
+    /// `decompress` does. The tail left at the end stays as it is. `xz`
+    /// selects the converter that liblzma's counterpart provides.
+    fn convert_in_pieces(codec: i64, xz: bool, data: &[u8], cuts: &[usize]) -> Vec<u8> {
+        let mut f = Filters::default();
+        match codec {
+            CODEC_X86 => f.x86_init(),
+            CODEC_ARM => f.arm_init(),
+            CODEC_ARMTHUMB => f.armthumb_init(),
+            _ => {}
+        }
+        if xz {
+            f.set_lzma2_filter(Some(codec)).unwrap();
+        }
+        let mut out = Vec::new();
+        let mut carry: Vec<u8> = Vec::new();
+        let mut at = 0;
+        for &end in cuts.iter().chain([&data.len()]) {
+            let mut piece = std::mem::take(&mut carry);
+            piece.extend_from_slice(&data[at..end]);
+            at = end;
+            let l = f.convert(codec, &mut piece).unwrap();
+            out.extend_from_slice(&piece[..l]);
+            carry = piece[l..].to_vec();
+        }
+        out.extend_from_slice(&carry);
+        out
+    }
+
+    fn hot_data() -> (Vec<u8>, impl FnMut() -> u32) {
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        // Bytes that make the filters' patterns likely.
+        let hot = [
+            0xE8, 0xE9, 0xEB, 0xF0, 0xF8, 0x94, 0x90, 0x48, 0xEF, 0x17, 0x0F, 0x80, 0, 0xFF,
+        ];
+        let data = (0..20_000)
+            .map(|_| {
+                let r = rnd();
+                if r & 3 == 0 {
+                    r as u8
+                } else {
+                    hot[(r >> 8) as usize % hot.len()]
+                }
+            })
+            .collect();
+        (data, rnd)
+    }
+
+    /// The converters upstream runs itself, over the whole of the data,
+    /// agree with the ones it hands to liblzma, and the latter do not depend
+    /// on the size of the buffers. (Upstream's x86 converter keeps its
+    /// `prevPosT` relative to the buffer it was set in, so it does depend on
+    /// them: see NOTES.md.)
+    #[test]
+    fn converters_agree_with_the_xz_ones() {
+        let (data, mut rnd) = hot_data();
+        for codec in CODECS {
+            let whole = convert_in_pieces(codec, false, &data, &[]);
+            assert_ne!(whole, data, "codec {codec:#x} changed nothing");
+            assert!(
+                convert_in_pieces(codec, true, &data, &[]) == whole,
+                "codec {codec:#x}"
+            );
+            for _ in 0..20 {
+                let mut cuts: Vec<usize> = (0..8).map(|_| rnd() as usize % data.len()).collect();
+                cuts.sort_unstable();
+                assert!(
+                    convert_in_pieces(codec, true, &data, &cuts) == whole,
+                    "codec {codec:#x} cuts {cuts:?}"
+                );
+                if codec != CODEC_X86 {
+                    assert!(
+                        convert_in_pieces(codec, false, &data, &cuts) == whole,
+                        "codec {codec:#x} cuts {cuts:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delta_adds_the_byte_a_distance_back() {
+        let mut f = Filters::default();
+        f.delta_init(2);
+        let mut buf = [1u8, 2, 1, 1, 1, 1, 0xFF, 0xFF];
+        f.delta_decode(&mut buf[..4]);
+        f.delta_decode(&mut buf[4..]);
+        assert_eq!(buf, [1, 2, 2, 3, 3, 4, 2, 3]);
     }
 }
