@@ -746,6 +746,84 @@ Phase 5 needs:
 - The BSD name check's `SIZE_MAX - 1` bound is implied by the 1 MiB bound and
   is not repeated.
 
+## rar5 reader (src/read/format/rar5.rs)
+
+### Ported as-is
+
+- Stored (method 0) entries are never checksum-verified. `rar5_read_data`
+  runs the CRC32 and BLAKE2sp check once `bytes_remaining == 0` and
+  `last_write_ptr == unpacked_size`, but unstoring advances
+  `last_unstore_ptr` and leaves `last_write_ptr` at 0. Only an empty stored
+  file is verified, so a stored file with a wrong CRC extracts without error.
+- A block that is merged from several volumes and needs more than one decode
+  pass (it produces more than half a window of output) is consumed twice.
+  `merge_block` already consumed the block and left it in `push_buf`, but
+  `process_block` clears `switch_multivolume` after the first pass, so when a
+  later pass finishes the block it consumes `cur_block_size` bytes again and
+  subtracts them from `bytes_remaining`. The data stream then loses its place:
+  a two-volume archive whose first block spans the volumes and unpacks to
+  300000 bytes yields 65537 bytes and no error. Only the small merged blocks
+  of the upstream test archives decode in one pass.
+- `file.solid_window_size` is in `struct file_header`, which
+  `reset_file_context` zeroes for every file, so the "Window size for this
+  solid file doesn't match" check can only fire on the continuation header of
+  a multivolume file, where the context is not reset.
+- `HEAD_ENDARC` of a volume treats `scan_for_signature` finding no next
+  volume (`ARCHIVE_EOF`) like finding one: only `ARCHIVE_FATAL` is tested, so
+  it sets `expected_vol_no` and returns `ARCHIVE_OK`, and the header loop ends
+  on the failed read of the next header.
+- `create_decode_tables` updates the table as it goes and fails when the code
+  lengths are over-subscribed, leaving it half built. The block is then
+  resumable (`block_parsing_finished` is already 0), and a later
+  `archive_read_data` decodes with the half-built table.
+- `push_data` ignores `push_data_ready`'s result. A range that cannot be
+  queued ("output stream is not continuous", full stack) leaves its message on
+  the handle and carries on; `last_write_ptr` still advances and the range is
+  never returned.
+- A negative `extra_data_size` compares as a huge unsigned number against an
+  extra record's size, so an unknown record is skipped (and consumed) without
+  the "exceeds remaining extra-field data" check once the size has gone
+  negative.
+- A compressed entry's first `archive_read_data_block` calls return
+  `ARCHIVE_OK` with an empty block (at `last_write_ptr`): the decoder queues
+  the unpacked range and the next call hands it out.
+- `rar5_read_data_skip` returns `ARCHIVE_EOF` if the data ends inside a solid
+  skip; `archive_read_data_skip` maps that to `ARCHIVE_OK`, while header
+  reading (`skip_unprocessed_bytes`) passes it on as the end of the archive.
+- The pathname, link target and owner names stop at the first NUL byte, as C
+  strings do.
+
+### Differences
+
+- `rar5_skip_remaining_block` finds how much of a header body the sub-parser
+  consumed by subtracting a read-ahead pointer from the body start. If a
+  `read_ahead` in between moved the buffer (a sub-parser asking for more than
+  was buffered), that difference is garbage. The port compares stream
+  positions.
+- The block being decoded is not kept as a pointer into the read-ahead
+  buffer between `read_data` calls (the buffer may have moved). A block that
+  needs several passes is read ahead again at the same position; a merged
+  block stays in `push_buf`.
+- Pending output is queued as a range of the window or filter buffer rather
+  than as pointers, and the 4 bytes after a block that the bit reader looks
+  at are the read-ahead's own bytes, as upstream. Reads past the end of any
+  buffer give 0 instead of undefined bytes.
+- The window is allocated fallibly, and zero filled when it grows (upstream
+  `realloc` leaves the added bytes uninitialized). `init_unpack` does not
+  allocate the `filtered_buf` that `run_filter` replaces before anything reads
+  it.
+- The merge buffer and filter output are allocated fallibly. They stay
+  bounded by the 16 MiB block size and the 4 MiB filter limit, and a failure
+  is `ARCHIVE_FATAL` with upstream's message.
+- Window, filter and distance arithmetic is masked or checked everywhere an
+  archive value is used as an index. Where upstream's would index outside the
+  window or a buffer (a corrupt filter range, a window that does not match the
+  allocation) the port fails with `ARCHIVE_FAILED`/`FATAL` or reads 0.
+- The signature is stored as is, not XORed with 0xA1 to keep the magic out of
+  the binary.
+- The QuickOpen and recovery offsets of the main header's locator record are
+  parsed and dropped; upstream stores them and never reads them.
+
 ## Crypto (`src/digest.rs`, `src/hmac.rs`, `src/cryptor.rs`)
 
 ### Differences
