@@ -11,6 +11,7 @@ pub mod iso9660;
 pub mod lha;
 pub mod mtree;
 pub mod rar;
+pub mod rar5;
 pub mod raw;
 pub mod tar;
 pub mod warc;

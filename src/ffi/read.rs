@@ -20,7 +20,7 @@ use crate::read::filter::{
 };
 use crate::read::format::{
     all as format_all, ar, by_code as format_by_code, cab, cpio, empty, iso9660, lha, mtree, rar,
-    raw, tar, warc, xar, zip,
+    rar5, raw, tar, warc, xar, zip,
 };
 use crate::read::{self, Read, Status};
 use crate::read_add_passphrase::PassphraseCallback;
@@ -1299,6 +1299,20 @@ pub extern "C" fn archive_read_support_format_zip_seekable(a: *mut Archive) -> c
     )
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_read_support_format_rar5(a: *mut Archive) -> c_int {
+    checked!(
+        archive_read_support_format_rar5,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| with_read(h, ARCHIVE_FATAL, |r| {
+            rar5::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
+        })
+    )
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -1328,6 +1342,7 @@ pub(super) mod tests {
             (format::LHA, archive_read_support_format_lha),
             (format::MTREE, archive_read_support_format_mtree),
             (format::RAR, archive_read_support_format_rar),
+            (format::RAR_V5, archive_read_support_format_rar5),
             (format::RAW, archive_read_support_format_raw),
             (format::TAR, archive_read_support_format_tar),
             (format::WARC, archive_read_support_format_warc),
