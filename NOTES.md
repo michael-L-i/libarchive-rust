@@ -712,3 +712,30 @@ Phase 5 needs:
   at most once, so the result is the same. An entry is kept until its last
   link arrives, so the table holds one name per unfinished multiply-linked
   file, each at most 1 MiB, and grows with the archive as upstream's does.
+
+## ar reader (`src/read/format/ar.rs`)
+
+### Ported as-is
+
+- `_ar_read_header` skips a `/` or `//` entry's data before consuming the 60
+  header bytes. The total consumed is the same, so the order is harmless.
+- `archive_read_format_ar_read_header` ignores a failed consume of the 8-byte
+  global header. A truncated global header therefore reads as end of archive
+  (ARCHIVE_EOF) with the consume's "Truncated input file" message left set.
+- A GNU long name `/N` points into the filename table without checking that
+  the characters after `/` are digits (the source has a TODO). `/9xyz` is
+  entry 9.
+- A GNU long name that points at an empty string (a table entry that starts
+  with its NUL) gives an empty pathname, not NULL, so it is accepted as a name.
+
+### Differences
+
+- Upstream sets `ar->strtab` to the `malloc`ed table before reading it, so a
+  failed read leaves a non-NULL table of uninitialized bytes. The port stores
+  the table only after it is read and checked. After a fatal error the archive
+  accepts no more headers, so the state is not observable.
+- The table and BSD names are copied from what the archive actually holds,
+  not allocated up front at the claimed size. The 1 GiB table limit and the
+  1 MiB BSD name limit are the upstream ones.
+- The BSD name check's `SIZE_MAX - 1` bound is implied by the 1 MiB bound and
+  is not repeated.

@@ -2,6 +2,7 @@
 //! exports `support`, the registration function.
 
 pub mod all;
+pub mod ar;
 pub mod by_code;
 pub mod cpio;
 pub mod empty;
