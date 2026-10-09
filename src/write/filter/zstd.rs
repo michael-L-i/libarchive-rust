@@ -224,7 +224,7 @@ impl Worker {
         let size = if level <= 1 {
             16 * 1024
         } else if level <= 3 {
-            64 * 1024
+            96 * 1024
         } else {
             128 * 1024
         };
