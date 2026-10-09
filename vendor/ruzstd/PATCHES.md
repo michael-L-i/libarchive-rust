@@ -7,8 +7,9 @@ Repository: https://github.com/KillingSpark/zstd-rs
 
 The manifest retains upstream package/features/dependencies and omits its
 examples, benchmarks and development dependencies. Fixture assets are not
-vendored. Decoder sources, including upstream's existing unsafe ring-buffer
-implementation, are unchanged. The encoding patch adds no unsafe code.
+vendored. Upstream's existing unsafe ring-buffer implementation is unchanged.
+The local patches add no unsafe code. Decoder changes are an inlining hint and
+safe growth of overlapping copies, described below; one unsafe call is removed.
 
 Before writing Huffman literals, count the exact payload bits for the selected
 new or reused table. If the payload alone is at least as large as the raw
@@ -68,3 +69,48 @@ No table layout, probability, public structure or encoded bit changes.
   repeated binary 2.849 -> 2.802. Relative to the literal-only patch, this
   targets the previously sampled source/mixed FSE cost; tiny differences
   on other workloads are noise.
+
+## Inline FSE decoder updates
+
+`src/fse/fse_decoder.rs` marks the small `FSEDecoder::update_state` method
+`#[inline]`. Its arithmetic, bounds checks and state transitions are unchanged.
+This lets optimized callers keep decoder and bit-reader state across the three
+updates made for each sequence, without introducing new decoding logic.
+
+- Profiling source-data decoding identified this call as a substantial cost.
+- Seven rotating in-memory decode medians on identical C-produced archives:
+  16 MiB source 26.06 -> 23.62 ms; mixed 13.94 -> 12.78 ms. Other measured
+  text, random and small-file cases are essentially unchanged.
+- 125 valid, truncated and mutated inputs match baseline status, errno,
+  error text, header count, decoded length and output SHA-256 exactly.
+- The harness, samples and profile are in sibling
+  `diagnostics/round4-zstd-read`. Final archive measurements and the full
+  compatibility suite use the combined integration build.
+
+## Expand overlapping matches through the initialized prefix
+
+`src/decoding/decode_buffer.rs` previously expanded a match in chunks no larger
+than its distance, copying one byte per iteration at distance one. It now keeps
+the logical source start fixed and copies the available initialized prefix,
+doubling the next chunk until the final partial copy. This uses the existing
+safe ring-buffer API and removes the helper's unsafe block. The whole match is
+still reserved once before copying; window rules, allocation requirements,
+error handling and decoded bytes are unchanged. No extra buffer is allocated.
+
+- A profile of a held-out Rust-produced zero-heavy archive attributed about
+  80% of decode time to repeated ring-buffer copies. Same-archive in-memory
+  decode medians improve 19.46 -> 0.94 ms; C-produced data with the same
+  contents improves 1.84 -> 0.96 ms. The optimization uses only match length
+  and distance, not byte values or dataset recognition.
+- Five tests of the actual ring/decode-buffer modules pass in the standalone
+  `diagnostics/round4-zstd-read/buffer-tests.rs` harness. The new reference
+  test covers 768 cases: distances 1 through 64, three lengths including
+  128 KiB, and four drained-prefix positions exercising source/destination
+  wrapping and capacity growth. Other existing module tests also pass.
+- 175 valid, truncated and mutated archive cases match prior status, errno,
+  error message, header count, output length and SHA-256 exactly. This includes
+  both C- and Rust-produced held-out zero-heavy archives.
+- Raw results and the profile are in sibling `diagnostics/round4-zstd-read`.
+  The published crate omits assets/dev dependencies used by its full vendor
+  suite; the standalone harness tests the real modules without replacing the
+  algorithm. Full project oracle validation uses the combined final build.

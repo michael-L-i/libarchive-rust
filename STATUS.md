@@ -165,6 +165,55 @@ report is retained in `../diagnostics/results/before-round3/`. The current
 `diagnostics/bin/rust-bsdtar` alias is the verified release snapshot; named
 before/after snapshots preserve both profiles. Work is committed locally.
 
+## Optimization round 4 checkpoint
+
+Baseline `916ee2b` to final code `497ebb8`. Seven focused units, implemented in
+separate worktrees and independently reviewed by Astra: exact rejection of Zstd
+Huffman output that would be discarded, direct FSE encoder state lookup, inline
+FSE decoder state updates, safe doubling of initialized overlapping matches,
+slicing-by-eight XZ/LZIP checksums, overlapping LZMA match-tail comparison, and
+skipping ordinary-permission ownership stats. Presets, parsing decisions and
+checksum validation are preserved. No new unsafe code; one unsafe copy loop is
+replaced by the existing safe buffer API. Original C/upstream remain unchanged.
+
+Same-profile release medians: 16 MiB random Zstd creation 52.0 -> 23.6 ms
+(C 14.2), mixed 72.9 -> 49.3 ms (C 32.9), source 91.5 -> 74.1 ms (C 41.5).
+16 MiB text XZ creation 176.0 -> 134.1 ms and extraction 38.4 -> 17.1 ms
+(C extraction 22.1); random XZ extraction 41.0 -> 19.8 ms (C 23.5).
+16 MiB repetitive 7zip creation 158.7 -> 142.8 ms, still above C's 94.8 ms.
+Added zero-heavy Zstd extraction 25.0 -> 6.5 ms, close to C's 5.7 ms.
+
+The overlap fix is generic across distances and content; the held-out case
+exposed one-byte-at-a-time expansion and then guided the general fix; its final
+result is not an untouched holdout. Seven-run confirmation finds random
+2 MiB 7zip and structured-record XZ creation effectively unchanged; compiled
+XZ creation has a 2.6% higher median with overlapping ranges. Not every case
+gets faster. Memory is broadly unchanged; CRC tables add 21 KiB read-only.
+All 37 checked before/after Rust archive pairs are byte-identical. The already
+used ruzstd version is vendored with license/hash provenance for five changed
+source files; no codec version or C backend was added.
+
+Final validation: 380 native tests passed, 1 opt-in ignored; strict all-target
+Clippy, rustfmt, diff and 454 public ABI symbols passed. Release upstream/front-
+end suite: 926 passed, 184 skipped, zero failures, crashes, timeouts or ratchet
+regressions in 66s (one worker, 30-second per-test timeout). Backend validation
+includes 6,790 exact decoder records, 1,440 exact encoded LZMA-family streams,
+533 exact Zstd encoded cases, exhaustive FSE state comparisons, 175 damaged/
+valid Zstd archive comparisons and 768 overlap/wrap/growth cases. Independent
+C decoding and bitwise/scalar references validate changed operations.
+
+Consolidated archive matrix: 999 timed operations, 333 extraction manifests,
+222 cross-reader checks. Same-C-archive matrix: 1,110 timed reader operations,
+555 extraction manifests. Another 63 targeted creation timings resolve noise.
+Every check passed. Only Zstd decoding changed after the initial full matrix;
+affected Zstd cases were rerun on final code, with each row's original binary
+hash and source run retained. Unchanged formats were not needlessly rerun.
+
+Current report and full separate C/Rust tables: `../diagnostics/results/REPORT.md`.
+Prior report: `../diagnostics/results/before-round4/REPORT.md`. Both builds use
+ordinary release settings; no profile/PGO/target-CPU tuning. Work is committed
+locally. Current `diagnostics/bin/rust-bsdtar` is the verified final release.
+
 ## Earlier checkpoints (historical)
 
 ### Phase 2 checkpoint

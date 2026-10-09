@@ -1703,12 +1703,16 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   bytes and relative compression ratios can differ on some inputs.
 - lzma-rust2 0.21.0 is vendored with a binary-tree match-extension patch:
   the skip path uses the backend's existing safe word-at-a-time comparison.
+  Match tails use a final overlapping word in place of scalar comparisons;
+  the already-equal overlap preserves the exact first-mismatch position.
   Presets and parsing decisions are unchanged; differential streams remain
   byte-identical. The sans-I/O LZMA2 decoder also initializes dictionary
   pages as chunks need them, reducing resident memory for short XZ streams.
   Declared virtual capacity, logical history and memory limits are unchanged;
   LZMA1 and pull readers retain full initialization. Provenance and validation
   are in `vendor/lzma-rust2/PATCHES.md`; its unsafe `optimization` feature stays off.
+  CRC32/CRC64 updates use safe slicing-by-eight tables, retaining exact checksum
+  and incremental semantics while adding 21 KiB of read-only tables.
 - XZ and Zstandard accept and validate `threads` but encode on one worker.
   XZ uses a single-thread stream header/index. LZ4 high compression levels
   use the safe block encoder, and linked blocks can be independently coded;
@@ -1730,6 +1734,15 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   exceeded by the bounded pipeline and trailer. The matcher emits a leading
   literal and splits matches above 65,538 bytes to avoid ruzstd 0.9's
   single-symbol FSE and match-length-code-52 encoding bugs.
+  The existing ruzstd 0.9.0 dependency is vendored with narrow encoder patches:
+  an exact Huffman payload-size lower bound skips output that would have been
+  discarded, and FSE encoder state selection uses exact range arithmetic in
+  place of a linear search. Measured encoded bytes remain identical. Its small
+  FSE decoder update has an inlining hint. Overlapping matches expand through
+  the growing initialized prefix using the existing safe ring-buffer API,
+  replacing one unsafe loop and avoiding distance-sized repeated copies. No
+  extra allocation or new unsafe code; ring-buffer internals are unchanged. License,
+  source hash and differential validation are in `vendor/ruzstd/PATCHES.md`.
 - grzip, lrzip and lzop use upstream's external-program fallback. Missing
   programs fail when the archive is opened. Explicit program filters parse
   argv using the existing command parser and never invoke a shell. Pipes
@@ -1764,7 +1777,8 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   explicit offsets. Cached physical position and length avoid seeks for
   contiguous writes and resizing files already at their target length. Sparse
   holes still require extension; write errors invalidate both cached values.
-  Ownership/permission failures are warnings.
+  Ordinary permission restoration skips the ownership stat needed only when
+  set-ID bits might require clearing. Ownership/permission failures are warnings.
 - Logical and hybrid disk walks fall back to the symlink for a broken target
   or a directory ancestor cycle. Matching queries use the live match handle
   so unmatched inclusion counts reflect the walk. Descend requests made from
