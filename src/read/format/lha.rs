@@ -41,7 +41,7 @@ use crate::time::{dos_to_unix, ntfs_to_unix};
 use crate::util::Error;
 use libc::wchar_t;
 use lzh::{Input, Lzh, Step};
-use std::ffi::{CStr, c_int};
+use std::ffi::c_int;
 use std::sync::{Arc, PoisonError};
 
 const BIRTHTIME_IS_SET: u8 = 1;
@@ -92,23 +92,6 @@ const EXT_UNIX_MTIME: u8 = 0x54;
 const EXT_OS2_NEW_ATTR: u8 = 0x7f;
 /// New attribute.
 const EXT_NEW_ATTR: u8 = 0xff;
-
-/// `format_name`: upstream formats "lha -%c%c%c-" from the method, which
-/// `lha_check_header_format` limits to these.
-const FORMAT_NAMES: [(&[u8; 3], &CStr); 12] = [
-    (b"lh0", c"lha -lh0-"),
-    (b"lh1", c"lha -lh1-"),
-    (b"lh2", c"lha -lh2-"),
-    (b"lh3", c"lha -lh3-"),
-    (b"lh4", c"lha -lh4-"),
-    (b"lh5", c"lha -lh5-"),
-    (b"lh6", c"lha -lh6-"),
-    (b"lh7", c"lha -lh7-"),
-    (b"lhd", c"lha -lhd-"),
-    (b"lzs", c"lha -lzs-"),
-    (b"lz4", c"lha -lz4-"),
-    (b"lz5", c"lha -lz5-"),
-];
 
 #[derive(Default)]
 struct Lha {
@@ -992,7 +975,9 @@ impl Lha {
             self.end_of_entry_cleanup = true;
             if self.setflag & CRC_IS_SET != 0 && self.crc != self.entry_crc_calculated {
                 let _ = a.warn(ARCHIVE_ERRNO_MISC, "LHa data CRC error");
-                return Data::Warn;
+                return Data::Warn {
+                    offset: self.entry_offset,
+                };
             }
         }
         Data::Eof {
@@ -1052,7 +1037,7 @@ impl Lha {
                 let _ = a.warn(ARCHIVE_ERRNO_FILE_FORMAT, msg);
                 // We know compressed size; just skip it.
                 let _ = self.read_data_skip(r);
-                return Ok(Data::Warn);
+                return Ok(Data::Warn { offset: 0 });
             };
             self.dec = Some(dec);
             // We've initialized decompression for this stream.
@@ -1369,9 +1354,7 @@ impl Format for Lha {
             self.end_of_entry = true;
         }
 
-        if let Some((_, name)) = FORMAT_NAMES.iter().find(|(m, _)| **m == self.method) {
-            a.format_name.set(Some(name));
-        }
+        a.set_format_name(&[b"lha -".as_slice(), &self.method, b"-"].concat());
 
         Ok(Status::Ok)
     }

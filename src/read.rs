@@ -193,7 +193,6 @@ impl Base {
 
     /// Sets a formatted `archive_format_name`, such as "CAB 1.3 (LZX)", in
     /// place of a static one. The name ends at a NUL, as a C string would.
-    #[allow(dead_code)] // used by the cab, lha and zip readers (phase 4)
     pub fn set_format_name(&self, name: &[u8]) {
         let mut buf = self.format_name_buf.borrow_mut();
         buf.clear();
@@ -1325,9 +1324,10 @@ pub enum Data<'r> {
     Eof { offset: i64 },
     /// A problem with the entry's data, already recorded on the handle (see
     /// `Reader::warn`): there is no block this time, and the caller gets
-    /// `ARCHIVE_WARN`. A later call may carry on.
+    /// `ARCHIVE_WARN`. A later call may carry on. `offset` is what the
+    /// caller gets as the block's offset.
     #[allow(dead_code)] // returned by the zip and rar readers (phase 4)
-    Warn,
+    Warn { offset: i64 },
 }
 
 /// What a format reader implements. A format owns its own state in `self`;
@@ -1397,7 +1397,7 @@ pub trait Format: Any {
             match self.read_data(r)? {
                 Data::Block { .. } => {}
                 Data::Eof { .. } => return Ok(Status::Ok),
-                Data::Warn => return Ok(Status::Warn),
+                Data::Warn { .. } => return Ok(Status::Warn),
             }
         }
     }
@@ -1868,7 +1868,7 @@ impl Read {
                         blk_off = offset;
                         eof = true;
                     }
-                    Data::Warn => warned = true,
+                    Data::Warn { .. } => warned = true,
                     Data::Block { data, offset } => {
                         blk_off = offset;
                         if blk_off < out_off {
@@ -2970,7 +2970,7 @@ mod tests {
         let (mut r, a) = opened(Script::new(&[(7, b"hi")], 9));
         let first = r.read_data_block(&a, |d| match d {
             Data::Block { data, offset } => Some((data.to_vec(), offset)),
-            Data::Eof { .. } | Data::Warn => None,
+            Data::Eof { .. } | Data::Warn { .. } => None,
         });
         assert_eq!(first, Ok(Some((b"hi".to_vec(), 7))));
         assert!(matches!(
@@ -3097,7 +3097,7 @@ mod tests {
             }
             // `Data::Warn` is what carries the warning back.
             let _ = r.warn(libc::EILSEQ, "bad checksum");
-            Ok(Data::Warn)
+            Ok(Data::Warn { offset: 0 })
         }
     }
 
@@ -3116,7 +3116,7 @@ mod tests {
         assert_eq!((a.state.get(), a.format.get()), (state::DATA, 7));
         assert_eq!(error(&a), "header oddity");
         // The data's warning is a status, with no block.
-        let got = r.read_data_block(&a, |d| matches!(d, Data::Warn));
+        let got = r.read_data_block(&a, |d| matches!(d, Data::Warn { .. }));
         assert_eq!(got, Ok(true));
         assert_eq!(error(&a), "bad checksum");
         // A skip stops at a warning and reports it, but the handle is fine.

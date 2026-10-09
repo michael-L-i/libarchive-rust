@@ -965,5 +965,3 @@ Phase 5 needs:
   with "Bad lzh data" instead of reading or writing out of bounds. The
   Huffman code lengths are 0 to 16 by construction, so valid streams are
   unaffected.
-- The format name ("lha -lh5-") comes from a static table of the twelve
-  methods `lha_check_header_format` admits, not a formatted buffer.
