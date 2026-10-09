@@ -2,6 +2,9 @@
 
 mod acl;
 mod archive;
+mod blake2s_ref;
+#[allow(dead_code)] // used by the rar5 reader (phase 4)
+mod blake2sp_ref;
 mod check_magic;
 mod cmdline;
 mod entry;
