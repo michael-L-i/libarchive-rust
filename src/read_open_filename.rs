@@ -211,7 +211,8 @@ impl Client for Filenames {
         self.nodes.len()
     }
 
-    fn open(&mut self, _a: &Base, node: usize) -> Result<(), Error> {
+    fn open(&mut self, a: &Base, node: usize) -> Result<(), Error> {
+        a.clear_error();
         self.nodes.get_mut(node).map_or(Ok(()), FileNode::open)
     }
 
