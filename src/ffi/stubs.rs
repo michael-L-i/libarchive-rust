@@ -8,9 +8,6 @@ use super::{
 };
 use std::ffi::{c_char, c_int};
 
-
-
-
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format(_a0: *mut Archive, _format_code: c_int) -> c_int {
     ARCHIVE_FATAL
@@ -24,12 +21,10 @@ pub extern "C" fn archive_write_set_format_by_name(
     ARCHIVE_FATAL
 }
 
-
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_iso9660(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
-
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_filter_by_ext(
@@ -60,63 +55,3 @@ pub extern "C" fn archive_write_open_filename_w(
 pub extern "C" fn archive_write_open_FILE(_a0: *mut Archive, _a1: *mut libc::FILE) -> c_int {
     ARCHIVE_FATAL
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
