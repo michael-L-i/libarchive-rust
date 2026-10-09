@@ -314,7 +314,6 @@ pub trait Client {
 
     /// The device and inode of the input being read, if it is a regular
     /// file: extraction must not overwrite it.
-    #[allow(dead_code)] // for archive_read_extract (phase 5)
     fn skip_file(&self) -> Option<(i64, i64)> {
         None
     }
@@ -1991,7 +1990,6 @@ impl Read {
 
     /// The device and inode of the input, which extraction must not
     /// overwrite.
-    #[allow(dead_code)] // for archive_read_extract (phase 5)
     pub fn skip_file(&self) -> Option<(i64, i64)> {
         self.skip_file.or_else(|| match &self.chain.first()?.imp {
             Imp::Client(c) => c.client.skip_file(),

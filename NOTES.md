@@ -19,8 +19,8 @@ Suspected upstream bugs ported as-is, and deliberate divergences, per unit.
   library is linked, so those sections never appear. The compression
   backends are Rust crates, so each `archive_*_version` reports the crate,
   not the C library: `<crate> <version>` read from `Cargo.lock` by
-  `build.rs`, e.g. `zlib/miniz_oxide 0.9.1`. ACL
-  backends are absent until phase 5 (archive_version_details.c).
+  `build.rs`, e.g. `zlib/miniz_oxide 0.9.1`. Darwin ACL support uses
+  native system APIs and has no separate linked-library version.
 - NULL handles: upstream dereferences them and crashes (except
   `archive_free(NULL)`, which returns `ARCHIVE_OK`). Ours return a fallback
   (`ARCHIVE_FATAL`, 0 or NULL) without touching anything.
@@ -615,13 +615,8 @@ Differences:
 - The filter skips skippable frames and checks each frame's content checksum,
   since ruzstd does neither. The window limit is libzstd's default, 128 MiB.
 
-Phase 5 needs:
-
-- zstd writing. ruzstd's encoder implements only the Uncompressed and Fastest
-  levels. Default, Better and Best hit `unimplemented!()`, so phase 5 needs
-  another encoder for the default levels.
-- bzip2 writing can use crabz2's safe encoder; level and streaming behavior
-  must be checked against the writer oracle when phase 5 lands.
+Phase 5 write adapters use crabz2 and a bounded ruzstd matcher; their
+streaming behavior and encoder differences are recorded below.
 
 ## mtree reader (src/read/format/mtree.rs)
 
@@ -1137,14 +1132,8 @@ the entry record and the extra fields, `zip/crypto.rs` the decryption, and
   `zip_read_decryption_header`'s tail (see above). The cryptor errors "lack
   of crypto library" cannot happen, and the messages for the `None` cases
   are kept.
-- The tests that need the zip writer or `archive_read_extract` (phase 5)
-  can't pass yet: `test_read_format_zip` (2 assertions on extraction),
-  `test_compat_zip_3`, `test_read_format_zip_high_compression2`,
-  `test_zip_filename_encoding_UTF8`, `test_read_format_zip_traditional_
-  encryption_data`, `test_read_format_zip_winzip_aes{128,256,256_stored,
-  256_large*}`, and the `zipx_*_encrypted` and `deflate_encrypted` tests with
-  their `_streaming` forms, `ppmd8_aes256_streaming`. The probe covers
-  their fixtures (and the unzip suite passes in full).
+- ZIP writer/extraction integration tests, including all encrypted ZIPX
+  methods and streaming forms, pass after Phase 5 integration.
 
 ## xar reader (`src/read/format/xar.rs`, `xar/toc.rs`)
 
@@ -1156,9 +1145,9 @@ the entry record and the extra fields, `zip/crypto.rs` the decryption, and
   xattr's data is never verified.
 - An xattr is decoded with the decoder that the entry's `entry_encoding`
   picks (xz stream or lzma alone) and named in its errors, whatever the
-  xattr's own `encoding` says. The xattr is also decoded in one call: it must
-  fit what is buffered and the 64 KiB output buffer, or "Decompressed size
-  error".
+  xattr's own `encoding` says. The upstream single-call attribute decoding
+  restriction is replaced by bounded incremental collection; see the XAR
+  writer/attribute notes below.
 - `xar_read_header` returns a conversion warning (name, user, group or link
   text that cannot be converted from UTF-8) before it moves to the file's
   data, if the file has no xattrs (an xattr's own result replaces the
@@ -1736,7 +1725,7 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   output is valid but need not match the C encoders byte for byte.
 - Upstream checks an attribute's entire decompressed size after one decoder
   call, so small input blocks can fail even for a valid archive. The Rust
-  reader collects incremental attribute output, checks both sizes and sums,
+  reader collects incremental attribute output, checks decoded sizes,
   and bounds the combined owned attribute values per entry at 64 MiB before allocating. This permits
   writer round trips through small callback blocks without uncontrolled
   allocation from the XML size field.
