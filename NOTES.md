@@ -785,8 +785,15 @@ Phase 5 needs:
 - A "CE" entry stores its offset and length in the file, so a record with two
   of them, or a continuation area with more, reads every request with the
   values of the last one.
-- `previous_number` starts at 0. A first entry with file number 0 (extent 0)
-  is returned as a hard link to the empty name.
+- `previous_number` starts at 0. A first entry with file number 0 (extent 0,
+  or PX inode 0 on every entry) takes the hard link branch before any entry
+  has been returned. `previous_pathname.s` is still NULL, so upstream sets no
+  hard link, but the entry still gets no size and no data.
+- `archive_string_empty` only zeroes the length. The name and symlink buffers
+  are read as C strings in places (`strcmp` for `rr_moved`, the "beyond
+  end-of-media" and out-of-order warnings, the symlink target), so after an
+  NM or SL entry empties them those places still see the old bytes, and a
+  symlink target can be stale. The port keeps the bytes and the length apart.
 - An out-of-order file warning prints `pathname.s`, which is NULL when
   Joliet names are in use; it is printed as "(null)".
 - A zisofs block of zero length (a hole) is returned as a whole block of

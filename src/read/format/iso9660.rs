@@ -135,38 +135,69 @@ fn be32(h: &[u8], off: usize) -> u32 {
         .map_or(0, u32::from_be_bytes)
 }
 
-/// An `archive_string`, whose buffer is NULL until something is appended: a
-/// symlink target exists only once an SL entry has put something in it.
+/// An `archive_string`: a buffer that is NULL until something is appended,
+/// and a length. Emptying only sets the length to zero and keeps the bytes,
+/// and code that reads the buffer as a C string (`name.s`) still sees them;
+/// code that goes by the length does not.
 #[derive(Default)]
-struct AString(Option<Vec<u8>>);
+struct AString {
+    buf: Option<Vec<u8>>,
+    len: usize,
+}
 
 impl AString {
-    fn empty(&mut self) {
-        if let Some(v) = &mut self.0 {
-            v.clear();
+    fn new(s: Vec<u8>) -> Self {
+        AString {
+            len: s.len(),
+            buf: Some(s),
         }
+    }
+
+    fn empty(&mut self) {
+        self.len = 0;
     }
 
     /// `archive_strncat`: at most `n` bytes, up to the first NUL.
     fn ncat(&mut self, p: &[u8], n: usize) {
         let p = p.get(..n).unwrap_or(p);
         let end = p.iter().position(|&c| c == 0).unwrap_or(p.len());
-        self.0
-            .get_or_insert_default()
-            .extend_from_slice(p.get(..end).unwrap_or_default());
+        let v = self.buf.get_or_insert_default();
+        v.truncate(self.len);
+        v.extend_from_slice(p.get(..end).unwrap_or_default());
+        self.len = v.len();
     }
 
     fn cat(&mut self, p: &[u8]) {
         self.ncat(p, p.len());
     }
 
+    fn is_set(&self) -> bool {
+        self.buf.is_some()
+    }
+
+    /// The string by its length.
     fn bytes(&self) -> &[u8] {
-        self.0.as_deref().unwrap_or_default()
+        self.buf
+            .as_deref()
+            .and_then(|v| v.get(..self.len))
+            .unwrap_or_default()
+    }
+
+    /// The buffer as a C string, `s`: up to its first NUL, whatever the
+    /// length is.
+    fn c_str(&self) -> &[u8] {
+        let v = self.buf.as_deref().unwrap_or_default();
+        v.get(..v.iter().position(|&c| c == 0).unwrap_or(v.len()))
+            .unwrap_or_default()
     }
 
     /// What `%s` prints.
     fn display(&self) -> &[u8] {
-        self.0.as_deref().unwrap_or(b"(null)")
+        if self.is_set() {
+            self.c_str()
+        } else {
+            b"(null)"
+        }
     }
 }
 
@@ -343,7 +374,7 @@ struct Iso9660 {
     read_ce_req: Heap,
 
     previous_number: i64,
-    previous_pathname: Vec<u8>,
+    previous_pathname: AString,
 
     /// Every directory record read.
     files: Vec<FileInfo>,
@@ -389,7 +420,7 @@ pub fn support(r: &mut Read) -> Result<Status, Error> {
         rr_moved: None,
         read_ce_req: Heap::default(),
         previous_number: 0,
-        previous_pathname: Vec::new(),
+        previous_pathname: AString::default(),
         files: Vec::new(),
         pending_files: Heap::default(),
         cache_files: VecDeque::new(),
@@ -1343,8 +1374,8 @@ impl Iso9660 {
             && parent_info.is_some_and(|(top, _, _)| top)
             && is_dir
             && self.rr_moved.is_none()
-            && f.name.0.is_some()
-            && matches!(f.name.bytes(), b"rr_moved" | b".rr_moved")
+            && f.name.is_set()
+            && matches!(f.name.c_str(), b"rr_moved" | b".rr_moved")
         {
             self.rr_moved = Some(idx);
             let f = &mut self.files[idx];
@@ -2187,7 +2218,7 @@ impl Format for Iso9660 {
                 ));
             };
             entry.set_pathname(&path);
-            self.pathname = AString(Some(path));
+            self.pathname = AString::new(path);
         }
 
         let f = &self.files[file];
@@ -2235,8 +2266,8 @@ impl Format for Iso9660 {
         // N.B.: Rock Ridge supports 64-bit device numbers.
         entry.set_rdev(f.rdev as Dev);
         entry.set_size(self.entry_bytes_remaining);
-        if let Some(symlink) = &f.symlink.0 {
-            entry.set_symlink(symlink);
+        if f.symlink.is_set() {
+            entry.set_symlink(f.symlink.c_str());
         }
 
         // Note: If the input isn't seekable, we can't rewind to return the
@@ -2260,7 +2291,10 @@ impl Format for Iso9660 {
                     );
                 }
             } else {
-                entry.set_hardlink(&self.previous_pathname);
+                // Nothing returned yet: a NULL target, which sets nothing.
+                if self.previous_pathname.is_set() {
+                    entry.set_hardlink(self.previous_pathname.c_str());
+                }
             }
             entry.unset_size();
             self.entry_bytes_remaining = 0;
@@ -2312,8 +2346,7 @@ impl Format for Iso9660 {
         if self.seen_joliet != 0 {
             self.utf16be_previous_path.clone_from(&self.utf16be_path);
         } else {
-            self.previous_pathname
-                .clone_from(&self.pathname.bytes().to_vec());
+            self.previous_pathname = AString::new(self.pathname.c_str().to_vec());
         }
 
         // Reset entry_bytes_remaining if the file is multi extent.
@@ -2368,7 +2401,9 @@ impl Format for Iso9660 {
                     ]
                     .concat(),
                 );
-                return Ok(Data::Warn);
+                return Ok(Data::Warn {
+                    offset: self.entry_sparse_offset,
+                });
             }
             self.entry_bytes_remaining = content.size as i64;
         }
@@ -2456,7 +2491,21 @@ mod tests {
         // A record that only has the flag byte leaves no target at all.
         let mut g = FileInfo::default();
         parse_rockridge_sl1(&mut g, b"\x00");
-        assert!(g.symlink.0.is_none());
+        assert!(!g.symlink.is_set());
+    }
+
+    #[test]
+    fn emptied_strings_keep_their_bytes_as_c_strings() {
+        let mut f = FileInfo::default();
+        parse_rockridge_sl1(&mut f, b"\x00\x00\x01X");
+        // A second SL record starts over with a "ROOT" component but its
+        // length-0 text leaves the old bytes beyond the new length.
+        parse_rockridge_sl1(&mut f, b"\x00\x10\x00");
+        assert_eq!(f.symlink.bytes(), b"ROOT");
+        let mut n = AString::default();
+        n.cat(b"RR_MOVED");
+        n.empty();
+        assert_eq!((n.bytes(), n.c_str()), (&b""[..], &b"RR_MOVED"[..]));
     }
 
     #[test]
