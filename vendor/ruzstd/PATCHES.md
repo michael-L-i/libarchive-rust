@@ -7,9 +7,10 @@ Repository: https://github.com/KillingSpark/zstd-rs
 
 The manifest retains upstream package/features/dependencies and omits its
 examples, benchmarks and development dependencies. Fixture assets are not
-vendored. Upstream's existing unsafe ring-buffer implementation is unchanged.
-The local patches add no unsafe code. Decoder changes are an inlining hint and
-safe growth of overlapping copies, described below; one unsafe call is removed.
+vendored. The ring buffer's existing unsafe memory accesses are unchanged. The local
+patches add no unsafe code. Decoder changes include inlining, safe growth of
+overlapping copies and bounded ring-index arithmetic, described below; one
+unsafe call is removed.
 
 Before writing Huffman literals, count the exact payload bits for the selected
 new or reused table. If the payload alone is at least as large as the raw
@@ -160,3 +161,29 @@ and removes the absolute-base arithmetic and overflow reset branch.
   using the real matcher source, including reset, expiry, overlap and
   skipped RLE blocks. Full archive integration checks use the combined
   branch. No compression settings or match-selection rules change.
+
+## Bound ring-buffer tail wrapping to one subtraction
+
+`src/decoding/ringbuffer.rs` replaces the runtime remainder when advancing the
+append tail in `extend` and `extend_from_within_unchecked`. Both operations
+already reserve (or require) enough space for the entire append, including the
+unused sentinel byte. Thus the append length and old tail are each strictly
+less than capacity, and their sum wraps at most once. A conditional subtraction
+produces the same tail without integer division. Existing memory accesses,
+allocation, window and error handling are unchanged; no unsafe code is added.
+
+- A fresh source-data decode profile identified ring-buffer match appends as
+  a substantial part of sequence execution. A seven-run alternating ABI
+  comparison improved 16 MiB source 23.364 -> 22.944 ms and mixed data
+  12.582 -> 12.405 ms. A separate 21-run confirmation yielded
+  23.188 -> 22.646 ms and 12.469 -> 12.195 ms respectively (about 2%).
+  Text, random, small-file and two sparse cases were essentially unchanged.
+- All seven inputs have matching output SHA-256 with both the baseline and
+  independent C libarchive. All 175 valid, truncated and mutated archives
+  match baseline status, errno, error text, headers, length and SHA-256.
+- Six tests of the actual ring/decode-buffer modules pass with debug
+  assertions, including 768 overlap, wrap and growth reference cases, plus
+  append tests immediately before, at and after the tail wrap boundary.
+- Profiles, ABI comparisons, rejected bit-reader/FSE batching trials and the
+  standalone actual-module tests are in sibling `diagnostics/round5-zstd-read`.
+  Final integration validation runs on the combined branch.

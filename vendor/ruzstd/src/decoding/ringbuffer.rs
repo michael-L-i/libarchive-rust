@@ -178,7 +178,13 @@ impl RingBuffer {
             }
         }
         // SAFETY: Upholds invariant 3 by wrapping `tail` around.
-        self.tail = (self.tail + len) % self.cap;
+        // Reserved space bounds len below capacity, so at most one wrap is needed.
+        let tail = self.tail + len;
+        self.tail = if tail >= self.cap {
+            tail - self.cap
+        } else {
+            tail
+        };
     }
 
     /// Advance head past `amount` elements, effectively removing
@@ -450,7 +456,13 @@ impl RingBuffer {
             }
         }
 
-        self.tail = (self.tail + len) % self.cap;
+        // The reserved-space contract bounds len below capacity.
+        let tail = self.tail + len;
+        self.tail = if tail >= self.cap {
+            tail - self.cap
+        } else {
+            tail
+        };
     }
 
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
@@ -786,6 +798,32 @@ unsafe fn copy_with_nobranch_check(
 #[cfg(test)]
 mod tests {
     use super::RingBuffer;
+
+    #[test]
+    fn append_at_tail_wrap_boundary() {
+        for len in [0, 4, 5, 6] {
+            for from_within in [false, true] {
+                let mut rb = RingBuffer::new();
+                rb.reserve(16);
+                rb.extend(b"0123456789ab");
+                rb.drop_first_n(5);
+                let mut expected = alloc::vec::Vec::from(&b"56789ab"[..]);
+                if from_within {
+                    rb.extend_from_within(0, len);
+                    expected.extend_from_slice(&b"56789ab"[..len]);
+                } else {
+                    rb.extend(&b"uvwxyz"[..len]);
+                    expected.extend_from_slice(&b"uvwxyz"[..len]);
+                }
+                let (first, second) = rb.as_slices();
+                assert_eq!(first.len() + second.len(), expected.len());
+                assert_eq!(first, &expected[..first.len()]);
+                assert_eq!(second, &expected[first.len()..]);
+                assert_eq!(rb.cap, 17);
+                assert_eq!(rb.tail, (12 + len) % 17);
+            }
+        }
+    }
 
     #[test]
     fn smoke() {
