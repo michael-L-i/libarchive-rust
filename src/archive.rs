@@ -139,6 +139,7 @@ impl Base {
 /// `ARCHIVE_FATAL`) instead of aliasing.
 #[allow(clippy::large_enum_variant)] // Handles live on the heap; kinds own their state.
 pub enum Kind {
+    Match(RefCell<crate::matching::Matching>),
     Read(RefCell<Read>),
     Write(RefCell<crate::write::Write>),
     #[allow(dead_code)] // Constructed by disk FFI.

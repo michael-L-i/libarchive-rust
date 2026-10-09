@@ -36,6 +36,9 @@ test_acl_to_text
 test_ar_mode
 test_archive_api_feature
 test_archive_clear_error
+test_archive_match_owner
+test_archive_match_path
+test_archive_parse_date
 test_archive_read_append_filter
 test_archive_read_close_twice
 test_archive_read_close_twice_open_fd

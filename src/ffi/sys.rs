@@ -203,6 +203,36 @@ pub fn try_zeroed_vec(len: usize) -> Option<Vec<u8>> {
     Some(unsafe { Vec::from_raw_parts(p, len, len) })
 }
 
+/// Calendar fields, standard timezone offset west of UTC, and DST state.
+pub(crate) fn date_clock(secs: i64, utc: bool) -> Option<(Tm, i64, bool)> {
+    let secs = libc::time_t::try_from(secs).ok()?;
+    // SAFETY: both routines initialize our own writable tm on success.
+    let t = unsafe {
+        let mut t = std::mem::zeroed::<libc::tm>();
+        let result = if utc {
+            libc::gmtime_r(&secs, &mut t)
+        } else {
+            libc::localtime_r(&secs, &mut t)
+        };
+        if result.is_null() {
+            return None;
+        }
+        t
+    };
+    Some((
+        Tm {
+            year: t.tm_year,
+            mon: t.tm_mon,
+            mday: t.tm_mday,
+            hour: t.tm_hour,
+            min: t.tm_min,
+            sec: t.tm_sec,
+        },
+        -(t.tm_gmtoff as i64) + if t.tm_isdst > 0 { 3600 } else { 0 },
+        t.tm_isdst > 0,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

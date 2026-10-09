@@ -1679,3 +1679,17 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - Where upstream would index outside a vector with a bad index (an entry
   with data but no folder, a pack stream index outside the table), the
   reader fails with "Damaged 7-Zip archive".
+
+## Matching (`src/matching.rs`, `pathmatch.rs`, `parse_date.rs`)
+
+- Inclusion patterns are anchored and optionally recursive; exclusions match
+  each pathname component. Inclusion hits are recorded before exclusions so
+  an explicitly excluded pathname is not reported as missing.
+- Date tokenization retains upstream's 250-token and 9999-number bounds;
+  Unix epoch strings bypass that tokenizer. The conversion retains upstream's
+  every-fourth-year leap count (including century years).
+- File-time exclusions overwrite previous conditions for the same pathname.
+  Missing ctime uses mtime for inclusion filters, as upstream does.
+- Lists and trees use owned strings and standard collections. Pattern-file
+  contents are read through Rust's file API, with CR/LF or NUL separation;
+  no compression or charset conversion is applied to file contents.
