@@ -458,9 +458,9 @@ impl Rar {
                 && self.file_flags & FHD_SPLIT_AFTER != 0
             {
                 self.filename_must_match = true;
-                let mut ret = self.read_header(r, None);
+                let mut ret = r.with_entry(|r, e| self.read_header(r, e));
                 if matches!(ret, Ok(Status::Eof)) {
-                    ret = self.read_header(r, None);
+                    ret = r.with_entry(|r, e| self.read_header(r, e));
                 }
                 self.filename_must_match = false;
                 match ret {
@@ -476,9 +476,9 @@ impl Rar {
         }
     }
 
-    /// `archive_read_format_rar_read_header`. Without an `entry`, which is
-    /// how upstream's callers in the middle of reading data pass `a->entry`
-    /// (and we can't reach it), the entry is left alone.
+    /// `archive_read_format_rar_read_header`. The calls in the middle of
+    /// reading data pass the handle's own entry, as upstream passes
+    /// `a->entry` (`Reader::with_entry`).
     fn read_header(
         &mut self,
         r: &mut Reader<'_>,
@@ -1343,9 +1343,9 @@ impl Format for Rar {
             if self.main_flags & MHD_VOLUME == 0 || self.file_flags & FHD_SPLIT_AFTER == 0 {
                 return Ok(Status::Ok);
             }
-            let mut ret = self.read_header(r, None)?;
+            let mut ret = r.with_entry(|r, e| self.read_header(r, e))?;
             if ret == Status::Eof {
-                ret = self.read_header(r, None)?;
+                ret = r.with_entry(|r, e| self.read_header(r, e))?;
             }
             if ret != Status::Ok {
                 return Ok(ret);
@@ -1386,7 +1386,7 @@ impl Rar {
             Some(Whence::End) => self.unp_size,
             _ => 0,
         };
-        client_offset = client_offset.saturating_add(offset);
+        client_offset = client_offset.wrapping_add(offset);
         if client_offset < 0 {
             // Can't seek past beginning of data block.
             return Ok(-1);
@@ -1429,7 +1429,7 @@ impl Rar {
                         previous.start_offset.wrapping_sub(previous.header_size),
                         Whence::Set,
                     )?;
-                    if self.read_header(r, None).ok() != Some(Status::Ok) {
+                    if r.with_entry(|r, e| self.read_header(r, e)).ok() != Some(Status::Ok) {
                         return Err(Error::new(
                             ARCHIVE_FAILED,
                             ARCHIVE_ERRNO_MISC,
@@ -1455,9 +1455,9 @@ impl Rar {
                     }
                     self.cursor -= 1;
                     r.seek(dbo(self, self.cursor)?.end_offset, Whence::Set)?;
-                    let mut ret = self.read_header(r, None).ok();
+                    let mut ret = r.with_entry(|r, e| self.read_header(r, e)).ok();
                     if ret == Some(Status::Eof) {
-                        ret = self.read_header(r, None).ok();
+                        ret = r.with_entry(|r, e| self.read_header(r, e)).ok();
                     }
                     if ret != Some(Status::Ok) {
                         return Err(Error::new(
