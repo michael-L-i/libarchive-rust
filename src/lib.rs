@@ -20,6 +20,9 @@ mod ffi;
 mod hmac;
 mod options;
 mod pack_dev;
+mod ppmd;
+mod ppmd7;
+mod ppmd8;
 mod read;
 mod read_add_passphrase;
 mod read_append_filter;
@@ -32,7 +35,7 @@ mod read_set_format;
 mod read_set_options;
 mod string;
 mod string_composition;
-#[allow(dead_code)] // used by the zip, 7zip, rar, rar5, lha and xar readers (phase 4)
+#[allow(dead_code)] // used by the zip, 7zip, rar, rar5 and lha readers (phase 4)
 mod time;
 mod util;
 mod version_details;

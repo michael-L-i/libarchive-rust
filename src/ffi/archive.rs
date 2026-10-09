@@ -116,7 +116,17 @@ pub extern "C" fn archive_format(a: *mut Archive) -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_format_name(a: *mut Archive) -> *const c_char {
-    with(a, std::ptr::null(), |h| cptr(h.base.format_name.get()))
+    with(a, std::ptr::null(), |h| match h.base.format_name.get() {
+        Some(name) => name.as_ptr(),
+        None => {
+            let buf = h.base.format_name_buf.borrow();
+            if buf.is_empty() {
+                std::ptr::null()
+            } else {
+                buf.as_ptr().cast()
+            }
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -412,6 +422,25 @@ mod tests {
     fn string(p: *const c_char) -> Option<String> {
         // SAFETY: the tests only pass pointers the library returned.
         (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn a_formatted_format_name_is_rewritten_in_place() {
+        let a = archive_read_new();
+        assert_eq!(string(archive_format_name(a)), None);
+        let set = |name: &[u8]| with(a, (), |h| h.base.set_format_name(name));
+        set(b"CAB 1.3 (NONE)");
+        let first = archive_format_name(a);
+        assert_eq!(string(first).as_deref(), Some("CAB 1.3 (NONE)"));
+        // A pointer handed out earlier still reads the current name.
+        set(b"CAB 1.3 (LZX)\0junk");
+        assert_eq!(archive_format_name(a), first);
+        assert_eq!(string(first).as_deref(), Some("CAB 1.3 (LZX)"));
+        // A static name takes over, and the buffer stays readable.
+        with(a, (), |h| h.base.set_format(0x60000, c"lha"));
+        assert_eq!(string(archive_format_name(a)).as_deref(), Some("lha"));
+        assert_eq!(string(first).as_deref(), Some("CAB 1.3 (LZX)"));
+        assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 
     #[test]
