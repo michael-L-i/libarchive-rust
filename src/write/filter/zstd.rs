@@ -49,7 +49,7 @@ impl Matches {
     fn new(size: usize) -> Self {
         Self {
             size,
-            data: Vec::with_capacity(WINDOW + size),
+            data: Vec::with_capacity(2 * WINDOW + size),
             start: 0,
             base: 0,
             positions: vec![0; 1 << HASH_BITS],
@@ -57,11 +57,14 @@ impl Matches {
         }
     }
     fn key(data: &[u8]) -> usize {
-        let word = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        (word.wrapping_mul(0x9e3779b1) >> (32 - HASH_BITS)) as usize
+        // A fifth byte separates common four-byte text prefixes.
+        let word = u64::from_le_bytes([
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+        ]);
+        ((word << 24).wrapping_mul(0xcf1bbcdcb7a56463) >> (64 - HASH_BITS)) as usize
     }
     fn remember(&mut self, at: usize) {
-        if at + 4 <= self.data.len() {
+        if at + 8 <= self.data.len() {
             self.positions[Self::key(&self.data[at..])] = self.base + at as u64 + 1;
         }
     }
@@ -76,10 +79,16 @@ impl Matcher for Matches {
         &self.data[self.start..]
     }
     fn commit_space(&mut self, mut data: Vec<u8>) {
-        let remove = self.data.len().saturating_sub(WINDOW);
+        // Retain an extra window before compacting, amortizing the history
+        // copy across many blocks. Match offsets still cannot exceed WINDOW.
+        let remove = if self.data.len() >= 2 * WINDOW {
+            self.data.len() - WINDOW
+        } else {
+            0
+        };
         if self
             .base
-            .checked_add((remove + WINDOW + self.size + 1) as u64)
+            .checked_add((self.data.len() + self.size + 1) as u64)
             .is_none()
         {
             // Positions need not wrap even for an indefinitely long stream.
@@ -96,16 +105,16 @@ impl Matcher for Matches {
         data.clear();
         self.space = data;
         // Include keys straddling the previous block boundary.
-        for at in self.start.saturating_sub(3)..self.start {
+        for at in self.start.saturating_sub(7)..self.start {
             self.remember(at);
         }
     }
     fn skip_matching(&mut self) {
         // ruzstd skips matching for RLE blocks, but subsequent blocks may
         // still reference their bytes.
-        if self.start + 4 <= self.data.len() {
+        if self.start + 8 <= self.data.len() {
             self.remember(self.start);
-            self.remember(self.data.len() - 4);
+            self.remember(self.data.len() - 8);
         }
     }
     fn reset(&mut self, _: CompressionLevel) {
@@ -124,7 +133,8 @@ impl Matcher for Matches {
         // valid even when the entire block repeats earlier history.
         self.remember(literal);
         let mut at = literal + usize::from(literal < self.data.len());
-        while at + 4 <= self.data.len() {
+        let mut misses = 0usize;
+        while at + 8 <= self.data.len() {
             let key = Self::key(&self.data[at..]);
             let position = self.positions[key];
             self.positions[key] = self.base + at as u64 + 1;
@@ -150,13 +160,17 @@ impl Matcher for Matches {
                     offset: at - prev,
                     match_len: n,
                 });
+                misses = 0;
                 at += n;
                 literal = at;
                 // Seed the tail without hashing every byte of long matches.
                 self.remember(at.saturating_sub(2));
                 self.remember(at.saturating_sub(1));
             } else {
-                at += 1;
+                // Back off only after sustained misses, and bound the stride so
+                // repeated regions can quickly restart dense matching.
+                misses += 1;
+                at += (1 + (misses >> 6)).min(16);
             }
         }
         emit(Sequence::Literals {
@@ -549,14 +563,27 @@ mod tests {
         data.extend_from_slice(&block);
         assert!(roundtrip(&data, 32768) < block.len() + 2048);
         // Force history compaction and then repeat across that boundary.
-        let mut data = random_bytes(WINDOW + 32768);
+        let mut data = random_bytes(2 * WINDOW + 32768);
         let tail = data[data.len() - 32768..].to_vec();
         data.extend_from_slice(&tail);
         assert!(roundtrip(&data, 32768) < data.len() - 30000);
     }
     #[test]
+    fn matcher_resumes_dense_search_after_incompressible_regions() {
+        let mut data = random_bytes(65536);
+        for _ in 0..2048 {
+            data.extend_from_slice(b"a repeated sentence after random bytes.\n");
+        }
+        data.extend_from_slice(&random_bytes(32768));
+        for _ in 0..2048 {
+            data.extend_from_slice(b"a second repeated sentence after random bytes.\n");
+        }
+        assert!(roundtrip(&data, 98304) < 103000);
+    }
+
+    #[test]
     fn matcher_handles_overlap_short_tails_and_skipped_rle_blocks() {
-        for length in [0, 1, 2, 3, 4, 5, 7, 15, 31, 1023, 4097, 65539] {
+        for length in [0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 31, 1023, 4097, 65539] {
             let data: Vec<_> = b"abcd".iter().copied().cycle().take(length).collect();
             roundtrip(&data, 16384);
         }
