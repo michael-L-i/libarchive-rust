@@ -837,3 +837,41 @@ Phase 5 needs:
 - `__archive_crc32` is the table implementation upstream uses without zlib;
   the result is identical to zlib's. There is no NULL-pointer case, as a
   slice is never null.
+
+## lha reader (src/read/format/lha.rs)
+
+### Ported as-is
+
+- `lha_check_header_format` compares the level byte as a `char`, which is
+  signed on the platforms we target: a "-lh?-" header with level 0x80 to
+  0xff bids 30 and is accepted as a header, then `read_header` fails with
+  "Unsupported LHa header level -N". (On unsigned-char platforms it would not
+  bid.)
+- `uname`, `gname`, `crc` and `header_crc` are not reset between entries, so
+  an entry without a user name, group name or header CRC extended header
+  inherits the previous entry's (a level 2 or 3 header without a CRC
+  extended header compares against the previous, or initial zero, value).
+- Header level 3 never skips the padding between the extended headers and
+  `header_size`; header level 2 does.
+- `lha_read_data_*` ask for one byte of look-ahead even when the compressed
+  data is used up: an archive whose last entry ends exactly at the end of
+  the file, after the decoder consumed everything, fails the next
+  `read_data` call with "Truncated LHa file body" if that call is made.
+- A directory (`-lhd-`) whose header carries a non-zero file CRC reports
+  "LHa data CRC error" at its end.
+- A read error while peeking at a header is treated as a short input (EOF
+  or "Truncated LHa header"), as upstream's `__archive_read_ahead` returning
+  NULL is.
+
+### Differences
+
+- The decoder window is zero filled (upstream mallocs it and fills only the
+  last 8/32/64 KiB with spaces; no valid distance reaches the rest).
+  The decoder is created per entry rather than reused, so no table state
+  carries over.
+- Every Huffman table, tree and window index is checked; corrupt tables fail
+  with "Bad lzh data" instead of reading or writing out of bounds. The
+  Huffman code lengths are 0 to 16 by construction, so valid streams are
+  unaffected.
+- The format name ("lha -lh5-") comes from a static table of the twelve
+  methods `lha_check_header_format` admits, not a formatted buffer.
