@@ -1383,8 +1383,11 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   three decoded BCJ2 side streams grow with the data instead of being
   allocated at the size the header gives; the decoded streams are the same.
   Every allocation is fallible.
-- **PPMd** memory is `Ppmd7::alloc`'s, which zeroes it (see the PPMd
-  section): an archive that asks for a few GiB of model costs that.
+- **Decoder memory.** LZMA1/LZMA2 dictionaries and PPMd models are capped
+  at 256 MiB before allocation, like the XZ filter. Oversized dictionaries
+  fail with "Decompression failed (5)"; oversized PPMd models fail with
+  ENOMEM. Upstream has no such limit, so unusually large valid models are
+  rejected here. PPMd arenas use lazily zeroed pages (see the PPMd section).
 - Where upstream would index outside a vector with a bad index (an entry
   with data but no folder, a pack stream index outside the table), the
   reader fails with "Damaged 7-Zip archive".

@@ -26,6 +26,8 @@ use std::io;
 
 /// libzstd's default window limit (`ZSTD_WINDOWLOG_LIMIT_DEFAULT`).
 const ZSTD_MAX_WINDOW: u64 = 1 << 27;
+/// The same dictionary/model budget as the XZ read filter.
+const MAX_DECODER_MEMORY: u32 = 256 * 1024 * 1024;
 const ZSTD_MAGIC: [u8; 4] = 0xFD2F_B528u32.to_le_bytes();
 /// The frame header descriptor's reserved bit.
 const ZSTD_RESERVED_BIT: u8 = 0x08;
@@ -681,6 +683,9 @@ impl SevenZip {
             } else {
                 (2 | u32::from(b & 1)) << (b / 2 + 11)
             };
+            if dict_size > MAX_DECODER_MEMORY {
+                return Err(failed("Decompression failed (5)"));
+            }
             self.coders.backend = Backend::Lzma2(Box::new(Lzma2Stream::new(dict_size)));
         } else {
             let &[b, d0, d1, d2, d3] = props else {
@@ -690,6 +695,9 @@ impl SevenZip {
                 return Err(lzma_options_error());
             }
             let dict_size = u32::from_le_bytes([d0, d1, d2, d3]);
+            if dict_size > MAX_DECODER_MEMORY {
+                return Err(failed("Decompression failed (5)"));
+            }
             // The size of the stream is known; a stream with no end marker
             // (7-Zip writes none) can't be finished otherwise.
             let size = if self.codec2 == CODEC_X86_BCJ2 {
@@ -726,6 +734,12 @@ impl SevenZip {
             || !(PPMD7_MIN_MEM_SIZE..=PPMD7_MAX_MEM_SIZE).contains(&msize)
         {
             return Err(malformed());
+        }
+        if msize > MAX_DECODER_MEMORY {
+            return Err(Error::fatal(
+                libc::ENOMEM,
+                "Coludn't allocate memory for PPMd",
+            ));
         }
         c.ppmd.free();
         if !c.ppmd.alloc(msize) {
@@ -887,5 +901,42 @@ impl SevenZip {
         }
 
         Ok((used, outbytes, eof))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_decoder_models_fail_before_allocation() {
+        for (codec, properties) in [
+            (CODEC_LZMA, vec![0x5d, 0xff, 0xff, 0xff, 0xff]),
+            (CODEC_LZMA2, vec![40]),
+            (CODEC_PPMD, vec![6, 0, 0, 0, 0x40]),
+        ] {
+            let mut reader = SevenZip {
+                codec,
+                ..SevenZip::default()
+            };
+            let coder = Coder {
+                codec,
+                properties,
+                ..Coder::default()
+            };
+            let error = if codec == CODEC_PPMD {
+                reader.init_ppmd(&coder)
+            } else {
+                reader.init_lzma(&coder, None)
+            }
+            .unwrap_err();
+            if codec == CODEC_PPMD {
+                assert_eq!(error.errno, libc::ENOMEM);
+                assert!(!reader.coders.ppmd.was_allocated());
+            } else {
+                assert_eq!(error.msg, b"Decompression failed (5)");
+                assert!(matches!(reader.coders.backend, Backend::None));
+            }
+        }
     }
 }

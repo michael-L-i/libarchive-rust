@@ -44,14 +44,14 @@ fn decode_codec_id(id: &[u8]) -> Option<i64> {
 }
 
 /// The first of `i` such that no bind pair has `inIndex == i`.
-fn first_unbound_in_stream(pairs: &[(usize, usize)], total: usize) -> Option<usize> {
-    let mut bound = vec![false; total];
+fn first_unbound_in_stream(pairs: &[(usize, usize)], total: usize) -> P<Option<usize>> {
+    let mut bound = vec_of(total, false)?;
     for &(in_index, _) in pairs {
         if let Some(b) = bound.get_mut(in_index) {
             *b = true;
         }
     }
-    bound.iter().position(|&b| !b)
+    Ok(bound.iter().position(|&b| !b))
 }
 
 /// `folder_uncompressed_size`.
@@ -294,7 +294,7 @@ impl SevenZip {
         f.num_packed_streams = in_streams_total - num_bind_pairs;
         // packedStreams are not needed; parse/verify nonetheless.
         if f.num_packed_streams == 1 {
-            if first_unbound_in_stream(&f.bind_pairs, in_streams_total).is_none() {
+            if first_unbound_in_stream(&f.bind_pairs, in_streams_total)?.is_none() {
                 return Err(Fail::Bad);
             }
         } else {
