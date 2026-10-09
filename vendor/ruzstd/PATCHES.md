@@ -136,3 +136,27 @@ are unchanged. No vendor codec algorithm changes or unsafe code are needed.
   cases, and 12 compaction/RLE/history cases exceeding 2 MiB. Independent
   C zstd validates all five 16 MiB streams. The new harness and profiles
   are in sibling `diagnostics/round5-zstd`; prior artifacts are unchanged.
+
+## Store matcher positions relative to retained history
+
+The archive matcher's table now stores buffer-relative `u32` positions plus
+one, instead of absolute `u64` stream positions. The history buffer is bounded
+by two 1 MiB windows plus a block of at most 128 KiB. When history compacts,
+saturating subtraction rebases all table entries and expires discarded
+positions to the existing zero sentinel. Matching still rejects positions
+beyond the 1 MiB distance limit. This halves the table from 512 to 256 KiB
+and removes the absolute-base arithmetic and overflow reset branch.
+
+- Nine alternating release-run medians versus the chunk-load-only matcher,
+  in milliseconds: random 11.23 -> 11.01, source 58.38 -> 55.80,
+  mixed 35.19 -> 34.07, periodic 2.73 -> 2.54, repeated binary 2.74 -> 2.54.
+  Against the original accepted baseline the combined changes improve
+  source 65.14 -> 55.78 and mixed 43.30 -> 37.82 in a separate paired run.
+- All 545 corpus and boundary inputs remain byte-identical both to the
+  chunk-load-only matcher and the frozen original baseline. This includes
+  repeated history across multiple compactions and skipped RLE blocks.
+  Independent C zstd validates all five large streams.
+- Five existing matcher/Huffman-state tests pass in an isolated harness
+  using the real matcher source, including reset, expiry, overlap and
+  skipped RLE blocks. Full archive integration checks use the combined
+  branch. No compression settings or match-selection rules change.

@@ -41,8 +41,7 @@ struct Matches {
     size: usize,
     data: Vec<u8>,
     start: usize,
-    base: u64,
-    positions: Vec<u64>,
+    positions: Vec<u32>,
     space: Vec<u8>,
 }
 impl Matches {
@@ -51,7 +50,6 @@ impl Matches {
             size,
             data: Vec::with_capacity(2 * WINDOW + size),
             start: 0,
-            base: 0,
             positions: vec![0; 1 << HASH_BITS],
             space: Vec::new(),
         }
@@ -65,7 +63,7 @@ impl Matches {
     }
     fn remember(&mut self, at: usize) {
         if at + 8 <= self.data.len() {
-            self.positions[Self::key(&self.data[at..])] = self.base + at as u64 + 1;
+            self.positions[Self::key(&self.data[at..])] = at as u32 + 1;
         }
     }
 }
@@ -86,19 +84,13 @@ impl Matcher for Matches {
         } else {
             0
         };
-        if self
-            .base
-            .checked_add((self.data.len() + self.size + 1) as u64)
-            .is_none()
-        {
-            // Positions need not wrap even for an indefinitely long stream.
-            self.data.clear();
-            self.positions.fill(0);
-            self.base = 0;
-        } else {
+        if remove != 0 {
             self.data.copy_within(remove.., 0);
             self.data.truncate(self.data.len() - remove);
-            self.base += remove as u64;
+            // Zero denotes an absent key; removed history expires to zero.
+            for position in &mut self.positions {
+                *position = position.saturating_sub(remove as u32);
+            }
         }
         self.start = self.data.len();
         self.data.extend_from_slice(&data);
@@ -121,7 +113,6 @@ impl Matcher for Matches {
         self.data.clear();
         self.positions.fill(0);
         self.start = 0;
-        self.base = 0;
     }
     fn window_size(&self) -> u64 {
         WINDOW as u64
@@ -137,10 +128,10 @@ impl Matcher for Matches {
         while at + 8 <= self.data.len() {
             let key = Self::key(&self.data[at..]);
             let position = self.positions[key];
-            self.positions[key] = self.base + at as u64 + 1;
+            self.positions[key] = at as u32 + 1;
             let prior = position
-                .checked_sub(self.base + 1)
-                .and_then(|p| usize::try_from(p).ok())
+                .checked_sub(1)
+                .map(|p| p as usize)
                 .filter(|&p| p < at && at - p <= WINDOW);
             if let Some(prev) = prior.filter(|&p| self.data[p..p + 4] == self.data[at..at + 4]) {
                 // ruzstd 0.9's code-52 extra-bit baseline is incorrect;
