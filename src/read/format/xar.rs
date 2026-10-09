@@ -29,6 +29,22 @@
 //! (TOC) and the heap of file data that the TOC points into. The TOC is read
 //! with the `xml` crate where upstream uses libxml2's xmlTextReader.
 
+fn attribute_budget(sizes: impl IntoIterator<Item = u64>) -> Result<(), crate::util::Error> {
+    let mut total = 0u64;
+    for size in sizes {
+        total = total
+            .checked_add(size)
+            .filter(|&n| n <= 64 * 1024 * 1024)
+            .ok_or_else(|| {
+                crate::util::Error::fatal(
+                    crate::archive::ARCHIVE_ERRNO_MISC,
+                    "XAR attribute exceeds size limit",
+                )
+            })?;
+    }
+    Ok(())
+}
+
 mod toc;
 
 use crate::archive::*;
@@ -655,6 +671,8 @@ impl Format for Xar {
         self.entry_a_sum = file.a_sum.clone();
         self.entry_e_sum = file.e_sum.clone();
 
+        // Bound all owned values before reading or allocating any attribute.
+        attribute_budget(file.xattrs.iter().map(|xattr| xattr.size))?;
         // Read extended attributes.
         for xattr in &file.xattrs {
             self.move_reading_point(r, xattr.offset)?;
@@ -886,6 +904,13 @@ impl Xar {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attribute_budget_limits_combined_values_before_allocation() {
+        assert!(super::attribute_budget([32 * 1024 * 1024, 32 * 1024 * 1024]).is_ok());
+        assert!(super::attribute_budget([32 * 1024 * 1024, 32 * 1024 * 1024 + 1]).is_err());
+        assert!(super::attribute_budget([u64::MAX, 1]).is_err());
+    }
+
     use super::*;
     use crate::archive::{Base, READ_MAGIC};
     use crate::read::filter::testing::noise;

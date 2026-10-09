@@ -1737,7 +1737,7 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - Upstream checks an attribute's entire decompressed size after one decoder
   call, so small input blocks can fail even for a valid archive. The Rust
   reader collects incremental attribute output, checks both sizes and sums,
-  and bounds each owned attribute at 64 MiB before allocating. This permits
+  and bounds the combined owned attribute values per entry at 64 MiB before allocating. This permits
   writer round trips through small callback blocks without uncontrolled
   allocation from the XML size field.
 

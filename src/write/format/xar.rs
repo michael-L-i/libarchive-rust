@@ -348,6 +348,12 @@ impl Xar {
             }
             full.extend(name);
             let last = n + 1 == parts.len();
+            if !last && name.len() > 255 {
+                return Err(Error::fatal(
+                    crate::archive::ARCHIVE_ERRNO_MISC,
+                    "A name buffer is too small",
+                ));
+            }
             if let Some(&index) = self.paths.get(&full) {
                 if !last && self.nodes[index].entry.filetype() != libc::S_IFDIR {
                     return Err(failed(
@@ -648,21 +654,44 @@ impl Format for Xar {
         let mut cloned = entry.clone_entry();
         let (path, converted) = cloned.pathname_l(self.sc.as_deref());
         let path = path.unwrap_or_default().to_vec();
-        let result = if converted {
+        let mut result = if converted {
             ARCHIVE_OK
         } else {
-            a.raise(Error::new(
-                ARCHIVE_WARN,
+            a.set_error(
                 crate::read::ARCHIVE_ERRNO_FILE_FORMAT,
-                [
-                    b"Can't translate pathname '".as_slice(),
-                    entry.pathname().map_or(&[][..], CStr::to_bytes),
-                    b"' to UTF-8",
-                ]
-                .concat(),
-            ))
+                Some(
+                    &[
+                        b"Can't translate pathname '".as_slice(),
+                        entry.pathname().map_or(&[][..], CStr::to_bytes),
+                        b"' to UTF-8",
+                    ]
+                    .concat(),
+                ),
+            );
+            ARCHIVE_WARN
         };
         cloned.set_pathname(&path);
+        if cloned.filetype() == libc::S_IFLNK {
+            let (link, converted) = cloned.symlink_l(self.sc.as_deref());
+            let link = link.map(<[u8]>::to_vec);
+            if !converted {
+                a.set_error(
+                    crate::read::ARCHIVE_ERRNO_FILE_FORMAT,
+                    Some(
+                        &[
+                            b"Can't translate symlink '".as_slice(),
+                            entry.symlink().map_or(&[][..], CStr::to_bytes),
+                            b"' to UTF-8",
+                        ]
+                        .concat(),
+                    ),
+                );
+                result = ARCHIVE_WARN;
+            }
+            if let Some(link) = link {
+                cloned.set_symlink(&link);
+            }
+        }
         let Some(index) = self.add(cloned)? else {
             return Ok(result);
         };
@@ -793,6 +822,38 @@ impl Format for Xar {
         self.finish_entry(sink)?;
         if self.nodes.is_empty() {
             return Ok(());
+        }
+        // Upstream aborts TOC generation when owner-name conversion warns.
+        for node in self.nodes.iter_mut().filter(|node| !node.virtual_dir) {
+            let entry = &mut node.entry;
+            let original = entry
+                .uname()
+                .map_or(Vec::new(), |name| name.to_bytes().to_vec());
+            if !entry.uname_l(self.sc.as_deref()).1 {
+                return Err(Error::fatal(
+                    crate::read::ARCHIVE_ERRNO_FILE_FORMAT,
+                    [
+                        b"Can't translate uname '".as_slice(),
+                        &original,
+                        b"' to UTF-8",
+                    ]
+                    .concat(),
+                ));
+            }
+            let original = entry
+                .gname()
+                .map_or(Vec::new(), |name| name.to_bytes().to_vec());
+            if !entry.gname_l(self.sc.as_deref()).1 {
+                return Err(Error::fatal(
+                    crate::read::ARCHIVE_ERRNO_FILE_FORMAT,
+                    [
+                        b"Can't translate gname '".as_slice(),
+                        &original,
+                        b"' to UTF-8",
+                    ]
+                    .concat(),
+                ));
+            }
         }
         let toc = self.toc();
         let compressed = miniz_oxide::deflate::compress_to_vec_zlib(toc.as_bytes(), self.level);
@@ -965,6 +1026,66 @@ mod tests {
             self.0.extend(data);
             Ok(())
         }
+    }
+    #[test]
+    fn invalid_utf8_path_returns_warning_without_panicking() {
+        let base = Base::new(WRITE_MAGIC);
+        let mut xar = Xar::default();
+        let mut entry = Entry::new(None);
+        entry.set_pathname(b"invalid-\xff");
+        entry.set_mode(libc::S_IFDIR | 0o755);
+        assert_eq!(
+            xar.header(&base, &mut entry, &mut Output::default())
+                .unwrap(),
+            ARCHIVE_WARN
+        );
+    }
+    #[test]
+    fn invalid_utf8_symlink_returns_warning_at_header() {
+        let base = Base::new(WRITE_MAGIC);
+        let mut xar = Xar::default();
+        let mut entry = Entry::new(None);
+        entry.set_pathname(b"link");
+        entry.set_mode(libc::S_IFLNK | 0o755);
+        entry.set_symlink(b"invalid-\xff");
+        assert_eq!(
+            xar.header(&base, &mut entry, &mut Output::default())
+                .unwrap(),
+            ARCHIVE_WARN
+        );
+    }
+    #[test]
+    fn invalid_owner_charset_aborts_toc_without_emitting_archive() {
+        for group in [false, true] {
+            let base = Base::new(WRITE_MAGIC);
+            let mut xar = Xar::default();
+            let mut entry = Entry::new(None);
+            entry.set_pathname(b"file");
+            entry.set_mode(libc::S_IFDIR | 0o755);
+            if group {
+                entry.set_gname(b"invalid-\xff");
+            } else {
+                entry.set_uname(b"invalid-\xff");
+            }
+            let mut out = Output::default();
+            assert_eq!(xar.header(&base, &mut entry, &mut out).unwrap(), ARCHIVE_OK);
+            assert_eq!(xar.close(&mut out).unwrap_err().code, ARCHIVE_FATAL);
+            assert!(out.0.is_empty());
+        }
+    }
+    #[test]
+    fn parent_component_limit_does_not_restrict_leaf_names() {
+        let mut xar = Xar::default();
+        let mut entry = Entry::new(None);
+        entry.set_mode(libc::S_IFDIR | 0o755);
+        entry.set_pathname(&[vec![b'a'; 256], b"leaf".to_vec()].join(&b'/'));
+        let error = xar.add(entry).unwrap_err();
+        assert_eq!(error.code, ARCHIVE_FATAL);
+        assert_eq!(error.msg, b"A name buffer is too small");
+        let mut entry = Entry::new(None);
+        entry.set_mode(libc::S_IFDIR | 0o755);
+        entry.set_pathname(&vec![b'a'; 512]);
+        assert!(xar.add(entry).unwrap().is_some());
     }
     #[test]
     fn upstream_basic_fixture_roundtrips_codecs_and_checksums() {
