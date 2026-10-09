@@ -122,18 +122,25 @@ impl Decoder {
         }
     }
 
-    /// How much input is worth presenting now: a retry decodes the unfinished
-    /// block again, so feeding it in doubling pieces keeps the work linear.
+    /// How much input `decompress` takes at once unless it is the `last`: a
+    /// retry decodes the unfinished block again, so taking input in doubling
+    /// pieces keeps the work linear. Callers present
+    /// `peek_available(wanted())`.
     pub(crate) fn wanted(&self) -> usize {
-        self.inbuf.len().max(4096)
+        let held = self.inbuf.len();
+        held.max(4096).min(MAX_INPUT - held).max(1)
     }
 
     /// `BZ2_bzDecompress`: consumes some of `input` and fills some of
-    /// `output`. Any error is the stream being corrupt.
+    /// `output`. Any error is the stream being corrupt. Unless `last` (the
+    /// read was cut short by the end of the input, or of the packed data),
+    /// fewer than `wanted()` bytes of input are left alone: nothing is
+    /// consumed and the caller presents more.
     pub(crate) fn decompress(
         &mut self,
         input: &[u8],
         output: &mut [u8],
+        last: bool,
     ) -> Result<Progress, crabz2::Error> {
         let mut p = Progress {
             end: self.done,
@@ -153,6 +160,9 @@ impl Decoder {
             self.next = 0;
 
             let rest = input.get(p.used..).unwrap_or_default();
+            if !last && rest.len() < self.wanted() {
+                return Ok(p);
+            }
             let take = rest.len().min(MAX_INPUT - self.inbuf.len());
             if take == 0 {
                 return if rest.is_empty() {
@@ -279,12 +289,17 @@ impl Filter for Bzip2 {
                 }
                 None => self.decoder.insert(Decoder::new()),
             };
-            let input = up.peek_available(dec.wanted())?;
+            let wanted = dec.wanted();
+            let input = up.peek_available(wanted)?;
             if input.is_empty() {
                 return Err(Error::fatal(ARCHIVE_ERRNO_MISC, "truncated bzip2 input"));
             }
             let p = dec
-                .decompress(input, self.out.get_mut(self.len..).unwrap_or_default())
+                .decompress(
+                    input,
+                    self.out.get_mut(self.len..).unwrap_or_default(),
+                    input.len() < wanted,
+                )
                 .map_err(|_| Error::fatal(ARCHIVE_ERRNO_MISC, "bzip decompression failed"))?;
             up.consume(p.used)?;
             self.len += p.produced;
@@ -313,8 +328,9 @@ mod tests {
         decode(support, data, block)
     }
 
-    /// Drives a `Decoder` as the zip, 7zip and xar readers do: `input_step`
-    /// bytes of what is left each call, `output_step` bytes of room.
+    /// Drives a `Decoder` as the zip, 7zip and xar readers do: at least
+    /// `input_step` bytes of what is left, and `wanted()` if more, each call;
+    /// `output_step` bytes of room; `last` when the input runs out.
     fn drive(
         stream: &[u8],
         input_step: usize,
@@ -323,9 +339,10 @@ mod tests {
         let mut dec = Decoder::new();
         let (mut out, mut pos) = (Vec::new(), 0);
         loop {
-            let input = &stream[pos..stream.len().min(pos + input_step)];
+            let n = input_step.max(dec.wanted());
+            let input = &stream[pos..stream.len().min(pos + n)];
             let mut room = vec![0; output_step];
-            let p = dec.decompress(input, &mut room)?;
+            let p = dec.decompress(input, &mut room, pos + input.len() == stream.len())?;
             out.extend_from_slice(&room[..p.produced]);
             pos += p.used;
             if p.end {
@@ -356,6 +373,33 @@ mod tests {
                 "steps {i} {o}"
             );
         }
+    }
+
+    #[test]
+    fn decoder_takes_small_pieces_only_as_the_last() {
+        let data = noise(30_000);
+        let stream = encode(&data);
+        let mut dec = Decoder::new();
+        let mut room = [0; 64];
+        // Short of wanted() and not the last: nothing is consumed.
+        for piece in [1, 100, 4095] {
+            let p = dec.decompress(&stream[..piece], &mut room, false).unwrap();
+            assert_eq!(p, Progress::default(), "piece {piece}");
+        }
+        // The same short pieces as the last decode, and `used` is exact.
+        let tail = [stream.as_slice(), b"BZh9 trailing".as_slice()].concat();
+        let (mut out, mut pos) = (Vec::new(), 0);
+        loop {
+            let input = &tail[pos..tail.len().min(pos + 100)];
+            let mut room = vec![0; 1000];
+            let p = dec.decompress(input, &mut room, true).unwrap();
+            out.extend_from_slice(&room[..p.produced]);
+            pos += p.used;
+            if p.end {
+                break;
+            }
+        }
+        assert_eq!((out, pos), (data, stream.len()));
     }
 
     #[test]
@@ -393,7 +437,7 @@ mod tests {
         let mut result = Ok(Progress::default());
         let mut pos = 0;
         while pos < junk.len() && result.is_ok() {
-            result = dec.decompress(&junk[pos..], &mut out);
+            result = dec.decompress(&junk[pos..], &mut out, false);
             pos += result.as_ref().map_or(0, |p| p.used);
         }
         assert!(result.is_err());

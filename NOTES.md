@@ -527,11 +527,16 @@ Backends, and why:
   per block, including Huffman tables. Concatenated members and trailing
   non-member bytes are supported. This replaces the c2rust libbz2 backend.
 - `bzip2::Decoder` gives the zip, 7zip and xar readers a `BZ2_bzDecompress`
-  step over crabz2's whole-block decoder. It holds the compressed bytes of an
-  unfinished block (at most 3 MiB) and decodes that block again when more
-  input arrives, so a caller that feeds a block in many small pieces does
-  quadratic work; `wanted()` says how much to present to keep it linear.
-  It consumes input only up to the end marker, as libbz2's `total_in` does.
+  step over crabz2's whole-block decoder: `decompress(input, output, last)`.
+  It holds the compressed bytes of an unfinished block (at most 3 MiB) and
+  decodes that block again when more input arrives. To keep that linear it
+  enforces the input size: unless `last`, a call with fewer than `wanted()`
+  bytes of input (the held bytes, at least 4096) consumes nothing and
+  returns `Progress::default()`. Callers present `peek_available(wanted())`
+  and set `last` when the read comes back short, from EOF or the packed-size
+  limit. It consumes input only up to the end marker, as libbz2's
+  `total_in` does, so `used` is exact and a zip data descriptor is not
+  swallowed.
 - zstd is `ruzstd` 0.9.0, a safe decoder with 41 mentions of `unsafe` in its
   ring buffer and decode buffer, and no crate-level `forbid`. Its checksum
   comes from twox-hash (84 mentions). `libzstd-rs-sys` was tried and dropped:
@@ -540,6 +545,15 @@ Backends, and why:
 
 Differences:
 
+- libbz2 accepts some corrupt streams that crabz2 rejects. In 100k fuzz
+  cases every divergence was a single-bit flip in a tiny stream where libbz2
+  returned `BZ_STREAM_END` with the right output length and this port
+  returned an error (`InvalidHuffman`, `InvalidMagic`, ...).
+- A truncated multi-block stream can deliver a different number of bytes
+  before the error than libbz2 does: a reviewer saw `bsdcat` print 0 bytes
+  for the oracle and 196608 for this port when a stream was cut at byte
+  201578. The previous filter (main) behaves the same, so this predates the
+  `Decoder`; truncations of two fixtures built here agree with the oracle.
 - `archive_bzlib_version` reports `crabz2 <version>`, not libbz2's version.
 - crabz2 checks a complete block's CRC before returning that block. A
   damaged block therefore delivers no partial bytes, where libbz2 can
@@ -746,6 +760,102 @@ Phase 5 needs:
 - The BSD name check's `SIZE_MAX - 1` bound is implied by the 1 MiB bound and
   is not repeated.
 
+## iso9660 reader (src/read/format/iso9660.rs)
+
+### Scope
+
+- The pinned `archive_read_support_format_iso9660.c` has no path table
+  reading, no El Torito boot catalog and no boot image entries. It scans
+  directory records from the root, and a Boot Record descriptor is only
+  recognized while bidding. The port has the same scope.
+
+### Ported as-is (suspected upstream bugs)
+
+- `bid` asks for 48 KiB (32 KiB reserved area and 8 descriptors) and gives up
+  if the input is shorter, so a smaller image is never recognized.
+- `parse_rockridge` returns `ARCHIVE_WARN` ("Tried to parse Rockridge
+  extensions, but none found") for a record whose system use area has no
+  SUSP entry, but both callers treat any non-OK result as failure, so one
+  such record in an image with SUSP makes the whole read fail with
+  `ARCHIVE_FATAL`. The port fails with that message.
+- Looking for the "RE" directory of a "CL" file (`next_cache_entry`) pops
+  entries from the RE list and puts the non-matching ones back, and stops
+  when it pops the first one again. That last pop is not put back, so a "CL"
+  file with no matching "RE" drops the first RE directory from the list.
+- A "CE" entry stores its offset and length in the file, so a record with two
+  of them, or a continuation area with more, reads every request with the
+  values of the last one.
+- `previous_number` starts at 0. A first entry with file number 0 (extent 0,
+  or PX inode 0 on every entry) takes the hard link branch before any entry
+  has been returned. `previous_pathname.s` is still NULL, so upstream sets no
+  hard link, but the entry still gets no size and no data.
+- `archive_string_empty` only zeroes the length. The name and symlink buffers
+  are read as C strings in places (`strcmp` for `rr_moved`, the "beyond
+  end-of-media" and out-of-order warnings, the symlink target), so after an
+  NM or SL entry empties them those places still see the old bytes, and a
+  symlink target can be stale. The port keeps the bytes and the length apart.
+- An out-of-order file warning prints `pathname.s`, which is NULL when
+  Joliet names are in use; it is printed as "(null)".
+- A zisofs block of zero length (a hole) is returned as a whole block of
+  zeros, even past the end of the declared size.
+- Empty files and symbolic links get the offset `-1`, which `offset << 16`
+  turns into the largest key but one, so they come out of the heap last.
+- The heap key is `offset << 16` plus the heap's length, which is not a
+  counter: after entries come out, keys of different entries can be equal,
+  and for 65536 or more pending entries they are not unique at all. Which of
+  two equal keys comes first is therefore part of the output, and the heaps
+  are ported as written rather than replaced with `BinaryHeap`.
+- `SL` and `NM` entries cut at the first NUL (`archive_strncat`), and a
+  Joliet name of odd length loses its last byte; a one-byte name becomes the
+  empty name.
+
+### Differences
+
+- A chain of parents that loops (a malformed image can make one with "CL"
+  and "RE" entries that point at each other) hangs upstream in the duplicate
+  directory check and the "CL" ancestor check, and overflows the stack in the
+  Joliet pathname builder. The port stops after as many steps as there are
+  records: the first two fail with "Directory structure contains loop" and
+  "Invalid Rockridge CL", the last with "Pathname is too long". Plain
+  pathnames keep upstream's depth limit of 1000.
+- A zisofs block whose zlib stream ends before the block's data is used up
+  makes upstream return empty blocks for ever, without consuming input. The
+  port fails with "zisofs decompression failed (-5)" when a decompression
+  step consumes and produces nothing.
+- The number in "zisofs decompression failed (%d)" is zlib's return code;
+  miniz_oxide gives its equivalent (`MZError` values are zlib's) for the
+  errors it has, and which corrupt streams are errors, and at which byte,
+  can differ from zlib.
+- The pending-file and continuation heaps hold indexes into one vector of
+  records, and the lists upstream threads through the records (`next`,
+  `re_next`) are separate queues. Upstream's lists share the `next` field
+  between the cache and the empty-file list, and `re_next` between the RE
+  and descendant lists; where an image makes one record be on two lists at
+  once, upstream corrupts them and the port does not.
+- A directory is read whole with one read-ahead of its size, as upstream
+  does; the size is bounded by the volume size from the descriptor, and a
+  size beyond the input fails once the input ends.
+- Name conversion failures are always "can't be converted" warnings; the
+  string layer does not report the `ENOMEM` case upstream tells apart.
+
+## Time and CRC helpers (`src/time.rs`, `src/crc32.rs`)
+
+### Ported as-is
+
+- `__archive_unix_to_ntfs` passes a signed `secs` to `archive_ckd_add_u64`,
+  which takes `uint64_t`. A negative `secs` (pre-1970, down to the NTFS
+  epoch) becomes a huge unsigned value, the addition overflows and the result
+  is `UINT64_MAX`. Only `secs < -11644473600` returns 0 as intended
+  (archive_time.c).
+- `__archive_dos_to_unix` returns `INT32_MAX` when `mktime` fails, which also
+  swallows a genuine 1969-12-31 23:59:59 UTC result of `-1` (archive_time.c).
+
+### Differences
+
+- `__archive_crc32` is the table implementation upstream uses without zlib;
+  the result is identical to zlib's. There is no NULL-pointer case, as a
+  slice is never null.
+
 ## Crypto (`src/digest.rs`, `src/hmac.rs`, `src/cryptor.rs`)
 
 ### Differences
@@ -819,24 +929,6 @@ Phase 5 needs:
   and AES-CTR in all three key sizes updated in pieces of 0 to 70 bytes (every
   partial-block case). All 2,900 outputs matched. The probe is not in the
   repository.
-
-## Time and CRC helpers (`src/time.rs`, `src/crc32.rs`)
-
-### Ported as-is
-
-- `__archive_unix_to_ntfs` passes a signed `secs` to `archive_ckd_add_u64`,
-  which takes `uint64_t`. A negative `secs` (pre-1970, down to the NTFS
-  epoch) becomes a huge unsigned value, the addition overflows and the result
-  is `UINT64_MAX`. Only `secs < -11644473600` returns 0 as intended
-  (archive_time.c).
-- `__archive_dos_to_unix` returns `INT32_MAX` when `mktime` fails, which also
-  swallows a genuine 1969-12-31 23:59:59 UTC result of `-1` (archive_time.c).
-
-### Differences
-
-- `__archive_crc32` is the table implementation upstream uses without zlib;
-  the result is identical to zlib's. There is no NULL-pointer case, as a
-  slice is never null.
 
 ## lha reader (src/read/format/lha.rs)
 
