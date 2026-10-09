@@ -94,6 +94,36 @@ failures, crashes, timeouts or ratchet regressions in 100 seconds with one
 worker and 30-second timeouts. All 60 benchmark commands and 24 content-manifest
 cross-reader checks passed. No build, test or benchmark process remains running.
 
+## 7zip and LZMA performance checkpoint
+
+Compared with c06c7a3 under identical Rust compiler settings, 7zip creation is
+3.4–4.0x faster on repetitive text and 1.8x faster on small files. Creation RSS
+falls from about 97 MiB to 24 MiB for 2 MiB text, 27 MiB for random data and
+10 MiB for 256 small files. Listing RSS falls from about 12 MiB to 4 MiB.
+At 16 MiB random input, peak RSS remains about 97 MiB. Incompressible creation
+has little speed improvement and some cases are 1–5% slower.
+
+The 7zip encoder sizes dictionaries to complete small streams, stages at most
+8 MiB on an anonymous temporary file, and replays through 64 KiB buffers.
+The decoder bounds validated LZMA2 history by known output size. A pinned local
+lzma-rust2 patch accelerates binary-tree match extension in safe Rust, improving
+repetitive XZ creation 3.1–3.8x without changing measured compressed bytes.
+Zstandard default blocks increase to 96 KiB, reducing text archive sizes a
+further 15–16% while preserving compression-level ordering.
+
+Final verification: 375 native tests passed; strict all-target Clippy, rustfmt,
+diff and all 454 ABI symbols passed. Full upstream/front-end suite: 926 passed,
+184 skipped, zero failures, crashes, timeouts or ratchet regressions in 68s,
+one worker with 30-second timeouts. Independent Astra reviews passed. Backend
+differential validation produced 1,440 byte-identical XZ/LZMA/lzip streams.
+The consolidated benchmark contains 702 successful timed commands, 234 content
+extraction checks and 156 cross-reader checks. 7zip was remeasured after its
+final staging adjustment; other measured format code was unchanged.
+
+Results, remaining gaps, compiler settings and IO tradeoffs are recorded in
+`../diagnostics/results/REPORT.md`; raw measurements identify source runs and
+binary hashes. Code is committed locally; no tests or benchmarks remain running.
+
 ## Earlier checkpoints (historical)
 
 ### Phase 2 checkpoint

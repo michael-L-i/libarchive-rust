@@ -1666,6 +1666,9 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   fail with "Decompression failed (5)"; oversized PPMd models fail with
   ENOMEM. Upstream has no such limit, so unusually large valid models are
   rejected here. PPMd arenas use lazily zeroed pages (see the PPMd section).
+  Within that limit, LZMA2 history is bounded by the known decoded stream
+  length (at least 4 KiB), including encoded headers and BCJ2 substreams.
+  No valid back-reference can require more history than the whole stream.
 - Where upstream would index outside a vector with a bad index (an entry
   with data but no folder, a pack stream index outside the table), the
   reader fails with "Damaged 7-Zip archive".
@@ -1698,12 +1701,19 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - Lzip uses upstream's dictionary and nice-length preset table. The safe
   backend has HC4 rather than HC3 for levels 0 and 1; their compressed
   bytes and relative compression ratios can differ on some inputs.
+- lzma-rust2 0.21.0 is vendored with one binary-tree match-extension patch:
+  the skip path uses the backend's existing safe word-at-a-time comparison.
+  Presets and parsing decisions are unchanged; differential streams remain
+  byte-identical. Provenance and validation are in
+  `vendor/lzma-rust2/PATCHES.md`; its unsafe `optimization` feature stays off.
 - XZ and Zstandard accept and validate `threads` but encode on one worker.
   XZ uses a single-thread stream header/index. LZ4 high compression levels
   use the safe block encoder, and linked blocks can be independently coded;
   these are valid linked streams but compression ratios differ.
 - ruzstd has only its fastest compression strategy; this adapter provides a
   bounded native matcher whose block search size increases with the level.
+  Levels 2–3 use 96 KiB blocks and higher levels use 128 KiB blocks to
+  amortize block headers and tables while retaining level-dependent output.
   It reuses a fixed hash table and a 1 MiB history window across blocks,
   including with the `long` option. Matcher storage is bounded at about
   1.75 MiB. A bounded encoder thread batches small writes and uses channel
@@ -1794,6 +1804,14 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   Zstandard and the native PPMd7 encoder are supported. Safe codec output
   differs from C codec bytes. PPMd has checked model accesses and a bounded
   model arena; its encoded bytes follow the upstream range coder.
+- LZMA1/LZMA2 input staging uses an anonymous temporary file bounded by the
+  preset dictionary and 8 MiB, replayed through a 64 KiB buffer. Complete
+  streams below that threshold and encoded headers size encoder history to
+  their input, while retaining preset search settings and advertised dictionary
+  properties. Larger streams keep the full preset dictionary. Staging adds at
+  most 8 MiB of temporary storage and one write/read pass; using a file avoids
+  allocator-retained heap buffers increasing large-archive peak RSS. Compression
+  bytes may change with match-finder table sizing.
 - ISO9660 implements levels 1–4, Joliet and Rock Ridge, deep-directory
   relocation, hardlinks, multi-extent records, zisofs and El Torito boot
   images. File data and compressed data use anonymous temporary files;
