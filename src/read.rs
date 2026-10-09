@@ -53,6 +53,22 @@ use std::ffi::{CStr, c_int};
 use std::rc::Rc;
 
 /// `ARCHIVE_ERRNO_FILE_FORMAT`: unrecognized or invalid file format.
+/// `EFTYPE` where the platform has it, else `EILSEQ`, as upstream picks.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub const ARCHIVE_ERRNO_FILE_FORMAT: c_int = libc::EFTYPE;
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
 pub const ARCHIVE_ERRNO_FILE_FORMAT: c_int = libc::EILSEQ;
 /// `ARCHIVE_ERRNO_PROGRAMMER`: illegal usage of the library.
 pub const ARCHIVE_ERRNO_PROGRAMMER: c_int = libc::EINVAL;
