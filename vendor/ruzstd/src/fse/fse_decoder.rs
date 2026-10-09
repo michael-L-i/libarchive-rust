@@ -40,6 +40,7 @@ impl<'t> FSEDecoder<'t> {
     }
 
     /// Advance the internal state to decode the next symbol in the bitstream.
+    #[inline]
     pub fn update_state(&mut self, bits: &mut BitReaderReversed<'_>) {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits(num_bits);
