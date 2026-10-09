@@ -627,6 +627,21 @@ mod tests {
     }
 
     #[test]
+    fn raw_literals_preserve_huffman_table_for_later_blocks() {
+        let size = 16384;
+        let mut data = random_bytes(size * 3);
+        for byte in &mut data[..size] {
+            *byte %= 127;
+        }
+        for byte in &mut data[2 * size..] {
+            *byte %= 127;
+        }
+        // The middle block needs raw literals; the last block can still use
+        // the Huffman table established by the first block.
+        assert!(roundtrip(&data, size) < data.len() - 2000);
+    }
+
+    #[test]
     fn matcher_frame_reset_discards_previous_positions() {
         let block = random_bytes(8192);
         let mut encoder =

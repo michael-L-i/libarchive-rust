@@ -43,3 +43,4 @@ lzma-rust2 = { version = "0.21.0", default-features = false, features = ["std", 
 
 [patch.crates-io]
 lzma-rust2 = { path = "vendor/lzma-rust2" }
+ruzstd = { path = "vendor/ruzstd" }
