@@ -56,7 +56,7 @@ pub const FILTERS: &[(c_int, Option<Support>)] = &[
     (code::LZOP, Some(lzop::support)),
     (code::GRZIP, Some(grzip::support)),
     (code::LZ4, Some(lz4::support)),
-    (code::ZSTD, None),
+    (code::ZSTD, Some(super::zstd::support)),
 ];
 
 /// `archive_read_support_filter_all`.

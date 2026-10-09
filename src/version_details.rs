@@ -44,7 +44,9 @@ pub const LIBLZMA: Option<&CStr> = Some(c"5.8.3");
 /// (upstream reports "1.0.8, 13-Jul-2019"). Update with the crate.
 pub const BZLIB: Option<&CStr> = Some(c"1.1.0-libbz2-rs-sys-0.2.5");
 pub const LIBLZ4: Option<&CStr> = Some(c"lz4_flex 0.14.0");
-pub const LIBZSTD: Option<&CStr> = None;
+/// The ruzstd 0.9.0 backend, which has no libzstd version (upstream reports
+/// "1.5.x"). Update with the crate.
+pub const LIBZSTD: Option<&CStr> = Some(c"0.9.0-ruzstd");
 pub const LIBLZO2: Option<&CStr> = None;
 pub const LIBRICHACL: Option<&CStr> = None;
 pub const LIBACL: Option<&CStr> = None;
@@ -96,7 +98,7 @@ mod tests {
     fn only_the_ported_backends() {
         assert_eq!(
             details(),
-            c"libarchive 3.9.0dev liblzma/5.8.3 bz2lib/1.1.0-libbz2-rs-sys-0.2.5 liblz4/lz4_flex 0.14.0 libb2/bundled"
+            c"libarchive 3.9.0dev liblzma/5.8.3 bz2lib/1.1.0-libbz2-rs-sys-0.2.5 liblz4/lz4_flex 0.14.0 libzstd/0.9.0-ruzstd libb2/bundled"
         );
     }
 

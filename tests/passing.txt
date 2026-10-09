@@ -3,6 +3,7 @@ cat/test_0
 cat/test_empty_gz
 cat/test_empty_lz4
 cat/test_empty_xz
+cat/test_empty_zstd
 cat/test_error
 cat/test_error_mixed
 cat/test_expand_Z
@@ -12,6 +13,7 @@ cat/test_expand_lz4
 cat/test_expand_mixed
 cat/test_expand_plain
 cat/test_expand_xz
+cat/test_expand_zstd
 cat/test_help
 cat/test_stdin
 cat/test_version

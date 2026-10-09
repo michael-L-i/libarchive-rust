@@ -103,8 +103,6 @@ mod tests {
         );
         assert_eq!(append_filter(&mut r, &a, 99), ARCHIVE_FATAL);
         assert_eq!(a.error_string().as_deref(), Some(b"Invalid filter code specified".as_slice()));
-        // A real filter that is not ported yet registers nothing.
-        assert_eq!(append_filter(&mut r, &a, code::ZSTD), ARCHIVE_FATAL);
     }
 
     #[test]

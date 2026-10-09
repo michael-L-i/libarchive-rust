@@ -15,6 +15,7 @@ pub mod program;
 pub mod rpm;
 pub mod uu;
 pub mod xz;
+pub mod zstd;
 #[cfg(test)]
 mod testing;
 
