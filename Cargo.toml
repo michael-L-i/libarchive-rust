@@ -40,3 +40,6 @@ opt-level = 3
 [dev-dependencies]
 crc32fast = "1"
 lzma-rust2 = { version = "0.21.0", default-features = false, features = ["std", "xz", "lzip", "encoder"] }
+
+[patch.crates-io]
+lzma-rust2 = { path = "vendor/lzma-rust2" }
