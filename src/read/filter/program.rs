@@ -125,7 +125,10 @@ impl Program {
         Ok(Program {
             name,
             code,
-            proc: Proc { child, exit: None },
+            proc: Proc {
+                child,
+                exit: Exit::Running,
+            },
             out: vec![0; OUT_LEN].into_boxed_slice(),
             len: 0,
         })
@@ -169,8 +172,16 @@ impl Filter for Program {
 /// they are closed.
 struct Proc {
     child: Child,
-    /// How the child ended, once it is reaped: `None` if waiting failed.
-    exit: Option<Option<ExitStatus>>,
+    exit: Exit,
+}
+
+/// Whether the child is reaped, and how it ended.
+#[derive(Clone, Copy)]
+enum Exit {
+    Running,
+    Exited(ExitStatus),
+    /// Waiting for the child failed.
+    WaitFailed,
 }
 
 impl Drop for Proc {
@@ -184,7 +195,13 @@ impl Proc {
     fn reap(&mut self) -> Option<ExitStatus> {
         self.child.stdin = None;
         self.child.stdout = None;
-        *self.exit.get_or_insert_with(|| self.child.wait().ok())
+        if let Exit::Running = self.exit {
+            self.exit = self.child.wait().map_or(Exit::WaitFailed, Exit::Exited);
+        }
+        match self.exit {
+            Exit::Exited(status) => Some(status),
+            _ => None,
+        }
     }
 
     /// Shuts down the child, returns `Ok` if it exited normally.
