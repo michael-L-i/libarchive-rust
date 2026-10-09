@@ -44,6 +44,7 @@ use std::io::Read as _;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::rc::Rc;
 
 const HAS_DEVICE: u32 = 0x0001;
 const HAS_FFLAGS: u32 = 0x0002;
@@ -73,10 +74,11 @@ const DIGEST_SHA512: c_int = 6;
 /// One line of the specification.
 struct MtreeEntry {
     name: Vec<u8>,
-    /// The `keyword=value` options, which upstream keeps in a list that new
-    /// ones are prepended to. The head of that list is the last element
-    /// here, and the options are parsed from it.
-    options: Vec<Vec<u8>>,
+    /// The `/set` options in effect when the line was read. Upstream copies
+    /// them into every entry; the snapshot is shared instead.
+    global: Rc<Vec<Vec<u8>>>,
+    /// The `keyword=value` options of the line itself.
+    own: Vec<Vec<u8>>,
     /// The name is a full path, not relative to the current directory.
     full: bool,
     used: bool,
@@ -225,8 +227,8 @@ impl Format for Mtree {
         }
 
         let offset = self.offset;
-        let remaining = usize::try_from(self.cur_size.saturating_sub(offset).max(0));
-        let want = remaining.map_or(self.buff.len(), |n| n.min(self.buff.len()));
+        let remaining = usize::try_from(self.cur_size.saturating_sub(offset)).unwrap_or(0);
+        let want = remaining.min(self.buff.len());
         let bytes_read = match file.read(self.buff.get_mut(..want).unwrap_or_default()) {
             Ok(n) => n,
             Err(e) => {
@@ -665,16 +667,18 @@ fn detect_form(r: &mut Reader<'_>) -> (c_int, bool) {
 
 /// Adds `token` (`keyword` or `keyword=value`) to `options`, replacing the
 /// option of the same keyword.
-fn set_option(options: &mut Vec<Vec<u8>>, token: &[u8]) {
-    let len = token.iter().position(|&c| c == b'=').unwrap_or(token.len());
-    remove_option(options, token.get(..len).unwrap_or_default());
-    options.push(token.to_vec());
+fn set_option<T: AsRef<[u8]>>(options: &mut Vec<T>, token: T) {
+    let bytes = token.as_ref();
+    let len = bytes.iter().position(|&c| c == b'=').unwrap_or(bytes.len());
+    remove_option(options, bytes.get(..len).unwrap_or_default());
+    options.push(token);
 }
 
-fn remove_option(options: &mut Vec<Vec<u8>>, key: &[u8]) {
-    let found = options
-        .iter()
-        .rposition(|o| o.starts_with(key) && o.get(key.len()).is_none_or(|&c| c == b'='));
+fn remove_option<T: AsRef<[u8]>>(options: &mut Vec<T>, key: &[u8]) {
+    let found = options.iter().rposition(|o| {
+        let o = o.as_ref();
+        o.starts_with(key) && o.get(key.len()).is_none_or(|&c| c == b'=')
+    });
     if let Some(i) = found {
         options.remove(i);
     }
@@ -1029,7 +1033,7 @@ impl Mtree {
     /// changes the global defaults and if it does, it is processed accordingly.
     /// Otherwise, the options of the line are merged with the current
     /// global options.
-    fn process_add_entry(&mut self, global: &[Vec<u8>], line: &[u8], is_form_d: bool) {
+    fn process_add_entry(&mut self, global: &Rc<Vec<Vec<u8>>>, line: &[u8], is_form_d: bool) {
         let (name, start, end) = if is_form_d {
             // Filename is last item on line.
             // Trim trailing whitespace.
@@ -1058,9 +1062,8 @@ impl Mtree {
         let idx = self.entries.len();
         let mut entry = MtreeEntry {
             name: parse_escapes(name),
-            // The options of the global list are added one by one to the
-            // front of the entry's list, which reverses their order.
-            options: global.iter().rev().cloned().collect(),
+            global: Rc::clone(global),
+            own: Vec::new(),
             full,
             used: false,
         };
@@ -1071,13 +1074,13 @@ impl Mtree {
                 .push(idx);
         }
         for token in tokens(line, start, end) {
-            set_option(&mut entry.options, token);
+            set_option(&mut entry.own, token.to_vec());
         }
         self.entries.push(entry);
     }
 
     fn read_mtree(&mut self, r: &mut Reader<'_>) -> Result<(), Error> {
-        let mut global: Vec<Vec<u8>> = Vec::new();
+        let mut global: Rc<Vec<Vec<u8>>> = Rc::default();
         let mut line = Vec::new();
 
         let is_form_d = detect_form(r).1;
@@ -1116,7 +1119,7 @@ impl Mtree {
                     break;
                 }
                 for token in tokens(text, 4, text.len()) {
-                    set_option(&mut global, token);
+                    set_option(Rc::make_mut(&mut global), token.to_vec());
                 }
             } else if p.len() > 6 && p.starts_with(b"/unset") {
                 if !matches!(at(p, 6), b' ' | b'\t') {
@@ -1131,9 +1134,9 @@ impl Mtree {
                 }
                 for token in tokens(args, 0, args.len()) {
                     if token == b"all" {
-                        global.clear();
+                        global = Rc::default();
                     } else {
-                        remove_option(&mut global, token);
+                        remove_option(Rc::make_mut(&mut global), token);
                     }
                 }
             } else {
@@ -1235,7 +1238,15 @@ impl Mtree {
             return Status::Ok;
         };
         let mut r = Status::Ok;
-        for opt in mp.options.iter().rev() {
+        // An entry starts with the global options, each added to the front
+        // of its list, which reverses their order. Its own options follow,
+        // each replacing an option of the same keyword. Parsing goes from
+        // the front of the list, which is the end here.
+        let mut options: Vec<&[u8]> = mp.global.iter().rev().map(|o| o.as_slice()).collect();
+        for token in &mp.own {
+            set_option(&mut options, token);
+        }
+        for opt in options.iter().rev() {
             if parse_keyword(a, &mut self.contents_name, entry, opt, kws) == Status::Warn {
                 r = Status::Warn;
             }

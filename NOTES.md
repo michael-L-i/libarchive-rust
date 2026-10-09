@@ -618,6 +618,9 @@ Phase 5 needs:
   entry that doesn't set uid, mtime and so on inherits the skipped one's.
 - `mtree_atol` stops where an overflow is detected, so in `time=<huge>.5`
   the fraction isn't parsed.
+- The bidder never consumes, so an input of nothing but comments is read
+  ahead whole before it is rejected (a 64 MB input takes about 136 MB in both
+  builds).
 - A file with no entries is parsed again, with a new link resolver, on
   every `read_header`, because "entries is NULL" is what says the file has
   not been read.
@@ -634,8 +637,13 @@ Phase 5 needs:
   next in the buffer, or outside of it. Ours reads NUL there.
 - The file system is reached with `std::fs` (`File::open`, `metadata`,
   `symlink_metadata`), which opens with `O_CLOEXEC` like
-  `__archive_ensure_cloexec_flag`. A path is the bytes up to the first NUL,
-  which the entry's strings can't have anyway.
+  `__archive_ensure_cloexec_flag`.
+- The `/set` options are a shared snapshot that entries point to, copied
+  only when a `/set` or `/unset` changes them, and an entry keeps only the
+  options of its own line. Upstream copies the whole list into every entry,
+  which grows without bound with the input (a `/set` of 6000 keywords and
+  30000 plain lines needs several GB). The options are merged when the
+  entry is parsed, in upstream's order; the output is the same.
 
 ## warc reader (`src/read/format/warc.rs`)
 
