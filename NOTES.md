@@ -813,7 +813,7 @@ one; see the first entry.
   1000 rounds and restarts the model.
 - `Ppmd7::alloc` and `Ppmd8::alloc` take the size as `u32` like upstream and
   fail the same way (`false`) if it is below `UNIT_SIZE` (PPMd7 only) or the
-  memory is not available (`try_reserve`).
+  memory is not available.
 - Only the decoding side is ported: `Ppmd7z_RangeEnc_*` and
   `Ppmd7_EncodeSymbol` wait for the 7zip writer.
 
@@ -1196,30 +1196,6 @@ the entry record and the extra fields, `zip/crypto.rs` the decryption, and
 
 ### Differences
 
-- The arena is zeroed. Upstream leaves the `malloc`ed memory uninitialized,
-  so any read of it (for example the stamp of a block the model never
-  wrote) is undefined; zero is one of the values it can read as. The
-  decoders match upstream byte for byte over all the streams we tried,
-  including corrupt ones. Zeroing touches the whole arena, where `malloc`
-  commits lazily, so a PPMd7 model of a few GiB costs real memory and time
-  at `alloc`.
-- Anything upstream would do outside the arena (a read, a write, a search
-  for a symbol that is not there, a free list that loops) marks the model
-  bad, and `decode_symbol` returns -2 ("invalid data") from then on. A model
-  the decoder built itself never does this; it is a guard, not a code path.
-- The range decoders would divide by zero (`Range /= total` giving 0) or
-  spin forever in `Normalize` (`Range == 0`) on some corrupt streams, and
-  upstream crashes or hangs. We return -2 instead.
-- `Ppmd8` `RestoreModel` in cut-off mode loops `CutOff` and `ExpandTextArea`
-  until enough memory is free. With a tiny arena (a few KiB; the zip reader
-  allocates at least 1 MiB) upstream can loop forever; ours gives up after
-  1000 rounds and restarts the model.
-- `Ppmd7::alloc` and `Ppmd8::alloc` take the size as `u32` like upstream and
-  fail the same way (`false`) if it is below `UNIT_SIZE` (PPMd7 only) or the
-  memory is not available (`try_reserve`).
-- Only the decoding side is ported: `Ppmd7z_RangeEnc_*` and
-  `Ppmd7_EncodeSymbol` wait for the 7zip writer.
-
 - The XML parser is the `xml` crate 1.4.0 (xml-rs, renamed), where upstream
   uses libxml2's `xmlTextReader` (expat elsewhere). It has
   `#![forbid(unsafe_code)]` and no dependencies, reads a stream, resolves
@@ -1374,9 +1350,9 @@ and the filters. The PPMd model is `ppmd7`, reached through `Ppmd7` and
   `__archive_read_filter_ahead` (archive_read.c, "Roll back to client
   buffer"), which assumes the copy-buffer bytes precede `client_next` in the
   current block. Upstream's zip bidder masks it for rar, so
-  `test_read_format_rar_multivolume` and `_multivolume_skip` should pass here
-  once zip is merged, but that is unproven. It is not a bug in the rar read
-  path.
+  `test_read_format_rar_multivolume` and `_multivolume_skip` both pass here
+  with ZIP merged, as confirmed by the Phase 4 integration run. It is not a
+  bug in the rar read path.
 
 ### Differences
 
