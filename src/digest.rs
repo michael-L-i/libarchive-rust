@@ -27,12 +27,13 @@
 
 // Ported from libarchive/archive_digest.c.
 
-//! Message digests for the mtree, xar, zip and 7zip code: MD5, RIPEMD-160,
-//! SHA-1, SHA-256, SHA-384 and SHA-512. Upstream picks one platform library
-//! per build and fills a table of init/update/final functions; here the
-//! RustCrypto crates are the only backend and the table is `Digest`.
+//! Message digests for the xar reader and the mtree, xar and zip writers:
+//! MD5, RIPEMD-160, SHA-1, SHA-256, SHA-384 and SHA-512. Upstream picks one
+//! platform library per build and fills a table of init/update/final
+//! functions; here the RustCrypto crates are the only backend and the table
+//! is `Digest`.
 
-#![allow(dead_code)] // for the xar reader and the mtree, xar, 7zip writers (phases 4-5)
+#![allow(dead_code)] // for the xar reader and the mtree, xar, zip writers (phases 4-5)
 
 use md5::Md5;
 use ripemd::Ripemd160;
