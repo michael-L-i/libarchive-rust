@@ -2,11 +2,10 @@
 2010-03-12 : Igor Pavlov : Public domain
 This code is based on PPMd var.H (2001): Dmitry Shkarin : Public domain */
 
-// Ported from libarchive/archive_ppmd7.c (decoder side only; the 7zip
-// writer's encoder waits for the writers).
+// Ported from libarchive/archive_ppmd7.c.
 #![allow(dead_code)] // used by the 7zip and rar readers
 
-//! PPMd var. H decoder, with the 7z and RAR range decoders.
+//! PPMd var. H model, encoder, and the 7z and RAR range decoders.
 //!
 //! The readers hold one long-lived [`Ppmd7`] and call, as upstream does:
 //! `free` / `alloc` / `init` to (re)start a model, [`Ppmd7RangeDec::init`]
@@ -1309,6 +1308,232 @@ a77f9fe0f9b6d46a2248f3eca0ad3bb44927c4c5931111fd4bbc7f296cc8276e\
                     assert!(out.len() <= 20_000 && last >= -2);
                 }
             }
+        }
+    }
+}
+
+/// The 7-Zip range encoder of Ppmd7Enc.c. Bytes can be drained between symbols.
+pub(crate) struct Ppmd7RangeEnc {
+    low: u64,
+    range: u32,
+    cache: u8,
+    cache_size: u64,
+    pub output: Vec<u8>,
+}
+impl Ppmd7RangeEnc {
+    pub(crate) fn new() -> Self {
+        Self {
+            low: 0,
+            range: u32::MAX,
+            cache: 0,
+            cache_size: 1,
+            output: Vec::new(),
+        }
+    }
+    fn shift_low(&mut self) {
+        if (self.low as u32) < 0xff000000 || self.low >> 32 != 0 {
+            let mut temp = self.cache;
+            loop {
+                self.output.push(temp.wrapping_add((self.low >> 32) as u8));
+                temp = 0xff;
+                self.cache_size -= 1;
+                if self.cache_size == 0 {
+                    break;
+                }
+            }
+            self.cache = (self.low as u32 >> 24) as u8;
+        }
+        self.cache_size += 1;
+        self.low = u64::from((self.low as u32).wrapping_shl(8));
+    }
+    fn normalize(&mut self) {
+        while self.range < 1 << 24 {
+            self.range <<= 8;
+            self.shift_low();
+        }
+    }
+    fn encode(&mut self, start: u32, size: u32, total: u32) -> bool {
+        if total == 0 || size == 0 {
+            return false;
+        }
+        self.range /= total;
+        self.low += u64::from(start) * u64::from(self.range);
+        self.range = self.range.wrapping_mul(size);
+        if self.range == 0 {
+            return false;
+        }
+        self.normalize();
+        true
+    }
+    fn bit(&mut self, prob: u32, one: bool) {
+        let bound = (self.range >> 14) * prob;
+        if one {
+            self.low += u64::from(bound);
+            self.range -= bound;
+        } else {
+            self.range = bound;
+        }
+        self.normalize();
+    }
+    pub(crate) fn finish(&mut self) {
+        for _ in 0..5 {
+            self.shift_low();
+        }
+    }
+}
+impl Ppmd7 {
+    pub(crate) fn encode_symbol(&mut self, rc: &mut Ppmd7RangeEnc, symbol: i32) -> bool {
+        if self.a.is_bad() {
+            return false;
+        }
+        let ok = self.encode_symbol_inner(rc, symbol);
+        ok && !self.a.is_bad()
+    }
+    fn encode_symbol_inner(&mut self, rc: &mut Ppmd7RangeEnc, symbol: i32) -> bool {
+        let mut mask = [0xffu8; 256];
+        let min = self.min_context;
+        let ns = self.num_stats(min);
+        if ns != 1 {
+            let mut s = self.stats(min);
+            let mut sum = 0;
+            for i in 0..ns {
+                let freq = u32::from(self.a.freq(s));
+                if i32::from(self.a.sym(s)) == symbol {
+                    if !rc.encode(sum, freq, self.summ_freq(min)) {
+                        return false;
+                    }
+                    self.found_state = s;
+                    if i == 0 {
+                        self.update1_0()
+                    } else {
+                        self.update1()
+                    }
+                    return true;
+                }
+                if i == 0 {
+                    self.prev_success = 0
+                }
+                sum += freq;
+                mask[usize::from(self.a.sym(s))] = 0;
+                s = s.wrapping_add(STATE_SIZE);
+            }
+            self.hi_bits_flag = u32::from(self.hb2flag[usize::from(self.a.sym(self.found_state))]);
+            let total = self.summ_freq(min);
+            if sum >= total || !rc.encode(sum, total - sum, total) {
+                return false;
+            }
+        } else {
+            let one = min.wrapping_add(ONE_STATE);
+            let hb = u32::from(self.hb2flag[usize::from(self.a.sym(self.found_state))]);
+            self.hi_bits_flag = hb;
+            let suffix_ns = self.num_stats(self.suffix(min));
+            let row = (u32::from(self.a.freq(one)).wrapping_sub(1) & 127) as usize;
+            let col = (self.prev_success
+                + u32::from(self.ns2bsindx[(suffix_ns.wrapping_sub(1) & 255) as usize])
+                + hb
+                + 2 * u32::from(self.hb2flag[usize::from(self.a.sym(one))])
+                + ((self.run_length >> 26) & 0x20) as u32)
+                & 63;
+            let prob = self.bin_summ[row][col as usize];
+            if i32::from(self.a.sym(one)) == symbol {
+                rc.bit(u32::from(prob), false);
+                self.bin_summ[row][col as usize] = update_prob_0(prob);
+                self.found_state = one;
+                self.update_bin();
+                return true;
+            }
+            rc.bit(u32::from(prob), true);
+            let prob = update_prob_1(prob);
+            self.bin_summ[row][col as usize] = prob;
+            self.init_esc = u32::from(K_EXP_ESCAPE[usize::from(prob >> 10) & 15]);
+            mask[usize::from(self.a.sym(one))] = 0;
+            self.prev_success = 0;
+        }
+        loop {
+            let masked = self.num_stats(self.min_context);
+            loop {
+                self.order_fall = self.order_fall.wrapping_add(1);
+                let suffix = self.suffix(self.min_context);
+                if suffix == 0 {
+                    return symbol == -1;
+                }
+                self.min_context = suffix;
+                if self.num_stats(suffix) != masked {
+                    break;
+                }
+            }
+            let (see, escape) = self.make_esc_freq(masked);
+            let mut states = Vec::new();
+            let mut s = self.stats(self.min_context);
+            let mut sum = 0;
+            let mut found = None;
+            for _ in 0..self.num_stats(self.min_context) {
+                if mask[usize::from(self.a.sym(s))] != 0 {
+                    let freq = u32::from(self.a.freq(s));
+                    if i32::from(self.a.sym(s)) == symbol {
+                        found = Some((s, sum, freq));
+                    }
+                    sum += freq;
+                    states.push(s);
+                }
+                s = s.wrapping_add(STATE_SIZE);
+            }
+            let total = sum + escape;
+            if let Some((s, low, freq)) = found {
+                if !rc.encode(low, freq, total) {
+                    return false;
+                }
+                self.see[see].update();
+                self.found_state = s;
+                self.update2();
+                return true;
+            }
+            if !rc.encode(sum, escape, total) {
+                return false;
+            }
+            self.see[see].summ = self.see[see].summ.wrapping_add(total as u16);
+            for s in states {
+                mask[usize::from(self.a.sym(s))] = 0;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod encoder_tests {
+    use super::*;
+    #[test]
+    fn encoder_round_trip_restarts_and_escapes() {
+        let input: Vec<u8> = (0..25_000)
+            .map(|i| ((i * 19 + i / 77) % 256) as u8)
+            .collect();
+        for memory in [2048, 1 << 20] {
+            let mut model = Ppmd7::new();
+            assert!(model.alloc(memory));
+            model.init(6);
+            let mut encoder = Ppmd7RangeEnc::new();
+            for &b in &input {
+                assert!(model.encode_symbol(&mut encoder, b.into()));
+            }
+            assert!(model.encode_symbol(&mut encoder, -1));
+            encoder.finish();
+            let stream = encoder.output;
+            let mut at = 0;
+            let mut src = || {
+                let b = stream.get(at).copied().unwrap_or(0);
+                at += 1;
+                b
+            };
+            let mut decoder = Ppmd7RangeDec::new_7z();
+            assert!(decoder.init(&mut src));
+            let mut model = Ppmd7::new();
+            assert!(model.alloc(memory));
+            model.init(6);
+            for &b in &input {
+                assert_eq!(model.decode_symbol(&mut decoder, &mut src), i32::from(b));
+            }
+            assert_eq!(model.decode_symbol(&mut decoder, &mut src), -1);
+            assert!(decoder.is_finished_ok());
         }
     }
 }

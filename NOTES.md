@@ -814,8 +814,9 @@ one; see the first entry.
 - `Ppmd7::alloc` and `Ppmd8::alloc` take the size as `u32` like upstream and
   fail the same way (`false`) if it is below `UNIT_SIZE` (PPMd7 only) or the
   memory is not available.
-- Only the decoding side is ported: `Ppmd7z_RangeEnc_*` and
-  `Ppmd7_EncodeSymbol` wait for the 7zip writer.
+- PPMd7 includes `Ppmd7z_RangeEnc_*` and `Ppmd7_EncodeSymbol` for the
+  7zip writer. Encoding shares the checked arena and model update paths
+  with decoding. PPMd8 encoding is not used by upstream writers.
 
 ## cab reader (src/read/format/cab.rs)
 
