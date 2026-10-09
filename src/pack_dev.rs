@@ -91,7 +91,9 @@ fn pack_split<const SHIFT: u32, const MAJOR: u32, const MINOR: u32>(
     if u64::from((dev & MAJOR) >> SHIFT) != major {
         error = Some(MAJOR_ERROR);
     }
-    if u64::from(dev & MINOR) != minor {
+    // The minor number is an int32_t upstream, which is sign-extended when
+    // compared, so a freebsd minor with bit 31 set never matches.
+    if i64::from((dev & MINOR) as i32) as u64 != minor {
         error = Some(MINOR_ERROR);
     }
     (dev as Dev, error)
@@ -163,5 +165,7 @@ mod tests {
             Some("invalid unit number")
         );
         assert_eq!(pack(b"linux", &[1]).1, Some(TOO_MANY_FIELDS));
+        assert_eq!(pack(b"freebsd", &[1, 1 << 31]).1, Some(MINOR_ERROR));
+        assert_eq!(pack(b"freebsd", &[1, 0xffff_00ff]).1, Some(MINOR_ERROR));
     }
 }
