@@ -69,3 +69,32 @@ Validation on Apple Silicon, 2026-10-09:
   A separate 16 MiB text pair is 31.955/31.857 ms. Timing is noisy; no speed
   improvement is claimed. Experiments and raw output are retained in sibling
   `diagnostics/lzma-decode-micro`. Integration oracle remains the root task.
+
+## XZ and LZIP checksum slicing
+
+`src/crc.rs` computes CRC32 and CRC64 eight bytes at a time using constant
+slicing tables. The reflected polynomials, initial/final XOR values, and
+incremental state are unchanged. Short tails use the original byte loop;
+word loads use safe byte arrays and work at every alignment and endianness.
+The additional read-only tables occupy 21 KiB. No new dependency or unsafe
+feature is needed. This affects XZ checks and LZIP CRC32, including writers.
+
+Validation on Apple Silicon, 2026-10-09:
+
+- A one-second sample of the baseline 16 MiB text XZ decoder attributes
+  570 of 631 main-thread samples to checksum updates.
+- Independent bitwise CRC32/CRC64 reference checks cover eight alignments,
+  lengths 0 through 513, and up to 18 streaming splits per input, including
+  empty parts and every tail length.
+- Isolated release XZ stream decoding, 21-run medians: 16 MiB text
+  31.425 -> 9.987 ms; 2 MiB random 6.413 -> 3.531 ms; small-files
+  1.315 -> 0.423 ms. These are backend measurements, not archive timings.
+- All 6,790 baseline decoder differential records match exactly, including
+  errors, consumption, output length/hash, truncations, mutations, dictionary
+  wrapping and larger dictionaries. All 1,440 XZ/LZMA/LZIP encoded streams
+  match the baseline byte for byte across presets 0 through 9.
+- All 26 self-contained vendor unit tests pass; eight BCJ tests need omitted
+  upstream fixture files. Vendor clippy passes with warnings denied; the
+  changed Rust file passes rustfmt.
+- Raw samples, differential records, and timings are retained in sibling
+  `diagnostics/round4-lzma-micro`. Integration oracle remains the root task.
