@@ -3,5 +3,6 @@
 
 pub mod all;
 pub mod by_code;
+pub mod cpio;
 pub mod empty;
 pub mod raw;
