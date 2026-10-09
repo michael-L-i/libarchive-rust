@@ -63,7 +63,7 @@ pub const FORMATS: &[(c_int, Option<Support>)] = &[
     //
     // These have potentially large look-ahead.
     (code::SEVENZIP, None),
-    (code::CAB, None),
+    (code::CAB, Some(super::cab::support)),
     (code::RAR, None),
     (code::RAR_V5, None),
     (code::ISO9660, None),
