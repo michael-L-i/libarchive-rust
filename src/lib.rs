@@ -43,3 +43,9 @@ mod time;
 mod util;
 mod version_details;
 mod r#virtual;
+mod write;
+
+#[allow(dead_code)] // Disk-specific FFI entry points are wired by the disk unit.
+mod read_disk;
+#[allow(dead_code)]
+mod write_disk;

@@ -1693,3 +1693,29 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - Lists and trees use owned strings and standard collections. Pattern-file
   contents are read through Rust's file API, with CR/LF or NUL separation;
   no compression or charset conversion is applied to file contents.
+
+## Write compression filters
+
+- gzip (miniz_oxide), bzip2 (crabz2), XZ/LZMA/lzip (lzma-rust2), LZ4
+  (lz4_flex), and Zstandard (ruzstd) use safe Rust encoders. Their output
+  decompresses to the same archive bytes but compressed bytes, ratios and
+  timing differ from the upstream C libraries. Encoder features on existing
+  dependencies are enabled; no C codec dependency is added.
+- XZ and Zstandard accept and validate `threads` but encode on one worker.
+  XZ uses a single-thread stream header/index. LZ4 high compression levels
+  use the safe block encoder, and linked blocks can be independently coded;
+  these are valid linked streams but compression ratios differ.
+- ruzstd has only its fastest compression strategy; this adapter provides a
+  bounded native matcher whose block search size increases with the level.
+  Its maximum search window is 128 KiB, including with the `long` option.
+  A bounded encoder thread allows a synchronous backend to stream to the
+  caller's callbacks without buffering the archive. Frame sizes and
+  frame-per-file flushing are honored at encoder block boundaries; an
+  output frame limit can be exceeded by one compressed block and trailer.
+- grzip, lrzip and lzop use upstream's external-program fallback. Missing
+  programs fail when the archive is opened. Explicit program filters parse
+  argv using the existing command parser and never invoke a shell. Pipes
+  are nonblocking and both directions are drained to avoid deadlocks;
+  dropping a filter kills and reaps its child.
+- Unix compress, uuencode and base64 encoding are native ports. Base64
+  reports the UU filter code, as upstream does; it has its own filter name.

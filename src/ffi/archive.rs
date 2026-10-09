@@ -8,7 +8,7 @@
 //! stays valid until that field changes or the handle is freed.
 
 use super::{ARCHIVE_FATAL, ARCHIVE_OK, Archive, guard};
-use crate::archive::{Handle, READ_MAGIC, state};
+use crate::archive::{Handle, READ_MAGIC, WRITE_MAGIC, state};
 use crate::util::{VERSION_NUMBER, VERSION_STRING};
 use crate::version_details as vd;
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -201,9 +201,19 @@ pub extern "C" fn archive_free(a: *mut Archive) -> c_int {
     guard(ARCHIVE_FATAL, || {
         // SAFETY: `a` is a live handle, only ever borrowed shared.
         let h = unsafe { &*a.cast::<Handle>() };
-        // Only read handles exist so far.
+        // Each kind supplies its virtual close and free operations.
         let states = state::ANY | state::FATAL;
-        if h.base.check_magic(READ_MAGIC, states, "archive_read_free") == ARCHIVE_FATAL {
+        let (magic, name) = match &h.kind {
+            crate::archive::Kind::Read(_) => (READ_MAGIC, "archive_read_free"),
+            crate::archive::Kind::Write(_) => (WRITE_MAGIC, "archive_write_free"),
+            crate::archive::Kind::WriteDisk(_) => {
+                (crate::archive::WRITE_DISK_MAGIC, "archive_write_free")
+            }
+            crate::archive::Kind::ReadDisk(_) => {
+                (crate::archive::READ_DISK_MAGIC, "archive_read_free")
+            }
+        };
+        if h.base.check_magic(magic, states, name) == ARCHIVE_FATAL {
             return ARCHIVE_FATAL;
         }
         let r = h.free();

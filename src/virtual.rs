@@ -41,13 +41,15 @@ impl Handle {
     pub fn filter_code(&self, n: c_int) -> c_int {
         match &self.kind {
             Kind::Read(r) => r.try_borrow().map_or(ARCHIVE_FATAL, |r| r.filter_code(n)),
-            _ => ARCHIVE_FATAL,
+            Kind::Write(w) => w.try_borrow().map_or(ARCHIVE_FATAL, |w| w.filter_code(n)),
+            _ => -1,
         }
     }
 
     pub fn filter_count(&self) -> c_int {
         match &self.kind {
             Kind::Read(r) => r.try_borrow().map_or(ARCHIVE_FATAL, |r| r.filter_count()),
+            Kind::Write(w) => w.try_borrow().map_or(ARCHIVE_FATAL, |w| w.filter_count()),
             _ => 0,
         }
     }
@@ -58,6 +60,9 @@ impl Handle {
             Kind::Read(r) => r.try_borrow().map_or(std::ptr::null(), |r| {
                 r.filter_name(n).map_or(std::ptr::null(), |s| s.as_ptr())
             }),
+            Kind::Write(w) => w.try_borrow().map_or(std::ptr::null(), |w| {
+                w.filter_name(n).map_or(std::ptr::null(), |s| s.as_ptr())
+            }),
             _ => std::ptr::null(),
         }
     }
@@ -67,7 +72,8 @@ impl Handle {
             Kind::Read(r) => r
                 .try_borrow()
                 .map_or(i64::from(ARCHIVE_FATAL), |r| r.filter_bytes(n)),
-            _ => 0,
+            Kind::Write(w) => w.try_borrow().map_or(-1, |w| w.filter_bytes(n)),
+            _ => -1,
         }
     }
 
@@ -78,6 +84,7 @@ impl Handle {
             Kind::Read(r) => r
                 .try_borrow_mut()
                 .map_or(ARCHIVE_FATAL, |mut r| r.next_header2(&self.base, entry)),
+            Kind::ReadDisk(r) => r.borrow_mut().next_header2(&self.base, entry),
             _ => ARCHIVE_FATAL,
         }
     }
@@ -86,6 +93,7 @@ impl Handle {
     pub fn read_entry(&self) -> *mut Entry {
         match &self.kind {
             Kind::Read(r) => r.try_borrow().map_or(std::ptr::null_mut(), |r| r.entry()),
+            Kind::ReadDisk(r) => r.borrow().entry(),
             _ => std::ptr::null_mut(),
         }
     }
@@ -96,6 +104,7 @@ impl Handle {
             Kind::Read(r) => r
                 .try_borrow_mut()
                 .map_or(std::ptr::null_mut(), |mut r| r.take_entry()),
+            Kind::ReadDisk(r) => r.borrow_mut().take_entry(),
             _ => std::ptr::null_mut(),
         }
     }
@@ -105,7 +114,7 @@ impl Handle {
             Kind::Read(r) => r
                 .try_borrow()
                 .map_or(i64::from(ARCHIVE_FATAL), |r| r.header_position()),
-            _ => 0,
+            _ => i64::from(ARCHIVE_FATAL),
         }
     }
 
@@ -113,6 +122,9 @@ impl Handle {
         match &self.kind {
             Kind::Read(r) => r.borrow_mut().close(&self.base),
             Kind::Match(_) => ARCHIVE_OK,
+            Kind::Write(w) => w.borrow_mut().close(&self.base),
+            Kind::WriteDisk(w) => w.borrow_mut().close(&self.base),
+            Kind::ReadDisk(r) => r.borrow_mut().close(&self.base),
         }
     }
 
@@ -123,6 +135,9 @@ impl Handle {
         match &self.kind {
             Kind::Read(r) => r.borrow_mut().free(&self.base),
             Kind::Match(_) => ARCHIVE_OK,
+            Kind::Write(w) => w.borrow_mut().free(&self.base),
+            Kind::WriteDisk(w) => w.borrow_mut().close(&self.base),
+            Kind::ReadDisk(r) => r.borrow_mut().close(&self.base),
         }
     }
 
@@ -134,26 +149,28 @@ impl Handle {
 
     pub fn write_finish_entry(&self) -> c_int {
         match &self.kind {
-            Kind::Read(_) | Kind::Match(_) => ARCHIVE_FATAL,
+            Kind::Read(_) | Kind::ReadDisk(_) | Kind::Match(_) => ARCHIVE_FATAL,
+            Kind::Write(w) => w.borrow_mut().finish_entry(&self.base),
+            Kind::WriteDisk(w) => w.borrow_mut().finish_entry(&self.base),
         }
     }
 
-    pub fn write_data(&self, _buf: &[u8]) -> isize {
+    pub fn write_data(&self, buf: &[u8]) -> isize {
         match &self.kind {
-            Kind::Read(_) | Kind::Match(_) => ARCHIVE_FATAL as isize,
+            Kind::Read(_) | Kind::ReadDisk(_) | Kind::Match(_) => ARCHIVE_FATAL as isize,
+            Kind::Write(w) => w.borrow_mut().data(&self.base, buf),
+            Kind::WriteDisk(w) => w.borrow_mut().data(&self.base, buf),
         }
     }
 
-    pub fn write_data_block(&self, _buf: &[u8], _offset: i64) -> isize {
-        match &self.kind {
-            // A kind without a write_data_block slot.
-            Kind::Read(_) | Kind::Match(_) => {
-                self.base.state.set(state::FATAL);
-                self.base.raise(Error::fatal(
-                    ARCHIVE_ERRNO_MISC,
-                    "archive_write_data_block not supported",
-                )) as isize
-            }
+    pub fn write_data_block(&self, buf: &[u8], offset: i64) -> isize {
+        if let Kind::WriteDisk(w) = &self.kind {
+            return w.borrow_mut().data_block(&self.base, buf, offset) as isize;
         }
+        self.base.state.set(state::FATAL);
+        self.base.raise(Error::fatal(
+            ARCHIVE_ERRNO_MISC,
+            "archive_write_data_block not supported",
+        )) as isize
     }
 }
