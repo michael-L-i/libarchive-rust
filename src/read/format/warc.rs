@@ -72,7 +72,10 @@ impl Format for Warc {
             let Some(buf) = r.read_ahead(HDR_PROBE_LEN).map_err(|_| bad_header())? else {
                 return Ok(Status::Eof);
             };
-            let hdr = header_end(buf).ok_or_else(bad_header)?;
+            // The record header is up to and including its blank line.
+            let hdr = find(buf, b"\r\n\r\n")
+                .and_then(|hit| buf.get(..hit + 4))
+                .ok_or_else(bad_header)?;
 
             // Only WARC 0.12 through WARC 1.0 are supported.
             let ver = read_version(hdr);
@@ -91,7 +94,7 @@ impl Format for Warc {
             let Some(cntlen) = read_length(hdr) else {
                 return Err(Error::fatal(libc::EINVAL, "Bad content length"));
             };
-            let Some(rtime) = read_date(hdr) else {
+            let Some(rtime) = header_value(hdr, b"\r\nWARC-Date:").and_then(parse_zulu_time) else {
                 return Err(Error::fatal(libc::EINVAL, "Bad record time"));
             };
 
@@ -105,7 +108,9 @@ impl Format for Warc {
             };
             // A Last-Modified record header is the mtime; WARC-Date is the ctime.
             let mtime = match target {
-                Some(_) => read_last_modified(hdr).unwrap_or(rtime),
+                Some(_) => header_value(hdr, b"\r\nLast-Modified:")
+                    .and_then(parse_zulu_time)
+                    .unwrap_or(rtime),
                 None => 0,
             };
 
@@ -186,12 +191,6 @@ fn bad_header() -> Error {
 /// The first occurrence of `needle` (not empty) in `hay`.
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
-}
-
-/// The record header at the start of `buf`, up to and including its blank line.
-fn header_end(buf: &[u8]) -> Option<&[u8]> {
-    let end = find(buf, b"\r\n\r\n")? + 4;
-    buf.get(..end)
 }
 
 /// The value of the header field that starts with `key` (a CRLF and the field
@@ -299,24 +298,11 @@ fn read_length(hdr: &[u8]) -> Option<i64> {
     })
 }
 
-/// The WARC-Date, as seconds since the epoch.
-fn read_date(hdr: &[u8]) -> Option<i64> {
-    parse_zulu_time(header_value(hdr, b"\r\nWARC-Date:")?)
-}
-
-/// The Last-Modified, as seconds since the epoch.
-fn read_last_modified(hdr: &[u8]) -> Option<i64> {
-    parse_zulu_time(header_value(hdr, b"\r\nLast-Modified:")?)
-}
-
 /// Parses a whole field value of the form `YYYY-MM-DDThh:mm:ssZ`, with leading
 /// blanks allowed. Upstream's `xstrpisotime` with its check that the value
 /// ends there.
 fn parse_zulu_time(value: &[u8]) -> Option<i64> {
-    let mut pos = value
-        .iter()
-        .take_while(|&&b| b == b' ' || b == b'\t')
-        .count();
+    let mut pos = value.len() - skip_blanks(value).len();
     let year = strtoi_lim(value, &mut pos, 1583, 4095)?;
     expect(value, &mut pos, b'-')?;
     let month = strtoi_lim(value, &mut pos, 1, 12)?;
