@@ -109,7 +109,11 @@ impl Base {
     /// Records `e` (unless it is `recorded` already) and returns the code to
     /// hand back to the C caller.
     pub fn raise(&self, e: Error) -> c_int {
-        debug_assert!(is_failure(e.code), "an Error carries a failure, not {}", e.code);
+        debug_assert!(
+            is_failure(e.code),
+            "an Error carries a failure, not {}",
+            e.code
+        );
         if !e.recorded {
             self.set_error(e.errno, Some(&e.msg));
         }
@@ -177,7 +181,10 @@ mod tests {
     #[test]
     fn raise_records_and_returns_code() {
         let a = Base::new(READ_MAGIC);
-        assert_eq!(a.raise(Error::new(ARCHIVE_FAILED, 22, "odd")), ARCHIVE_FAILED);
+        assert_eq!(
+            a.raise(Error::new(ARCHIVE_FAILED, 22, "odd")),
+            ARCHIVE_FAILED
+        );
         assert_eq!(
             (a.errno.get(), a.error_string().as_deref()),
             (22, Some(b"odd".as_slice()))
@@ -187,8 +194,16 @@ mod tests {
 
     #[test]
     fn only_failures_are_errors() {
-        assert!([ARCHIVE_RETRY, ARCHIVE_FAILED, ARCHIVE_FATAL].into_iter().all(is_failure));
-        assert!(![ARCHIVE_OK, ARCHIVE_EOF, ARCHIVE_WARN].into_iter().any(is_failure));
+        assert!(
+            [ARCHIVE_RETRY, ARCHIVE_FAILED, ARCHIVE_FATAL]
+                .into_iter()
+                .all(is_failure)
+        );
+        assert!(
+            ![ARCHIVE_OK, ARCHIVE_EOF, ARCHIVE_WARN]
+                .into_iter()
+                .any(is_failure)
+        );
     }
 
     #[test]

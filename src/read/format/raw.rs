@@ -83,7 +83,9 @@ impl Format for Raw {
             // Keep reporting the end of the entry, so that a caller that
             // asks once more after end-of-file still gets a position it can
             // use.
-            return Ok(Data::Eof { offset: self.offset });
+            return Ok(Data::Eof {
+                offset: self.offset,
+            });
         }
 
         // Get whatever bytes are immediately available.
@@ -91,7 +93,9 @@ impl Format for Raw {
         let Some(data) = r.read_ahead(1)? else {
             // Record and return end-of-file.
             self.end_of_file = true;
-            return Ok(Data::Eof { offset: self.offset });
+            return Ok(Data::Eof {
+                offset: self.offset,
+            });
         };
         // Return the bytes we just read.
         let offset = self.offset;

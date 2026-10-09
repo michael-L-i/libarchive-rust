@@ -414,7 +414,11 @@ mod tests {
 
     #[test]
     fn a_program_killed_by_a_signal_is_reported() {
-        let (mut r, a, code) = open("sh -c \"head -c 100000; kill -9 $$\"", b"", pattern(200_000));
+        let (mut r, a, code) = open(
+            "sh -c \"head -c 100000; kill -9 $$\"",
+            b"",
+            pattern(200_000),
+        );
         assert_eq!(code, ARCHIVE_OK);
         assert!(drain(&mut r, &a).is_err());
         assert_eq!(error(&a), "Child process exited with signal 9");

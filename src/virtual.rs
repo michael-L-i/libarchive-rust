@@ -80,9 +80,7 @@ impl Handle {
     /// The entry a read handle reads headers into, or NULL.
     pub fn read_entry(&self) -> *mut Entry {
         match &self.kind {
-            Kind::Read(r) => r
-                .try_borrow()
-                .map_or(std::ptr::null_mut(), |r| r.entry()),
+            Kind::Read(r) => r.try_borrow().map_or(std::ptr::null_mut(), |r| r.entry()),
         }
     }
 

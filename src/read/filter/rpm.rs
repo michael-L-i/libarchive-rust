@@ -30,7 +30,9 @@
 
 use crate::archive::ARCHIVE_FATAL;
 use crate::archive::Base;
-use crate::read::{ARCHIVE_ERRNO_FILE_FORMAT, Filter, FilterBidder, Read, Reader, Status, filter_code};
+use crate::read::{
+    ARCHIVE_ERRNO_FILE_FORMAT, Filter, FilterBidder, Read, Reader, Status, filter_code,
+};
 use crate::util::Error;
 use std::ffi::{CStr, c_int};
 
@@ -127,7 +129,10 @@ fn skip_prologue(up: &mut Reader<'_>) -> Result<(), Error> {
         skip_padding(up)?;
     }
     if !seen_header {
-        return Err(Error::fatal(ARCHIVE_ERRNO_FILE_FORMAT, "Unrecognized rpm header"));
+        return Err(Error::fatal(
+            ARCHIVE_ERRNO_FILE_FORMAT,
+            "Unrecognized rpm header",
+        ));
     }
     Ok(())
 }

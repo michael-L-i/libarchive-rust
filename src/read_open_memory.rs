@@ -72,7 +72,10 @@ impl<D: AsRef<[u8]>> Client for Memory<D> {
     }
 
     fn block(&self) -> &[u8] {
-        self.data.as_ref().get(self.block.clone()).unwrap_or_default()
+        self.data
+            .as_ref()
+            .get(self.block.clone())
+            .unwrap_or_default()
     }
 
     fn can_skip(&self) -> bool {
@@ -135,7 +138,10 @@ mod tests {
     #[test]
     fn reads_in_blocks_of_the_read_size() {
         let mut m = Memory::new(b"0123456789".to_vec(), 4);
-        assert_eq!(collect(&mut m), [b"0123".to_vec(), b"4567".to_vec(), b"89".to_vec()]);
+        assert_eq!(
+            collect(&mut m),
+            [b"0123".to_vec(), b"4567".to_vec(), b"89".to_vec()]
+        );
         let mut m = Memory::new(b"0123456789".to_vec(), 100);
         assert_eq!(collect(&mut m), [b"0123456789".to_vec()]);
         // A zero read size reads nothing, rather than looping or dividing
@@ -167,8 +173,17 @@ mod tests {
         assert_eq!(m.seek(&base(), 0, -2, Whence::Cur).unwrap(), 5);
         assert_eq!(m.seek(&base(), 0, 0, Whence::End).unwrap(), 10);
         assert_eq!(m.seek(&base(), 0, -10, Whence::End).unwrap(), 0);
-        for (off, whence) in [(-1, Whence::Set), (11, Whence::Set), (1, Whence::End), (i64::MAX, Whence::Cur), (i64::MIN, Whence::End)] {
-            assert_eq!(m.seek(&base(), 0, off, whence).unwrap_err().code, ARCHIVE_FATAL);
+        for (off, whence) in [
+            (-1, Whence::Set),
+            (11, Whence::Set),
+            (1, Whence::End),
+            (i64::MAX, Whence::Cur),
+            (i64::MIN, Whence::End),
+        ] {
+            assert_eq!(
+                m.seek(&base(), 0, off, whence).unwrap_err().code,
+                ARCHIVE_FATAL
+            );
         }
         // A failed seek leaves the position alone.
         assert_eq!(m.seek(&base(), 0, 0, Whence::Cur).unwrap(), 0);

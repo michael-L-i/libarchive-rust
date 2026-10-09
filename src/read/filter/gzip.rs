@@ -520,7 +520,9 @@ mod tests {
     /// NOTES.md, gzip Differences.
     #[test]
     fn a_back_reference_before_the_start_is_accepted() {
-        let gz = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 0x03, 0x61, 0, 0, 0, 0, 0, 0, 0, 0];
+        let gz = [
+            0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 0x03, 0x61, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         let (out, status, error) = decode(&gz, 64);
         assert_eq!((out.len(), status, error.as_str()), (0, ARCHIVE_FATAL, ""));
     }

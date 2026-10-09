@@ -160,7 +160,11 @@ mod tests {
     }
 
     fn tempfile_with(data: &[u8]) -> std::fs::File {
-        let path = std::env::temp_dir().join(format!("archive-sys-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let path = std::env::temp_dir().join(format!(
+            "archive-sys-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::write(&path, data).unwrap();
         let f = std::fs::File::open(&path).unwrap();
         std::fs::remove_file(&path).unwrap();

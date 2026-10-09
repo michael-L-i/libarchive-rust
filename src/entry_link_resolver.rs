@@ -160,9 +160,7 @@ impl LinkResolver {
     ) -> (Option<Box<Entry>>, Option<Box<Entry>>) {
         let Some(mut entry) = entry else {
             // The end of the stream: the next held-back entry, if any.
-            let deferred = self
-                .next_entry(true)
-                .and_then(|le| le.entry.take());
+            let deferred = self.next_entry(true).and_then(|le| le.entry.take());
             return (deferred, None);
         };
         // If it has only one link, there is nothing to match.
@@ -261,10 +259,7 @@ impl LinkResolver {
     fn next_entry(&mut self, deferred: bool) -> Option<&mut Link> {
         self.spare = None;
         for chain in &mut self.buckets {
-            let Some(pos) = chain
-                .iter()
-                .rposition(|le| le.entry.is_some() == deferred)
-            else {
+            let Some(pos) = chain.iter().rposition(|le| le.entry.is_some() == deferred) else {
                 continue;
             };
             let removed = chain.remove(pos);

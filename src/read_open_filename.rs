@@ -29,10 +29,10 @@
 //! one file, or from several, one after another (a multi-volume archive).
 //! A missing name is the standard input.
 
-use crate::read_open_fd::buffer;
-use crate::ffi::sys::Fd;
 use crate::archive::Base;
+use crate::ffi::sys::Fd;
 use crate::read::{Client, Status, Whence};
+use crate::read_open_fd::buffer;
 use crate::util::Error;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -98,7 +98,6 @@ impl Filenames {
             len: 0,
         }
     }
-
 }
 
 /// Whether `fd` is a device that seeks like a disk.

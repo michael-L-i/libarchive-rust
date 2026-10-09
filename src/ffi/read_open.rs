@@ -33,7 +33,11 @@ fn open(h: &Handle, first_callback: &str, client: Box<dyn Client>) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_open_memory(a: *mut Archive, buff: *const c_void, size: usize) -> c_int {
+pub extern "C" fn archive_read_open_memory(
+    a: *mut Archive,
+    buff: *const c_void,
+    size: usize,
+) -> c_int {
     archive_read_open_memory2(a, buff, size, size)
 }
 
@@ -52,9 +56,15 @@ pub extern "C" fn archive_read_open_memory2(
         // SAFETY: the caller promises the block stays valid until the
         // archive is closed or freed.
         let Some(mem) = (unsafe { UserMem::new(buff, size) }) else {
-            return h.base.raise(Error::fatal(libc::EINVAL, "Invalid memory block"));
+            return h
+                .base
+                .raise(Error::fatal(libc::EINVAL, "Invalid memory block"));
         };
-        open(h, "archive_read_set_open_callback", Box::new(Memory::new(mem, read_size)))
+        open(
+            h,
+            "archive_read_set_open_callback",
+            Box::new(Memory::new(mem, read_size)),
+        )
     })
 }
 
@@ -77,7 +87,9 @@ pub extern "C" fn archive_read_open_FILE(a: *mut Archive, file: *mut libc::FILE)
     with(a, ARCHIVE_FATAL, |h| {
         h.base.clear_error();
         if file.is_null() {
-            return h.base.raise(Error::fatal(libc::EINVAL, "Invalid FILE pointer"));
+            return h
+                .base
+                .raise(Error::fatal(libc::EINVAL, "Invalid FILE pointer"));
         }
         // SAFETY: the caller promises the stream stays valid, and unused by
         // anyone else, until the archive is closed or freed.
@@ -125,7 +137,11 @@ unsafe fn names(filenames: *const *const c_char) -> Vec<Option<Vec<u8>>> {
 fn open_names(a: *mut Archive, names: Vec<Option<Vec<u8>>>, block_size: usize) -> c_int {
     with(a, ARCHIVE_FATAL, |h| {
         h.base.clear_error();
-        open(h, "archive_read_add_callback_data", Box::new(Filenames::new(names, block_size)))
+        open(
+            h,
+            "archive_read_add_callback_data",
+            Box::new(Filenames::new(names, block_size)),
+        )
     })
 }
 
@@ -172,7 +188,9 @@ pub extern "C" fn archive_read_open_filename_w(
         let mut wide = Vec::new();
         if !wfilename.is_null() {
             // SAFETY: the caller passes a NUL-terminated wide string.
-            while let Some(&c) = (unsafe { wfilename.add(wide.len()).as_ref() }).filter(|&&c| c != 0) {
+            while let Some(&c) =
+                (unsafe { wfilename.add(wide.len()).as_ref() }).filter(|&&c| c != 0)
+            {
                 wide.push(c);
             }
         }
@@ -230,12 +248,18 @@ mod tests {
         let data = b"memory block contents".to_vec();
         for read_size in [4, 1000] {
             let a = new();
-            assert_eq!(archive_read_open_memory2(a, data.as_ptr().cast(), data.len(), read_size), ARCHIVE_OK);
+            assert_eq!(
+                archive_read_open_memory2(a, data.as_ptr().cast(), data.len(), read_size),
+                ARCHIVE_OK
+            );
             assert_eq!(drain(a), data);
             assert_eq!(archive_free(a), ARCHIVE_OK);
         }
         let a = new();
-        assert_eq!(archive_read_open_memory(a, data.as_ptr().cast(), data.len()), ARCHIVE_OK);
+        assert_eq!(
+            archive_read_open_memory(a, data.as_ptr().cast(), data.len()),
+            ARCHIVE_OK
+        );
         assert_eq!(archive_free(a), ARCHIVE_OK);
         // An empty block is fine; a NULL block with a size is not.
         let a = new();
@@ -243,7 +267,10 @@ mod tests {
         assert_eq!(drain(a), b"");
         assert_eq!(archive_free(a), ARCHIVE_OK);
         let a = new();
-        assert_eq!(archive_read_open_memory(a, std::ptr::null(), 5), ARCHIVE_FATAL);
+        assert_eq!(
+            archive_read_open_memory(a, std::ptr::null(), 5),
+            ARCHIVE_FATAL
+        );
         assert_eq!(error(a).as_deref(), Some("Invalid memory block"));
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
@@ -251,11 +278,19 @@ mod tests {
     #[test]
     fn opening_twice_names_the_first_callback() {
         let a = new();
-        assert_eq!(archive_read_open_memory(a, b"x".as_ptr().cast(), 1), ARCHIVE_OK);
-        assert_eq!(archive_read_open_memory(a, b"x".as_ptr().cast(), 1), ARCHIVE_FATAL);
+        assert_eq!(
+            archive_read_open_memory(a, b"x".as_ptr().cast(), 1),
+            ARCHIVE_OK
+        );
+        assert_eq!(
+            archive_read_open_memory(a, b"x".as_ptr().cast(), 1),
+            ARCHIVE_FATAL
+        );
         assert_eq!(
             error(a).as_deref(),
-            Some("INTERNAL ERROR: Function 'archive_read_set_open_callback' invoked with archive structure in state 'header', should be in state 'new'")
+            Some(
+                "INTERNAL ERROR: Function 'archive_read_set_open_callback' invoked with archive structure in state 'header', should be in state 'new'"
+            )
         );
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
@@ -272,7 +307,9 @@ mod tests {
         // A regular file is not to be overwritten by extraction.
         let a = new();
         archive_read_open_fd(a, f.as_raw_fd(), 5);
-        assert!(with(a, false, |h| with_read(h, false, |r| r.skip_file().is_some())));
+        assert!(with(a, false, |h| with_read(h, false, |r| r
+            .skip_file()
+            .is_some())));
         assert_eq!(archive_free(a), ARCHIVE_OK);
         let a = new();
         assert_eq!(archive_read_open_fd(a, -1, 5), ARCHIVE_FATAL);
@@ -295,7 +332,10 @@ mod tests {
         // SAFETY: the stream is open and no longer used.
         unsafe { libc::fclose(file) };
         let a = new();
-        assert_eq!(archive_read_open_FILE(a, std::ptr::null_mut()), ARCHIVE_FATAL);
+        assert_eq!(
+            archive_read_open_FILE(a, std::ptr::null_mut()),
+            ARCHIVE_FATAL
+        );
         assert_eq!(archive_free(a), ARCHIVE_OK);
         std::fs::remove_file(p).unwrap();
     }
@@ -305,7 +345,10 @@ mod tests {
         let p = temp("name", 0, b"named file");
         let path = c(&p);
         let a = new();
-        assert_eq!(archive_read_open_filename(a, path.as_ptr(), 10240), ARCHIVE_OK);
+        assert_eq!(
+            archive_read_open_filename(a, path.as_ptr(), 10240),
+            ARCHIVE_OK
+        );
         assert_eq!(drain(a), b"named file");
         assert_eq!(archive_free(a), ARCHIVE_OK);
         let a = new();
@@ -313,7 +356,10 @@ mod tests {
         assert_eq!(archive_free(a), ARCHIVE_OK);
 
         let a = new();
-        assert_eq!(archive_read_open_filename(a, c"/nonexistent/x".as_ptr(), 10240), ARCHIVE_FATAL);
+        assert_eq!(
+            archive_read_open_filename(a, c"/nonexistent/x".as_ptr(), 10240),
+            ARCHIVE_FATAL
+        );
         assert_eq!(error(a).as_deref(), Some("Failed to open '/nonexistent/x'"));
         assert_eq!(archive_free(a), ARCHIVE_OK);
         std::fs::remove_file(p).unwrap();
@@ -330,14 +376,20 @@ mod tests {
         let mut list: Vec<*const c_char> = cs.iter().map(|s| s.as_ptr()).collect();
         list.push(std::ptr::null());
         let a = new();
-        assert_eq!(archive_read_open_filenames(a, list.as_mut_ptr(), 10240), ARCHIVE_OK);
+        assert_eq!(
+            archive_read_open_filenames(a, list.as_mut_ptr(), 10240),
+            ARCHIVE_OK
+        );
         assert_eq!(drain(a), b"part one, part two, part three");
         assert_eq!(archive_free(a), ARCHIVE_OK);
 
         // An empty name ends the list.
         list.insert(2, c"".as_ptr());
         let a = new();
-        assert_eq!(archive_read_open_filenames(a, list.as_mut_ptr(), 10240), ARCHIVE_OK);
+        assert_eq!(
+            archive_read_open_filenames(a, list.as_mut_ptr(), 10240),
+            ARCHIVE_OK
+        );
         assert_eq!(drain(a), b"part one, part two, ");
         assert_eq!(archive_free(a), ARCHIVE_OK);
         for p in paths {
@@ -356,7 +408,10 @@ mod tests {
             .chain([0])
             .collect();
         let a = new();
-        assert_eq!(archive_read_open_filename_w(a, wide.as_ptr(), 10240), ARCHIVE_OK);
+        assert_eq!(
+            archive_read_open_filename_w(a, wide.as_ptr(), 10240),
+            ARCHIVE_OK
+        );
         assert_eq!(drain(a), b"wide name");
         assert_eq!(archive_free(a), ARCHIVE_OK);
         std::fs::remove_file(p).unwrap();

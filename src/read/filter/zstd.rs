@@ -133,15 +133,11 @@ fn failed(name: &str) -> Error {
 fn may_start_magic(head: &[u8]) -> bool {
     let frame = head.iter().zip(MAGIC_BYTES).all(|(b, m)| *b == m);
     // A skippable magic is 0x184D2A5X: only the first byte varies.
-    let skippable = head.iter().zip([0x50, 0x2A, 0x4D, 0x18]).enumerate().all(
-        |(i, (b, m))| {
-            if i == 0 {
-                b & 0xF0 == m
-            } else {
-                *b == m
-            }
-        },
-    );
+    let skippable = head
+        .iter()
+        .zip([0x50, 0x2A, 0x4D, 0x18])
+        .enumerate()
+        .all(|(i, (b, m))| if i == 0 { b & 0xF0 == m } else { *b == m });
     frame || skippable
 }
 
@@ -241,8 +237,7 @@ fn decode_failure(input: Input<'_, '_>, e: Option<&FrameDecoderError>) -> Error 
             "Frame requires too much memory for decoding"
         }
         Some(
-            FrameDecoderError::DictNotProvided { .. }
-            | FrameDecoderError::DictionaryDecodeError(_),
+            FrameDecoderError::DictNotProvided { .. } | FrameDecoderError::DictionaryDecodeError(_),
         ) => "Dictionary mismatch",
         Some(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(_))) => {
             "Unknown frame descriptor"
@@ -393,7 +388,10 @@ mod tests {
         let frame = [MAGIC_BYTES.as_slice(), &[0x00, (32 - 10) << 3, 0, 0]].concat();
         assert_eq!(
             decode_zst(&frame, 4096),
-            Err("Zstd decompression failed: Frame requires too much memory for decoding".to_string())
+            Err(
+                "Zstd decompression failed: Frame requires too much memory for decoding"
+                    .to_string()
+            )
         );
     }
 
@@ -409,7 +407,10 @@ mod tests {
         }
         for prefix in [&MAGIC_BYTES[..1], &MAGIC_BYTES[..3], &[0x50, 0x2A][..]] {
             let stream = [frame.as_slice(), prefix].concat();
-            assert_eq!(decode_zst(&stream, 4096), Err("Truncated zstd input".to_string()));
+            assert_eq!(
+                decode_zst(&stream, 4096),
+                Err("Truncated zstd input".to_string())
+            );
         }
     }
 
@@ -421,10 +422,7 @@ mod tests {
                 // Too short to bid, the raw format reads it as it is.
                 Ok(out) => assert!(n < 8 && out == frame[..n], "offset {n}"),
                 // Too short to bid, the open fails as an unknown format.
-                Err(msg) => assert!(
-                    n < 8 || msg == "Truncated zstd input",
-                    "offset {n}: {msg}"
-                ),
+                Err(msg) => assert!(n < 8 || msg == "Truncated zstd input", "offset {n}: {msg}"),
             }
         }
     }

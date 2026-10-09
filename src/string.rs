@@ -1409,7 +1409,6 @@ pub(crate) fn conversion_from_charset(
     get_sconv_object(a, charset, &current, flag)
 }
 
-
 /// Copy `src` to `out` (replacing its contents) in locale conversion.
 /// On failure `out` holds the partial output.
 pub(crate) fn strncpy_l(
@@ -2141,7 +2140,10 @@ mod tests {
         let mut m = mstr.clone();
         assert_eq!(m.get_mbs(Some(a)).unwrap(), Some(exp.as_bytes()));
         let mut m = mstr.clone();
-        assert_eq!(m.get_utf8_c(Some(a)).unwrap().map(CStr::to_bytes), Some(exp.as_bytes()));
+        assert_eq!(
+            m.get_utf8_c(Some(a)).unwrap().map(CStr::to_bytes),
+            Some(exp.as_bytes())
+        );
         let mut m = mstr.clone();
         assert_eq!(m.get_wcs(Some(a)).unwrap(), Some(wexp));
         let mut m = mstr.clone();

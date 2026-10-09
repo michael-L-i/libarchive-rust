@@ -124,10 +124,16 @@ mod tests {
             Ok(0)
         }
 
-        fn options(&mut self, _: &Base, key: &[u8], value: Option<&[u8]>) -> Option<Result<Status, Error>> {
+        fn options(
+            &mut self,
+            _: &Base,
+            key: &[u8],
+            value: Option<&[u8]>,
+        ) -> Option<Result<Status, Error>> {
             Some(match key {
                 b"flag" => {
-                    self.seen.push(format!("{:?}", value.map(String::from_utf8_lossy)));
+                    self.seen
+                        .push(format!("{:?}", value.map(String::from_utf8_lossy)));
                     Ok(Status::Ok)
                 }
                 b"broken" => Err(Error::fatal(libc::EINVAL, "Broken option")),
@@ -184,12 +190,24 @@ mod tests {
     #[test]
     fn format_options_reach_the_named_module_only() {
         let (mut r, a) = handle();
-        assert_eq!(r.set_format_option(&a, Some(b"opt"), b"flag", Some(b"1")), ARCHIVE_OK);
+        assert_eq!(
+            r.set_format_option(&a, Some(b"opt"), b"flag", Some(b"1")),
+            ARCHIVE_OK
+        );
         assert_eq!(r.set_format_option(&a, None, b"flag", None), ARCHIVE_OK);
         // A module without options does not count as matched.
-        assert_eq!(r.set_format_option(&a, Some(b"plain"), b"flag", None), UNKNOWN_MODULE);
-        assert_eq!(r.set_format_option(&a, Some(b"nope"), b"flag", None), UNKNOWN_MODULE);
-        assert_eq!(r.set_format_option(&a, Some(b"opt"), b"other", None), ARCHIVE_WARN);
+        assert_eq!(
+            r.set_format_option(&a, Some(b"plain"), b"flag", None),
+            UNKNOWN_MODULE
+        );
+        assert_eq!(
+            r.set_format_option(&a, Some(b"nope"), b"flag", None),
+            UNKNOWN_MODULE
+        );
+        assert_eq!(
+            r.set_format_option(&a, Some(b"opt"), b"other", None),
+            ARCHIVE_WARN
+        );
         // The active format is only set while options run.
         assert_eq!(r.format, None);
     }
@@ -197,8 +215,14 @@ mod tests {
     #[test]
     fn a_fatal_option_stops_and_records() {
         let (mut r, a) = handle();
-        assert_eq!(r.set_format_option(&a, None, b"broken", None), ARCHIVE_FATAL);
-        assert_eq!((error(&a), a.errno.get()), ("Broken option".into(), libc::EINVAL));
+        assert_eq!(
+            r.set_format_option(&a, None, b"broken", None),
+            ARCHIVE_FATAL
+        );
+        assert_eq!(
+            (error(&a), a.errno.get()),
+            ("Broken option".into(), libc::EINVAL)
+        );
     }
 
     #[test]

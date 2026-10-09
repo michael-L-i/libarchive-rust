@@ -25,7 +25,6 @@
 
 // Ported from libarchive/archive_read_add_passphrase.c.
 
-
 //! Decryption passphrases: the list `archive_read_add_passphrase` builds, the
 //! callback of last resort, and the candidate iteration format readers drive
 //! with `reset` and `next`.
@@ -150,7 +149,10 @@ mod tests {
         // Trying every candidate rotates the list a full turn.
         p.reset();
         let all = [next(&mut p), next(&mut p), next(&mut p), next(&mut p)];
-        assert_eq!(all, [Some("a".into()), Some("b".into()), Some("c".into()), None]);
+        assert_eq!(
+            all,
+            [Some("a".into()), Some("b".into()), Some("c".into()), None]
+        );
         // If the second one decrypts, the next entry starts with it.
         p.reset();
         assert_eq!(next(&mut p).as_deref(), Some("a"));

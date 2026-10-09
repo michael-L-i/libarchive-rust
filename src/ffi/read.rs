@@ -1,25 +1,25 @@
 //! The exported functions of archive_read.c and the files around it.
 
+use super::ArchiveEntry;
 use super::archive::{bytes, with};
 use super::client::CClient;
+use super::sys::Fd;
 use super::{
     ARCHIVE_FATAL, ARCHIVE_OK, Archive, archive_close_callback, archive_open_callback,
-    archive_passphrase_callback, archive_read_callback, archive_seek_callback, archive_skip_callback, archive_switch_callback,
-    guard,
+    archive_passphrase_callback, archive_read_callback, archive_seek_callback,
+    archive_skip_callback, archive_switch_callback, guard,
 };
+use crate::archive::{ARCHIVE_EOF, ARCHIVE_WARN};
 use crate::archive::{Base, Handle, Kind, READ_MAGIC, state};
+use crate::entry::Entry;
+use crate::read::Data;
 use crate::read::filter::{
-    all as filter_all, bzip2 as filter_bzip2, by_code as filter_by_code, compress, grzip, gzip,
+    all as filter_all, by_code as filter_by_code, bzip2 as filter_bzip2, compress, grzip, gzip,
     lrzip, lz4 as filter_lz4, lzop, none as filter_none, program, rpm, uu as filter_uu,
     xz as filter_xz, zstd as filter_zstd,
 };
 use crate::read::format::{all as format_all, by_code as format_by_code, empty, raw};
 use crate::read::{self, Read, Status};
-use super::ArchiveEntry;
-use super::sys::Fd;
-use crate::entry::Entry;
-use crate::archive::{ARCHIVE_EOF, ARCHIVE_WARN};
-use crate::read::Data;
 use crate::read_add_passphrase::PassphraseCallback;
 use crate::util::Error;
 use crate::{options, read_append_filter, read_data_into_fd, read_set_format, read_set_options};
@@ -198,7 +198,9 @@ pub extern "C" fn archive_read_support_filter_by_code(a: *mut Archive, code: c_i
         READ_MAGIC,
         state::NEW,
         ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| filter_by_code::support(r, &h.base, code))
+        |h| with_read(h, ARCHIVE_FATAL, |r| filter_by_code::support(
+            r, &h.base, code
+        ))
     )
 }
 
@@ -273,7 +275,9 @@ pub extern "C" fn archive_read_support_format_by_code(a: *mut Archive, code: c_i
         READ_MAGIC,
         state::NEW,
         ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| format_by_code::support(r, &h.base, code))
+        |h| with_read(h, ARCHIVE_FATAL, |r| format_by_code::support(
+            r, &h.base, code
+        ))
     )
 }
 
@@ -286,7 +290,9 @@ pub extern "C" fn archive_read_set_format(a: *mut Archive, code: c_int) -> c_int
         READ_MAGIC,
         state::NEW,
         ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| read_set_format::set_format(r, &h.base, code))
+        |h| with_read(h, ARCHIVE_FATAL, |r| read_set_format::set_format(
+            r, &h.base, code
+        ))
     )
 }
 
@@ -298,7 +304,9 @@ pub extern "C" fn archive_read_append_filter(a: *mut Archive, code: c_int) -> c_
         READ_MAGIC,
         state::NEW,
         ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| read_append_filter::append_filter(r, &h.base, code))
+        |h| with_read(h, ARCHIVE_FATAL, |r| read_append_filter::append_filter(
+            r, &h.base, code
+        ))
     )
 }
 
@@ -337,12 +345,18 @@ fn with_program(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_program(a: *mut Archive, cmd: *const c_char) -> c_int {
+pub extern "C" fn archive_read_support_filter_program(
+    a: *mut Archive,
+    cmd: *const c_char,
+) -> c_int {
     archive_read_support_filter_program_signature(a, cmd, std::ptr::null(), 0)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_compression_program(a: *mut Archive, cmd: *const c_char) -> c_int {
+pub extern "C" fn archive_read_support_compression_program(
+    a: *mut Archive,
+    cmd: *const c_char,
+) -> c_int {
     archive_read_support_filter_program(a, cmd)
 }
 
@@ -380,7 +394,13 @@ pub extern "C" fn archive_read_append_filter_program_signature(
     signature: *const c_void,
     signature_len: usize,
 ) -> c_int {
-    with_program(a, cmd, signature, signature_len, read_append_filter::append_filter_program)
+    with_program(
+        a,
+        cmd,
+        signature,
+        signature_len,
+        read_append_filter::append_filter_program,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -420,67 +440,130 @@ pub extern "C" fn archive_read_support_filter_lzop(a: *mut Archive) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_open_callback(a: *mut Archive, callback: archive_open_callback) -> c_int {
-    checked!(archive_read_set_open_callback, a, READ_MAGIC, state::NEW, ARCHIVE_FATAL, |h| {
-        with_read(h, ARCHIVE_FATAL, |r| {
-            r.callbacks.opener = callback;
-            ARCHIVE_OK
-        })
-    })
+pub extern "C" fn archive_read_set_open_callback(
+    a: *mut Archive,
+    callback: archive_open_callback,
+) -> c_int {
+    checked!(
+        archive_read_set_open_callback,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| {
+            with_read(h, ARCHIVE_FATAL, |r| {
+                r.callbacks.opener = callback;
+                ARCHIVE_OK
+            })
+        }
+    )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_read_callback(a: *mut Archive, callback: archive_read_callback) -> c_int {
-    checked!(archive_read_set_read_callback, a, READ_MAGIC, state::NEW, ARCHIVE_FATAL, |h| {
-        with_read(h, ARCHIVE_FATAL, |r| {
-            r.callbacks.reader = callback;
-            ARCHIVE_OK
-        })
-    })
+pub extern "C" fn archive_read_set_read_callback(
+    a: *mut Archive,
+    callback: archive_read_callback,
+) -> c_int {
+    checked!(
+        archive_read_set_read_callback,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| {
+            with_read(h, ARCHIVE_FATAL, |r| {
+                r.callbacks.reader = callback;
+                ARCHIVE_OK
+            })
+        }
+    )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_skip_callback(a: *mut Archive, callback: archive_skip_callback) -> c_int {
-    checked!(archive_read_set_skip_callback, a, READ_MAGIC, state::NEW, ARCHIVE_FATAL, |h| {
-        with_read(h, ARCHIVE_FATAL, |r| {
-            r.callbacks.skipper = callback;
-            ARCHIVE_OK
-        })
-    })
+pub extern "C" fn archive_read_set_skip_callback(
+    a: *mut Archive,
+    callback: archive_skip_callback,
+) -> c_int {
+    checked!(
+        archive_read_set_skip_callback,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| {
+            with_read(h, ARCHIVE_FATAL, |r| {
+                r.callbacks.skipper = callback;
+                ARCHIVE_OK
+            })
+        }
+    )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_seek_callback(a: *mut Archive, callback: archive_seek_callback) -> c_int {
-    checked!(archive_read_set_seek_callback, a, READ_MAGIC, state::NEW, ARCHIVE_FATAL, |h| {
-        with_read(h, ARCHIVE_FATAL, |r| {
-            r.callbacks.seeker = callback;
-            ARCHIVE_OK
-        })
-    })
+pub extern "C" fn archive_read_set_seek_callback(
+    a: *mut Archive,
+    callback: archive_seek_callback,
+) -> c_int {
+    checked!(
+        archive_read_set_seek_callback,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| {
+            with_read(h, ARCHIVE_FATAL, |r| {
+                r.callbacks.seeker = callback;
+                ARCHIVE_OK
+            })
+        }
+    )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_close_callback(a: *mut Archive, callback: archive_close_callback) -> c_int {
-    checked!(archive_read_set_close_callback, a, READ_MAGIC, state::NEW, ARCHIVE_FATAL, |h| {
-        with_read(h, ARCHIVE_FATAL, |r| {
-            r.callbacks.closer = callback;
-            ARCHIVE_OK
-        })
-    })
+pub extern "C" fn archive_read_set_close_callback(
+    a: *mut Archive,
+    callback: archive_close_callback,
+) -> c_int {
+    checked!(
+        archive_read_set_close_callback,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| {
+            with_read(h, ARCHIVE_FATAL, |r| {
+                r.callbacks.closer = callback;
+                ARCHIVE_OK
+            })
+        }
+    )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_switch_callback(a: *mut Archive, callback: archive_switch_callback) -> c_int {
-    checked!(archive_read_set_switch_callback, a, READ_MAGIC, state::NEW, ARCHIVE_FATAL, |h| {
-        with_read(h, ARCHIVE_FATAL, |r| {
-            r.callbacks.switcher = callback;
-            ARCHIVE_OK
-        })
-    })
+pub extern "C" fn archive_read_set_switch_callback(
+    a: *mut Archive,
+    callback: archive_switch_callback,
+) -> c_int {
+    checked!(
+        archive_read_set_switch_callback,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| {
+            with_read(h, ARCHIVE_FATAL, |r| {
+                r.callbacks.switcher = callback;
+                ARCHIVE_OK
+            })
+        }
+    )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_set_callback_data(a: *mut Archive, client_data: *mut c_void) -> c_int {
+pub extern "C" fn archive_read_set_callback_data(
+    a: *mut Archive,
+    client_data: *mut c_void,
+) -> c_int {
     archive_read_set_callback_data2(a, client_data, 0)
 }
 
@@ -506,7 +589,9 @@ pub extern "C" fn archive_read_set_callback_data2(
                     *slot = client_data;
                     ARCHIVE_OK
                 }
-                None => h.base.raise(Error::fatal(libc::EINVAL, "Invalid index specified")),
+                None => h
+                    .base
+                    .raise(Error::fatal(libc::EINVAL, "Invalid index specified")),
             }
         })
     )
@@ -528,7 +613,9 @@ pub extern "C" fn archive_read_add_callback_data(
             let data = &mut r.callbacks.data;
             let index = index as usize;
             if index > data.len() {
-                return h.base.raise(Error::fatal(libc::EINVAL, "Invalid index specified"));
+                return h
+                    .base
+                    .raise(Error::fatal(libc::EINVAL, "Invalid index specified"));
             }
             if data.len() >= c_uint::MAX as usize || data.try_reserve(1).is_err() {
                 return h.base.raise(Error::fatal(libc::ENOMEM, "No memory"));
@@ -540,39 +627,54 @@ pub extern "C" fn archive_read_add_callback_data(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_append_callback_data(a: *mut Archive, client_data: *mut c_void) -> c_int {
+pub extern "C" fn archive_read_append_callback_data(
+    a: *mut Archive,
+    client_data: *mut c_void,
+) -> c_int {
     // The number of nodes, which is where the new one goes.
-    let nodes = with(a, 0, |h| {
-        with_read(h, 0, |r| r.callbacks.data.len())
-    });
-    archive_read_add_callback_data(a, client_data, c_uint::try_from(nodes).unwrap_or(c_uint::MAX))
+    let nodes = with(a, 0, |h| with_read(h, 0, |r| r.callbacks.data.len()));
+    archive_read_add_callback_data(
+        a,
+        client_data,
+        c_uint::try_from(nodes).unwrap_or(c_uint::MAX),
+    )
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_prepend_callback_data(a: *mut Archive, client_data: *mut c_void) -> c_int {
+pub extern "C" fn archive_read_prepend_callback_data(
+    a: *mut Archive,
+    client_data: *mut c_void,
+) -> c_int {
     archive_read_add_callback_data(a, client_data, 0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_open1(a: *mut Archive) -> c_int {
-    checked!(archive_read_open, a, READ_MAGIC, state::NEW, ARCHIVE_FATAL, |h| {
-        with_read(h, ARCHIVE_FATAL, |r| {
-            h.base.clear_error();
-            if r.callbacks.reader.is_none() {
-                h.base.set_error(
-                    libc::EINVAL,
-                    Some(b"No reader function provided to archive_read_open"),
-                );
-                h.base.state.set(state::FATAL);
-                return ARCHIVE_FATAL;
-            }
-            let callbacks = std::mem::take(&mut r.callbacks);
-            // SAFETY: `a` is this live handle, which owns the client; the C
-            // caller registered the callbacks to be called with it.
-            let client = unsafe { CClient::new(a, callbacks) };
-            r.open(&h.base, Box::new(client))
-        })
-    })
+    checked!(
+        archive_read_open,
+        a,
+        READ_MAGIC,
+        state::NEW,
+        ARCHIVE_FATAL,
+        |h| {
+            with_read(h, ARCHIVE_FATAL, |r| {
+                h.base.clear_error();
+                if r.callbacks.reader.is_none() {
+                    h.base.set_error(
+                        libc::EINVAL,
+                        Some(b"No reader function provided to archive_read_open"),
+                    );
+                    h.base.state.set(state::FATAL);
+                    return ARCHIVE_FATAL;
+                }
+                let callbacks = std::mem::take(&mut r.callbacks);
+                // SAFETY: `a` is this live handle, which owns the client; the C
+                // caller registered the callbacks to be called with it.
+                let client = unsafe { CClient::new(a, callbacks) };
+                r.open(&h.base, Box::new(client))
+            })
+        }
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -740,15 +842,16 @@ pub extern "C" fn archive_read_set_passphrase_callback(
         state::NEW,
         ARCHIVE_FATAL,
         |h| with_read(h, ARCHIVE_FATAL, |r| {
-            r.passphrases.set_callback(callback.map(|callback| -> PassphraseCallback {
-                Box::new(move || {
-                    // SAFETY: the caller registered the callback to be called
-                    // with this handle and data; the handle owns this
-                    // closure.
-                    let p = unsafe { callback(a, client_data) };
-                    cstr(p).map(<[u8]>::to_vec)
-                })
-            }));
+            r.passphrases
+                .set_callback(callback.map(|callback| -> PassphraseCallback {
+                    Box::new(move || {
+                        // SAFETY: the caller registered the callback to be called
+                        // with this handle and data; the handle owns this
+                        // closure.
+                        let p = unsafe { callback(a, client_data) };
+                        cstr(p).map(<[u8]>::to_vec)
+                    })
+                }));
             ARCHIVE_OK
         })
     )
@@ -805,7 +908,9 @@ pub extern "C" fn archive_read_data_block(
         ARCHIVE_FATAL,
         |h| with_read(h, ARCHIVE_FATAL, |r| {
             let block = r.read_data_block(&h.base, |data| match data {
-                Data::Block { data, offset } => (data.as_ptr().cast(), data.len(), offset, ARCHIVE_OK),
+                Data::Block { data, offset } => {
+                    (data.as_ptr().cast(), data.len(), offset, ARCHIVE_OK)
+                }
                 Data::Eof { offset } => (std::ptr::null(), 0, offset, ARCHIVE_EOF),
                 Data::Warn => (std::ptr::null(), 0, 0, ARCHIVE_WARN),
             });
@@ -868,7 +973,8 @@ pub extern "C" fn archive_seek_data(a: *mut Archive, offset: i64, whence: c_int)
         READ_MAGIC,
         state::DATA,
         i64::from(ARCHIVE_FATAL),
-        |h| with_read(h, i64::from(ARCHIVE_FATAL), |r| r.seek_data(&h.base, offset, whence))
+        |h| with_read(h, i64::from(ARCHIVE_FATAL), |r| r
+            .seek_data(&h.base, offset, whence))
     )
 }
 
@@ -880,7 +986,11 @@ pub extern "C" fn archive_read_data_into_fd(a: *mut Archive, fd: c_int) -> c_int
         READ_MAGIC,
         state::DATA,
         ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| read_data_into_fd::data_into_fd(r, &h.base, Fd(fd)))
+        |h| with_read(h, ARCHIVE_FATAL, |r| read_data_into_fd::data_into_fd(
+            r,
+            &h.base,
+            Fd(fd)
+        ))
     )
 }
 
@@ -906,7 +1016,10 @@ pub extern "C" fn archive_read_next_header2(a: *mut Archive, entry: *mut Archive
 /// Reads the next header into the handle's own entry and returns it, even
 /// when the header failed.
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_next_header(a: *mut Archive, entryp: *mut *mut ArchiveEntry) -> c_int {
+pub extern "C" fn archive_read_next_header(
+    a: *mut Archive,
+    entryp: *mut *mut ArchiveEntry,
+) -> c_int {
     put(entryp, std::ptr::null_mut());
     let r = checked!(
         archive_read_next_header,
@@ -924,7 +1037,10 @@ pub extern "C" fn archive_read_next_header(a: *mut Archive, entryp: *mut *mut Ar
         }
     );
     // The entry comes back even when the header does not.
-    put(entryp, with(a, std::ptr::null_mut(), |h| h.read_entry().cast()));
+    put(
+        entryp,
+        with(a, std::ptr::null_mut(), |h| h.read_entry().cast()),
+    );
     r
 }
 
@@ -978,7 +1094,10 @@ pub(super) mod tests {
         assert_eq!(archive_read_support_format_all(a), ARCHIVE_OK);
         assert_eq!(error(a), None);
         // Nothing is ported yet to register by code; a bad code is reported.
-        assert_eq!(archive_read_support_format_by_code(a, 0x7777_0000), ARCHIVE_FATAL);
+        assert_eq!(
+            archive_read_support_format_by_code(a, 0x7777_0000),
+            ARCHIVE_FATAL
+        );
         assert_eq!(error(a).as_deref(), Some("Invalid format code specified"));
         assert_eq!(archive_read_support_filter_by_code(a, 0), ARCHIVE_OK);
         assert_eq!(archive_read_support_filter_by_code(a, 99), ARCHIVE_FATAL);
@@ -992,10 +1111,15 @@ pub(super) mod tests {
         assert_eq!(archive_read_support_filter_all(a), ARCHIVE_FATAL);
         assert_eq!(
             error(a).as_deref(),
-            Some("INTERNAL ERROR: Function 'archive_read_support_filter_all' invoked with archive structure in state 'header', should be in state 'new'")
+            Some(
+                "INTERNAL ERROR: Function 'archive_read_support_filter_all' invoked with archive structure in state 'header', should be in state 'new'"
+            )
         );
         assert_eq!(archive_free(a), ARCHIVE_OK);
-        assert_eq!(archive_read_support_format_all(std::ptr::null_mut()), ARCHIVE_FATAL);
+        assert_eq!(
+            archive_read_support_format_all(std::ptr::null_mut()),
+            ARCHIVE_FATAL
+        );
     }
 
     use crate::read::{Data, Format, Reader, Status};
@@ -1019,7 +1143,11 @@ pub(super) mod tests {
             key: &[u8],
             _: Option<&[u8]>,
         ) -> Option<Result<Status, Err_>> {
-            Some(Ok(if key == b"flag" { Status::Ok } else { Status::Warn }))
+            Some(Ok(if key == b"flag" {
+                Status::Ok
+            } else {
+                Status::Warn
+            }))
         }
 
         fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<Status, Err_> {
@@ -1070,7 +1198,12 @@ pub(super) mod tests {
     }
 
     fn volume(data: &'static [u8]) -> *mut c_void {
-        Box::into_raw(Box::new(Volume { data, pos: 0, closed: 0 })).cast()
+        Box::into_raw(Box::new(Volume {
+            data,
+            pos: 0,
+            closed: 0,
+        }))
+        .cast()
     }
 
     fn closed(volume: *mut c_void) -> usize {
@@ -1108,8 +1241,14 @@ pub(super) mod tests {
     fn c_callbacks_read_and_close() {
         let a = archive_read_new();
         register_anything(a);
-        assert_eq!(archive_read_set_read_callback(a, Some(read_volume)), ARCHIVE_OK);
-        assert_eq!(archive_read_set_close_callback(a, Some(close_volume)), ARCHIVE_OK);
+        assert_eq!(
+            archive_read_set_read_callback(a, Some(read_volume)),
+            ARCHIVE_OK
+        );
+        assert_eq!(
+            archive_read_set_close_callback(a, Some(close_volume)),
+            ARCHIVE_OK
+        );
         let v = volume(b"hello, world");
         assert_eq!(archive_read_set_callback_data(a, v), ARCHIVE_OK);
         assert_eq!(archive_read_open1(a), ARCHIVE_OK);
@@ -1138,7 +1277,10 @@ pub(super) mod tests {
     fn a_failing_reader_makes_open_fail() {
         let a = archive_read_new();
         register_anything(a);
-        assert_eq!(archive_read_open(a, std::ptr::null_mut(), None, Some(no_data), None), ARCHIVE_FATAL);
+        assert_eq!(
+            archive_read_open(a, std::ptr::null_mut(), None, Some(no_data), None),
+            ARCHIVE_FATAL
+        );
         assert_eq!(with(a, 0, |h| h.base.state.get()), state::FATAL);
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
@@ -1147,16 +1289,28 @@ pub(super) mod tests {
     fn callback_data_nodes_are_read_in_order() {
         let a = archive_read_new();
         register_anything(a);
-        assert_eq!(archive_read_set_read_callback(a, Some(read_volume)), ARCHIVE_OK);
-        assert_eq!(archive_read_set_close_callback(a, Some(close_volume)), ARCHIVE_OK);
+        assert_eq!(
+            archive_read_set_read_callback(a, Some(read_volume)),
+            ARCHIVE_OK
+        );
+        assert_eq!(
+            archive_read_set_close_callback(a, Some(close_volume)),
+            ARCHIVE_OK
+        );
         // Out-of-range indexes are refused.
-        assert_eq!(archive_read_add_callback_data(a, volume(b""), 1), ARCHIVE_FATAL);
+        assert_eq!(
+            archive_read_add_callback_data(a, volume(b""), 1),
+            ARCHIVE_FATAL
+        );
         assert_eq!(error(a).as_deref(), Some("Invalid index specified"));
         let (first, second, third) = (volume(b"first-"), volume(b"second"), volume(b"-third"));
         assert_eq!(archive_read_set_callback_data(a, second), ARCHIVE_OK);
         assert_eq!(archive_read_prepend_callback_data(a, first), ARCHIVE_OK);
         assert_eq!(archive_read_append_callback_data(a, third), ARCHIVE_OK);
-        assert_eq!(archive_read_set_callback_data2(a, volume(b"-last"), 3), ARCHIVE_FATAL);
+        assert_eq!(
+            archive_read_set_callback_data2(a, volume(b"-last"), 3),
+            ARCHIVE_FATAL
+        );
         assert_eq!(archive_read_open1(a), ARCHIVE_OK);
         assert_eq!(drain(a), b"first-second-third");
         assert_eq!(archive_free(a), ARCHIVE_OK);
@@ -1179,7 +1333,11 @@ pub(super) mod tests {
             i64::from(archive_filter_name(a, 0).is_null()),
         ];
         REENTRANT.store(
-            i64::from(answers.iter().all(|&r| r == i64::from(ARCHIVE_FATAL) || r == 1)),
+            i64::from(
+                answers
+                    .iter()
+                    .all(|&r| r == i64::from(ARCHIVE_FATAL) || r == 1),
+            ),
             std::sync::atomic::Ordering::SeqCst,
         );
         ARCHIVE_OK
@@ -1189,9 +1347,18 @@ pub(super) mod tests {
     fn getters_called_from_callbacks_fall_back_instead_of_panicking() {
         let a = archive_read_new();
         register_anything(a);
-        assert_eq!(archive_read_set_read_callback(a, Some(read_volume)), ARCHIVE_OK);
-        assert_eq!(archive_read_set_close_callback(a, Some(close_and_ask)), ARCHIVE_OK);
-        assert_eq!(archive_read_set_callback_data(a, volume(b"data")), ARCHIVE_OK);
+        assert_eq!(
+            archive_read_set_read_callback(a, Some(read_volume)),
+            ARCHIVE_OK
+        );
+        assert_eq!(
+            archive_read_set_close_callback(a, Some(close_and_ask)),
+            ARCHIVE_OK
+        );
+        assert_eq!(
+            archive_read_set_callback_data(a, volume(b"data")),
+            ARCHIVE_OK
+        );
         assert_eq!(archive_read_open1(a), ARCHIVE_OK);
         // Outside a callback the getters work.
         assert_eq!(crate::ffi::archive::archive_filter_count(a), 1);
@@ -1203,18 +1370,29 @@ pub(super) mod tests {
     fn options_reach_formats_and_report_unknown_names() {
         let a = new_with_format();
         let opt = |m: &CStr, o: &CStr, v: Option<&CStr>| {
-            archive_read_set_option(a, m.as_ptr(), o.as_ptr(), v.map_or(std::ptr::null(), CStr::as_ptr))
+            archive_read_set_option(
+                a,
+                m.as_ptr(),
+                o.as_ptr(),
+                v.map_or(std::ptr::null(), CStr::as_ptr),
+            )
         };
         assert_eq!(opt(c"anything", c"flag", Some(c"1")), ARCHIVE_OK);
         assert_eq!(opt(c"", c"flag", None), ARCHIVE_OK);
         assert_eq!(opt(c"nomod", c"flag", None), crate::archive::ARCHIVE_FAILED);
         assert_eq!(error(a).as_deref(), Some("Unknown module name: `nomod'"));
-        assert_eq!(archive_read_set_options(a, c"anything:flag,!flag,flag=2".as_ptr()), ARCHIVE_OK);
+        assert_eq!(
+            archive_read_set_options(a, c"anything:flag,!flag,flag=2".as_ptr()),
+            ARCHIVE_OK
+        );
         assert_eq!(
             archive_read_set_options(a, c"anything:bad".as_ptr()),
             crate::archive::ARCHIVE_FAILED
         );
-        assert_eq!(error(a).as_deref(), Some("Undefined option: `anything:bad'"));
+        assert_eq!(
+            error(a).as_deref(),
+            Some("Undefined option: `anything:bad'")
+        );
         assert_eq!(archive_read_set_options(a, std::ptr::null()), ARCHIVE_OK);
         assert_eq!(
             archive_read_set_filter_option(a, c"gzip".as_ptr(), c"x".as_ptr(), std::ptr::null()),
@@ -1230,7 +1408,10 @@ pub(super) mod tests {
 
     fn opened() -> *mut Archive {
         let a = new_with_format();
-        assert_eq!(crate::ffi::read_open::archive_read_open_memory(a, b"x".as_ptr().cast(), 1), ARCHIVE_OK);
+        assert_eq!(
+            crate::ffi::read_open::archive_read_open_memory(a, b"x".as_ptr().cast(), 1),
+            ARCHIVE_OK
+        );
         a
     }
 
@@ -1251,7 +1432,10 @@ pub(super) mod tests {
             archive_read_add_passphrase(a, c"".as_ptr()),
             crate::archive::ARCHIVE_FAILED
         );
-        assert_eq!(error(a).as_deref(), Some("Empty passphrase is unacceptable"));
+        assert_eq!(
+            error(a).as_deref(),
+            Some("Empty passphrase is unacceptable")
+        );
         assert_eq!(archive_read_add_passphrase(a, c"one".as_ptr()), ARCHIVE_OK);
         assert_eq!(
             archive_read_set_passphrase_callback(a, c"two".as_ptr().cast_mut().cast(), Some(offer)),
@@ -1281,7 +1465,10 @@ pub(super) mod tests {
         let mut buf = [0u8; 8];
         let (mut p, mut n, mut off) = (std::ptr::null(), 1usize, 5i64);
         // Not in the data state yet.
-        assert_eq!(archive_read_data_block(a, &mut p, &mut n, &mut off), ARCHIVE_FATAL);
+        assert_eq!(
+            archive_read_data_block(a, &mut p, &mut n, &mut off),
+            ARCHIVE_FATAL
+        );
         assert!(error(a).is_some_and(|e| e.contains("archive_read_data_block")));
         let a = opened();
         with(a, (), |h| h.base.state.set(state::DATA));
@@ -1292,10 +1479,19 @@ pub(super) mod tests {
             crate::archive::ARCHIVE_EOF
         );
         assert_eq!((p.is_null(), n, off), (true, 0, 0));
-        assert_eq!(archive_seek_data(a, 0, 0), i64::from(crate::archive::ARCHIVE_FAILED));
-        assert_eq!(error(a).as_deref(), Some("Cannot seek data with this format"));
+        assert_eq!(
+            archive_seek_data(a, 0, 0),
+            i64::from(crate::archive::ARCHIVE_FAILED)
+        );
+        assert_eq!(
+            error(a).as_deref(),
+            Some("Cannot seek data with this format")
+        );
         // A bad whence is the format's to judge.
-        assert_eq!(archive_seek_data(a, 0, 77), i64::from(crate::archive::ARCHIVE_FAILED));
+        assert_eq!(
+            archive_seek_data(a, 0, 77),
+            i64::from(crate::archive::ARCHIVE_FAILED)
+        );
         let a = opened();
         with(a, (), |h| h.base.state.set(state::DATA));
         assert_eq!(archive_read_data_skip(a), ARCHIVE_OK);
@@ -1308,7 +1504,10 @@ pub(super) mod tests {
     fn next_header_returns_the_handles_entry() {
         let a = opened();
         let mut e: *mut ArchiveEntry = std::ptr::null_mut();
-        assert_eq!(archive_read_next_header(a, &mut e), crate::archive::ARCHIVE_EOF);
+        assert_eq!(
+            archive_read_next_header(a, &mut e),
+            crate::archive::ARCHIVE_EOF
+        );
         assert!(!e.is_null());
         assert_eq!(with(a, 0, |h| h.base.state.get()), state::EOF);
         // Wrong state now.
@@ -1318,8 +1517,14 @@ pub(super) mod tests {
 
         let a = opened();
         let own = crate::ffi::entry::archive_entry_new2(a);
-        assert_eq!(archive_read_next_header2(a, own), crate::archive::ARCHIVE_EOF);
-        assert_eq!(archive_read_next_header2(a, std::ptr::null_mut()), ARCHIVE_FATAL);
+        assert_eq!(
+            archive_read_next_header2(a, own),
+            crate::archive::ARCHIVE_EOF
+        );
+        assert_eq!(
+            archive_read_next_header2(a, std::ptr::null_mut()),
+            ARCHIVE_FATAL
+        );
         crate::ffi::entry::archive_entry_free(own);
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
@@ -1330,7 +1535,12 @@ pub(super) mod tests {
         assert_eq!(archive_read_support_format_raw(a), ARCHIVE_OK);
         let data = b"some raw bytes".repeat(10);
         assert_eq!(
-            crate::ffi::read_open::archive_read_open_memory2(a, data.as_ptr().cast(), data.len(), 7),
+            crate::ffi::read_open::archive_read_open_memory2(
+                a,
+                data.as_ptr().cast(),
+                data.len(),
+                7
+            ),
             ARCHIVE_OK
         );
         let mut e: *mut ArchiveEntry = std::ptr::null_mut();
@@ -1340,9 +1550,15 @@ pub(super) mod tests {
         assert_eq!(unsafe { CStr::from_ptr(name) }, c"data");
         assert_eq!(crate::ffi::entry::archive_entry_perm(e), 0o644);
         let mut buf = vec![0u8; 200];
-        assert_eq!(archive_read_data(a, buf.as_mut_ptr().cast(), buf.len()), data.len() as isize);
+        assert_eq!(
+            archive_read_data(a, buf.as_mut_ptr().cast(), buf.len()),
+            data.len() as isize
+        );
         assert_eq!(&buf[..data.len()], &data[..]);
-        assert_eq!(archive_read_next_header(a, &mut e), crate::archive::ARCHIVE_EOF);
+        assert_eq!(
+            archive_read_next_header(a, &mut e),
+            crate::archive::ARCHIVE_EOF
+        );
         assert_eq!(crate::ffi::archive::archive_format(a), 0x90000);
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
@@ -1352,14 +1568,24 @@ pub(super) mod tests {
         let a = archive_read_new();
         assert_eq!(archive_read_support_format_all(a), ARCHIVE_OK);
         assert_eq!(archive_read_support_format_raw(a), ARCHIVE_OK);
-        assert_eq!(crate::ffi::read_open::archive_read_open_memory(a, std::ptr::null(), 0), ARCHIVE_OK);
+        assert_eq!(
+            crate::ffi::read_open::archive_read_open_memory(a, std::ptr::null(), 0),
+            ARCHIVE_OK
+        );
         let mut e: *mut ArchiveEntry = std::ptr::null_mut();
-        assert_eq!(archive_read_next_header(a, &mut e), crate::archive::ARCHIVE_EOF);
+        assert_eq!(
+            archive_read_next_header(a, &mut e),
+            crate::archive::ARCHIVE_EOF
+        );
         assert_eq!(crate::ffi::archive::archive_format(a), 0x60000);
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 
-    unsafe extern "C" fn null_buffer(_: *mut Archive, _: *mut c_void, _: *mut *const c_void) -> isize {
+    unsafe extern "C" fn null_buffer(
+        _: *mut Archive,
+        _: *mut c_void,
+        _: *mut *const c_void,
+    ) -> isize {
         3
     }
 
@@ -1371,7 +1597,10 @@ pub(super) mod tests {
             archive_read_open(a, std::ptr::null_mut(), None, Some(null_buffer), None),
             ARCHIVE_FATAL
         );
-        assert_eq!(error(a).as_deref(), Some("Read callback returned a NULL buffer"));
+        assert_eq!(
+            error(a).as_deref(),
+            Some("Read callback returned a NULL buffer")
+        );
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 }

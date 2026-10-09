@@ -206,7 +206,8 @@ Small, incremental commits in upstream libarchive's style:
 - Body only when needed, wrapped at 72, saying why rather than what.
 - Porting commits end with `Ported-from: libarchive/<file> @ 8bb3bbd`.
 - One logical change per commit. Each commit builds, passes
-  `cargo clippy -- -D warnings`, and doesn't lower the oracle pass count.
+  `cargo clippy -- -D warnings` and `cargo fmt --check`, and doesn't lower
+  the oracle pass count.
 
 ## Upstream
 

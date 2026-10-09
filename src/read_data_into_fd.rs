@@ -220,7 +220,10 @@ pub fn data_into_fd(r: &mut Read, a: &Base, fd: Fd) -> c_int {
     if can_lseek {
         let offset = fd.lseek(0, libc::SEEK_CUR);
         if offset.map(|o| o.checked_sub(fd_offset)) != Ok(Some(out.actual_offset)) {
-            a.set_error(offset.err().unwrap_or(ARCHIVE_ERRNO_MISC), Some(b"Seek error"));
+            a.set_error(
+                offset.err().unwrap_or(ARCHIVE_ERRNO_MISC),
+                Some(b"Seek error"),
+            );
             return ARCHIVE_FATAL;
         }
     }
@@ -264,7 +267,10 @@ mod tests {
         fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
             self.next += 1;
             Ok(match self.blocks.get(self.next - 1) {
-                Some((offset, data)) => Data::Block { data, offset: *offset },
+                Some((offset, data)) => Data::Block {
+                    data,
+                    offset: *offset,
+                },
                 None => Data::Eof { offset: self.end },
             })
         }
@@ -273,10 +279,18 @@ mod tests {
     fn entry(blocks: &[(i64, &[u8])], end: i64, declared: Option<i64>) -> (Read, Base) {
         let mut r = Read::default();
         let blocks = blocks.iter().map(|(o, d)| (*o, d.to_vec())).collect();
-        let format = Blocks { blocks, end, next: 0, declared };
+        let format = Blocks {
+            blocks,
+            end,
+            next: 0,
+            declared,
+        };
         assert_eq!(r.register_format(Box::new(format)).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
-        assert_eq!(r.open(&a, Box::new(Memory::new(b"x".to_vec(), 1))), ARCHIVE_OK);
+        assert_eq!(
+            r.open(&a, Box::new(Memory::new(b"x".to_vec(), 1))),
+            ARCHIVE_OK
+        );
         // The declared size comes from the header, as it does for a caller.
         assert_eq!(r.next_header2(&a, &mut Entry::new(None)), ARCHIVE_OK);
         assert_eq!(r.entry_bytes_declared, declared);
@@ -366,7 +380,10 @@ mod tests {
     fn write_errors_are_fatal() {
         let (mut r, a) = entry(&[(0, b"ab")], 2, None);
         assert_eq!(data_into_fd(&mut r, &a, Fd(-1)), ARCHIVE_FATAL);
-        assert_eq!((error(&a), a.errno.get()), ("Write error".into(), libc::EBADF));
+        assert_eq!(
+            (error(&a), a.errno.get()),
+            ("Write error".into(), libc::EBADF)
+        );
     }
 
     #[test]

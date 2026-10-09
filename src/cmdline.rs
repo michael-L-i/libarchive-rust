@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2012 Michihiro NAKAJIMA 
+ * Copyright (c) 2012 Michihiro NAKAJIMA
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without

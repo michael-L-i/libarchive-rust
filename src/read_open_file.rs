@@ -28,8 +28,8 @@
 //! The client behind `archive_read_open_FILE`: reads an archive from a C
 //! `FILE *` the caller owns.
 
-use crate::ffi::sys::CFile;
 use crate::archive::Base;
+use crate::ffi::sys::CFile;
 use crate::read::{Client, Whence};
 use crate::read_open_fd::buffer;
 use crate::util::Error;

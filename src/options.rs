@@ -67,7 +67,11 @@ pub fn set_option(
         if vp.is_none() {
             return ARCHIVE_OK;
         }
-        return a.raise(Error::new(ARCHIVE_FAILED, ARCHIVE_ERRNO_MISC, "Empty option"));
+        return a.raise(Error::new(
+            ARCHIVE_FAILED,
+            ARCHIVE_ERRNO_MISC,
+            "Empty option",
+        ));
     };
 
     match use_option(mp, op, vp) {
@@ -220,10 +224,7 @@ mod tests {
 
     /// A handler that records its calls and answers from `answers` (OK when
     /// they run out).
-    fn recording(
-        calls: &Rc<RefCell<Vec<Call>>>,
-        answers: Vec<c_int>,
-    ) -> Box<Handler<'static>> {
+    fn recording(calls: &Rc<RefCell<Vec<Call>>>, answers: Vec<c_int>) -> Box<Handler<'static>> {
         let (calls, mut answers) = (Rc::clone(calls), answers.into_iter());
         Box::new(move |m, o, v| {
             calls.borrow_mut().push((m.map(s), s(o), v.map(s)));
@@ -247,11 +248,23 @@ mod tests {
         let mut h = recording(&calls, vec![]);
         // Nothing to do; empty strings are missing.
         assert_eq!(set_option(&a, None, None, None, &mut h), ARCHIVE_OK);
-        assert_eq!(set_option(&a, Some(b""), Some(b""), Some(b""), &mut h), ARCHIVE_OK);
+        assert_eq!(
+            set_option(&a, Some(b""), Some(b""), Some(b""), &mut h),
+            ARCHIVE_OK
+        );
         // A value without an option.
-        assert_eq!(set_option(&a, None, None, Some(b"v"), &mut h), ARCHIVE_FAILED);
-        assert_eq!((error(&a), a.errno.get()), ("Empty option".into(), ARCHIVE_ERRNO_MISC));
-        assert_eq!(set_option(&a, Some(b"tar"), Some(b"x"), Some(b"y"), &mut h), ARCHIVE_OK);
+        assert_eq!(
+            set_option(&a, None, None, Some(b"v"), &mut h),
+            ARCHIVE_FAILED
+        );
+        assert_eq!(
+            (error(&a), a.errno.get()),
+            ("Empty option".into(), ARCHIVE_ERRNO_MISC)
+        );
+        assert_eq!(
+            set_option(&a, Some(b"tar"), Some(b"x"), Some(b"y"), &mut h),
+            ARCHIVE_OK
+        );
         assert_eq!(set_option(&a, None, Some(b"x"), None, &mut h), ARCHIVE_OK);
         assert_eq!(*calls.borrow(), [call("tar", "x", "y"), call("", "x", "")]);
     }
@@ -260,14 +273,29 @@ mod tests {
     fn single_option_errors() {
         let a = Base::new(READ_MAGIC);
         let calls = Rc::default();
-        let mut h = recording(&calls, vec![UNKNOWN_MODULE, ARCHIVE_WARN, ARCHIVE_WARN, ARCHIVE_FATAL]);
-        assert_eq!(set_option(&a, Some(b"nomod"), Some(b"o"), None, &mut h), ARCHIVE_FAILED);
+        let mut h = recording(
+            &calls,
+            vec![UNKNOWN_MODULE, ARCHIVE_WARN, ARCHIVE_WARN, ARCHIVE_FATAL],
+        );
+        assert_eq!(
+            set_option(&a, Some(b"nomod"), Some(b"o"), None, &mut h),
+            ARCHIVE_FAILED
+        );
         assert_eq!(error(&a), "Unknown module name: `nomod'");
-        assert_eq!(set_option(&a, Some(b"m"), Some(b"o"), Some(b"v"), &mut h), ARCHIVE_FAILED);
+        assert_eq!(
+            set_option(&a, Some(b"m"), Some(b"o"), Some(b"v"), &mut h),
+            ARCHIVE_FAILED
+        );
         assert_eq!(error(&a), "Undefined option: `m:o=v'");
-        assert_eq!(set_option(&a, None, Some(b"o"), None, &mut h), ARCHIVE_FAILED);
+        assert_eq!(
+            set_option(&a, None, Some(b"o"), None, &mut h),
+            ARCHIVE_FAILED
+        );
         assert_eq!(error(&a), "Undefined option: `!o'");
-        assert_eq!(set_option(&a, None, Some(b"o"), Some(b"v"), &mut h), ARCHIVE_FATAL);
+        assert_eq!(
+            set_option(&a, None, Some(b"o"), Some(b"v"), &mut h),
+            ARCHIVE_FATAL
+        );
     }
 
     #[test]
@@ -301,8 +329,14 @@ mod tests {
         assert_eq!(calls.borrow().len(), 2);
         // But they count as an option that worked: "a," with a failing
         // "a" is a warning, not a failure.
-        assert_eq!(set_options(&a, b"a,", &mut recording(&calls, vec![ARCHIVE_FAILED])), ARCHIVE_WARN);
-        assert_eq!(set_options(&a, b"a", &mut recording(&calls, vec![ARCHIVE_FAILED])), ARCHIVE_FAILED);
+        assert_eq!(
+            set_options(&a, b"a,", &mut recording(&calls, vec![ARCHIVE_FAILED])),
+            ARCHIVE_WARN
+        );
+        assert_eq!(
+            set_options(&a, b"a", &mut recording(&calls, vec![ARCHIVE_FAILED])),
+            ARCHIVE_FAILED
+        );
     }
 
     #[test]
@@ -315,8 +349,14 @@ mod tests {
         };
         assert_eq!(run(vec![], b""), (ARCHIVE_OK, 0));
         // Some failed, some did not.
-        assert_eq!(run(vec![ARCHIVE_OK, ARCHIVE_FAILED], b"a,b"), (ARCHIVE_WARN, 2));
-        assert_eq!(run(vec![ARCHIVE_FAILED, ARCHIVE_FAILED], b"a,b"), (ARCHIVE_FAILED, 2));
+        assert_eq!(
+            run(vec![ARCHIVE_OK, ARCHIVE_FAILED], b"a,b"),
+            (ARCHIVE_WARN, 2)
+        );
+        assert_eq!(
+            run(vec![ARCHIVE_FAILED, ARCHIVE_FAILED], b"a,b"),
+            (ARCHIVE_FAILED, 2)
+        );
         // A failure for a named module is final.
         assert_eq!(run(vec![ARCHIVE_FAILED], b"m:a,b"), (ARCHIVE_FAILED, 1));
         assert_eq!(run(vec![ARCHIVE_FATAL], b"a,b"), (ARCHIVE_FATAL, 1));
@@ -327,7 +367,10 @@ mod tests {
         assert_eq!(error(&a), "Unknown module name: `m'");
         // The pseudo-option that makes unknown modules harmless.
         assert_eq!(
-            run(vec![UNKNOWN_MODULE, ARCHIVE_OK], b"__ignore_wrong_module_name__,m:a,b"),
+            run(
+                vec![UNKNOWN_MODULE, ARCHIVE_OK],
+                b"__ignore_wrong_module_name__,m:a,b"
+            ),
             (ARCHIVE_OK, 2)
         );
         // Only with a value.
@@ -344,12 +387,33 @@ mod tests {
         let mut unknown = |_: Option<&[u8]>, _: &[u8], _: Option<&[u8]>| UNKNOWN_MODULE;
         let mut unknown2 = |_: Option<&[u8]>, _: &[u8], _: Option<&[u8]>| UNKNOWN_MODULE;
         let mut fatal = |_: Option<&[u8]>, _: &[u8], _: Option<&[u8]>| ARCHIVE_FATAL;
-        assert_eq!(set_either_option(None, b"o", None, &mut ok, &mut warn), ARCHIVE_OK);
-        assert_eq!(set_either_option(None, b"o", None, &mut warn, &mut ok), ARCHIVE_OK);
-        assert_eq!(set_either_option(None, b"o", None, &mut unknown, &mut warn), ARCHIVE_WARN);
-        assert_eq!(set_either_option(None, b"o", None, &mut ok, &mut unknown), ARCHIVE_OK);
-        assert_eq!(set_either_option(None, b"o", None, &mut unknown, &mut unknown2), UNKNOWN_MODULE);
-        assert_eq!(set_either_option(None, b"o", None, &mut fatal, &mut ok), ARCHIVE_FATAL);
-        assert_eq!(set_either_option(None, b"o", None, &mut ok, &mut fatal), ARCHIVE_FATAL);
+        assert_eq!(
+            set_either_option(None, b"o", None, &mut ok, &mut warn),
+            ARCHIVE_OK
+        );
+        assert_eq!(
+            set_either_option(None, b"o", None, &mut warn, &mut ok),
+            ARCHIVE_OK
+        );
+        assert_eq!(
+            set_either_option(None, b"o", None, &mut unknown, &mut warn),
+            ARCHIVE_WARN
+        );
+        assert_eq!(
+            set_either_option(None, b"o", None, &mut ok, &mut unknown),
+            ARCHIVE_OK
+        );
+        assert_eq!(
+            set_either_option(None, b"o", None, &mut unknown, &mut unknown2),
+            UNKNOWN_MODULE
+        );
+        assert_eq!(
+            set_either_option(None, b"o", None, &mut fatal, &mut ok),
+            ARCHIVE_FATAL
+        );
+        assert_eq!(
+            set_either_option(None, b"o", None, &mut ok, &mut fatal),
+            ARCHIVE_FATAL
+        );
     }
 }

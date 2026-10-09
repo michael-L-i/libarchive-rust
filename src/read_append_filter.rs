@@ -102,7 +102,10 @@ mod tests {
             Some(b"Cannot append program filter using archive_read_append_filter".as_slice())
         );
         assert_eq!(append_filter(&mut r, &a, 99), ARCHIVE_FATAL);
-        assert_eq!(a.error_string().as_deref(), Some(b"Invalid filter code specified".as_slice()));
+        assert_eq!(
+            a.error_string().as_deref(),
+            Some(b"Invalid filter code specified".as_slice())
+        );
     }
 
     #[test]
@@ -110,6 +113,9 @@ mod tests {
         let (mut r, a) = (Read::default(), Base::new(READ_MAGIC));
         assert_eq!(append_filter_program(&mut r, &a, b"cat", b""), ARCHIVE_OK);
         assert_eq!(r.filter_code(0), code::PROGRAM);
-        assert_eq!(append_filter_program(&mut r, &a, b"nonexistent", b""), ARCHIVE_FATAL);
+        assert_eq!(
+            append_filter_program(&mut r, &a, b"nonexistent", b""),
+            ARCHIVE_FATAL
+        );
     }
 }

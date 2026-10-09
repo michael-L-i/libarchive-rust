@@ -25,7 +25,6 @@
 
 // Ported from libarchive/archive_read.c.
 
-
 //! The read side of `struct archive`: the filter chain with its read-ahead
 //! buffer, and the traits that format readers and decompression filters are
 //! written against.
@@ -273,7 +272,13 @@ pub trait Client {
 
     /// Seeks within node `node` and returns the new offset in the node. A
     /// negative-code error means the node cannot seek.
-    fn seek(&mut self, _a: &Base, _node: usize, _offset: i64, _whence: Whence) -> Result<i64, Error> {
+    fn seek(
+        &mut self,
+        _a: &Base,
+        _node: usize,
+        _offset: i64,
+        _whence: Whence,
+    ) -> Result<i64, Error> {
         Err(Error::recorded(ARCHIVE_FAILED))
     }
 
@@ -578,7 +583,11 @@ impl Stage {
     /// The bytes at `loc`.
     fn data(&self, loc: Loc) -> &[u8] {
         let (buf, start, len) = match loc {
-            Loc::Client => (self.imp.filter().block(), self.client_next, self.client_avail),
+            Loc::Client => (
+                self.imp.filter().block(),
+                self.client_next,
+                self.client_avail,
+            ),
             Loc::Copy => (self.buffer.as_slice(), self.next, self.avail),
         };
         let end = start.saturating_add(len);
@@ -1026,7 +1035,12 @@ impl<'a> Reader<'a> {
     /// reader, so it can be taken before `read_ahead` and used while the
     /// slice is held.
     pub fn consume_later(&self) -> ConsumeLater {
-        ConsumeLater(self.chain.last().map(|s| Rc::clone(&s.later)).unwrap_or_default())
+        ConsumeLater(
+            self.chain
+                .last()
+                .map(|s| Rc::clone(&s.later))
+                .unwrap_or_default(),
+        )
     }
 
     /// Consumes what `consume_later` promised. Runs first in every method
@@ -1367,7 +1381,12 @@ pub trait Format: Any {
 
     /// `archive_seek_data`. `whence` is the caller's, unchecked, as upstream
     /// passes it; `Whence::from_c` converts the valid ones.
-    fn seek_data(&mut self, _r: &mut Reader<'_>, _offset: i64, _whence: c_int) -> Result<i64, Error> {
+    fn seek_data(
+        &mut self,
+        _r: &mut Reader<'_>,
+        _offset: i64,
+        _whence: c_int,
+    ) -> Result<i64, Error> {
         Err(Error::new(
             ARCHIVE_FAILED,
             ARCHIVE_ERRNO_MISC,
@@ -1571,7 +1590,10 @@ impl Read {
 
         // There were no bidders; this is a serious programmer error.
         let Some(slot) = best_slot else {
-            a.raise(Error::fatal(ARCHIVE_ERRNO_FILE_FORMAT, "No formats registered"));
+            a.raise(Error::fatal(
+                ARCHIVE_ERRNO_FILE_FORMAT,
+                "No formats registered",
+            ));
             return None;
         };
         // There were bidders, but no non-zero bids; this means we can't
@@ -1782,11 +1804,12 @@ impl Read {
             return Self::fail(a, e).into();
         }
         let Some((format, mut rd)) = self.active(a) else {
-            return a.raise(Error::fatal(
-                ARCHIVE_ERRNO_PROGRAMMER,
-                "Internal error: no format",
-            ))
-            .into();
+            return a
+                .raise(Error::fatal(
+                    ARCHIVE_ERRNO_PROGRAMMER,
+                    "Internal error: no format",
+                ))
+                .into();
         };
         match format.seek_data(&mut rd, offset, whence) {
             Ok(r) => r,
@@ -2095,7 +2118,13 @@ mod tests {
             self.seekable
         }
 
-        fn seek(&mut self, _a: &Base, node: usize, offset: i64, whence: Whence) -> Result<i64, Error> {
+        fn seek(
+            &mut self,
+            _a: &Base,
+            node: usize,
+            offset: i64,
+            whence: Whence,
+        ) -> Result<i64, Error> {
             let len = self.nodes[node].len() as i64;
             let to = match whence {
                 Whence::Set => offset,
@@ -2208,7 +2237,10 @@ mod tests {
         let (mut r, a) = setup(mem);
         let mut rd = r.reader(&a);
         for want in [1, 10, 11, 100, 101, 700, 1000] {
-            assert_eq!(rd.peek_available(want).unwrap().get(..want), Some(&data[..want]));
+            assert_eq!(
+                rd.peek_available(want).unwrap().get(..want),
+                Some(&data[..want])
+            );
         }
         // Data stays contiguous when the buffer has to move it forward.
         rd.consume(995).unwrap();
@@ -2326,7 +2358,11 @@ mod tests {
         rd.consume(1000).unwrap();
         assert_eq!(rd.position(), 201_100);
         assert_eq!(
-            log.borrow().events.iter().filter(|e| e.starts_with("seek")).count(),
+            log.borrow()
+                .events
+                .iter()
+                .filter(|e| e.starts_with("seek"))
+                .count(),
             1
         );
     }
@@ -2342,7 +2378,10 @@ mod tests {
         assert_eq!(rd.peek_available(20).unwrap(), &data[..20]);
         rd.consume(5).unwrap();
         assert_eq!(rd.seek(50, Whence::Set).unwrap(), 50);
-        assert_eq!((rd.position(), rd.peek_available(1).unwrap()), (50, &data[50..58]));
+        assert_eq!(
+            (rd.position(), rd.peek_available(1).unwrap()),
+            (50, &data[50..58])
+        );
         assert_eq!(rd.seek(-10, Whence::Cur).unwrap(), 40);
         assert_eq!(rd.peek_available(1).unwrap(), &data[40..48]);
         assert_eq!(rd.seek(-4, Whence::End).unwrap(), 96);
@@ -2388,14 +2427,20 @@ mod tests {
         rd.consume(8).unwrap();
         let e = rd.peek_available(1).unwrap_err();
         assert!(e.recorded && e.code == ARCHIVE_FATAL);
-        assert_eq!((error(&a), a.errno.get()), ("Error reading test input".into(), libc::EIO));
+        assert_eq!(
+            (error(&a), a.errno.get()),
+            ("Error reading test input".into(), libc::EIO)
+        );
         a.clear_error();
         // Once a stream has failed, so does everything after it.
         assert_eq!(rd.peek_available(1).unwrap_err().code, ARCHIVE_FATAL);
         assert_eq!(rd.skip(1).unwrap_err().code, ARCHIVE_FATAL);
         // A consume on a failed stream says it was truncated.
         assert!(rd.consume(1).is_err());
-        assert_eq!(error(&a), "Truncated input file (needed 1 bytes, only 0 available)");
+        assert_eq!(
+            error(&a),
+            "Truncated input file (needed 1 bytes, only 0 available)"
+        );
     }
 
     #[test]
@@ -2409,7 +2454,12 @@ mod tests {
         }))));
         assert_eq!(r.filter_count(), 2);
         assert_eq!(
-            (r.filter_code(0), r.filter_name(0), r.filter_code(1), r.filter_code(-1)),
+            (
+                r.filter_code(0),
+                r.filter_name(0),
+                r.filter_code(1),
+                r.filter_code(-1)
+            ),
             (99, Some(c"upper"), 0, 0)
         );
         assert_eq!(r.filter_name(2), None);
@@ -2475,7 +2525,10 @@ mod tests {
     fn handle_lifecycle() {
         let h = new();
         assert_eq!((h.base.magic, h.base.state.get()), (READ_MAGIC, state::NEW));
-        assert_eq!((h.filter_count(), h.filter_code(0), h.filter_bytes(-1)), (0, -1, -1));
+        assert_eq!(
+            (h.filter_count(), h.filter_code(0), h.filter_bytes(-1)),
+            (0, -1, -1)
+        );
         h.base.set_error(5, Some(b"stale"));
         assert_eq!(h.close(), ARCHIVE_OK);
         assert_eq!((h.base.state.get(), h.base.errno.get()), (state::CLOSED, 0));
@@ -2502,7 +2555,10 @@ mod tests {
         assert!(rd.consume(1).is_err());
         assert_eq!(rd.seek(0, Whence::Set).unwrap_err().code, ARCHIVE_FATAL);
         assert_eq!((rd.position(), rd.can_seek()), (0, false));
-        assert_eq!((r.filter_count(), r.filter_bytes(-1), r.filter_name(0)), (0, -1, None));
+        assert_eq!(
+            (r.filter_count(), r.filter_bytes(-1), r.filter_name(0)),
+            (0, -1, None)
+        );
     }
 
     #[test]
@@ -2528,8 +2584,16 @@ mod tests {
         }
         let closed = Rc::new(Cell_::new(Vec::new()));
         let mut r = Read::default();
-        let e = r.open_client(&Base::new(READ_MAGIC), Box::new(Failing(Rc::clone(&closed)))).unwrap_err();
-        assert_eq!((e.code, e.errno, e.msg.as_slice()), (ARCHIVE_FATAL, libc::ENOENT, b"nope".as_slice()));
+        let e = r
+            .open_client(
+                &Base::new(READ_MAGIC),
+                Box::new(Failing(Rc::clone(&closed))),
+            )
+            .unwrap_err();
+        assert_eq!(
+            (e.code, e.errno, e.msg.as_slice()),
+            (ARCHIVE_FATAL, libc::ENOENT, b"nope".as_slice())
+        );
         assert_eq!(*closed.borrow(), ["close 0", "close 1"]);
         assert_eq!(r.filter_count(), 0);
     }
@@ -2583,7 +2647,10 @@ mod tests {
 
     impl FilterBidder for UpperBidder {
         fn bid(&mut self, up: &mut Reader<'_>) -> Result<c_int, Error> {
-            let lowercase = up.peek_available(1)?.first().is_some_and(u8::is_ascii_lowercase);
+            let lowercase = up
+                .peek_available(1)?
+                .first()
+                .is_some_and(u8::is_ascii_lowercase);
             Ok(if lowercase { self.0 } else { 0 })
         }
 
@@ -2623,7 +2690,10 @@ mod tests {
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_FATAL);
         assert_eq!(error(&a), "No formats registered");
-        assert_eq!((a.errno.get(), a.state.get()), (ARCHIVE_ERRNO_FILE_FORMAT, state::FATAL));
+        assert_eq!(
+            (a.errno.get(), a.state.get()),
+            (ARCHIVE_ERRNO_FILE_FORMAT, state::FATAL)
+        );
 
         let mut r = Read::default();
         assert_eq!(r.register_format(fake::<0>(0, &log)).unwrap(), Status::Ok);
@@ -2637,7 +2707,10 @@ mod tests {
     fn a_fatal_bid_aborts_the_open() {
         let log = Rc::default();
         let mut r = Read::default();
-        assert_eq!(r.register_format(fake::<0>(ARCHIVE_FATAL, &log)).unwrap(), Status::Ok);
+        assert_eq!(
+            r.register_format(fake::<0>(ARCHIVE_FATAL, &log)).unwrap(),
+            Status::Ok
+        );
         assert_eq!(r.register_format(fake::<1>(9, &log)).unwrap(), Status::Ok);
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"data"), ARCHIVE_FATAL);
@@ -2675,7 +2748,10 @@ mod tests {
         assert_eq!(r.register_format(fake::<0>(1, &log)).unwrap(), Status::Warn);
         assert_eq!(r.formats.len(), 1);
         for _ in 0..16 {
-            assert_eq!(r.register_bidder(Box::new(UpperBidder(1))).unwrap(), Status::Ok);
+            assert_eq!(
+                r.register_bidder(Box::new(UpperBidder(1))).unwrap(),
+                Status::Ok
+            );
         }
         let e = r.register_bidder(Box::new(UpperBidder(1))).unwrap_err();
         assert_eq!((e.code, e.errno), (ARCHIVE_FATAL, libc::ENOMEM));
@@ -2685,9 +2761,18 @@ mod tests {
     #[test]
     fn the_best_bidding_filter_is_stacked_until_nobody_bids() {
         let mut r = Read::default();
-        assert_eq!(r.register_bidder(Box::new(UpperBidder(1))).unwrap(), Status::Ok);
-        assert_eq!(r.register_bidder(Box::new(UpperBidder(3))).unwrap(), Status::Ok);
-        assert_eq!(r.register_format(fake::<0>(1, &Rc::default())).unwrap(), Status::Ok);
+        assert_eq!(
+            r.register_bidder(Box::new(UpperBidder(1))).unwrap(),
+            Status::Ok
+        );
+        assert_eq!(
+            r.register_bidder(Box::new(UpperBidder(3))).unwrap(),
+            Status::Ok
+        );
+        assert_eq!(
+            r.register_format(fake::<0>(1, &Rc::default())).unwrap(),
+            Status::Ok
+        );
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"abc"), ARCHIVE_OK);
         // One filter: after upper-casing nobody bids.
@@ -2703,12 +2788,18 @@ mod tests {
                 Ok(1)
             }
             fn init(&mut self, _: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error> {
-                Ok(Box::new(Upper { out: Vec::new(), closed: Rc::default() }))
+                Ok(Box::new(Upper {
+                    out: Vec::new(),
+                    closed: Rc::default(),
+                }))
             }
         }
         let mut r = Read::default();
         assert_eq!(r.register_bidder(Box::new(Always)).unwrap(), Status::Ok);
-        assert_eq!(r.register_format(fake::<0>(1, &Rc::default())).unwrap(), Status::Ok);
+        assert_eq!(
+            r.register_format(fake::<0>(1, &Rc::default())).unwrap(),
+            Status::Ok
+        );
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"abc"), ARCHIVE_FATAL);
         assert_eq!(error(&a), "Input requires too many filters for decoding");
@@ -2717,12 +2808,21 @@ mod tests {
     #[test]
     fn appended_filters_skip_bidding_and_sit_on_the_client() {
         let mut r = Read::default();
-        assert_eq!(r.register_bidder(Box::new(UpperBidder(1))).unwrap(), Status::Ok);
+        assert_eq!(
+            r.register_bidder(Box::new(UpperBidder(1))).unwrap(),
+            Status::Ok
+        );
         let a = Base::new(READ_MAGIC);
         assert_eq!(r.append_last_bidder(&a), ARCHIVE_OK);
-        assert_eq!(r.register_format(fake::<0>(1, &Rc::default())).unwrap(), Status::Ok);
+        assert_eq!(
+            r.register_format(fake::<0>(1, &Rc::default())).unwrap(),
+            Status::Ok
+        );
         assert_eq!(open_with(&mut r, &a, b"xyz"), ARCHIVE_OK);
-        assert_eq!((r.filter_count(), r.filter_code(0), r.filter_code(1)), (2, 99, 0));
+        assert_eq!(
+            (r.filter_count(), r.filter_code(0), r.filter_code(1)),
+            (2, 99, 0)
+        );
         assert_eq!(r.reader(&a).peek_available(3).unwrap(), b"XYZ");
         // Appending with no bidder is a programmer error.
         let mut none = Read::default();
@@ -2795,7 +2895,10 @@ mod tests {
             let block = self.blocks.get(self.next);
             self.next += 1;
             Ok(match block {
-                Some((offset, data)) => Data::Block { data, offset: *offset },
+                Some((offset, data)) => Data::Block {
+                    data,
+                    offset: *offset,
+                },
                 None => Data::Eof { offset: self.end },
             })
         }
@@ -2847,7 +2950,10 @@ mod tests {
             Data::Eof { .. } | Data::Warn => None,
         });
         assert_eq!(first, Ok(Some((b"hi".to_vec(), 7))));
-        assert!(matches!(r.read_data_block(&a, |d| matches!(d, Data::Eof { offset: 9 })), Ok(true)));
+        assert!(matches!(
+            r.read_data_block(&a, |d| matches!(d, Data::Eof { offset: 9 })),
+            Ok(true)
+        ));
     }
 
     #[test]
@@ -2863,7 +2969,10 @@ mod tests {
     #[test]
     fn seek_data_is_refused_by_default() {
         let (mut r, a) = opened(Script::new(&[], 0));
-        assert_eq!(r.seek_data(&a, 0, libc::SEEK_SET), i64::from(ARCHIVE_FAILED));
+        assert_eq!(
+            r.seek_data(&a, 0, libc::SEEK_SET),
+            i64::from(ARCHIVE_FAILED)
+        );
         assert_eq!(error(&a), "Cannot seek data with this format");
         assert_eq!(a.errno.get(), ARCHIVE_ERRNO_MISC);
     }
@@ -2928,10 +3037,16 @@ mod tests {
         }
         let mut r = Read::default();
         assert_eq!(r.register_bidder(Box::new(Failing)).unwrap(), Status::Ok);
-        assert_eq!(r.register_format(fake::<0>(1, &Rc::default())).unwrap(), Status::Ok);
+        assert_eq!(
+            r.register_format(fake::<0>(1, &Rc::default())).unwrap(),
+            Status::Ok
+        );
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"abc"), ARCHIVE_FATAL);
-        assert_eq!((error(&a), a.state.get()), ("bidder failed".into(), state::FATAL));
+        assert_eq!(
+            (error(&a), a.state.get()),
+            ("bidder failed".into(), state::FATAL)
+        );
     }
 
     /// A format whose data ends in a warning.
@@ -2966,7 +3081,10 @@ mod tests {
     #[test]
     fn warnings_continue_and_are_not_errors() {
         let mut r = Read::default();
-        assert_eq!(r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap(), Status::Ok);
+        assert_eq!(
+            r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap(),
+            Status::Ok
+        );
         let a = Base::new(READ_MAGIC);
         assert_eq!(open_with(&mut r, &a, b"x"), ARCHIVE_OK);
         let mut e = Entry::new(None);
@@ -2981,7 +3099,10 @@ mod tests {
         // A skip stops at a warning and reports it, but the handle is fine.
         let (mut r, a) = {
             let mut r = Read::default();
-            assert_eq!(r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap(), Status::Ok);
+            assert_eq!(
+                r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap(),
+                Status::Ok
+            );
             let a = Base::new(READ_MAGIC);
             open_with(&mut r, &a, b"x");
             (r, a)
@@ -2992,7 +3113,10 @@ mod tests {
         // read_data hands the status on, as upstream's archive_read_data does.
         let (mut r, a) = {
             let mut r = Read::default();
-            assert_eq!(r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap(), Status::Ok);
+            assert_eq!(
+                r.register_format(Box::new(WarnsAtTheEnd(false))).unwrap(),
+                Status::Ok
+            );
             let a = Base::new(READ_MAGIC);
             open_with(&mut r, &a, b"x");
             (r, a)
@@ -3019,8 +3143,14 @@ mod tests {
 
     /// An `ar` member: name, mtime, mode and data, padded to even length.
     fn ar_member(name: &str, mtime: u64, data: &[u8]) -> Vec<u8> {
-        let mut m = format!("{name:<16}{mtime:<12}{:<6}{:<6}{:<8}{:<10}`\n", 0, 0, "100644", data.len())
-            .into_bytes();
+        let mut m = format!(
+            "{name:<16}{mtime:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            0,
+            0,
+            "100644",
+            data.len()
+        )
+        .into_bytes();
         m.extend_from_slice(data);
         if data.len() % 2 == 1 {
             m.push(b'\n');
@@ -3038,7 +3168,11 @@ mod tests {
 
     fn ar_open(bytes: &[u8], read_size: usize) -> (Read, Base) {
         let mut r = Read::default();
-        assert_eq!(r.register_format(Box::new(ar_example::Ar::default())).unwrap(), Status::Ok);
+        assert_eq!(
+            r.register_format(Box::new(ar_example::Ar::default()))
+                .unwrap(),
+            Status::Ok
+        );
         let a = Base::new(READ_MAGIC);
         let mem = crate::read_open_memory::Memory::new(bytes.to_vec(), read_size);
         assert_eq!(r.open(&a, Box::new(mem)), ARCHIVE_OK);
@@ -3074,7 +3208,10 @@ mod tests {
             let mut e = Entry::new(None);
             assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_OK);
             assert_eq!((e.size(), a.format.get()), (5, 0x70000));
-            assert_eq!(e.pathname().map(|p| p.to_bytes().to_vec()), Some(b"hello.txt".to_vec()));
+            assert_eq!(
+                e.pathname().map(|p| p.to_bytes().to_vec()),
+                Some(b"hello.txt".to_vec())
+            );
             assert_eq!(e.mtime(), 1000);
             assert_eq!(ar_data(&mut r, &a), b"hello");
             // The padding byte and unread data are skipped.
@@ -3111,7 +3248,10 @@ mod tests {
         let nameless = ar_archive(&[ar_member("", 1, b"data")]);
         let (mut r, a) = ar_open(&nameless, 16);
         assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_WARN);
-        assert_eq!((a.state.get(), error(&a)), (state::DATA, "ar member without a name".into()));
+        assert_eq!(
+            (a.state.get(), error(&a)),
+            (state::DATA, "ar member without a name".into())
+        );
         assert_eq!(ar_data(&mut r, &a), b"data");
     }
 
@@ -3133,7 +3273,10 @@ mod tests {
     fn raw_reads_many_blocks_and_consumes_each_on_the_next_call() {
         let data = text(1000);
         let mut r = Read::default();
-        assert_eq!(crate::read::format::raw::support(&mut r).unwrap(), Status::Ok);
+        assert_eq!(
+            crate::read::format::raw::support(&mut r).unwrap(),
+            Status::Ok
+        );
         let a = Base::new(READ_MAGIC);
         let (mem, _) = Mem::new(&data, 7);
         assert_eq!(r.open(&a, Box::new(mem)), ARCHIVE_OK);
@@ -3158,7 +3301,10 @@ mod tests {
         // So did the one that skips, for a reader that stopped early.
         let (mem, _) = Mem::new(&data, 7);
         let mut r2 = Read::default();
-        assert_eq!(crate::read::format::raw::support(&mut r2).unwrap(), Status::Ok);
+        assert_eq!(
+            crate::read::format::raw::support(&mut r2).unwrap(),
+            Status::Ok
+        );
         assert_eq!(r2.open(&a, Box::new(mem)), ARCHIVE_OK);
         assert_eq!(r2.next_header2(&a, &mut e), ARCHIVE_OK);
         assert!(r2.read_data_block(&a, |_| ()).is_ok());
@@ -3208,15 +3354,27 @@ mod tests {
         let truncated = "Truncated input file (needed 100 bytes, only 5 available)";
         // The next read_data.
         let (mut r, a, _) = over();
-        assert_eq!(r.read_data_block(&a, |d| matches!(d, Data::Block { data, .. } if data == b"1234")), Ok(true));
+        assert_eq!(
+            r.read_data_block(
+                &a,
+                |d| matches!(d, Data::Block { data, .. } if data == b"1234")
+            ),
+            Ok(true)
+        );
         assert_eq!(r.read_data_block(&a, |_| ()), Err(ARCHIVE_FATAL));
-        assert_eq!((a.state.get(), error(&a)), (state::FATAL, truncated.to_string()));
+        assert_eq!(
+            (a.state.get(), error(&a)),
+            (state::FATAL, truncated.to_string())
+        );
 
         // The skip that the next header does.
         let (mut r, a, mut e) = over();
         assert!(r.read_data_block(&a, |_| ()).is_ok());
         assert_eq!(r.next_header2(&a, &mut e), ARCHIVE_FATAL);
-        assert_eq!((a.state.get(), error(&a)), (state::FATAL, truncated.to_string()));
+        assert_eq!(
+            (a.state.get(), error(&a)),
+            (state::FATAL, truncated.to_string())
+        );
 
         // An explicit read_data_skip.
         let (mut r, a, _) = over();
@@ -3228,7 +3386,10 @@ mod tests {
         let (mut r, a, _) = over();
         assert!(r.read_data_block(&a, |_| ()).is_ok());
         let mut rd = r.reader(&a);
-        assert_eq!(rd.read_ahead(1).unwrap_err(), Error::recorded(ARCHIVE_FATAL));
+        assert_eq!(
+            rd.read_ahead(1).unwrap_err(),
+            Error::recorded(ARCHIVE_FATAL)
+        );
         assert_eq!(error(&a), truncated);
     }
 

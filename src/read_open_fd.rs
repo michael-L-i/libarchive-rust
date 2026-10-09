@@ -29,8 +29,8 @@
 //! descriptor the caller owns.
 
 use crate::archive::ARCHIVE_FAILED;
-use crate::ffi::sys::Fd;
 use crate::archive::Base;
+use crate::ffi::sys::Fd;
 use crate::read::{Client, Whence};
 use crate::util::Error;
 
@@ -208,8 +208,14 @@ mod tests {
         c.read(&base(), 0).unwrap();
         assert!(c.block().is_empty());
         let e = c.seek(&base(), 0, -1, Whence::Set).unwrap_err();
-        assert_eq!((e.code, e.errno), (crate::archive::ARCHIVE_FATAL, libc::EINVAL));
-        assert_eq!(e.msg, format!("Error seeking in a file descriptor({})", f.as_raw_fd()).into_bytes());
+        assert_eq!(
+            (e.code, e.errno),
+            (crate::archive::ARCHIVE_FATAL, libc::EINVAL)
+        );
+        assert_eq!(
+            e.msg,
+            format!("Error seeking in a file descriptor({})", f.as_raw_fd()).into_bytes()
+        );
     }
 
     #[test]
@@ -217,7 +223,10 @@ mod tests {
         let Err(e) = ReadFd::new(Fd(-1), 8) else {
             panic!("fd -1 opened");
         };
-        assert_eq!((e.errno, e.msg.as_slice()), (libc::EBADF, b"Can't stat fd -1".as_slice()));
+        assert_eq!(
+            (e.errno, e.msg.as_slice()),
+            (libc::EBADF, b"Can't stat fd -1".as_slice())
+        );
     }
 
     #[test]
@@ -232,7 +241,10 @@ mod tests {
         assert_eq!(c.skip(&base(), 0, 100).unwrap(), 0);
         let e = c.seek(&base(), 0, 0, Whence::Set).unwrap_err();
         assert_eq!((e.code, e.errno), (ARCHIVE_FAILED, libc::ESPIPE));
-        assert_eq!(e.msg, format!("A file descriptor({}) is not seekable(PIPE)", r.0).into_bytes());
+        assert_eq!(
+            e.msg,
+            format!("A file descriptor({}) is not seekable(PIPE)", r.0).into_bytes()
+        );
     }
 
     #[test]
@@ -242,6 +254,9 @@ mod tests {
         let (mut c, _) = ReadFd::new(fd, 4).unwrap();
         c.fd = Fd(-1);
         let e = c.read(&base(), 0).unwrap_err();
-        assert_eq!((e.errno, e.msg.as_slice()), (libc::EBADF, b"Error reading fd -1".as_slice()));
+        assert_eq!(
+            (e.errno, e.msg.as_slice()),
+            (libc::EBADF, b"Error reading fd -1".as_slice())
+        );
     }
 }

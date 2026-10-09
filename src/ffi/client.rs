@@ -101,7 +101,10 @@ impl Client for CClient {
         match usize::try_from(n) {
             Ok(n) if n > 0 && buff.is_null() => {
                 self.block = (std::ptr::null(), 0);
-                Err(Error::fatal(libc::EINVAL, "Read callback returned a NULL buffer"))
+                Err(Error::fatal(
+                    libc::EINVAL,
+                    "Read callback returned a NULL buffer",
+                ))
             }
             Ok(n) => {
                 self.block = (buff.cast(), n);
