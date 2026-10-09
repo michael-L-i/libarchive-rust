@@ -34,6 +34,7 @@ use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 pub(super) fn with_read<T>(h: &Handle, fallback: T, f: impl FnOnce(&mut Read) -> T) -> T {
     match &h.kind {
         Kind::Read(r) => r.try_borrow_mut().map_or(fallback, |mut r| f(&mut r)),
+        _ => fallback,
     }
 }
 
@@ -888,6 +889,7 @@ pub extern "C" fn archive_read_header_position(a: *mut Archive) -> i64 {
 pub extern "C" fn archive_read_format_capabilities(a: *mut Archive) -> c_int {
     with(a, 0, |h| match &h.kind {
         Kind::Read(r) => r.try_borrow().map_or(0, |r| r.format_capabilities()),
+        _ => 0,
     })
 }
 
@@ -897,6 +899,7 @@ pub extern "C" fn archive_read_has_encrypted_entries(a: *mut Archive) -> c_int {
         Kind::Read(r) => r
             .try_borrow()
             .map_or(read::ENCRYPTION_UNSUPPORTED, |r| r.has_encrypted_entries()),
+        _ => read::ENCRYPTION_UNSUPPORTED,
     })
 }
 
