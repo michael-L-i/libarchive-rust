@@ -18,6 +18,7 @@ cat/test_help
 cat/test_stdin
 cat/test_version
 cpio/test_0
+cpio/test_basic
 cpio/test_cmdline
 cpio/test_extract_cpio_Z
 cpio/test_extract_cpio_absolute_paths
@@ -35,7 +36,9 @@ cpio/test_option_0
 cpio/test_option_B_upper
 cpio/test_option_C_upper
 cpio/test_option_J_upper
+cpio/test_option_L_upper
 cpio/test_option_Z_upper
+cpio/test_option_a
 cpio/test_option_b64encode
 cpio/test_option_c
 cpio/test_option_d
@@ -55,6 +58,8 @@ cpio/test_option_y
 cpio/test_option_z
 cpio/test_option_zstd
 cpio/test_owner_parse
+cpio/test_passthrough_dotdot
+cpio/test_passthrough_reverse
 tar/test_0
 tar/test_basic
 tar/test_copy
@@ -88,6 +93,8 @@ tar/test_option_b64encode
 tar/test_option_exclude
 tar/test_option_exclude_vcs
 tar/test_option_fflags
+tar/test_option_gid_gname
+tar/test_option_group
 tar/test_option_ignore_zeros_mode_c
 tar/test_option_ignore_zeros_mode_r
 tar/test_option_ignore_zeros_mode_t
@@ -98,17 +105,20 @@ tar/test_option_k
 tar/test_option_keep_newer_files
 tar/test_option_lz4
 tar/test_option_lzma
+tar/test_option_mode
 tar/test_option_mtime
 tar/test_option_n
 tar/test_option_newer_than
 tar/test_option_nodump
 tar/test_option_older_than
+tar/test_option_owner
 tar/test_option_passphrase
 tar/test_option_q
 tar/test_option_r
 tar/test_option_s
 tar/test_option_safe_writes
 tar/test_option_stdout_size_exceeds_declared
+tar/test_option_uid_uname
 tar/test_option_uuencode
 tar/test_option_xattrs
 tar/test_option_xz
@@ -271,6 +281,7 @@ test_gnutar_filename_encoding_UTF32_substitute
 test_gnutar_filename_encoding_UTF8_CP866
 test_gnutar_filename_encoding_long_gname_utf16
 test_link_resolver
+test_open_failure
 test_open_fd
 test_open_file
 test_open_filename
