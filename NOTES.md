@@ -814,8 +814,9 @@ one; see the first entry.
 - `Ppmd7::alloc` and `Ppmd8::alloc` take the size as `u32` like upstream and
   fail the same way (`false`) if it is below `UNIT_SIZE` (PPMd7 only) or the
   memory is not available.
-- Only the decoding side is ported: `Ppmd7z_RangeEnc_*` and
-  `Ppmd7_EncodeSymbol` wait for the 7zip writer.
+- PPMd7 includes `Ppmd7z_RangeEnc_*` and `Ppmd7_EncodeSymbol` for the
+  7zip writer. Encoding shares the checked arena and model update paths
+  with decoding. PPMd8 encoding is not used by upstream writers.
 
 ## cab reader (src/read/format/cab.rs)
 
@@ -1694,6 +1695,47 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   contents are read through Rust's file API, with CR/LF or NUL separation;
   no compression or charset conversion is applied to file contents.
 
+## Write compression filters
+
+- gzip (miniz_oxide), bzip2 (crabz2), XZ/LZMA/lzip (lzma-rust2), LZ4
+  (lz4_flex), and Zstandard (ruzstd) use safe Rust encoders. Their output
+  decompresses to the same archive bytes but compressed bytes, ratios and
+  timing differ from the upstream C libraries. Encoder features on existing
+  dependencies are enabled; no C codec dependency is added.
+- Lzip uses upstream's dictionary and nice-length preset table. The safe
+  backend has HC4 rather than HC3 for levels 0 and 1; their compressed
+  bytes and relative compression ratios can differ on some inputs.
+- XZ and Zstandard accept and validate `threads` but encode on one worker.
+  XZ uses a single-thread stream header/index. LZ4 high compression levels
+  use the safe block encoder, and linked blocks can be independently coded;
+  these are valid linked streams but compression ratios differ.
+- ruzstd has only its fastest compression strategy; this adapter provides a
+  bounded native matcher whose block search size increases with the level.
+  Its maximum search window is 128 KiB, including with the `long` option.
+  A bounded encoder thread allows a synchronous backend to stream to the
+  caller's callbacks without buffering the archive. Frame sizes and
+  frame-per-file flushing are honored at encoder block boundaries; an
+  output frame limit can be exceeded by the bounded encoder pipeline and trailer.
+- grzip, lrzip and lzop use upstream's external-program fallback. Missing
+  programs fail when the archive is opened. Explicit program filters parse
+  argv using the existing command parser and never invoke a shell. Pipes
+  are nonblocking and both directions are drained to avoid deadlocks;
+  dropping a filter kills and reaps its child.
+- Unix compress, uuencode and base64 encoding are native ports. Base64
+  reports the UU filter code, as upstream does; it has its own filter name.
+
+## XAR writing and attribute streaming
+
+- XAR data and attributes are spooled in private, immediately unlinked files;
+  the compressed XML table is emitted at close. SHA-1, MD5, SHA-256 and SHA-512
+  checksums and none/zlib/bzip2/LZMA/XZ data encodings are supported. Safe codec
+  output is valid but need not match the C encoders byte for byte.
+- Upstream checks an attribute's entire decompressed size after one decoder
+  call, so small input blocks can fail even for a valid archive. The Rust
+  reader collects incremental attribute output, checks both sizes and sums,
+  and bounds each owned attribute at 64 MiB before allocating. This permits
+  writer round trips through small callback blocks without uncontrolled
+  allocation from the XML size field.
 ## Disk traversal and extraction (`src/read_disk.rs`, `src/write_disk.rs`)
 
 - Disk writes keep each parent directory open and create/open/link children
@@ -1711,6 +1753,13 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   callbacks are recorded without reborrowing the active disk state.
 - Platform calls and client callbacks live only in `src/ffi/disk*.rs`.
   Extended attribute lists are bounded to 1 MiB and individual values to
+
+- Bare `HHMM` date tokens set hour/minute fields without incrementing
+  upstream's `HaveTime`: alone they resolve to midnight; with a date they
+  supply its time, and a following explicit time can override them.
+- ZIP LZMA properties use the safe encoder's actual preset dictionary size.
+  Encryption covers the ZIP-LZMA prefix as well as compressed bytes, including
+  the AES authentication checksum.
   16 MiB before allocating. Darwin ACLs are translated through native ACL
   APIs. Mac metadata uses native `fcopyfile` packing/unpacking; AppleDouble
   entries are merged into their sibling using the same anchored directory.
@@ -1725,3 +1774,20 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   skip holes, while ordinary reads preserve zero bytes. Sparse maps are
   bounded to one million extents. Remote filesystem detection uses native
   `statfs`; synthetic status is unknown (-1) on macOS, as upstream's build.
+## Archive writers
+
+- Writer lifecycle, callback/file/fd/FILE/memory outputs, format/filter options,
+  selectors and passphrase callbacks are implemented at the public ABI boundary.
+  Caller-owned fds and FILE streams remain open. Callback close return values
+  are ignored, matching upstream; failed client opens release their free callback.
+- Tar variants stream data and preserve pax sparse maps, ACLs, flags, extended
+  attributes and AppleDouble metadata. GNU long names, charset conversion and
+  pax binary fallbacks follow upstream. Pax alignment is bounded to 1 MiB.
+- ar and cpio variants, raw, shar, mtree and WARC writers are native safe ports.
+  Mtree hashes are computed incrementally, including replacement of preset
+  entry digests when data is supplied. Its paths are capped at 1 MiB and its
+  directory hierarchy at 1000 levels rather than using unbounded recursion.
+- ZIP streams stored and compressed entries, ZIP64 records, traditional
+  encryption and WinZip AES. Compression uses the safe filter backends described
+  above; compressed bytes can differ from upstream. Passphrase copies are
+  cleared on writer destruction.

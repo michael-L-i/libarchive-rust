@@ -244,6 +244,7 @@ struct Date {
     month: Option<i64>,
     day: Option<i64>,
     time: Option<(i64, i64, i64)>,
+    time_count: u8,
     zone: Option<(i64, bool)>,
     weekday: Option<(i64, i64)>,
     rel_sec: i64,
@@ -308,6 +309,7 @@ pub(crate) fn parse(now: i64, input: &[u8]) -> Option<i64> {
         month: None,
         day: None,
         time: None,
+        time_count: 0,
         zone: None,
         weekday: None,
         rel_sec: 0,
@@ -334,7 +336,8 @@ pub(crate) fn parse(now: i64, input: &[u8]) -> Option<i64> {
                 }
                 n += 1;
             }
-            set(&mut d.time, time)?;
+            d.time_count += 1;
+            d.time = Some(time);
             if matches!(t[n].0, 43 | 45) && t[n + 1].0 == NUMBER {
                 let zone = (t[n + 1].1 / 100 * 3600 + t[n + 1].1 % 100 * 60)
                     * if t[n].0 == 43 { -1 } else { 1 };
@@ -343,7 +346,8 @@ pub(crate) fn parse(now: i64, input: &[u8]) -> Option<i64> {
             }
         } else if t[0].0 == NUMBER && t[1].0 == AMPM {
             let hour = (if t[0].1 == 12 { 0 } else { t[0].1 }) + if t[1].1 == 1 { 12 } else { 0 };
-            set(&mut d.time, (hour, 0, 0))?;
+            d.time_count += 1;
+            d.time = Some((hour, 0, 0));
             n = 2;
         } else if matches!(t[0].0, ZONE | DAYZONE) {
             set(&mut d.zone, (t[0].1, t[0].0 == DAYZONE || t[1].0 == DST))?;
@@ -439,10 +443,11 @@ pub(crate) fn parse(now: i64, input: &[u8]) -> Option<i64> {
                 }
             } else if t[0].0 == NUMBER {
                 let value = t[0].1;
-                if d.time.is_some() && d.year.is_none() && !d.rel {
+                if d.time_count > 0 && d.year.is_none() && !d.rel {
                     set(&mut d.year, value)?;
                 } else if value < 24 {
-                    set(&mut d.time, (value, 0, 0))?;
+                    d.time_count += 1;
+                    d.time = Some((value, 0, 0));
                 } else if value / 100 < 24 && value % 100 < 60 {
                     d.time = Some((value / 100, value % 100, 0));
                 } else {
@@ -452,6 +457,9 @@ pub(crate) fn parse(now: i64, input: &[u8]) -> Option<i64> {
             }
         }
         if n == 0 {
+            return None;
+        }
+        if d.time_count > 1 {
             return None;
         }
         i += n;
@@ -466,7 +474,7 @@ pub(crate) fn parse(now: i64, input: &[u8]) -> Option<i64> {
     let absolute = d.year.is_some()
         || d.month.is_some()
         || d.day.is_some()
-        || d.time.is_some()
+        || d.time_count > 0
         || d.weekday.is_some();
     let mut start = if absolute {
         convert(
@@ -520,4 +528,25 @@ pub(crate) fn parse(now: i64, input: &[u8]) -> Option<i64> {
         };
     }
     Some(if start == -1 { 0 } else { start })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+    #[test]
+    fn bare_hhmm_keeps_upstream_have_time_quirk() {
+        let now = 1_700_000_123;
+        assert_eq!(parse(now, b"513"), parse(now, b""));
+        assert_eq!(
+            parse(now, b"1970/01/02 513 UTC"),
+            Some(86_400 + 5 * 3600 + 13 * 60)
+        );
+        assert_eq!(parse(now, b"513 23:00 UTC"), parse(now, b"23:00 UTC"));
+        assert_eq!(parse(now, b"23:00 513 UTC"), None);
+        assert_eq!(
+            parse(now, b"1970/01/02 23:00 513 UTC"),
+            Some(86_400 + 5 * 3600 + 13 * 60)
+        );
+        assert_eq!(parse(now, b"5:13 23:00 UTC"), None);
+    }
 }
