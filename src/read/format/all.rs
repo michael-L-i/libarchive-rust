@@ -50,13 +50,13 @@ pub const FORMATS: &[(c_int, Option<Support>)] = &[
     // part of the archive. If one of these bids high, we can maybe avoid
     // running any of the more expensive bidders below.
     (code::AR, None),
-    (code::CPIO, None),
+    (code::CPIO, Some(super::cpio::support)),
     (code::EMPTY, Some(super::empty::support)),
     (code::LHA, None),
     (code::MTREE, Some(super::mtree::support)),
     (code::TAR, None),
     (code::XAR, None),
-    (code::WARC, None),
+    (code::WARC, Some(super::warc::support)),
     // Install expensive bidders last. By doing them last, we increase the
     // chance that a high bid from someone else will make it unnecessary for
     // these to do anything at all.
