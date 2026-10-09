@@ -244,7 +244,28 @@ impl Write {
                     bytes: counts,
                     output,
                 }) {
-                    return a.raise(e);
+                    let mut status = a.raise(e);
+                    // Only downstream filters have opened successfully.
+                    for j in i + 1..self.filters.len() {
+                        let (head, tail) = self.filters.split_at_mut(j + 1);
+                        let (_, counts) = self.bytes.split_at_mut(j + 1);
+                        if let Err(e) = head[j].close(&mut Pipeline {
+                            filters: tail,
+                            bytes: counts,
+                            output,
+                        }) {
+                            status = status.min(a.raise(e));
+                        }
+                    }
+                    if let Err(e) = output.close() {
+                        status = status.min(a.raise(e));
+                    }
+                    if let Some(mut output) = self.output.take() {
+                        output.sink.free();
+                    }
+                    self.filters.clear();
+                    self.bytes.clear();
+                    return status;
                 }
             }
         }
@@ -578,4 +599,78 @@ pub fn unsupported(entry: &mut Entry, format: &[u8]) -> Error {
         crate::read::ARCHIVE_ERRNO_FILE_FORMAT,
         [path, b": ", format, b" format cannot archive ", &kind].concat(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct Client(Rc<RefCell<Vec<&'static str>>>);
+    impl Sink for Client {
+        fn write(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<(), Error> {
+            self.0.borrow_mut().push("client close");
+            Ok(())
+        }
+        fn free(&mut self) {
+            self.0.borrow_mut().push("client free");
+        }
+    }
+    struct TestFilter {
+        events: Rc<RefCell<Vec<&'static str>>>,
+        fail: bool,
+    }
+    impl Filter for TestFilter {
+        fn open(&mut self, _: &mut dyn Sink) -> Result<(), Error> {
+            if self.fail {
+                Err(Error::fatal(libc::EIO, "test open failure"))
+            } else {
+                Ok(())
+            }
+        }
+        fn write(&mut self, data: &[u8], sink: &mut dyn Sink) -> Result<(), Error> {
+            sink.write(data)
+        }
+        fn close(&mut self, _: &mut dyn Sink) -> Result<(), Error> {
+            self.events.borrow_mut().push(if self.fail {
+                "failed filter close"
+            } else {
+                "tail close"
+            });
+            Ok(())
+        }
+        fn code(&self) -> c_int {
+            0
+        }
+        fn name(&self) -> &CStr {
+            c"test"
+        }
+    }
+    #[test]
+    fn failed_filter_open_closes_only_opened_tail_and_frees_client_once() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut writer = Write::default();
+        for fail in [true, false] {
+            writer.add_filter(Box::new(TestFilter {
+                events: events.clone(),
+                fail,
+            }));
+        }
+        let base = Base::new(WRITE_MAGIC);
+        assert_eq!(
+            writer.open(&base, Box::new(Client(events.clone()))),
+            ARCHIVE_FATAL
+        );
+        assert_eq!(
+            &*events.borrow(),
+            &["tail close", "client close", "client free"]
+        );
+        assert!(writer.filters.is_empty());
+        assert_eq!(writer.free(&base), ARCHIVE_OK);
+        assert_eq!(events.borrow().len(), 3);
+    }
 }
