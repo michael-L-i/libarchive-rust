@@ -137,6 +137,9 @@ struct Memory {
 }
 impl Sink for Memory {
     fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        if data.is_empty() {
+            return Ok(());
+        }
         if data.len() > self.len - self.used {
             return Err(Error::fatal(libc::ENOMEM, "Buffer exhausted"));
         }
@@ -495,6 +498,45 @@ pub extern "C" fn archive_write_set_format_cpio_pwb(a: *mut Archive) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+    unsafe extern "C" fn fail_open(_: *mut Archive, _: *mut c_void) -> c_int {
+        ARCHIVE_FATAL
+    }
+    unsafe extern "C" fn count_free(_: *mut Archive, p: *mut c_void) -> c_int {
+        // SAFETY: the test registers its live counter pointer.
+        unsafe {
+            *p.cast::<usize>() += 1;
+        }
+        ARCHIVE_OK
+    }
+    #[test]
+    fn failed_open_releases_client_data_once() {
+        let a = archive_write_new();
+        let mut freed = 0usize;
+        assert_eq!(
+            archive_write_open2(
+                a,
+                (&mut freed as *mut usize).cast(),
+                Some(fail_open),
+                None,
+                None,
+                Some(count_free)
+            ),
+            ARCHIVE_FATAL
+        );
+        assert_eq!(freed, 1);
+        assert_eq!(super::super::archive::archive_free(a), ARCHIVE_OK);
+        assert_eq!(freed, 1);
+    }
+    #[test]
+    fn empty_memory_sink_accepts_null_output() {
+        let mut sink = Memory {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+            used: 0,
+            used_ptr: std::ptr::null_mut(),
+        };
+        assert_eq!(sink.write(&[]), Ok(()));
+    }
     #[test]
     fn raw_memory_writer_delays_blocks_and_finishes_exactly() {
         let a = archive_write_new();

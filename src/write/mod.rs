@@ -202,7 +202,10 @@ impl Write {
         }
         let r = match sink.open() {
             Ok(r) => r,
-            Err(e) => return a.raise(e),
+            Err(e) => {
+                sink.free();
+                return a.raise(e);
+            }
         };
         if r < ARCHIVE_WARN {
             sink.free();
@@ -237,6 +240,7 @@ impl Write {
         f: impl FnOnce(&mut dyn Format, &mut dyn Sink) -> Result<T, Error>,
     ) -> Result<T, Error> {
         let Some(format) = self.format.as_mut() else {
+            a.state.set(state::FATAL);
             return Err(Error::fatal(
                 -1,
                 "Format must be set before you can write to an archive",
