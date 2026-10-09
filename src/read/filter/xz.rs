@@ -27,13 +27,15 @@
 // Ported from libarchive/archive_read_support_filter_xz.c.
 
 //! The xz, lzma (lzma_alone) and lzip filters, which share one decoder.
-//! liblzma is replaced by the pure Rust `xz` crate, a port of liblzma 5.8.
+//! liblzma is replaced by the safe Rust `lzma-rust2` crate, whose sans-I/O
+//! `XzStream` and `LzmaStream` take the place of liblzma's `lzma_code`.
 
 use crate::archive::*;
 use crate::read::{Filter, FilterBidder, Read, Reader, Status, filter_code};
 use crate::util::Error;
+use lzma_rust2::{Action, LzmaStream, Status as Code, StreamResult, XzStream};
 use std::ffi::{CStr, c_int};
-use xz::stream::{self, Action, Filters, Stream};
+use std::io::{self, ErrorKind};
 
 /// The three formats this decoder handles.
 #[derive(Clone, Copy, PartialEq)]
@@ -81,23 +83,52 @@ pub fn support_lzip(r: &mut Read, _: &Base) -> Result<Status, Error> {
 }
 
 const OUT_BLOCK_SIZE: usize = 64 * 1024;
+/// Maximum decoder memory, including the dictionary.
+const MEM_LIMIT_KIB: u32 = 256 * 1024;
 
 fn misc(msg: &str) -> Error {
     Error::fatal(ARCHIVE_ERRNO_MISC, msg)
 }
 
 /// Chooses an error message for a failure of the library.
-fn failure(e: stream::Error) -> Error {
-    match e {
-        stream::Error::Mem => {
-            Error::fatal(libc::ENOMEM, "Lzma library error: Cannot allocate memory")
+fn failure(e: &io::Error) -> Error {
+    misc(match e.kind() {
+        ErrorKind::Unsupported => "Lzma library error: Invalid options",
+        ErrorKind::UnexpectedEof => "Lzma library error:  No progress is possible",
+        ErrorKind::OutOfMemory => {
+            return Error::fatal(libc::ENOMEM, "Lzma library error: Out of memory");
         }
-        stream::Error::MemLimit => Error::fatal(libc::ENOMEM, "Lzma library error: Out of memory"),
-        stream::Error::Format => misc("Lzma library error: format not recognized"),
-        stream::Error::Options => misc("Lzma library error: Invalid options"),
-        stream::Error::Data => misc("Lzma library error: Corrupted input data"),
-        _ => misc("Lzma decompression failed:  Unknown error"),
+        _ => "Lzma library error: Corrupted input data",
+    })
+}
+
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+            k += 1;
+        }
+        table[i] = c;
+        i += 1;
     }
+    table
+};
+
+/// The CRC-32 of lzip, continued from `crc` over `data`.
+fn crc32(crc: u32, data: &[u8]) -> u32 {
+    !data.iter().fold(!crc, |c, &b| {
+        CRC_TABLE
+            .get(usize::from((c as u8) ^ b))
+            .map_or(0, |t| t ^ (c >> 8))
+    })
 }
 
 struct Bidder(Kind);
@@ -112,7 +143,7 @@ impl FilterBidder for Bidder {
     }
 
     fn init(&mut self, _up: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error> {
-        Ok(Box::new(Xz::new(self.0)?))
+        Ok(Box::new(Xz::new(self.0)))
     }
 }
 
@@ -206,18 +237,41 @@ fn lzma_bid(up: &mut Reader<'_>) -> Result<c_int, Error> {
     Ok(bits_checked)
 }
 
-/// 48 if a lzip member header starts here: the magic bytes `LZIP`, a
+/// Whether `h` starts with a lzip member header: the magic bytes `LZIP`, a
 /// version of 0 or 1, and a dictionary size of 1 << 12 to 1 << 29.
+fn lzip_header(h: &[u8]) -> bool {
+    h.starts_with(b"LZIP")
+        && matches!(h.get(4), Some(0 | 1))
+        && h.get(5).is_some_and(|d| (12..=29).contains(&(d & 0x1f)))
+}
+
+/// 48 if a lzip member header starts here.
 fn lzip_has_member(up: &mut Reader<'_>) -> Result<c_int, Error> {
-    let valid = |h: &[u8]| {
-        h.starts_with(b"LZIP")
-            && matches!(h.get(4), Some(0 | 1))
-            && h.get(5).is_some_and(|d| (12..=29).contains(&(d & 0x1f)))
-    };
     Ok(match up.read_ahead(6)? {
-        Some(h) if valid(h) => 48,
+        Some(h) if lzip_header(h) => 48,
         _ => 0,
     })
+}
+
+/// The library's decoder: xz streams, or LZMA1 with a .lzma header, or the
+/// raw LZMA1 of a lzip member.
+enum Stream {
+    Xz(Box<XzStream>),
+    Lzma(Box<LzmaStream>),
+}
+
+impl Stream {
+    fn process(
+        &mut self,
+        input: &[u8],
+        out: &mut [u8],
+        action: Action,
+    ) -> io::Result<StreamResult> {
+        match self {
+            Stream::Xz(s) => s.process(input, out, action),
+            Stream::Lzma(s) => s.process(input, out, action),
+        }
+    }
 }
 
 /// The decoder of all three filters.
@@ -233,6 +287,9 @@ struct Xz {
     eof: bool,
 
     // Following variables are used for lzip only.
+    /// Bytes the library took from the end of a member but that follow it.
+    /// They come before whatever `up` has left.
+    pending: Vec<u8>,
     lzip_ver: u8,
     crc32: u32,
     member_in: u64,
@@ -240,29 +297,57 @@ struct Xz {
 }
 
 impl Xz {
-    /// Sets up the library. xz and lzma are decoded with no memory limit.
-    fn new(kind: Kind) -> Result<Self, Error> {
+    /// Sets up bounded decoders for xz and lzma.
+    fn new(kind: Kind) -> Self {
         let stream = match kind {
-            Kind::Xz => Some(Stream::new_stream_decoder(u64::MAX, stream::CONCATENATED)),
-            Kind::Lzma => Some(Stream::new_lzma_decoder(u64::MAX)),
+            Kind::Xz => Some(Stream::Xz(Box::new(XzStream::new_mem_limit(
+                true,
+                MEM_LIMIT_KIB,
+            )))),
+            Kind::Lzma => Some(Stream::Lzma(Box::new(LzmaStream::new_mem_limit(
+                MEM_LIMIT_KIB,
+                None,
+            )))),
             Kind::Lzip => None,
         };
-        Ok(Xz {
+        Xz {
             kind,
-            stream: stream.transpose().map_err(failure)?,
+            stream,
             out: vec![0; OUT_BLOCK_SIZE],
             block: 0,
             eof: false,
+            pending: Vec::new(),
             lzip_ver: 0,
             crc32: 0,
             member_in: 0,
             member_out: 0,
-        })
+        }
+    }
+
+    /// The next `n` bytes of the input, or `None` at the end of it.
+    fn ahead(&self, up: &mut Reader<'_>, n: usize) -> Result<Option<Vec<u8>>, Error> {
+        let mut bytes = self.pending.get(..n).unwrap_or(&self.pending).to_vec();
+        if bytes.len() < n {
+            let Some(h) = up.read_ahead(n - bytes.len())? else {
+                return Ok(None);
+            };
+            bytes.extend_from_slice(h.get(..n - bytes.len()).unwrap_or(h));
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Consumes `n` bytes of the input that `ahead` has seen.
+    fn eat(&mut self, up: &mut Reader<'_>, n: usize) -> Result<(), Error> {
+        let kept = n.min(self.pending.len());
+        self.pending.drain(..kept);
+        up.consume(n - kept)?;
+        Ok(())
     }
 
     /// Initializes the library from the header of a lzip member.
     fn lzip_init(&mut self, up: &mut Reader<'_>) -> Result<Stream, Error> {
-        let Some(&[.., ver, log2dic]) = up.read_ahead(6)?.and_then(|h| h.first_chunk::<6>()) else {
+        let header = self.ahead(up, 6)?;
+        let Some(&[.., ver, log2dic]) = header.as_deref().and_then(|h| h.first_chunk::<6>()) else {
             // Unreachable: a bid has already seen the whole header.
             return Err(misc("truncated input"));
         };
@@ -273,16 +358,21 @@ impl Xz {
         if log2dic & 0x1f > 12 {
             dicsize -= (dicsize / 16) * u32::from(log2dic >> 5);
         }
-        let mut props = [0x5d; 5];
-        props[1..].copy_from_slice(&dicsize.to_le_bytes());
+
+        if u64::from(dicsize) > u64::from(MEM_LIMIT_KIB) * 1024 {
+            return Err(Error::fatal(
+                libc::ENOMEM,
+                "Lzma library error: Out of memory",
+            ));
+        }
 
         // Consume lzip header.
-        up.consume(6)?;
+        self.eat(up, 6)?;
         self.member_in = 6;
 
-        let mut filters = Filters::new();
-        filters.lzma1_properties(&props).map_err(failure)?;
-        Stream::new_raw_decoder(&filters).map_err(failure)
+        LzmaStream::new_with_props(u64::MAX, 0x5d, dicsize, None)
+            .map(|s| Stream::Lzma(Box::new(s)))
+            .map_err(|e| failure(&e))
     }
 
     /// Checks the trailer of a lzip member, and prepares for the next member
@@ -290,7 +380,7 @@ impl Xz {
     fn lzip_tail(&mut self, up: &mut Reader<'_>) -> Result<(), Error> {
         let tail = if self.lzip_ver == 0 { 12 } else { 20 };
         let failed = |msg: &str| Error::new(ARCHIVE_FAILED, ARCHIVE_ERRNO_MISC, msg);
-        let trailer = up.read_ahead(tail)?.and_then(|p| {
+        let trailer = self.ahead(up, tail)?.and_then(|p| {
             let (crc, p) = p.split_first_chunk::<4>()?;
             let (size, p) = p.split_first_chunk::<8>()?;
             let member = p.first_chunk().copied().map(u64::from_le_bytes);
@@ -315,11 +405,11 @@ impl Xz {
         if self.lzip_ver == 1 && self.member_in.checked_add(20) != member {
             return Err(failed("Lzip: Member size error"));
         }
-        up.consume(tail)?;
+        self.eat(up, tail)?;
 
         // If current lzip data consists of multi member, try decompressing
         // a next member.
-        if lzip_has_member(up)? != 0 {
+        if self.ahead(up, 6)?.is_some_and(|h| lzip_header(&h)) {
             self.stream = None;
             self.crc32 = 0;
             self.member_out = 0;
@@ -342,20 +432,23 @@ impl Filter for Xz {
     /// Return the next block of decompressed data.
     fn read(&mut self, up: &mut Reader<'_>) -> Result<(), Error> {
         loop {
-            let member_in = self.member_in;
+            let was_eof = self.eof;
             let mut filled = 0;
 
             // Try to fill the output buffer.
             while filled < self.out.len() && !self.eof {
-                let stream = match &mut self.stream {
+                let stream = match self.stream.take() {
                     Some(stream) => stream,
                     // Initialize the library for lzip.
-                    None => {
-                        let stream = self.lzip_init(up)?;
-                        self.stream.insert(stream)
-                    }
+                    None => self.lzip_init(up)?,
                 };
-                let input = up.peek_available(1).map_err(|_| misc("truncated input"))?;
+                let stream = self.stream.insert(stream);
+                let from_pending = !self.pending.is_empty();
+                let input = if from_pending {
+                    &self.pending
+                } else {
+                    up.peek_available(1).map_err(|_| misc("truncated input"))?
+                };
 
                 // Decompress as much as we can in one pass.
                 let action = if input.is_empty() {
@@ -363,41 +456,56 @@ impl Filter for Xz {
                 } else {
                     Action::Run
                 };
-                let (in_before, out_before) = (stream.total_in(), stream.total_out());
                 let space = self.out.get_mut(filled..).unwrap_or_default();
-                match stream.process(input, space, action) {
-                    // Found end of stream.
-                    Ok(stream::Status::StreamEnd) => self.eof = true,
-                    // Decompressor made some progress.
-                    Ok(stream::Status::Ok) => {}
-                    Ok(stream::Status::MemNeeded) => {
-                        return Err(misc("Lzma library error:  No progress is possible"));
-                    }
-                    Ok(_) => return Err(misc("Lzma decompression failed:  Unknown error")),
-                    Err(e) => return Err(failure(e)),
+                let r = stream
+                    .process(input, space, action)
+                    .map_err(|e| failure(&e))?;
+                if r.bytes_consumed == 0 && r.bytes_produced == 0 && r.status == Code::Ok {
+                    return Err(misc("Lzma library error:  No progress is possible"));
                 }
-                let used = stream.total_in() - in_before;
-                filled += usize::try_from(stream.total_out() - out_before).unwrap_or_default();
-                up.consume(used)?;
-                self.member_in += used;
+                if r.bytes_consumed > input.len() || r.bytes_produced > space.len() {
+                    return Err(misc("Lzma library error: Corrupted input data"));
+                }
+                // Found end of stream.
+                self.eof = r.status == Code::StreamEnd;
+                filled += r.bytes_produced;
+
+                // The library keeps a few bytes past the end of a lzip
+                // member; they belong to the trailer and the next member.
+                let extra = match (&*stream, self.eof) {
+                    (Stream::Lzma(s), true) => s.unused_input().to_vec(),
+                    _ => Vec::new(),
+                };
+                if from_pending {
+                    self.pending.drain(..r.bytes_consumed);
+                } else {
+                    up.consume(r.bytes_consumed)?;
+                }
+                self.member_in = self
+                    .member_in
+                    .checked_add(r.bytes_consumed as u64)
+                    .ok_or_else(|| misc("Lzma library error: Corrupted input data"))?
+                    .saturating_sub(extra.len() as u64);
+                self.pending.splice(..0, extra);
             }
 
             self.block = filled;
-            self.member_out += filled as u64;
+            self.member_out = self
+                .member_out
+                .checked_add(filled as u64)
+                .ok_or_else(|| misc("Lzma library error: Corrupted input data"))?;
             if self.kind != Kind::Lzip {
                 return Ok(());
             }
             if filled == 0 {
-                if member_in != self.member_in && self.eof {
+                if !was_eof && self.eof {
                     self.lzip_tail(up)?;
                     if !self.eof {
                         continue;
                     }
                 }
             } else {
-                let mut crc = crc32fast::Hasher::new_with_initial(self.crc32);
-                crc.update(self.block());
-                self.crc32 = crc.finalize();
+                self.crc32 = crc32(self.crc32, self.block());
                 if self.eof {
                     self.lzip_tail(up)?;
                 }
@@ -417,11 +525,39 @@ mod tests {
     use crate::entry::Entry;
     use crate::read::{Data, Format};
     use crate::read_open_memory::Memory;
+    use lzma_rust2::{CheckType, LzmaOptions, LzmaWriter, XzOptions, XzWriter};
     use std::io::Write;
-    use xz::stream::LzmaOptions;
-    use xz::write::XzEncoder;
 
     type Register = crate::read::filter::all::Support;
+
+    #[test]
+    fn oversized_dictionaries_fail_before_allocating() {
+        let mut alone = vec![0x5d];
+        alone.extend_from_slice(&(512u32 << 20).to_le_bytes());
+        alone.extend_from_slice(&u64::MAX.to_le_bytes());
+        alone.extend_from_slice(&[0; 16]);
+        assert_eq!(
+            decode_with(Some(support_lzma), &alone, 7).unwrap_err(),
+            "Lzma library error: Out of memory"
+        );
+        let lzip = b"LZIP\x01\x1d";
+        assert_eq!(
+            decode_with(Some(support_lzip), lzip, 7).unwrap_err(),
+            "Lzma library error: Out of memory"
+        );
+
+        let mut xz = b"\xfd7zXZ\x00\x00\x00".to_vec();
+        xz.extend_from_slice(&crc32(0, &[0, 0]).to_le_bytes());
+        // One LZMA2 filter, whose property 40 asks for a 4 GiB dictionary.
+        let header = [2, 0, 0x21, 1, 40, 0, 0, 0];
+        xz.extend_from_slice(&header);
+        xz.extend_from_slice(&crc32(0, &header).to_le_bytes());
+        xz.extend_from_slice(&[0; 16]);
+        assert_eq!(
+            decode_with(Some(support_xz), &xz, 7).unwrap_err(),
+            "Lzma library error: Out of memory"
+        );
+    }
 
     /// A format that takes any stream, so that tests can read the filters'
     /// output directly.
@@ -509,32 +645,36 @@ mod tests {
             .collect()
     }
 
-    fn encode(stream: Stream, data: &[u8]) -> Vec<u8> {
-        let mut e = XzEncoder::new_stream(Vec::new(), stream);
+    fn xz(data: &[u8]) -> Vec<u8> {
+        let mut options = XzOptions::with_preset(6);
+        options.set_check_sum_type(CheckType::Crc64);
+        let mut e = XzWriter::new(Vec::new(), options).unwrap();
         e.write_all(data).unwrap();
         e.finish().unwrap()
     }
 
-    fn xz(data: &[u8]) -> Vec<u8> {
-        encode(
-            Stream::new_easy_encoder(6, stream::Check::Crc64).unwrap(),
-            data,
-        )
+    /// A .lzma stream, whose size is in the header when `known`, or else
+    /// ends with a marker.
+    fn lzma_with(data: &[u8], known: bool) -> Vec<u8> {
+        let options = LzmaOptions::with_preset(6);
+        let size = known.then_some(data.len() as u64);
+        let mut e = LzmaWriter::new_use_header(Vec::new(), &options, size).unwrap();
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
     }
 
     fn lzma(data: &[u8]) -> Vec<u8> {
-        let options = LzmaOptions::new_preset(6).unwrap();
-        encode(Stream::new_lzma_encoder(&options).unwrap(), data)
+        lzma_with(data, false)
     }
 
     /// A lzip member of the given version, whose trailer can be damaged.
     fn lzip_with(data: &[u8], ver: u8, crc: u32, size: u64, member: Option<u64>) -> Vec<u8> {
-        let mut options = LzmaOptions::new_preset(6).unwrap();
-        options.dict_size(1 << 20);
-        let mut filters = Filters::new();
-        filters.lzma1(&options);
+        let mut options = LzmaOptions::with_preset(6);
+        options.dict_size = 1 << 20;
+        let mut e = LzmaWriter::new_no_header(Vec::new(), &options, true).unwrap();
+        e.write_all(data).unwrap();
         let mut m = [b"LZIP".as_slice(), &[ver, 20]].concat();
-        m.extend(encode(Stream::new_raw_encoder(&filters).unwrap(), data));
+        m.extend(e.finish().unwrap());
         m.extend(crc.to_le_bytes());
         m.extend(size.to_le_bytes());
         if ver == 1 {
@@ -545,7 +685,7 @@ mod tests {
     }
 
     fn lzip(data: &[u8], ver: u8) -> Vec<u8> {
-        lzip_with(data, ver, crc32fast::hash(data), data.len() as u64, None)
+        lzip_with(data, ver, crc32(0, data), data.len() as u64, None)
     }
 
     fn lzip1(data: &[u8]) -> Vec<u8> {
@@ -584,6 +724,8 @@ mod tests {
             assert_eq!(decode(&encode(&exact), 5000), Ok(exact), "{name} one block");
         }
         assert_eq!(decode(&lzip(b"v0", 0), 2), Ok(b"v0".to_vec()));
+        // A .lzma stream of known size, with no end marker.
+        assert_eq!(decode(&lzma_with(&data, true), 7), Ok(data));
     }
 
     #[test]
@@ -627,7 +769,7 @@ mod tests {
     #[test]
     fn lzip_trailers_are_checked() {
         let data = sample(5000);
-        let (crc, size) = (crc32fast::hash(&data), data.len() as u64);
+        let (crc, size) = (crc32(0, &data), data.len() as u64);
         let whole = lzip(&data, 1);
         for (packed, error) in [
             (
@@ -669,7 +811,7 @@ mod tests {
         let trailing = [&packed[..], b"garbage!"].concat();
         assert_eq!(
             decode(&trailing, 100),
-            Err("Lzma library error:  No progress is possible".into())
+            Err("Lzma library error: Corrupted input data".into())
         );
         let mut flipped = packed;
         flipped[40] ^= 0x55;

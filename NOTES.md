@@ -357,22 +357,39 @@ Differences:
 
 ### Differences
 
-- liblzma is replaced by the pure Rust `xz` crate (a port of liblzma
-  5.8.3; the oracle links 5.8.4; `archive_liblzma_version` reports
-  `xz <version>`, see Core). The crate has the same stream API, so
-  the error messages and which input is rejected match; a bug fix between
-  5.8.3 and 5.8.4 could differ on unusual damaged input. `LZMA_MEMLIMIT` is
-  disabled as upstream does for liblzma 5.
+- liblzma is replaced by the safe Rust `lzma-rust2` crate (default features
+  off, so `forbid(unsafe_code)` holds; its `optimization` feature is the only
+  `unsafe`). Its sans-I/O `XzStream` and `LzmaStream` take `lzma_code`'s
+  place: `XzStream` for xz (concatenated streams, padding, CRC32, CRC64,
+  SHA-256 and no check), `LzmaStream` for lzma_alone (known size or end
+  marker) and for the raw LZMA1 of a lzip member. The one dependency with
+  `unsafe` is `sha2` (via `cpufeatures`), for the xz SHA-256 check.
+  Decoder memory is capped at 256 MiB before dictionary allocation; oversized
+  xz, lzma and lzip dictionaries fail with ENOMEM. Upstream disables its
+  memory limit, so unusually large valid dictionaries are rejected here.
+  The earlier backend review compared about 100,000 truncated and mutated
+  streams; this integration also checks the pinned fixtures. The differences:
+  - The error text is chosen from the `io::ErrorKind` of the failure, not
+    from liblzma's status: corrupt input of any kind reads "Lzma library
+    error: Corrupted input data" (liblzma says "format not recognized" for a
+    bad magic number), input that ends too soon reads "No progress is
+    possible", and "Invalid options" is kept for an unsupported filter.
+    Every failure is fatal, as liblzma's are.
+  - A .lzma stream with an end marker whose input is cut inside the last
+    bytes of the range coder is accepted with its complete output, when the
+    missing bytes are zero: `LzmaStream` decodes the last bytes of input
+    against zero padding, and cannot say whether it did. liblzma fails with
+    "No progress is possible". It turned up twice in the corpus; a cut
+    lzip member is still caught by its trailer.
+  - `XzStream` takes at most one delta or branch (BCJ) filter before LZMA2
+    in a block. A block that chains several fails as unsupported where
+    liblzma decodes it. (The ARM64 and RISC-V filters are supported.)
 - The "Using external xz program" fallback is not ported: the decoder is
   always built in.
 - A read error while a filter bids is passed up as a failure where
   upstream's bid returns 0 (see the read core notes). The same goes for the
   `lzip_has_member` call in `lzip_tail`: a read error right after a lzip
   trailer is fatal here, but upstream reads it as a clean end of input.
-- The `xz` crate's `xz-core` is a c2rust translation of liblzma with about
-  1,000 `unsafe` blocks. It is pure Rust but not safe Rust, so this path
-  does not yet meet the project's memory-safety goal. A safe Rust decoder
-  with liblzma's stream semantics is a tracked follow-up.
 - `lzip_init` does not re-check the dictionary size: `lzip_has_member` has
   already validated every header it reads.
 

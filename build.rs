@@ -4,7 +4,7 @@
 /// (The bzip2 backend reports its own `BZ2_bzlibVersion` instead.)
 const BACKENDS: &[(&str, &str)] = &[
     ("ZLIB", "miniz_oxide"),
-    ("LIBLZMA", "xz"),
+    ("LIBLZMA", "lzma-rust2"),
     ("LIBLZ4", "lz4_flex"),
     ("LIBZSTD", "ruzstd"),
 ];

@@ -12,7 +12,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
 libc = "0.2"
 crc32fast = "1"
-xz = "=0.4.6-rc.0"
+lzma-rust2 = { version = "0.21.0", default-features = false, features = ["std", "xz"] }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "safe-encode"] }
 xxhash-rust = { version = "0.8.19", default-features = false, features = ["xxh32"] }
 bzip2 = "0.6.1"
@@ -30,3 +30,6 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[dev-dependencies]
+lzma-rust2 = { version = "0.21.0", default-features = false, features = ["std", "xz", "encoder"] }
