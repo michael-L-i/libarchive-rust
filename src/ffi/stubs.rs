@@ -188,46 +188,6 @@ pub extern "C" fn archive_write_set_format_7zip(_a0: *mut Archive) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_ar_bsd(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_ar_svr4(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_cpio(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_cpio_bin(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_cpio_newc(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_cpio_odc(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_cpio_pwb(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_gnutar(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_iso9660(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
@@ -243,32 +203,12 @@ pub extern "C" fn archive_write_set_format_mtree_classic(_a0: *mut Archive) -> c
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_pax(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_pax_restricted(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_shar(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_shar_dump(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_ustar(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_v7tar(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }
 

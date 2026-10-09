@@ -309,13 +309,14 @@ impl WriteDisk {
     }
 
     fn restore(&self, a: &Base, path: &Path, entry: &Entry) -> c_int {
-        if entry.filetype() != libc::S_IFLNK && self.options & PERM != 0 {
-            if let Err(e) = fs::set_permissions(
+        if entry.filetype() != libc::S_IFLNK
+            && self.options & PERM != 0
+            && let Err(e) = fs::set_permissions(
                 path,
                 fs::Permissions::from_mode(entry.mode() as u32 & 0o7777),
-            ) {
-                return failure(a, e, "Can't set permissions", path);
-            }
+            )
+        {
+            return failure(a, e, "Can't set permissions", path);
         }
         ARCHIVE_OK
     }

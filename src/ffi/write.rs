@@ -420,6 +420,78 @@ pub extern "C" fn archive_write_set_options(a: *mut Archive, opts: *const c_char
     })
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_v7tar(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::tar::Tar::new(0x30000)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_ustar(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::tar::Tar::new(0x30001)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_pax(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::tar::Tar::new(0x30002)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_pax_restricted(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::tar::Tar::new(0x30003)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_gnutar(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::tar::Tar::new(0x30004)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_ar_bsd(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::ar::Ar::new(true)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_ar_svr4(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::ar::Ar::new(false)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_cpio(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::cpio::Cpio::new(0x10001)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_cpio_odc(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::cpio::Cpio::new(0x10001)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_cpio_newc(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::cpio::Cpio::new(0x10004)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_cpio_bin(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::cpio::Cpio::new(0x10002)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn archive_write_set_format_cpio_pwb(a: *mut Archive) -> c_int {
+    with_writer(a, |b, w| {
+        w.set_format(b, Box::new(crate::write::format::cpio::Cpio::new(0x10006)))
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
