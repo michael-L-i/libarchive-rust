@@ -670,6 +670,11 @@ impl SevenZip {
             }
         }
 
+        let size = if self.codec2 == CODEC_X86_BCJ2 {
+            self.main_stream_bytes_remaining
+        } else {
+            self.folder_outbytes_remaining
+        };
         let props = coder1.properties.as_slice();
         if self.codec == CODEC_LZMA2 {
             let &[b] = props else {
@@ -686,6 +691,10 @@ impl SevenZip {
             if dict_size > MAX_DECODER_MEMORY {
                 return Err(failed("Decompression failed (5)"));
             }
+            // No valid match can refer farther back than this stream's output.
+            // Encoded headers often advertise a much larger dictionary.
+            let dict_size =
+                u32::try_from(size).map_or(dict_size, |size| dict_size.min(size.max(4096)));
             self.coders.backend = Backend::Lzma2(Box::new(Lzma2Stream::new(dict_size)));
         } else {
             let &[b, d0, d1, d2, d3] = props else {
@@ -700,11 +709,6 @@ impl SevenZip {
             }
             // The size of the stream is known; a stream with no end marker
             // (7-Zip writes none) can't be finished otherwise.
-            let size = if self.codec2 == CODEC_X86_BCJ2 {
-                self.main_stream_bytes_remaining
-            } else {
-                self.folder_outbytes_remaining
-            };
             let stream = LzmaStream::new_with_props(
                 u64::try_from(size).unwrap_or(u64::MAX),
                 b,
@@ -907,6 +911,75 @@ impl SevenZip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lzma2_dictionary_covers_the_decoded_stream() {
+        use lzma_rust2::{Lzma2Options, Lzma2Writer};
+        use std::io::Write;
+
+        // The second half needs history beyond the minimum dictionary.
+        let mut state = 0x12345678u32;
+        let mut data: Vec<u8> = (0..8192)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        data.extend_from_within(..);
+        let mut encoder = Lzma2Writer::new(Vec::new(), Lzma2Options::with_preset(1));
+        encoder.write_all(&data).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let coder = Coder {
+            codec: CODEC_LZMA2,
+            properties: vec![22], // 8 MiB advertised dictionary.
+            ..Coder::default()
+        };
+        let bcj2 = Coder {
+            codec: CODEC_X86_BCJ2,
+            ..Coder::default()
+        };
+        for (size, main_size, filter) in [
+            (data.len() as i64, 0, None),
+            (-1, 0, None),
+            (i64::MAX, 0, None),
+            (1, data.len() as i64, Some(&bcj2)),
+        ] {
+            let mut reader = SevenZip {
+                codec: CODEC_LZMA2,
+                folder_outbytes_remaining: size,
+                main_stream_bytes_remaining: main_size,
+                ..SevenZip::default()
+            };
+            reader.init_lzma(&coder, filter).unwrap();
+            let Backend::Lzma2(stream) = &mut reader.coders.backend else {
+                panic!("missing LZMA2 decoder");
+            };
+            let mut output = vec![0; data.len() + 1];
+            let result = stream
+                .process(&encoded, &mut output, Action::Finish)
+                .unwrap();
+            assert_eq!(result.status, LzStatus::StreamEnd);
+            assert_eq!(&output[..result.bytes_produced], data);
+        }
+
+        // A false tiny size must still reject matches outside its history.
+        let mut reader = SevenZip {
+            codec: CODEC_LZMA2,
+            folder_outbytes_remaining: 1,
+            ..SevenZip::default()
+        };
+        reader.init_lzma(&coder, None).unwrap();
+        let Backend::Lzma2(stream) = &mut reader.coders.backend else {
+            panic!("missing LZMA2 decoder");
+        };
+        assert!(
+            stream
+                .process(&encoded, &mut vec![0; data.len() + 1], Action::Finish)
+                .is_err()
+        );
+    }
 
     #[test]
     fn oversized_decoder_models_fail_before_allocation() {
