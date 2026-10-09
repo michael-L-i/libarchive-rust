@@ -36,6 +36,8 @@ cpio/test_option_t
 cpio/test_option_u
 cpio/test_option_version
 cpio/test_owner_parse
+cpio/test_passthrough_dotdot
+cpio/test_passthrough_reverse
 tar/test_0
 tar/test_crlf_mtree
 tar/test_edit_pathname_hardlink
@@ -58,6 +60,7 @@ tar/test_option_C_upper
 tar/test_option_H_upper
 tar/test_option_L_upper
 tar/test_option_O_upper
+tar/test_option_U_upper
 tar/test_option_X_upper
 tar/test_option_b64encode
 tar/test_option_exclude
@@ -66,6 +69,7 @@ tar/test_option_ignore_zeros_mode_c
 tar/test_option_ignore_zeros_mode_t
 tar/test_option_ignore_zeros_mode_x
 tar/test_option_j
+tar/test_option_k
 tar/test_option_keep_newer_files
 tar/test_option_lz4
 tar/test_option_lzma
@@ -73,6 +77,7 @@ tar/test_option_n
 tar/test_option_nodump
 tar/test_option_passphrase
 tar/test_option_s
+tar/test_option_safe_writes
 tar/test_option_stdout_size_exceeds_declared
 tar/test_option_uuencode
 tar/test_option_xattrs
@@ -83,6 +88,7 @@ tar/test_patterns
 tar/test_print_longpath
 tar/test_stdio
 tar/test_strip_components
+tar/test_symlink_dir
 tar/test_version
 test_acl_from_text
 test_acl_nfs4
