@@ -536,7 +536,7 @@ pub extern "C" fn archive_read_extract(
                 return ARCHIVE_FATAL;
             };
             let mut r = r.borrow_mut();
-            let skip = r.skip_file;
+            let skip = r.skip_file();
             let e = r.extract.get_or_insert_with(Extract::default);
             e.disk.options = flags;
             e.disk.skip_file = skip;
@@ -616,7 +616,7 @@ pub extern "C" fn archive_read_extract2(
     guard(ARCHIVE_FATAL, || {
         let skip = with(a, None, |h| {
             if let Kind::Read(r) = &h.kind {
-                r.borrow().skip_file
+                r.borrow().skip_file()
             } else {
                 None
             }
@@ -676,6 +676,39 @@ mod tests {
             std::env::temp_dir().join(format!("libarchive-{name}-{}-{unique}", std::process::id()));
         std::fs::create_dir(&path).unwrap();
         std::fs::canonicalize(path).unwrap()
+    }
+    #[test]
+    fn filename_extraction_refuses_to_overwrite_its_input() {
+        use crate::ffi::{archive::archive_free, read::*, read_open::*};
+        for separate_disk in [false, true] {
+            let root = directory("extract-self");
+            let path = root.join("input.archive");
+            let original = b"archive input must remain unchanged";
+            std::fs::write(&path, original).unwrap();
+            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let reader = archive_read_new();
+            assert_eq!(archive_read_support_format_raw(reader), ARCHIVE_OK);
+            assert_eq!(
+                archive_read_open_filename(reader, name.as_ptr(), 7),
+                ARCHIVE_OK
+            );
+            let mut entry = std::ptr::null_mut();
+            assert_eq!(archive_read_next_header(reader, &mut entry), ARCHIVE_OK);
+            // SAFETY: next_header returns this reader's live Entry.
+            unsafe { &mut *entry.cast::<Entry>() }.set_pathname(path.as_os_str().as_bytes());
+            let result = if separate_disk {
+                let disk = archive_write_disk_new();
+                let result = archive_read_extract2(reader, entry, disk);
+                assert_eq!(archive_free(disk), ARCHIVE_OK);
+                result
+            } else {
+                archive_read_extract(reader, entry, 0)
+            };
+            assert_eq!(result, archive::ARCHIVE_WARN);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(archive_free(reader), ARCHIVE_OK);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
     #[test]
     fn safe_writes_replace_only_the_destination_link() {
