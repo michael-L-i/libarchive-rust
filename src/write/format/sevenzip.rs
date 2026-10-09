@@ -77,7 +77,7 @@ enum Coder {
     Ppmd(Box<Ppmd7>, Ppmd7RangeEnc),
 }
 impl Coder {
-    fn new(codec: u32, level: i64) -> Result<(Self, Vec<u8>), Error> {
+    fn new(codec: u32, level: i64, input_size: Option<usize>) -> Result<(Self, Vec<u8>), Error> {
         let l = level.clamp(0, 9) as u8;
         let mut props = Vec::new();
         let coder = match codec {
@@ -98,18 +98,20 @@ impl Coder {
                 Self::Filter(f)
             }
             LZMA => {
-                let options = LzmaOptions::with_preset(l.into());
+                let mut options = LzmaOptions::with_preset(l.into());
                 props.push(((options.pb * 5 + options.lp) * 9 + options.lc) as u8);
                 props.extend_from_slice(&options.dict_size.to_le_bytes());
+                limit_dictionary(&mut options, input_size);
                 Self::Lzma(LzmaWriter::new_no_header(Vec::new(), &options, true).map_err(io_error)?)
             }
             LZMA2 => {
-                let options = Lzma2Options::with_preset(l.into());
+                let mut options = Lzma2Options::with_preset(l.into());
                 let dict = options.lzma_options.dict_size;
                 let property = (0u8..=39)
                     .find(|&p| dict <= (2 | u32::from(p & 1)) << (p / 2 + 11))
                     .ok_or_else(|| Error::fatal(libc::EINVAL, "Invalid LZMA2 dictionary"))?;
                 props.push(property);
+                limit_dictionary(&mut options.lzma_options, input_size);
                 Self::Lzma2(Lzma2Writer::new(Vec::new(), options))
             }
             PPMD => {
@@ -170,6 +172,16 @@ impl Coder {
         }
     }
 }
+// Once the entire stream is known, no match can reach beyond its input.
+// Keep the preset dictionary in the archive properties for compatibility.
+fn limit_dictionary(options: &mut LzmaOptions, input_size: Option<usize>) {
+    if let Some(size) = input_size {
+        options.dict_size = options
+            .dict_size
+            .min(u32::try_from(size).unwrap_or(u32::MAX).max(4096));
+    }
+}
+
 pub struct SevenZip {
     files: Vec<FileInfo>,
     current: Option<usize>,
@@ -177,6 +189,7 @@ pub struct SevenZip {
     codec: u32,
     level: i64,
     coder: Option<Coder>,
+    pending: Vec<u8>,
     properties: Vec<u8>,
     spool: Option<Spool>,
 }
@@ -189,6 +202,7 @@ impl Default for SevenZip {
             codec: LZMA,
             level: 6,
             coder: None,
+            pending: Vec::new(),
             properties: Vec::new(),
             spool: None,
         }
@@ -206,9 +220,9 @@ impl SevenZip {
                     ),
                 ));
             }
-            let (coder, props) = Coder::new(self.codec, self.level)?;
-            self.coder = Some(coder);
-            self.properties = props;
+            if self.codec != LZMA && self.codec != LZMA2 {
+                self.start_coder(None)?;
+            }
             self.spool = Some(Spool {
                 file: crate::write::temp_file()?,
                 len: 0,
@@ -216,8 +230,35 @@ impl SevenZip {
         }
         Ok(())
     }
+    fn start_coder(&mut self, input_size: Option<usize>) -> Result<(), Error> {
+        let (mut coder, props) = Coder::new(self.codec, self.level, input_size)?;
+        if let Some(spool) = &mut self.spool {
+            coder.write(&self.pending, spool)?;
+        }
+        self.pending = Vec::new();
+        self.coder = Some(coder);
+        self.properties = props;
+        Ok(())
+    }
     fn append(&mut self, data: &[u8]) -> Result<(), Error> {
-        if let (Some(coder), Some(spool)) = (&mut self.coder, &mut self.spool) {
+        if self.coder.is_none() && self.spool.is_some() && !data.is_empty() {
+            // A solid stream may span many entries. Wait for its total size,
+            // but bound staging even at presets with very large dictionaries.
+            let limit = LzmaOptions::with_preset(self.level.clamp(0, 9) as u32)
+                .dict_size
+                .min(8 << 20) as usize;
+            if data.len() <= limit.saturating_sub(self.pending.len()) {
+                self.pending
+                    .try_reserve(data.len())
+                    .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate 7-Zip input"))?;
+                self.pending.extend_from_slice(data);
+            } else {
+                self.start_coder(None)?;
+                if let (Some(coder), Some(spool)) = (&mut self.coder, &mut self.spool) {
+                    coder.write(data, spool)?;
+                }
+            }
+        } else if let (Some(coder), Some(spool)) = (&mut self.coder, &mut self.spool) {
             coder.write(data, spool)?;
         }
         if let Some(file) = self.current.and_then(|i| self.files.get_mut(i)) {
@@ -568,6 +609,9 @@ impl Format for SevenZip {
         Ok(())
     }
     fn close(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
+        if self.coder.is_none() && self.spool.is_some() {
+            self.start_coder(Some(self.pending.len()))?;
+        }
         if let (Some(coder), Some(spool)) = (self.coder.take(), self.spool.as_mut()) {
             coder.finish(spool)?;
         }
@@ -589,7 +633,8 @@ impl Format for SevenZip {
         let mut encoded_header = Vec::new();
         if files.len() > 1 && self.codec != COPY {
             let header_codec = if self.codec == LZMA2 { LZMA2 } else { LZMA };
-            let (mut coder, props) = Coder::new(header_codec, self.level.clamp(0, 9))?;
+            let (mut coder, props) =
+                Coder::new(header_codec, self.level.clamp(0, 9), Some(header.len()))?;
             struct VecSink<'a>(&'a mut Vec<u8>);
             impl Sink for VecSink<'_> {
                 fn write(&mut self, data: &[u8]) -> Result<(), Error> {
@@ -638,5 +683,143 @@ impl Format for SevenZip {
         }
         sink.write(&encoded_header)?;
         sink.write(&header)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Bytes(Vec<u8>);
+    impl Sink for Bytes {
+        fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+            self.0.extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    fn decode(codec: u32, props: &[u8], data: &[u8], size: usize) -> Vec<u8> {
+        let mut reader: Box<dyn Read + '_> = if codec == LZMA {
+            Box::new(
+                lzma_rust2::LzmaReader::new_with_props(
+                    data,
+                    size as u64,
+                    props[0],
+                    u32::from_le_bytes(props[1..5].try_into().unwrap()),
+                    None,
+                )
+                .unwrap(),
+            )
+        } else {
+            let p = props[0];
+            Box::new(lzma_rust2::Lzma2Reader::new(
+                data,
+                (2 | u32::from(p & 1)) << (p / 2 + 11),
+                None,
+            ))
+        };
+        let mut decoded = Vec::new();
+        reader.read_to_end(&mut decoded).unwrap();
+        decoded
+    }
+
+    #[test]
+    fn sized_coders_preserve_properties_and_roundtrip() {
+        for codec in [LZMA, LZMA2] {
+            for size in [0, 1, 4095, 4096, 4097, 65537] {
+                let data: Vec<_> = (0..size).map(|i| (i * 37 % 251) as u8).collect();
+                let (mut coder, props) = Coder::new(codec, 0, Some(size)).unwrap();
+                let mut encoded = Bytes(Vec::new());
+                coder.write(&data, &mut encoded).unwrap();
+                coder.finish(&mut encoded).unwrap();
+                let (_, original_props) = Coder::new(codec, 0, None).unwrap();
+                assert_eq!(props, original_props);
+                assert_eq!(decode(codec, &props, &encoded.0, size), data);
+            }
+        }
+    }
+
+    #[test]
+    fn small_solid_stream_finishes_with_padding_and_per_file_crcs() {
+        for codec in [LZMA, LZMA2] {
+            let mut archive = SevenZip {
+                codec,
+                level: 0,
+                ..SevenZip::default()
+            };
+            let mut output = Bytes(Vec::new());
+            archive.initialize().unwrap();
+            let mut expected = Vec::new();
+            for (name, data, padding) in [(b"a", b"first".as_slice(), 0), (b"b", b"second", 3)] {
+                let size = data.len() + padding;
+                archive.current = Some(archive.files.len());
+                archive.remaining = size as u64;
+                archive.files.push(FileInfo {
+                    name: vec![name[0], 0],
+                    mode: 0o100644,
+                    size: size as u64,
+                    times: [None; 3],
+                    crc: 0,
+                });
+                archive.data(data, &mut output).unwrap();
+                archive.finish_entry(&mut output).unwrap();
+                let mut padded = data.to_vec();
+                padded.resize(size, 0);
+                assert_eq!(
+                    archive.files.last().unwrap().crc,
+                    crate::crc32::crc32(0, &padded)
+                );
+                expected.extend(padded);
+            }
+            assert!(archive.coder.is_none());
+            archive.close(&mut output).unwrap();
+            assert_eq!(archive.pending.capacity(), 0);
+            let packed = archive.spool.as_ref().unwrap().len as usize;
+            assert_eq!(
+                decode(
+                    codec,
+                    &archive.properties,
+                    &output.0[32..32 + packed],
+                    expected.len()
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn solid_staging_flushes_once_at_dictionary_boundary() {
+        for codec in [LZMA, LZMA2] {
+            let mut archive = SevenZip {
+                codec,
+                level: 0,
+                ..SevenZip::default()
+            };
+            archive.initialize().unwrap();
+            let limit = LzmaOptions::with_preset(0).dict_size as usize;
+            let data: Vec<_> = (0..limit).map(|i| (i * 17 % 251) as u8).collect();
+            // Separate writes stand in for successive entries in a solid stream.
+            archive.append(&data[..limit / 2]).unwrap();
+            archive.append(&data[limit / 2..]).unwrap();
+            assert!(archive.coder.is_none());
+            assert_eq!(archive.pending.len(), limit);
+            archive.append(&data).unwrap();
+            assert!(archive.coder.is_some());
+            assert_eq!(archive.pending.capacity(), 0);
+            archive
+                .coder
+                .take()
+                .unwrap()
+                .finish(archive.spool.as_mut().unwrap())
+                .unwrap();
+            let spool = archive.spool.as_mut().unwrap();
+            spool.file.rewind().unwrap();
+            let mut encoded = Vec::new();
+            spool.file.read_to_end(&mut encoded).unwrap();
+            assert_eq!(
+                decode(codec, &archive.properties, &encoded, limit * 2),
+                data.repeat(2)
+            );
+        }
     }
 }
