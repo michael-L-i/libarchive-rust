@@ -2,6 +2,8 @@
 
 mod acl;
 mod archive;
+#[allow(dead_code)] // used by blake2sp_ref, ported next
+mod blake2s_ref;
 mod check_magic;
 mod cmdline;
 mod entry;
