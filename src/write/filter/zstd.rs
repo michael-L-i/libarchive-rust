@@ -579,21 +579,24 @@ mod tests {
         data.extend_from_slice(&repeated);
         data.extend_from_slice(&[0; 65536]);
         data.extend_from_slice(b"abcdabcdabcdabcdx");
-        let encoded = compressed(&data, 65536);
-        let mut input = crate::write::temp_file().unwrap();
-        input.write_all(&encoded).unwrap();
-        input.seek(SeekFrom::Start(0)).unwrap();
-        let result = Command::new(decoder)
-            .stdin(input)
-            .stdout(Stdio::piped())
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        assert_eq!(result.stdout, data);
+        let periodic: Vec<_> = b"abcd".iter().copied().cycle().take(400003).collect();
+        for (data, block_size) in [(data.as_slice(), 65536), (periodic.as_slice(), 131072)] {
+            let encoded = compressed(data, block_size);
+            let mut input = crate::write::temp_file().unwrap();
+            input.write_all(&encoded).unwrap();
+            input.seek(SeekFrom::Start(0)).unwrap();
+            let result = Command::new(&decoder)
+                .stdin(input)
+                .stdout(Stdio::piped())
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(result.stdout, data);
+        }
     }
 
     #[test]

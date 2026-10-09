@@ -1704,11 +1704,16 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   these are valid linked streams but compression ratios differ.
 - ruzstd has only its fastest compression strategy; this adapter provides a
   bounded native matcher whose block search size increases with the level.
-  Its maximum search window is 128 KiB, including with the `long` option.
-  A bounded encoder thread allows a synchronous backend to stream to the
-  caller's callbacks without buffering the archive. Frame sizes and
-  frame-per-file flushing are honored at encoder block boundaries; an
-  output frame limit can be exceeded by the bounded encoder pipeline and trailer.
+  It reuses a fixed hash table and a 1 MiB history window across blocks,
+  including with the `long` option. Matcher storage is bounded at about
+  1.75 MiB. A bounded encoder thread batches small writes and uses channel
+  notifications for backpressure, allowing the synchronous backend to
+  stream without buffering the archive or polling with sleeps.
+  Frame sizes and frame-per-file flushing are honored at encoder block
+  boundaries; compressed-output thresholds remain approximate and can be
+  exceeded by the bounded pipeline and trailer. The matcher emits a leading
+  literal and splits matches above 65,538 bytes to avoid ruzstd 0.9's
+  single-symbol FSE and match-length-code-52 encoding bugs.
 - grzip, lrzip and lzop use upstream's external-program fallback. Missing
   programs fail when the archive is opened. Explicit program filters parse
   argv using the existing command parser and never invoke a shell. Pipes
