@@ -127,6 +127,33 @@ impl CFile {
     }
 }
 
+/// `mktime` of a broken-down local time with `tm_isdst` unknown (-1). The
+/// fields are those of `struct tm` and are normalized by `mktime`; -1 if it
+/// can't represent the time.
+#[allow(clippy::useless_conversion)] // time_t is narrower on some platforms
+pub fn mktime_local(
+    year: c_int,
+    mon: c_int,
+    mday: c_int,
+    hour: c_int,
+    min: c_int,
+    sec: c_int,
+) -> i64 {
+    // SAFETY: an all-zero `tm` is valid (its pointer members, where it has
+    // any, are NULL), and `mktime` only reads and normalizes it.
+    unsafe {
+        let mut tm = std::mem::zeroed::<libc::tm>();
+        tm.tm_year = year;
+        tm.tm_mon = mon;
+        tm.tm_mday = mday;
+        tm.tm_hour = hour;
+        tm.tm_min = min;
+        tm.tm_sec = sec;
+        tm.tm_isdst = -1;
+        i64::from(libc::mktime(&mut tm))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

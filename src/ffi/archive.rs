@@ -116,7 +116,9 @@ pub extern "C" fn archive_format(a: *mut Archive) -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_format_name(a: *mut Archive) -> *const c_char {
-    with(a, std::ptr::null(), |h| cptr(h.base.format_name.get()))
+    with(a, std::ptr::null(), |h| {
+        cptr(h.base.format_name.borrow().as_deref())
+    })
 }
 
 #[unsafe(no_mangle)]

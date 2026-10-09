@@ -48,8 +48,9 @@ use crate::entry::Entry;
 use crate::read_add_passphrase::Passphrases;
 use crate::util::Error;
 use std::any::Any;
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::ffi::{CStr, c_int};
+use std::ffi::{CStr, CString, c_int};
 use std::rc::Rc;
 
 /// `ARCHIVE_ERRNO_FILE_FORMAT`: unrecognized or invalid file format.
@@ -188,7 +189,14 @@ impl Base {
     /// Sets the format code and name `archive_format` reports.
     pub fn set_format(&self, code: c_int, name: &'static CStr) {
         self.format.set(code);
-        self.format_name.set(Some(name));
+        *self.format_name.borrow_mut() = Some(Cow::Borrowed(name));
+    }
+
+    /// Sets a formatted name for `archive_format_name` to report, such as
+    /// "CAB 1.3 (LZX)". The name has no NUL.
+    pub fn set_format_name(&self, name: Vec<u8>) {
+        let name = CString::new(name).unwrap_or_default();
+        *self.format_name.borrow_mut() = Some(Cow::Owned(name));
     }
 }
 

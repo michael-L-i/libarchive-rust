@@ -29,6 +29,7 @@
 
 use crate::read::Read;
 use crate::string::ConvCache;
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, c_int};
 use std::sync::{Arc, Mutex};
@@ -86,7 +87,9 @@ pub struct Base {
     pub magic: u32,
     pub state: Cell<u32>,
     pub format: Cell<c_int>,
-    pub format_name: Cell<Option<&'static CStr>>,
+    /// `archive_format_name`'s string: a static one, or a formatted one (a CAB's
+    /// version and compression) that stays put until the name changes.
+    pub format_name: RefCell<Option<Cow<'static, CStr>>>,
     /// Number of file entries processed.
     pub file_count: Cell<c_int>,
     pub errno: Cell<c_int>,
@@ -108,7 +111,7 @@ impl Base {
             magic,
             state: Cell::new(state::NEW),
             format: Cell::new(0),
-            format_name: Cell::new(None),
+            format_name: RefCell::new(None),
             file_count: Cell::new(0),
             errno: Cell::new(0),
             error: RefCell::new(Vec::new()),
