@@ -107,6 +107,15 @@ Divergences:
   check (0xE1 does not decode to U+0410), so upstream's
   `test_archive_string_update_utf8_koi8` skips there; a variant that checks
   only the multibyte forms runs instead.
+- On macOS the port converts with the system `iconv` (libc), while the
+  oracle build links Homebrew's GNU libiconv. They differ on some legacy
+  charsets: under `ru_RU.KOI8-R`, `ja_JP.eucJP` or `ja_JP.SJIS` with
+  `hdrcharset=CP932` or ISO-8859-1, the system `iconv` transliterates or
+  accepts bytes GNU libiconv rejects (`café` reads as `caf'e`; `\xff\xfe`
+  converts from CP932 instead of failing with "... can't be converted").
+  The conversion code is the same; only the library differs. Seen in the
+  tar reader's differential runs; all other locale and charset
+  combinations matched.
 
 ## archive_entry and archive_acl (`src/entry*.rs`, `src/acl.rs`)
 
