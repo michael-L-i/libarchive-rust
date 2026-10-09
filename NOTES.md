@@ -107,6 +107,15 @@ Divergences:
   check (0xE1 does not decode to U+0410), so upstream's
   `test_archive_string_update_utf8_koi8` skips there; a variant that checks
   only the multibyte forms runs instead.
+- On macOS the port converts with the system `iconv` (libc), while the
+  oracle build links Homebrew's GNU libiconv. They differ on some legacy
+  charsets: under `ru_RU.KOI8-R`, `ja_JP.eucJP` or `ja_JP.SJIS` with
+  `hdrcharset=CP932` or ISO-8859-1, the system `iconv` transliterates or
+  accepts bytes GNU libiconv rejects (`café` reads as `caf'e`; `\xff\xfe`
+  converts from CP932 instead of failing with "... can't be converted").
+  The conversion code is the same; only the library differs. Seen in the
+  tar reader's differential runs; all other locale and charset
+  combinations matched.
 
 ## archive_entry and archive_acl (`src/entry*.rs`, `src/acl.rs`)
 
@@ -760,6 +769,123 @@ Phase 5 needs:
 - The BSD name check's `SIZE_MAX - 1` bound is implied by the 1 MiB bound and
   is not repeated.
 
+## cab reader (src/read/format/cab.rs)
+
+Suspected upstream bugs, ported as-is:
+
+- `read_data_invoked` is set by the first `read_data` and never cleared, so
+  once any entry has been read, skipping a later entry decompresses it
+  (`cab_consume_cfdata`) instead of just counting `bytes_skipped`
+  (archive_read_support_format_cab.c).
+- A name longer than 255 bytes is "Invalid CAB header": the name is read
+  with `cab_read_ahead_remaining(a, 256)` and must end inside that window.
+- `cab_dos_time` hands the CFFILE date and time to `mktime` unchecked in the
+  local time zone, so a month or day of 0 is normalized (month 0 is
+  December of the year before) and the result depends on `TZ`.
+- A failed CFDATA checksum is `ARCHIVE_FAILED` in `cab_checksum_finish`, but
+  every caller turns any negative result into `ARCHIVE_FATAL`.
+- `cab_read_data` returns `ARCHIVE_OK` with no data when the read-ahead of a
+  non-empty CFDATA is empty, instead of an error.
+- `lzx_decode_init` keeps the old window size in a `uint16_t`, so windows of
+  64 KiB and more are reallocated for every folder. Here each folder gets a
+  fresh decoder, which is the same thing.
+
+Differences:
+
+- `archive_format_name` is formatted ("CAB 1.3 (LZX)"), kept with
+  `Base::set_format_name` in a buffer that is rewritten in place.
+- MSZIP is inflated with miniz_oxide instead of zlib. `inflateSetDictionary`
+  after each block is reproduced by decoding into a contiguous buffer that
+  holds the previous block (the dictionary) in front of the new output, in
+  non-wrapping mode, so valid data decodes identically. On corrupt data the
+  `(%d)` in "Deflate decompression failed (%d)" is -3 (Z_DATA_ERROR) for
+  any invalid data and -5 (Z_BUF_ERROR) when the CFDATA's compressed bytes
+  run out; the exact point where a corrupt stream is noticed can differ
+  from zlib's, as with the gzip filter.
+- Every LZX table, window and position-slot access is bounds-checked; where
+  upstream's invariants would be broken by corrupt input (a position slot
+  or a table index out of range) the decoder fails with "LZX decompression
+  failed (-25)". Huffman table writes that would leave the table fail the
+  same way.
+
+## iso9660 reader (src/read/format/iso9660.rs)
+
+### Scope
+
+- The pinned `archive_read_support_format_iso9660.c` has no path table
+  reading, no El Torito boot catalog and no boot image entries. It scans
+  directory records from the root, and a Boot Record descriptor is only
+  recognized while bidding. The port has the same scope.
+
+### Ported as-is (suspected upstream bugs)
+
+- `bid` asks for 48 KiB (32 KiB reserved area and 8 descriptors) and gives up
+  if the input is shorter, so a smaller image is never recognized.
+- `parse_rockridge` returns `ARCHIVE_WARN` ("Tried to parse Rockridge
+  extensions, but none found") for a record whose system use area has no
+  SUSP entry, but both callers treat any non-OK result as failure, so one
+  such record in an image with SUSP makes the whole read fail with
+  `ARCHIVE_FATAL`. The port fails with that message.
+- Looking for the "RE" directory of a "CL" file (`next_cache_entry`) pops
+  entries from the RE list and puts the non-matching ones back, and stops
+  when it pops the first one again. That last pop is not put back, so a "CL"
+  file with no matching "RE" drops the first RE directory from the list.
+- A "CE" entry stores its offset and length in the file, so a record with two
+  of them, or a continuation area with more, reads every request with the
+  values of the last one.
+- `previous_number` starts at 0. A first entry with file number 0 (extent 0,
+  or PX inode 0 on every entry) takes the hard link branch before any entry
+  has been returned. `previous_pathname.s` is still NULL, so upstream sets no
+  hard link, but the entry still gets no size and no data.
+- `archive_string_empty` only zeroes the length. The name and symlink buffers
+  are read as C strings in places (`strcmp` for `rr_moved`, the "beyond
+  end-of-media" and out-of-order warnings, the symlink target), so after an
+  NM or SL entry empties them those places still see the old bytes, and a
+  symlink target can be stale. The port keeps the bytes and the length apart.
+- An out-of-order file warning prints `pathname.s`, which is NULL when
+  Joliet names are in use; it is printed as "(null)".
+- A zisofs block of zero length (a hole) is returned as a whole block of
+  zeros, even past the end of the declared size.
+- Empty files and symbolic links get the offset `-1`, which `offset << 16`
+  turns into the largest key but one, so they come out of the heap last.
+- The heap key is `offset << 16` plus the heap's length, which is not a
+  counter: after entries come out, keys of different entries can be equal,
+  and for 65536 or more pending entries they are not unique at all. Which of
+  two equal keys comes first is therefore part of the output, and the heaps
+  are ported as written rather than replaced with `BinaryHeap`.
+- `SL` and `NM` entries cut at the first NUL (`archive_strncat`), and a
+  Joliet name of odd length loses its last byte; a one-byte name becomes the
+  empty name.
+
+### Differences
+
+- A chain of parents that loops (a malformed image can make one with "CL"
+  and "RE" entries that point at each other) hangs upstream in the duplicate
+  directory check and the "CL" ancestor check, and overflows the stack in the
+  Joliet pathname builder. The port stops after as many steps as there are
+  records: the first two fail with "Directory structure contains loop" and
+  "Invalid Rockridge CL", the last with "Pathname is too long". Plain
+  pathnames keep upstream's depth limit of 1000.
+- A zisofs block whose zlib stream ends before the block's data is used up
+  makes upstream return empty blocks for ever, without consuming input. The
+  port fails with "zisofs decompression failed (-5)" when a decompression
+  step consumes and produces nothing.
+- The number in "zisofs decompression failed (%d)" is zlib's return code;
+  miniz_oxide gives its equivalent (`MZError` values are zlib's) for the
+  errors it has, and which corrupt streams are errors, and at which byte,
+  can differ from zlib.
+- The pending-file and continuation heaps hold indexes into one vector of
+  records, and the lists upstream threads through the records (`next`,
+  `re_next`) are separate queues. Upstream's lists share the `next` field
+  between the cache and the empty-file list, and `re_next` between the RE
+  and descendant lists; where an image makes one record be on two lists at
+  once, upstream corrupts them and the port does not.
+- A directory is read whole with one read-ahead of its size, as upstream
+  does; the size is bounded by the volume size from the descriptor, and a
+  size beyond the input fails once the input ends.
+- Name conversion failures are always "can't be converted" warnings; the
+  string layer does not report the `ENOMEM` case upstream tells apart.
+
 ## Time and CRC helpers (`src/time.rs`, `src/crc32.rs`)
 
 ### Ported as-is
@@ -1017,3 +1143,255 @@ the entry record and the extra fields, `zip/crypto.rs` the decryption, and
   256_large*}`, and the `zipx_*_encrypted` and `deflate_encrypted` tests with
   their `_streaming` forms, `ppmd8_aes256_streaming`. The probe covers
   their fixtures (and the unzip suite passes in full).
+
+## xar reader (`src/read/format/xar.rs`, `xar/toc.rs`)
+
+### Ported as-is
+
+- The checksum algorithms of an extended attribute's `archived-checksum` and
+  `extracted-checksum` are never recorded (`xml_start` only changes state for
+  the `ea` children, unlike `data`), so only the digits are stored and an
+  xattr's data is never verified.
+- An xattr is decoded with the decoder that the entry's `entry_encoding`
+  picks (xz stream or lzma alone) and named in its errors, whatever the
+  xattr's own `encoding` says. The xattr is also decoded in one call: it must
+  fit what is buffered and the 64 KiB output buffer, or "Decompressed size
+  error".
+- `xar_read_header` returns a conversion warning (name, user, group or link
+  text that cannot be converted from UTF-8) before it moves to the file's
+  data, if the file has no xattrs (an xattr's own result replaces the
+  warning). The data then reads from wherever the previous entry left off.
+  Entries read in order hide it.
+- `xar_read_data_skip` adds the bytes of the last block to `xar->offset`
+  again (they were added when the block was read), so skipping the rest of
+  an entry that was read in part leaves `xar->offset` too far ahead and the
+  next move to a file's data comes up short.
+- The `Undelete` ext2 flag is `nouunlink`, the BSD user flag's name.
+- The header size field is checked by the bid and not when the TOC is read.
+- A checksum with a digit that is not hexadecimal has the length -1: it
+  never matches. An odd digit at the end is ignored, and more than 64 bytes
+  of digits are cut off.
+- Numbers stop at the first byte that is not a digit (`12ab` is 12); only an
+  overflow is an error, with no message. A time is 20 bytes exactly and its
+  last byte (the `Z`) is not checked. Seconds up to 60 and days up to 31 in
+  any month are accepted and normalized, like `timegm()`.
+- After the end of a zlib stream another call returns the end again without
+  progress, so a TOC or an entry whose packed length goes past the end of
+  its stream fails with "XAR decompressor made no progress"; after the end of
+  an xz or bzip2 stream, with "xz decompression failed (11)" or "bzip
+  decompression failed".
+- Hardlinks: a `type` element with more than one `link` attribute, or a file
+  that is already an original or a link, is "File with multiple link
+  attributes". Links are counted by the id in `link`, which must fit 32 bits,
+  and joined to the original with that id; a link 0 is no link.
+- A directory that has only a name and a type is not an entry. A name is
+  taken from the first `name` element only, and a nested file's pathname is
+  its parent's, a `/` and its own.
+- A directory's `nlink` is its subdirectories plus 2.
+- Only archived and extracted SHA-1, MD5, SHA-256 and SHA-512 checksums
+  exist (the style is read with the first three letters in any case); the
+  entry's checksums are checked when its last byte of packed data is read,
+  and a mismatch loses that last block.
+
+### Differences
+
+- The XML parser is the `xml` crate 1.4.0 (xml-rs, renamed), where upstream
+  uses libxml2's `xmlTextReader` (expat elsewhere). It has
+  `#![forbid(unsafe_code)]` and no dependencies, reads a stream, resolves
+  namespaces and checks well-formedness strictly. quick-xml (also
+  `forbid(unsafe_code)`, no dependencies) is a pull parser too, but checks
+  far less of the document (names, characters, prefixes) than libxml2 does;
+  roxmltree builds a whole tree, which would report a malformed ending
+  before any file. Upstream's callbacks are mapped onto its events: element
+  start with the local names and values of the attributes, element end, and
+  the text of a text node that is not blank, with the same states. Comments
+  and processing instructions split text as in libxml2; CDATA and blank text
+  are ignored, as upstream's reader ignores their node types.
+- Where the XML is malformed, both fail with `ARCHIVE_FATAL`, errno
+  `ARCHIVE_ERRNO_MISC`, and "XML Parsing error: " and a message, but the text
+  is the crate's, with a position (`1:61 Unexpected token: <`), not
+  libxml2's (`Extra content at the end of the document\n`). The depth limit is
+  libxml2's: 257 nested elements are accepted and the 258th is an error (the
+  message is its text). libxml2's limits on a text node, an attribute value
+  and a name are not mirrored.
+- What the two parsers accept differs, and the fixtures and a differential
+  run of 7,300 mutated archives found these (all else on the same path, in
+  error codes and entries, matched):
+  - Unbound namespace prefixes (`<x:file>`, `a:b="c"`) are a warning in
+    libxml2 (the message is left in the archive error and the read goes on)
+    and an error here. `xml` as an element prefix is accepted by libxml2 and
+    rejected here.
+  - Namespace declarations are not attributes here; libxml2's reader lists
+    `xmlns` and `xmlns:p` among them, so a declaration `xmlns:id="u"` on a
+    `file` would be its id attribute upstream.
+  - Internal entities of a DOCTYPE are expanded here; libxml2's reader
+    gives an entity reference node, which upstream ignores. An encoding
+    declaration that the bytes contradict (UTF-8 declared, UTF-16 found) is
+    an error here.
+  - libxml2's reader parses ahead (4096 bytes at a time) before it hands out
+    a node, so with an error in the XML and an error from a callback in a TOC
+    that small, upstream reports the XML error. This streams: the callback
+    error comes first, as it would for a longer TOC. Likewise a TOC that
+    cannot be read to the end (truncated file, data past a zlib stream) reports
+    the read error ("Truncated archive file", "XAR decompressor made no
+    progress") here, and libxml2's syntax error ("Extra content at the end of
+    the document") upstream when the XML is incomplete at that point. When
+    the XML was complete, upstream reports the read error too.
+- zlib is miniz_oxide's streaming inflater (zlib wrapper, Adler-32 checked).
+  The one difference is corrupt data: a back-reference reaching before the
+  start of the output is accepted (see the gzip filter), so an entry with
+  such data fails in the size or checksum check ("Decompressed size error",
+  "Checksum error") where upstream says "File decompression failed (-3)". The
+  zlib error numbers are mapped from the crate's errors (-3 data, -5 no
+  progress); xz and lzma failures have liblzma's numbers by kind (8 options,
+  10 no progress, 5 memory, 9 for the rest, 11 for a decoder already
+  ended). xz and lzma limit the decoder's memory to 256 MiB like the xz
+  filter (upstream has none).
+- bzip2 is the streaming `Decoder` of the bzip2 filter, with `last` set when
+  the packed size or the end of the file cut the read short. bzlib returns
+  empty blocks while it reads the start of a block; the decoder does not, so
+  the number and the sizes of the blocks that `archive_read_data_block`
+  returns differ from upstream for bzip2, xz, lzma and (a little) gzip
+  entries. The bytes and the sizes in total are the same.
+- lzma-rust2's streams can hold decoded bytes back after they have taken the
+  last of the packed bytes (liblzma decodes only as far as the output goes,
+  and zlib and libbz2 deliver everything they have decoded). Upstream would
+  stop when the packed bytes are used up, so here the held output is read out
+  and handed on first, by the entry or the TOC, before the end is decided.
+  With it gzip, bzip2 and xz entries are unchanged and lzma-alone entries
+  match upstream.
+- Corrupt xz and lzma data differs from liblzma, as in the xz filter. xz with 8
+  bytes of garbage after the stream succeeds upstream and fails here with
+  code 9, losing the entry's output. lzma with 2 bytes of garbage fails
+  upstream with code 11 after the data is delivered and succeeds here. An lzma
+  stream cut short by one byte or more delivers everything upstream and fails
+  here with "Decompressed size error". A cut xz stream delivers 1580 bytes
+  upstream and 1561 here in the case tried. A stream of the wrong format gives
+  code 9 or 5 here and 7 in liblzma. Dictionaries of 256 MiB or more decode
+  upstream (no limit) and fail here with code 5.
+- xml-rs accepts `<?xml version="1.1"?>`, which libxml2 rejects with
+  "Unsupported version '1.1'".
+- A read callback that returns no bytes but used some input is the end of the
+  TOC to libxml2, which stops reading it. The TOC is read on here until
+  bytes arrive.
+- Bounds (upstream has none): the TOC may be at most 1 GiB uncompressed
+  ("Rejecting malformed xar archive: TOC exceeds 1 gigabyte", `ARCHIVE_ERRNO_MISC`).
+  Its job is to bound what xml-rs buffers, which it does not limit itself (a
+  CDATA section, say); the memory for files and xattrs is in proportion to the
+  TOC bytes present, so it is bounded by this too. A pathname is at most 1 MiB
+  (`ENOMEM`). Each file keeps its own name and its parent, and the pathname is
+  put together when the entry is returned (and so is a hardlink's target), so
+  deep nesting does not copy a parent's pathname into every file; the length
+  check is made then, and not while the TOC is read. A checksum size over 64
+  in the TOC is a read of that length and "Checksum error". The declared
+  uncompressed size of the TOC is only compared with what was read, at the
+  end, as upstream.
+- Offsets: a seek back that the input cannot do is "Cannot seek"
+  (`ARCHIVE_FAILED`), as upstream; any other failure of the seek (upstream
+  goes on with the offset set to the error code) fails with it.
+- A file with no `name` element has no pathname in the entry (upstream's
+  string is NULL and the entry's is cleared); one whose name decodes to nothing
+  has the empty pathname, as upstream. Entry fields are set where upstream sets
+  them, and the format and its name only when the TOC has been read.
+- `xmlCleanupParser()` after every TOC has no counterpart.
+- The unsafe footprint of what the reader adds is nil: `xml` forbids
+  `unsafe` and has no dependencies. The digests are RustCrypto's (see Core).
+- The archives of the upstream tests and nine more files of the fixtures
+  (`test_read_format_xar*`) read the same entries, data and errors through
+  upstream and through this reader. The reader is also checked against
+  generated archives with the gzip, bzip2, xz, lzma and no encoding and files
+  of up to 300,000 bytes in blocks of 13, 4096 and 100,000 bytes (the data,
+  sizes and hashes are equal), and 7,300 mutated fixtures, each in two
+  block sizes (TOC XML edits with the archive repaired, header edits,
+  truncations, heap edits).
+
+## tar reader (src/read/format/tar.rs)
+
+### Ported as-is
+
+- The hard link size heuristic calls `archive_read_format_tar_bid(a, 50)`,
+  which looks at the stream position. The record of the hard link entry itself
+  has not been consumed yet at that point (`unconsumed`), so it bids on the
+  entry's own header, not on the one that follows as the comment says. The
+  port bids on the entry's own header too.
+- `header_gnutar` assigns the result of `header_common` to `err`, which drops
+  the warnings of the name conversions before it (their messages stay).
+- `gnu_add_sparse_entry` links the new block before checking it, so a
+  rejected block stays in the list as an empty one. `GNU.sparse.map` turns the
+  resulting `ARCHIVE_FATAL` into `ARCHIVE_WARN`, and the entry then carries
+  that empty block.
+- A sparse entry whose only data block covers the whole file is
+  `ARCHIVE_FATAL` ("Malformed sparse map data"): `archive_entry_sparse_count`
+  drops such a block, so its count differs from the number added. Adjacent
+  blocks merged by `archive_entry_sparse_add_entry` and blocks past the end
+  of the file are fatal for the same reason.
+- `sparse_offset`, `sparse_numbytes` and the GNU sparse major/minor numbers
+  are not reset between entries.
+- `pax_attribute_read_number` returns `ARCHIVE_FATAL` without a message for a
+  value over 64 bytes, and `ARCHIVE_WARN` without a message for a negative or
+  overflowing number. A malformed time sets "Ignoring malformed pax X" even
+  when the call failed fatally.
+- `SCHILY.xattr.` takes values below 16 MiB but `LIBARCHIVE.xattr.` and
+  `RHT.security.selinux` take values up to it. `LIBARCHIVE.xattr.` skips an
+  oversized value with a warning and no message. `SCHILY.xattr.` and
+  `LIBARCHIVE.xattr.` names end at their first NUL, which `%00` can produce.
+- `pax_attribute_SUN_holesdata` tests for a `\n` at the end of a field, which
+  cannot be there (the value excludes the newline), so the test is dead.
+- `read_body_to_string` and `header_pax_records` consume an oversized body
+  before the pending record of the header has been consumed. The total is the
+  same.
+- The `X` header is the Sun variant of `x` and is refused when repeated with
+  either, but a repeated `K`, `L` or `V` only warns.
+- `process_mac_extensions` defaults to on only where upstream was built with
+  `copyfile.h` (macOS); here that is Apple targets.
+
+### Differences
+
+- `entry_offset` is not kept: upstream sets it and never reads it.
+- `compat-2x` only passes `SCONV_SET_OPT_UTF8_LIBARCHIVE2X` to the
+  conversion, which does nothing on this platform (see archive_string).
+- The sparse list is a `VecDeque`, and the 1.0 map's lines are read one at a
+  time (at most 100 bytes each, as upstream limits them) instead of through
+  the shared `line` buffer.
+- No allocation is bounded beyond upstream's limits: names and values are
+  copied from bytes the archive holds, so memory use is at most the size of the
+  input, as upstream's is. An attribute name can be as long as the buffered
+  part of its line (up to 100 million characters).
+- A failed `read_ahead` (not only a short archive) is reported with the
+  "Truncated ..." message of the call site, as upstream does for its `NULL`.
+
+## lha reader (src/read/format/lha.rs)
+
+### Ported as-is
+
+- `lha_check_header_format` compares the level byte as a `char`, which is
+  signed on the platforms we target: a "-lh?-" header with level 0x80 to
+  0xff bids 30 and is accepted as a header, then `read_header` fails with
+  "Unsupported LHa header level -N". (On unsigned-char platforms it would not
+  bid.)
+- `uname`, `gname`, `crc` and `header_crc` are not reset between entries, so
+  an entry without a user name, group name or header CRC extended header
+  inherits the previous entry's (a level 2 or 3 header without a CRC
+  extended header compares against the previous, or initial zero, value).
+- Header level 3 never skips the padding between the extended headers and
+  `header_size`; header level 2 does.
+- `lha_read_data_*` ask for one byte of look-ahead even when the compressed
+  data is used up: an archive whose last entry ends exactly at the end of
+  the file, after the decoder consumed everything, fails the next
+  `read_data` call with "Truncated LHa file body" if that call is made.
+- A directory (`-lhd-`) whose header carries a non-zero file CRC reports
+  "LHa data CRC error" at its end.
+- A read error while peeking at a header is treated as a short input (EOF
+  or "Truncated LHa header"), as upstream's `__archive_read_ahead` returning
+  NULL is.
+
+### Differences
+
+- The decoder window is zero filled (upstream mallocs it and fills only the
+  last 8/32/64 KiB with spaces; no valid distance reaches the rest).
+  The decoder is created per entry rather than reused, so no table state
+  carries over.
+- Every Huffman table, tree and window index is checked; corrupt tables fail
+  with "Bad lzh data" instead of reading or writing out of bounds. The
+  Huffman code lengths are 0 to 16 by construction, so valid streams are
+  unaffected.

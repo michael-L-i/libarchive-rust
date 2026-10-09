@@ -85,7 +85,7 @@ pub fn support_lzip(r: &mut Read, _: &Base) -> Result<Status, Error> {
 
 const OUT_BLOCK_SIZE: usize = 64 * 1024;
 /// Maximum decoder memory, including the dictionary.
-const MEM_LIMIT_KIB: u32 = 256 * 1024;
+pub(crate) const MEM_LIMIT_KIB: u32 = 256 * 1024;
 
 fn misc(msg: &str) -> Error {
     Error::fatal(ARCHIVE_ERRNO_MISC, msg)
@@ -227,13 +227,13 @@ fn lzip_has_member(up: &mut Reader<'_>) -> Result<c_int, Error> {
 
 /// The library's decoder: xz streams, or LZMA1 with a .lzma header, or the
 /// raw LZMA1 of a lzip member.
-enum Stream {
+pub(crate) enum Stream {
     Xz(Box<XzStream>),
     Lzma(Box<LzmaStream>),
 }
 
 impl Stream {
-    fn process(
+    pub(crate) fn process(
         &mut self,
         input: &[u8],
         out: &mut [u8],

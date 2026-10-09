@@ -1324,9 +1324,10 @@ pub enum Data<'r> {
     Eof { offset: i64 },
     /// A problem with the entry's data, already recorded on the handle (see
     /// `Reader::warn`): there is no block this time, and the caller gets
-    /// `ARCHIVE_WARN`. A later call may carry on.
+    /// `ARCHIVE_WARN`. A later call may carry on. `offset` is what the
+    /// caller gets as the block's offset.
     #[allow(dead_code)] // returned by the zip and rar readers (phase 4)
-    Warn,
+    Warn { offset: i64 },
 }
 
 /// What a format reader implements. A format owns its own state in `self`;
@@ -1396,7 +1397,7 @@ pub trait Format: Any {
             match self.read_data(r)? {
                 Data::Block { .. } => {}
                 Data::Eof { .. } => return Ok(Status::Ok),
-                Data::Warn => return Ok(Status::Warn),
+                Data::Warn { .. } => return Ok(Status::Warn),
             }
         }
     }
@@ -1856,7 +1857,7 @@ impl Read {
             if written == dest.len() {
                 break written as isize;
             }
-            if st.offset == st.output_offset && st.pending.is_empty() {
+            if st.offset == st.output_offset && st.pos == st.pending.len() {
                 let (mut out_off, mut blk_off) = (st.output_offset, st.offset);
                 let mut leftover = Vec::new();
                 let mut out_of_order = false;
@@ -1867,7 +1868,7 @@ impl Read {
                         blk_off = offset;
                         eof = true;
                     }
-                    Data::Warn => warned = true,
+                    Data::Warn { .. } => warned = true,
                     Data::Block { data, offset } => {
                         blk_off = offset;
                         if blk_off < out_off {
@@ -1884,7 +1885,7 @@ impl Read {
                 if warned {
                     break 'read ARCHIVE_WARN as isize;
                 }
-                (st.output_offset, st.offset, st.pending) = (out_off, blk_off, leftover);
+                (st.output_offset, st.offset, st.pending, st.pos) = (out_off, blk_off, leftover, 0);
                 if eof && blk_off == out_off {
                     break 'read written as isize;
                 }
@@ -1909,9 +1910,9 @@ impl Read {
                 &mut written,
                 &mut st.output_offset,
                 &mut st.offset,
-                &st.pending,
+                st.pending.get(st.pos..).unwrap_or_default(),
             );
-            st.pending.drain(..n);
+            st.pos += n;
         };
         self.read_data = st;
         result
@@ -2038,9 +2039,12 @@ impl Read {
 struct ReadData {
     /// Offset in the entry of the next byte `read_data` hands out.
     output_offset: i64,
-    /// Offset in the entry of the first byte of `pending`.
+    /// Offset in the entry of the first byte of `pending` not handed out.
     offset: i64,
     pending: Vec<u8>,
+    /// How much of `pending` is handed out. A cursor rather than draining
+    /// the front, which made small reads of a large block quadratic.
+    pos: usize,
 }
 
 #[cfg(test)]
@@ -2969,7 +2973,7 @@ mod tests {
         let (mut r, a) = opened(Script::new(&[(7, b"hi")], 9));
         let first = r.read_data_block(&a, |d| match d {
             Data::Block { data, offset } => Some((data.to_vec(), offset)),
-            Data::Eof { .. } | Data::Warn => None,
+            Data::Eof { .. } | Data::Warn { .. } => None,
         });
         assert_eq!(first, Ok(Some((b"hi".to_vec(), 7))));
         assert!(matches!(
@@ -3096,7 +3100,7 @@ mod tests {
             }
             // `Data::Warn` is what carries the warning back.
             let _ = r.warn(libc::EILSEQ, "bad checksum");
-            Ok(Data::Warn)
+            Ok(Data::Warn { offset: 0 })
         }
     }
 
@@ -3115,7 +3119,7 @@ mod tests {
         assert_eq!((a.state.get(), a.format.get()), (state::DATA, 7));
         assert_eq!(error(&a), "header oddity");
         // The data's warning is a status, with no block.
-        let got = r.read_data_block(&a, |d| matches!(d, Data::Warn));
+        let got = r.read_data_block(&a, |d| matches!(d, Data::Warn { .. }));
         assert_eq!(got, Ok(true));
         assert_eq!(error(&a), "bad checksum");
         // A skip stops at a warning and reports it, but the handle is fine.

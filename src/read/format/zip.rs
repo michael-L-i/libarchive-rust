@@ -1440,7 +1440,7 @@ impl<const SEEKABLE: bool> Format for Zip<SEEKABLE> {
             }
         };
         let (Out::Buf(size) | Out::Stream(size) | Out::Dec(size)) = out else {
-            return Ok(Data::Warn);
+            return Ok(Data::Warn { offset });
         };
 
         // FAIL if there are more uncompressed bytes than were initially
