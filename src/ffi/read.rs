@@ -1050,6 +1050,49 @@ pub extern "C" fn archive_seek_data(a: *mut Archive, offset: i64, whence: c_int)
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_data_into_fd(a: *mut Archive, fd: c_int) -> c_int {
+    if let Some(ret) = with(a, None, |h| match &h.kind {
+        Kind::ReadDisk(d) => Some({
+            let mut disk = d.borrow_mut();
+            let mut bytes = vec![0; 64 * 1024];
+            let output = Fd(fd);
+            loop {
+                let n = disk.data(&h.base, &mut bytes);
+                if n < 0 {
+                    break n as c_int;
+                }
+                if n == 0 {
+                    break ARCHIVE_OK;
+                }
+                let mut remaining = &bytes[..n as usize];
+                let mut error = None;
+                while !remaining.is_empty() {
+                    match output.write(remaining) {
+                        Ok(0) => {
+                            error = Some(
+                                h.base
+                                    .raise(crate::util::Error::fatal(libc::EIO, "Write failed")),
+                            );
+                            break;
+                        }
+                        Ok(n) => remaining = &remaining[n..],
+                        Err(e) if e == libc::EINTR => continue,
+                        Err(e) => {
+                            error =
+                                Some(h.base.raise(crate::util::Error::fatal(e, "Write failed")));
+                            break;
+                        }
+                    }
+                }
+                if let Some(error) = error {
+                    break error;
+                }
+            }
+        }),
+        _ => None,
+    }) {
+        return ret;
+    }
+
     checked!(
         archive_read_data_into_fd,
         a,

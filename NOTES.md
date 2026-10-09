@@ -1711,5 +1711,17 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   callbacks are recorded without reborrowing the active disk state.
 - Platform calls and client callbacks live only in `src/ffi/disk*.rs`.
   Extended attribute lists are bounded to 1 MiB and individual values to
-  16 MiB before allocating. Platform-specific ACL/Mac metadata restoration
-  and AppleDouble/HFS handling are still being completed.
+  16 MiB before allocating. Darwin ACLs are translated through native ACL
+  APIs. Mac metadata uses native `fcopyfile` packing/unpacking; AppleDouble
+  entries are merged into their sibling using the same anchored directory.
+- HFS compression uses safe miniz_oxide zlib blocks. Resource-fork headers,
+  inline attributes and compression flags match upstream; compressed block
+  bytes can differ from zlib. Optional compression is limited to files of
+  256 MiB, with larger files retaining an ordinary data fork to bound the
+  resource buffer. Failure to enable compression restores the data fork.
+- `SAFE_WRITES` creates a fresh sibling with `O_EXCL` and renames it on entry
+  completion. A failed/abandoned write removes only its owned temporary.
+  Sparse metadata is discovered through `SEEK_DATA`/`SEEK_HOLE`; block reads
+  skip holes, while ordinary reads preserve zero bytes. Sparse maps are
+  bounded to one million extents. Remote filesystem detection uses native
+  `statfs`; synthetic status is unknown (-1) on macOS, as upstream's build.

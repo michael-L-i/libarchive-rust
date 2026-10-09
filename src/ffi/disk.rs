@@ -270,15 +270,15 @@ pub extern "C" fn archive_read_disk_can_descend(a: *mut Archive) -> c_int {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_current_filesystem(a: *mut Archive) -> c_int {
-    read(a, -1, |_, d| d.filesystem)
+    with(a, -1, |h| h.base.disk_filesystem.get())
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_current_filesystem_is_synthetic(a: *mut Archive) -> c_int {
-    read(a, -1, |_, _| 0)
+    with(a, -1, |h| h.base.disk_synthetic.get())
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_current_filesystem_is_remote(a: *mut Archive) -> c_int {
-    read(a, -1, |_, _| 0)
+    with(a, -1, |h| h.base.disk_remote.get())
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_set_behavior(a: *mut Archive, flags: c_int) -> c_int {
@@ -527,7 +527,7 @@ pub extern "C" fn archive_read_extract(
     flags: c_int,
 ) -> c_int {
     guard(ARCHIVE_FATAL, || {
-        let result = with(a, ARCHIVE_FATAL, |h| {
+        let mut result = with(a, ARCHIVE_FATAL, |h| {
             let Kind::Read(r) = &h.kind else {
                 return ARCHIVE_FATAL;
             };
@@ -544,45 +544,50 @@ pub extern "C" fn archive_read_extract(
             if code < 0 {
                 h.base.copy_error(&e.base);
             }
-            code
+            code.max(archive::ARCHIVE_WARN)
         });
-        if result < 0 {
-            return result;
-        }
-        loop {
-            let mut data = std::ptr::null();
-            let mut size = 0;
-            let mut offset = 0;
-            let code = super::read::archive_read_data_block(a, &mut data, &mut size, &mut offset);
-            if code == archive::ARCHIVE_EOF {
-                break;
-            }
-            if code < 0 {
-                return code;
-            }
-            let code = with(a, ARCHIVE_FATAL, |h| {
-                let Kind::Read(r) = &h.kind else {
-                    return ARCHIVE_FATAL;
-                };
-                let mut r = r.borrow_mut();
-                let Some(e) = &mut r.extract else {
-                    return ARCHIVE_FATAL;
-                };
-                let Some(bytes) = super::archive::bytes(data, size) else {
-                    return ARCHIVE_FATAL;
-                };
-                let code = e.disk.data_block(&e.base, bytes, offset);
-                if code < 0 {
-                    h.base.copy_error(&e.base);
+        // SAFETY: caller's entry remains live for extraction.
+        let copy = unsafe { entry.cast::<Entry>().as_ref() }
+            .is_some_and(|e| e.size_is_set() == 0 || e.size() > 0);
+        if result == ARCHIVE_OK && copy {
+            loop {
+                let mut data = std::ptr::null();
+                let mut size = 0;
+                let mut offset = 0;
+                let code =
+                    super::read::archive_read_data_block(a, &mut data, &mut size, &mut offset);
+                if code == archive::ARCHIVE_EOF {
+                    break;
                 }
-                code
-            });
-            if code < 0 {
-                return code;
+                if code != ARCHIVE_OK {
+                    result = code;
+                    break;
+                }
+                let code = with(a, ARCHIVE_FATAL, |h| {
+                    let Kind::Read(r) = &h.kind else {
+                        return ARCHIVE_FATAL;
+                    };
+                    let mut r = r.borrow_mut();
+                    let Some(e) = &mut r.extract else {
+                        return ARCHIVE_FATAL;
+                    };
+                    let Some(bytes) = super::archive::bytes(data, size) else {
+                        return ARCHIVE_FATAL;
+                    };
+                    let code = e.disk.data_block(&e.base, bytes, offset);
+                    if code < 0 {
+                        h.base.copy_error(&e.base);
+                    }
+                    code.max(archive::ARCHIVE_WARN)
+                });
+                if code < 0 {
+                    result = code;
+                    break;
+                }
+                progress(a);
             }
-            progress(a);
         }
-        with(a, ARCHIVE_FATAL, |h| {
+        let finish = with(a, ARCHIVE_FATAL, |h| {
             let Kind::Read(r) = &h.kind else {
                 return ARCHIVE_FATAL;
             };
@@ -590,13 +595,17 @@ pub extern "C" fn archive_read_extract(
             let Some(e) = &mut r.extract else {
                 return ARCHIVE_FATAL;
             };
-            let code = e.disk.finish_entry(&e.base);
-            if code < 0 {
+            let code = e.disk.finish_entry(&e.base).max(archive::ARCHIVE_WARN);
+            if code < 0 && result == ARCHIVE_OK {
                 h.base.copy_error(&e.base);
             }
             code
-        })
+        });
+        result.min(finish)
     })
+}
+fn copy_extract_error(a: *mut Archive, dest: *mut Archive) {
+    with(a, (), |h| with(dest, (), |d| h.base.copy_error(&d.base)));
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_extract2(
@@ -605,27 +614,161 @@ pub extern "C" fn archive_read_extract2(
     dest: *mut Archive,
 ) -> c_int {
     guard(ARCHIVE_FATAL, || {
-        let code = super::write::archive_write_header(dest, entry);
-        if code < 0 {
-            return code;
+        let skip = with(a, None, |h| {
+            if let Kind::Read(r) = &h.kind {
+                r.borrow().skip_file
+            } else {
+                None
+            }
+        });
+        if let Some((dev, ino)) = skip {
+            archive_write_disk_set_skip_file(dest, dev, ino);
         }
-        loop {
-            let mut data = std::ptr::null();
-            let mut size = 0;
-            let mut offset = 0;
-            let code = super::read::archive_read_data_block(a, &mut data, &mut size, &mut offset);
-            if code == archive::ARCHIVE_EOF {
-                break;
-            }
-            if code < 0 {
-                return code;
-            }
-            let code = super::archive::archive_write_data_block(dest, data, size, offset);
-            if code < 0 {
-                return code as c_int;
-            }
-            progress(a);
+        let mut result = super::write::archive_write_header(dest, entry).max(archive::ARCHIVE_WARN);
+        if result < 0 {
+            copy_extract_error(a, dest);
         }
-        super::archive::archive_write_finish_entry(dest)
+        // SAFETY: caller's entry remains live for extraction.
+        let copy = unsafe { entry.cast::<Entry>().as_ref() }
+            .is_some_and(|e| e.size_is_set() == 0 || e.size() > 0);
+        if result == ARCHIVE_OK && copy {
+            loop {
+                let mut data = std::ptr::null();
+                let mut size = 0;
+                let mut offset = 0;
+                let code =
+                    super::read::archive_read_data_block(a, &mut data, &mut size, &mut offset);
+                if code == archive::ARCHIVE_EOF {
+                    break;
+                }
+                if code != ARCHIVE_OK {
+                    result = code;
+                    break;
+                }
+                let code = (super::archive::archive_write_data_block(dest, data, size, offset)
+                    as c_int)
+                    .max(archive::ARCHIVE_WARN);
+                if code < 0 {
+                    copy_extract_error(a, dest);
+                    result = code;
+                    break;
+                }
+                progress(a);
+            }
+        }
+        let finish = super::archive::archive_write_finish_entry(dest).max(archive::ARCHIVE_WARN);
+        if finish < 0 && result == ARCHIVE_OK {
+            copy_extract_error(a, dest);
+        }
+        result.min(finish)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn directory(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("libarchive-{name}-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::canonicalize(path).unwrap()
+    }
+    #[test]
+    fn safe_writes_replace_only_the_destination_link() {
+        let root = directory("atomic");
+        let path = root.join("file");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::hard_link(&path, root.join("other")).unwrap();
+        let mut entry = Entry::new(None);
+        entry.set_pathname(path.as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFREG | 0o600);
+        entry.set_size(3);
+        let base = Base::new(archive::WRITE_DISK_MAGIC);
+        let mut disk = write_disk::WriteDisk::default();
+        disk.options = 0x40000;
+        assert_eq!(disk.header(&base, &entry), 0);
+        assert_eq!(disk.data(&base, b"new"), 3);
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert_eq!(disk.finish_entry(&base), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(std::fs::read(root.join("other")).unwrap(), b"old");
+        assert_eq!(disk.close(&base), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    unsafe extern "C" fn descend_filter(
+        a: *mut Archive,
+        _data: *mut c_void,
+        _entry: *mut ArchiveEntry,
+    ) -> c_int {
+        if archive_read_disk_can_descend(a) != 0 {
+            assert_eq!(archive_read_disk_descend(a), 0);
+            0
+        } else {
+            1
+        }
+    }
+    #[test]
+    fn metadata_callback_can_descend_while_filtering_directories() {
+        let root = directory("walk");
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/file"), b"data").unwrap();
+        let disk = archive_read_disk_new();
+        let path = CString::new(root.as_os_str().as_bytes()).unwrap();
+        assert_eq!(archive_read_disk_open(disk, path.as_ptr()), 0);
+        assert_eq!(
+            archive_read_disk_set_metadata_filter_callback(
+                disk,
+                Some(descend_filter),
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        let mut entry = Entry::new(None);
+        let ptr = (&mut entry as *mut Entry).cast();
+        assert_eq!(super::super::read::archive_read_next_header2(disk, ptr), 0);
+        assert_eq!(
+            entry.pathname().unwrap().to_bytes(),
+            root.join("dir/file").as_os_str().as_bytes()
+        );
+        let mut data = [0; 4];
+        assert_eq!(
+            super::super::read::archive_read_data(disk, data.as_mut_ptr().cast(), 4),
+            4
+        );
+        assert_eq!(&data, b"data");
+        assert_eq!(
+            super::super::read::archive_read_next_header2(disk, ptr),
+            archive::ARCHIVE_EOF
+        );
+        assert_eq!(super::super::archive::archive_read_free(disk), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn logical_walk_does_not_recurse_into_ancestor_symlinks() {
+        let root = directory("cycle");
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::os::unix::fs::symlink(&root, root.join("dir/link")).unwrap();
+        let disk = archive_read_disk_new();
+        let path = CString::new(root.as_os_str().as_bytes()).unwrap();
+        assert_eq!(archive_read_disk_set_symlink_logical(disk), 0);
+        assert_eq!(archive_read_disk_open(disk, path.as_ptr()), 0);
+        let mut entry = Entry::new(None);
+        let ptr = (&mut entry as *mut Entry).cast();
+        let mut count = 0;
+        while super::super::read::archive_read_next_header2(disk, ptr) == 0 {
+            count += 1;
+            assert!(count <= 3);
+            if archive_read_disk_can_descend(disk) != 0 {
+                assert_eq!(archive_read_disk_descend(disk), 0);
+            }
+        }
+        assert_eq!(count, 3);
+        assert_eq!(entry.filetype(), 0);
+        assert_eq!(super::super::archive::archive_read_free(disk), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
