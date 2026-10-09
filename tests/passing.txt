@@ -86,6 +86,7 @@ tar/test_option_H_upper
 tar/test_option_L_upper
 tar/test_option_O_upper
 tar/test_option_T_upper
+tar/test_option_U_upper
 tar/test_option_X_upper
 tar/test_option_a
 tar/test_option_b
@@ -128,6 +129,7 @@ tar/test_patterns
 tar/test_print_longpath
 tar/test_stdio
 tar/test_strip_components
+tar/test_symlink_dir
 tar/test_version
 test_acl_from_text
 test_acl_nfs4
