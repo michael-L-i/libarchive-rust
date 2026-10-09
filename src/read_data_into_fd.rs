@@ -187,7 +187,7 @@ pub fn data_into_fd(r: &mut Read, a: &Base, fd: Fd) -> c_int {
                 out.target_offset = offset;
                 Step::Eof
             }
-            Data::Warn => Step::Stop(ARCHIVE_WARN),
+            Data::Warn { .. } => Step::Stop(ARCHIVE_WARN),
         });
         match step {
             Ok(Step::Continue) => {}

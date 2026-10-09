@@ -914,7 +914,7 @@ pub extern "C" fn archive_read_data_block(
                     (data.as_ptr().cast(), data.len(), offset, ARCHIVE_OK)
                 }
                 Data::Eof { offset } => (std::ptr::null(), 0, offset, ARCHIVE_EOF),
-                Data::Warn => (std::ptr::null(), 0, 0, ARCHIVE_WARN),
+                Data::Warn { offset } => (std::ptr::null(), 0, offset, ARCHIVE_WARN),
             });
             match block {
                 Ok((p, n, o, code)) => {
