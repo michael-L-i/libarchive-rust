@@ -66,7 +66,7 @@ pub const FORMATS: &[(c_int, Option<Support>)] = &[
     (code::CAB, None),
     (code::RAR, None),
     (code::RAR_V5, None),
-    (code::ISO9660, None),
+    (code::ISO9660, Some(super::iso9660::support)),
     // Seek is really bad, since it forces the read-ahead logic to discard
     // buffered data.
     (code::ZIP, None),
