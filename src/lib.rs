@@ -4,6 +4,7 @@ mod acl;
 mod archive;
 mod check_magic;
 mod cmdline;
+mod digest;
 mod entry;
 mod entry_copy_stat;
 mod entry_link_resolver;
