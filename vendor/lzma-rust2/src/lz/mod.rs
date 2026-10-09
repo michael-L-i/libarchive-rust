@@ -78,6 +78,20 @@ fn extend_match_safe(s1: &[u8], s2: &[u8]) -> usize {
         }
     }
 
+    // An overlapping final word covers the tail without bytewise comparisons.
+    // Bytes before `matched` have already compared equal.
+    if matched < len && len >= WORD_SIZE {
+        let start = len - WORD_SIZE;
+        let word1 = usize::from_ne_bytes(s1[start..len].try_into().unwrap());
+        let word2 = usize::from_ne_bytes(s2[start..len].try_into().unwrap());
+        let diff = word1 ^ word2;
+        #[cfg(target_endian = "little")]
+        let matching_bytes = (diff.trailing_zeros() / 8) as usize;
+        #[cfg(target_endian = "big")]
+        let matching_bytes = (diff.leading_zeros() / 8) as usize;
+        return start + matching_bytes;
+    }
+
     while matched < len && s1[matched] == s2[matched] {
         matched += 1;
     }
@@ -142,5 +156,31 @@ fn extend_match_safe(s1: &[u8], s2: &[u8]) -> usize {
         }
 
         extended_len
+    }
+}
+
+#[cfg(all(test, not(feature = "optimization")))]
+mod tests {
+    use super::extend_match_safe;
+
+    #[test]
+    fn word_matches_equal_byte_reference_through_tails() {
+        let a: Vec<u8> = (0..320).map(|i| (i * 37) as u8).collect();
+        for offset in 0..8 {
+            for len in 0..=300 {
+                let left = &a[offset..offset + len];
+                let mut right = left.to_vec();
+                assert_eq!(extend_match_safe(left, &right), len);
+                for mismatch in 0..len {
+                    right[mismatch] ^= 0x80;
+                    let expected = left.iter().zip(&right).take_while(|(a, b)| a == b).count();
+                    assert_eq!(extend_match_safe(left, &right), expected);
+                    right[mismatch] ^= 0x80;
+                }
+                if len > 0 {
+                    assert_eq!(extend_match_safe(left, &right[..len - 1]), len - 1);
+                }
+            }
+        }
     }
 }

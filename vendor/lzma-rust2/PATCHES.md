@@ -98,3 +98,30 @@ Validation on Apple Silicon, 2026-10-09:
   changed Rust file passes rustfmt.
 - Raw samples, differential records, and timings are retained in sibling
   `diagnostics/round4-lzma-micro`. Integration oracle remains the root task.
+
+## Encoder match comparison tails
+
+The safe `extend_match_safe` in `src/lz/mod.rs` compares a remaining short
+suffix with a final overlapping native word when the complete match region
+is at least one word long. The overlap contains only bytes already proved
+equal; leading/trailing zeros locate the same first differing byte on either
+endianness. Regions shorter than a word retain scalar comparisons. This
+applies to BT4 and HC4 without changing match limits or parse decisions.
+
+Validation on Apple Silicon, 2026-10-09:
+
+- Default-preset-6 raw LZMA2 profiling shows BT4 skip in 531 of 547 active
+  text samples, and 487 skip plus 189 find-matches samples on source data.
+  The original word matcher still compared short tails byte by byte.
+- A scalar-reference test checks every mismatch position at lengths 0 through
+  300, eight alignments, equal inputs and unequal slice lengths. It passes;
+  all 1,440 encoder differential streams remain byte-identical, and vendor
+  clippy with warnings denied and changed-file rustfmt pass.
+- Raw LZMA2 16 MiB text compression: 130.940 -> 111.891 ms (seven-run
+  medians). Source: 2131.094 -> 2051.142 ms (two runs; limited sample).
+  Five alternating random pairs have medians 2580.359 -> 2555.104 ms,
+  with overlapping ranges 2533.298–2584.172 and 2525.717–2583.543 ms.
+  No random-data speed improvement is claimed. Encoded lengths are unchanged.
+- Profiles, reference harness and raw timings are retained under sibling
+  `diagnostics/round4-lzma-micro`. Integration/held-out archive validation
+  remains the root task. No decoder code changes in this patch.
