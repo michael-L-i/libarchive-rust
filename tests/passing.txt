@@ -62,6 +62,7 @@ tar/test_option_L_upper
 tar/test_option_O_upper
 tar/test_option_U_upper
 tar/test_option_X_upper
+tar/test_option_acls
 tar/test_option_b64encode
 tar/test_option_exclude
 tar/test_option_exclude_vcs

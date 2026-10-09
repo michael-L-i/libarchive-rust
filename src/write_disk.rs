@@ -343,7 +343,8 @@ impl WriteDisk {
         };
         a.state.set(state::HEADER);
         if !self.skipped {
-            if let Some(file) = self.file.take()
+            let file = self.file.take();
+            if let Some(file) = &file
                 && let Err(e) = file.set_len(self.limit.unwrap_or(self.max_offset))
             {
                 return failure(a, e, "Can't truncate", &path);
@@ -354,6 +355,9 @@ impl WriteDisk {
                     return failure(a, e, "Can't rename temporary file", &path);
                 }
                 target = destination;
+            }
+            if let Some(file) = file {
+                target.retain_file(file);
             }
             #[cfg(target_vendor = "apple")]
             if let Some(name) = path
