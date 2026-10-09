@@ -13,6 +13,7 @@ pub mod mtree;
 pub mod rar;
 pub mod rar5;
 pub mod raw;
+pub mod sevenzip;
 pub mod tar;
 pub mod warc;
 pub mod xar;

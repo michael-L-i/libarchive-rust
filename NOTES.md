@@ -1588,3 +1588,118 @@ and the filters. The PPMd model is `ppmd7`, reached through `Ppmd7` and
 - The QuickOpen and recovery offsets of the main header's locator record are
   parsed and dropped; upstream stores them and never reads them.
 
+## 7zip reader (src/read/format/sevenzip/)
+
+The module is the directory `src/read/format/sevenzip/` (a Rust identifier
+can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
+(header), `stream.rs` (the folder/stream reader), `codec.rs`, `filters.rs`
+(BCJ, BCJ2, Delta) and `sfx.rs`.
+
+### Ported as-is
+
+- `read_SubStreamsInfo` only copies a folder's CRC to its one substream if a
+  kCRC section follows; without one, a folder whose only file has a known
+  CRC is checked against nothing.
+- `Bcj2_Decode` with an empty output buffer returns before it saves how
+  much of the range coder's stream the initialisation read, so a later call
+  would read those five bytes again as data. The copy of the stashed odd
+  bytes (here and in `decompress`) always starts at index 0 and doesn't
+  move the rest down, so a partial copy would repeat bytes. Neither can
+  happen with the buffer sizes the reader uses.
+- `x86_Convert` stores `prevPosT` as a position in the buffer it just
+  converted, and the next buffer starts at the unconverted tail, so a
+  branch opcode within three bytes of the end of a buffer is forgotten:
+  whether an x86 stream converts correctly depends on where the calls
+  happened to cut it. (7-Zip's Bra86.c turns the position into a distance
+  before it saves it.) The other converters are position-independent. Only
+  the converters upstream runs itself have this; the x86 filter of an LZMA2
+  coder is liblzma's upstream, and is correct (here lzma-rust2's).
+- A symlink entry's contents are read while the header is read. A bad CRC
+  there only sets the error message; the status stays `ARCHIVE_OK`.
+- `read_Times` and kAttributes read the "external" byte and ignore it (only
+  `dataIndex` is parsed for times); external data is not supported.
+- `get_pe_sfx_offset` only checks for the "PE" signature when it had to
+  read more than the first 64 bytes to get the COFF header.
+- `bid` leaves the error it set (for example "Couldn't find out 7-Zip
+  header") on the handle when it bids 0, and ours does the same.
+- The range decoder's final state (`Ppmd7z_RangeDec_IsFinishedOK`) is never
+  checked, so trailing garbage after a PPMd stream is not noticed.
+- The `UMAX_ENTRY` limit of 100 million is the only limit on files,
+  folders' substreams and sizes, as upstream. Memory for entries is about
+  100 bytes each.
+
+### Differences
+
+- **Bad CRC.** Upstream returns `ARCHIVE_WARN` together with the entry's
+  last block. `Data::Block` can't carry a status, and `Data::Warn` has no
+  block, so the block is returned first and the next `read_data` returns
+  `Data::Warn` (with the "7-Zip bad CRC" message), then end of data.
+  `archive_read_data` therefore delivers the last block's bytes and then
+  reports the warning; upstream reports the warning first and delivers the
+  bytes on the call after it.
+- **Encrypted entries.** Upstream sets "metadata encrypted" on `a->entry`
+  whenever a folder is found to be encrypted, also when that is first noticed
+  in `read_data`. `Format::read_data` has no entry, so this is only done
+  while a header is read (an encrypted header, an encrypted symlink). Both
+  flags are set by `read_header` for an entry whose folder has a crypto
+  coder, as upstream.
+- **liblzma, zlib, libbz2 and libzstd** are `lzma-rust2`, `miniz_oxide`,
+  the bzip2 filter's `Decoder` (crabz2) and `ruzstd`. On valid data the output
+  is the same. On corrupt data they differ in which errors they find, what
+  they say and how much they output before the error: liblzma's raw LZMA
+  decoder happily decodes garbage that lzma-rust2 rejects ("dist overflow",
+  a missing final range coder byte), miniz_oxide accepts distances that
+  zlib calls too far back, and a failed call outputs nothing from that call
+  (upstream delivers what the library had written). lzma-rust2 also decodes
+  ahead into its dictionary, as far as the input it was given goes, so a
+  corrupt stream can fail a read long before the data it damages. Error messages are
+  `Decompression failed (9)` for any lzma-rust2 failure (8 for options, 5 for
+  memory), `File decompression failed (n)` with zlib's numbers for
+  miniz_oxide, and libzstd's names for ruzstd's errors where there is a
+  match.
+- **LZMA is given the size.** Upstream starts liblzma's raw LZMA1 decoder
+  without a size; 7-Zip writes no end marker, so liblzma returns every byte
+  that the range coder can still decode. lzma-rust2 keeps the last bytes back
+  until it knows the stream is over, so it is given the folder's size (the
+  main stream's, for BCJ2). It is always called with `Action::Run`, and the
+  stream is finished by the reader's counts: once an LZMA1 stream has all its
+  data the rest of its packed stream counts as used, because liblzma would
+  decode it as output that the reader then clips. LZMA2 with a missing end
+  marker is therefore accepted, as upstream does. A decoder that has taken
+  all its input but still holds output (`pending_output`) is called with no
+  input to get it, where liblzma leaves the input it doesn't need.
+- **BCJ filters.** Upstream hands the branch filters of an LZMA2 coder to
+  liblzma and runs its own converters for every other coder. Here lzma-rust2's
+  `StreamFilter` stands in for liblzma's, with the same protocol as the
+  converters (the unconverted tail is carried to the next call), and Delta is
+  always the reader's own (liblzma's and upstream's are the same
+  algorithm). A unit test checks that the two sets of converters agree. The
+  chunking of the calls is the decoders', so where upstream's x86 converter
+  depends on it (see above) the output can differ from upstream's.
+- **ZSTD.** libzstd skips skippable frames, which 7-Zip-zstd writes in front
+  of its frame, and checks the frame content size, the reserved bit and the
+  checksum. ruzstd does none of that, so these are done in the reader (as in
+  the zstd filter). ruzstd holds a window of output back until the frame
+  ends or the window is passed, so a corrupt frame fails before any of its
+  output is delivered. A frame that the packed stream ends in the middle of
+  is "Damaged 7-Zip archive", as upstream's no-progress check says. A
+  dictionary frame is an error.
+- **Bounds.** Counts from the header are checked against what is left of the
+  header before they size an allocation: pack streams, folders (as
+  upstream), the bind pairs of a folder, substreams and the entries
+  (`files_info_numfiles_is_sane`, as upstream). Upstream's check that a
+  one-packed-stream folder has an unbound input is quadratic in the number
+  of bind pairs; here it is a bitmap. Properties, names and skipped
+  properties are read in pieces of 64 KiB, so a size in the header can't
+  size a buffer (upstream asks `header_bytes` for all of it at once). The
+  three decoded BCJ2 side streams grow with the data instead of being
+  allocated at the size the header gives; the decoded streams are the same.
+  Every allocation is fallible.
+- **Decoder memory.** LZMA1/LZMA2 dictionaries and PPMd models are capped
+  at 256 MiB before allocation, like the XZ filter. Oversized dictionaries
+  fail with "Decompression failed (5)"; oversized PPMd models fail with
+  ENOMEM. Upstream has no such limit, so unusually large valid models are
+  rejected here. PPMd arenas use lazily zeroed pages (see the PPMd section).
+- Where upstream would index outside a vector with a bad index (an entry
+  with data but no folder, a pack stream index outside the table), the
+  reader fails with "Damaged 7-Zip archive".
