@@ -139,6 +139,7 @@ impl Base {
 /// `ARCHIVE_FATAL`) instead of aliasing.
 pub enum Kind {
     Read(RefCell<Read>),
+    Match(RefCell<crate::matching::Matching>),
 }
 
 /// A `struct archive *` is a leaked `Box<Handle>`.

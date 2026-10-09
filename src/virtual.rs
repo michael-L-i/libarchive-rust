@@ -41,12 +41,14 @@ impl Handle {
     pub fn filter_code(&self, n: c_int) -> c_int {
         match &self.kind {
             Kind::Read(r) => r.try_borrow().map_or(ARCHIVE_FATAL, |r| r.filter_code(n)),
+            _ => ARCHIVE_FATAL,
         }
     }
 
     pub fn filter_count(&self) -> c_int {
         match &self.kind {
             Kind::Read(r) => r.try_borrow().map_or(ARCHIVE_FATAL, |r| r.filter_count()),
+            _ => 0,
         }
     }
 
@@ -56,6 +58,7 @@ impl Handle {
             Kind::Read(r) => r.try_borrow().map_or(std::ptr::null(), |r| {
                 r.filter_name(n).map_or(std::ptr::null(), |s| s.as_ptr())
             }),
+            _ => std::ptr::null(),
         }
     }
 
@@ -64,6 +67,7 @@ impl Handle {
             Kind::Read(r) => r
                 .try_borrow()
                 .map_or(i64::from(ARCHIVE_FATAL), |r| r.filter_bytes(n)),
+            _ => 0,
         }
     }
 
@@ -74,6 +78,7 @@ impl Handle {
             Kind::Read(r) => r
                 .try_borrow_mut()
                 .map_or(ARCHIVE_FATAL, |mut r| r.next_header2(&self.base, entry)),
+            _ => ARCHIVE_FATAL,
         }
     }
 
@@ -81,6 +86,7 @@ impl Handle {
     pub fn read_entry(&self) -> *mut Entry {
         match &self.kind {
             Kind::Read(r) => r.try_borrow().map_or(std::ptr::null_mut(), |r| r.entry()),
+            _ => std::ptr::null_mut(),
         }
     }
 
@@ -90,6 +96,7 @@ impl Handle {
             Kind::Read(r) => r
                 .try_borrow_mut()
                 .map_or(std::ptr::null_mut(), |mut r| r.take_entry()),
+            _ => std::ptr::null_mut(),
         }
     }
 
@@ -98,12 +105,14 @@ impl Handle {
             Kind::Read(r) => r
                 .try_borrow()
                 .map_or(i64::from(ARCHIVE_FATAL), |r| r.header_position()),
+            _ => 0,
         }
     }
 
     pub fn close(&self) -> c_int {
         match &self.kind {
             Kind::Read(r) => r.borrow_mut().close(&self.base),
+            Kind::Match(_) => ARCHIVE_OK,
         }
     }
 
@@ -113,6 +122,7 @@ impl Handle {
     pub fn free(&self) -> c_int {
         match &self.kind {
             Kind::Read(r) => r.borrow_mut().free(&self.base),
+            Kind::Match(_) => ARCHIVE_OK,
         }
     }
 
@@ -124,20 +134,20 @@ impl Handle {
 
     pub fn write_finish_entry(&self) -> c_int {
         match &self.kind {
-            Kind::Read(_) => ARCHIVE_FATAL,
+            Kind::Read(_) | Kind::Match(_) => ARCHIVE_FATAL,
         }
     }
 
     pub fn write_data(&self, _buf: &[u8]) -> isize {
         match &self.kind {
-            Kind::Read(_) => ARCHIVE_FATAL as isize,
+            Kind::Read(_) | Kind::Match(_) => ARCHIVE_FATAL as isize,
         }
     }
 
     pub fn write_data_block(&self, _buf: &[u8], _offset: i64) -> isize {
         match &self.kind {
             // A kind without a write_data_block slot.
-            Kind::Read(_) => {
+            Kind::Read(_) | Kind::Match(_) => {
                 self.base.state.set(state::FATAL);
                 self.base.raise(Error::fatal(
                     ARCHIVE_ERRNO_MISC,

@@ -10,6 +10,7 @@ mod archive;
 pub(crate) mod client;
 pub(crate) mod entry;
 mod entry_link_resolver;
+pub(crate) mod matching;
 mod read;
 mod read_open;
 #[rustfmt::skip]
