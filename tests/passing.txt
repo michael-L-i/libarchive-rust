@@ -89,6 +89,7 @@ test_create_child_environment
 test_entry
 test_entry_mac_metadata_self_copy
 test_entry_strmode
+test_fully_sparse_files
 test_fuzz_ar
 test_fuzz_cab
 test_fuzz_cpio
@@ -512,8 +513,10 @@ test_read_pax_xattr_schily
 test_read_set_format
 test_read_set_wrong_format
 test_read_too_many_filters
+test_sparse_basic
 test_sparse_clear
 test_sparse_iterator
+test_warn_missing_hardlink_target
 test_write_disk
 test_write_disk_appledouble
 test_write_disk_appledouble_zip

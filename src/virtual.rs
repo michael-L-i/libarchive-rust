@@ -73,6 +73,7 @@ impl Handle {
                 .try_borrow()
                 .map_or(i64::from(ARCHIVE_FATAL), |r| r.filter_bytes(n)),
             Kind::Write(w) => w.try_borrow().map_or(-1, |w| w.filter_bytes(n)),
+            Kind::WriteDisk(w) if n == 0 || n == -1 => w.try_borrow().map_or(-1, |w| w.bytes),
             _ => -1,
         }
     }
