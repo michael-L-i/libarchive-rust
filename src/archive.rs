@@ -137,9 +137,14 @@ impl Base {
 /// constructs it; each kind sits behind its own `RefCell`, so a client
 /// callback that re-enters the same kind panics (and `guard` reports
 /// `ARCHIVE_FATAL`) instead of aliasing.
+#[allow(clippy::large_enum_variant)] // Handles live on the heap; kinds own their state.
 pub enum Kind {
     Read(RefCell<Read>),
     Write(RefCell<crate::write::Write>),
+    #[allow(dead_code)] // Constructed by disk FFI.
+    WriteDisk(RefCell<crate::write_disk::WriteDisk>),
+    #[allow(dead_code)]
+    ReadDisk(RefCell<crate::read_disk::ReadDisk>),
 }
 
 /// A `struct archive *` is a leaked `Box<Handle>`.

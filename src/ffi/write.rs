@@ -122,7 +122,10 @@ pub extern "C" fn archive_write_header(a: *mut Archive, e: *mut ArchiveEntry) ->
         let Some(e) = (unsafe { e.cast::<crate::entry::Entry>().as_mut() }) else {
             return ARCHIVE_FATAL;
         };
-        writer(h, ARCHIVE_FATAL, |w| w.header(&h.base, e))
+        match &h.kind {
+            Kind::WriteDisk(w) => w.borrow_mut().header(&h.base, e),
+            _ => writer(h, ARCHIVE_FATAL, |w| w.header(&h.base, e)),
+        }
     })
 }
 
