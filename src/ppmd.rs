@@ -109,15 +109,12 @@ pub(crate) struct Arena {
 
 impl Arena {
     /// A zeroed arena of `len` bytes, or `None` if it can't be allocated.
-    /// Upstream's `malloc` leaves it uninitialized; zero is one of the
-    /// values that can read back.
+    /// Upstream's `malloc` leaves it uninitialized; the decoders never
+    /// depend on its contents.
     pub fn alloc(len: u64) -> Option<Arena> {
         let len = usize::try_from(len).ok()?;
-        let mut mem = Vec::new();
-        mem.try_reserve_exact(len).ok()?;
-        mem.resize(len, 0);
         Some(Arena {
-            mem,
+            mem: crate::ffi::sys::try_zeroed_vec(len)?,
             bad: Cell::new(false),
         })
     }

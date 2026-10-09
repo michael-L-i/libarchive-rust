@@ -14,7 +14,7 @@ pub mod none;
 pub mod program;
 pub mod rpm;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 pub mod uu;
 pub mod xz;
 pub mod zstd;
