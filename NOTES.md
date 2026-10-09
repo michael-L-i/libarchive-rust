@@ -739,3 +739,77 @@ Phase 5 needs:
   1 MiB BSD name limit are the upstream ones.
 - The BSD name check's `SIZE_MAX - 1` bound is implied by the 1 MiB bound and
   is not repeated.
+
+## Crypto (`src/digest.rs`, `src/hmac.rs`, `src/cryptor.rs`)
+
+### Differences
+
+- One backend replaces upstream's CommonCrypto, CNG, mbed TLS, Nettle, OpenSSL,
+  libmd and libc glue, and the "unsupported" stubs: RustCrypto `md-5` 0.11,
+  `ripemd` 0.2, `sha1` 0.11, `sha2` 0.11, `hmac` 0.13, `pbkdf2` 0.13 and `aes`
+  0.9, all with default features off (`alloc` on for the hashes, so a `Digest`
+  can hold any of them). Nothing is ever "unsupported": MD5, RIPEMD-160,
+  SHA-1/256/384/512, HMAC-SHA1, PBKDF2 and AES-CTR always exist. The oracle
+  here (macOS) has no RIPEMD-160 at all (`archive_rmd160_init` fails), so that
+  one is checked against the paper's vectors only. The readers' "Decryption is
+  unsupported due to lack of crypto library" paths can only be reached by an
+  AES key of a wrong length, which they never pass.
+- AES-CTR is ported from upstream, not taken from the `ctr` crate (one fewer
+  dependency, and the counter handling is exactly upstream's). The counter is
+  the low 8 bytes of a block that starts at zero, little-endian, incremented
+  before each block is encrypted, so the first block of key stream is for
+  counter 1; it wraps within those 8 bytes and never carries into the rest.
+  A partial block's key stream carries over to the next `update`, which
+  processes the shorter of the input and output lengths. Encrypt and decrypt
+  are the same operation. Upstream's doubled function groups (`decrypto_*` and
+  `encrypto_*`) are one `AesCtr`.
+- `AesCtr::new` fails only for a key that is not 16, 24 or 32 bytes (the
+  OpenSSL and CNG backends fail the same way). `HmacSha1::new` takes any key and returns `Option` only to keep
+  the callers' error path. `pbkdf2_sha1` cannot fail, so it returns nothing
+  where upstream returns 0 or -1. A digest, HMAC or AES context is consumed by
+  `finalize` or dropped; there are no `release`/`cleanup` calls. Keys are not
+  zeroed on drop (the `zeroize` features are off), where the C backends
+  clear theirs in `release`.
+- `archive_version_details` has no crypto section. Upstream names one
+  platform library (`CommonCrypto/system`, `openssl/3.x`, ...); the port has
+  seven crates and none of the upstream keys, so there is nothing honest to
+  put under them. The compression backends keep upstream's key because each
+  replaces exactly one library (see Core).
+
+### Backend choice and unsafe footprint
+
+- Candidates were these crates against hand-rolled hashes (rejected: the
+  hashes are the hot path of the mtree and xar writers, and hand-rolled
+  crypto is the wrong thing to maintain) and `openssl` or `ring` (C or
+  assembly, ruled out). RustCrypto is pure Rust with a portable fallback in
+  every crate.
+- `unsafe` is only in the CPU-intrinsic backends, chosen at run time by
+  `cpufeatures`, with the portable code as the fallback: `sha1` (x86 SHA-NI,
+  aarch64 SHA-2), `sha2` (the same, plus AVX2 and aarch64 SHA-3), `aes` (AES-NI
+  and aarch64), `cpufeatures`, and `md-5` only on loongarch64 (an assembly
+  block). `ripemd`, `hmac`, `pbkdf2`, `digest`, `cipher`, `crypto-common` and
+  `ctutils` forbid `unsafe` or have none. `inout` (via `cipher`) and `cmov`
+  (constant-time moves, via `ctutils`) carry a few `unsafe` blocks, and so
+  do `block-buffer` and `hybrid-array`. `sha2` and `cpufeatures` were already
+  in the tree through `lzma-rust2`'s xz SHA-256 check.
+- These crates pick their backend with `--cfg` flags (`sha1_backend="soft"`,
+  `sha2_backend="soft"`, `aes_backend="soft"`), not Cargo features, so the
+  intrinsics cannot be turned off from `Cargo.toml`. Forcing them through
+  `.cargo/config.toml` was rejected: `RUSTFLAGS` in the environment replaces
+  it, and the portable code is slower than the intrinsics on the mtree, xar and
+  zip paths (not measured). The footprint is accepted; set those cfgs to remove it.
+
+### Verification
+
+- Vectors: RFC 1321 (MD5), the RIPEMD-160 paper, FIPS 180 (SHA-1, 256, 384,
+  512, and a million `a`), RFC 2202 (HMAC-SHA1), RFC 6070 (PBKDF2-HMAC-SHA1),
+  and NIST SP 800-38A F.5 (the first block of AES-128, 192 and 256 CTR key
+  stream, which is the encrypted counter block).
+- Against upstream: a C probe linked against `build/oracle/libarchive.a`
+  (`__archive_digest`, `__archive_hmac`, `__archive_cryptor`; CommonCrypto and
+  libSystem here) generated 400 random cases of 0 to 4000 bytes with random
+  chunking: MD5 and SHA-1/256/384/512, HMAC-SHA1 with keys of 0 to 150 bytes,
+  PBKDF2 with 100 random passwords, salts, round counts and output lengths,
+  and AES-CTR in all three key sizes updated in pieces of 0 to 70 bytes (every
+  partial-block case). All 2,900 outputs matched. The probe is not in the
+  repository.
