@@ -9,7 +9,7 @@ name = "archive"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
 libc = "0.2"
 crc32fast = "1"
 xz = "=0.4.6-rc.0"
