@@ -497,3 +497,78 @@ Phase 5 look-ahead: `lz4_flex` (feature `frame`) has a frame writer with
 linked or independent blocks and block and content checksums, which is the
 frame format `archive_write_filter_lz4` needs. It does not write the legacy
 format, so that part would need our own encoder.
+
+## Read filters: bzip2 and zstd (`src/read/filter/bzip2.rs`, `zstd.rs`)
+
+Backends, and why:
+
+- bzip2 is `bzip2` 0.6.1 over libbz2-rs-sys 0.2.5. libbz2-rs-sys is a
+  c2rust translation (142 mentions of `unsafe` in 8 files) and is tracked for
+  replacement. The safe candidate, `bzip2-rs` 0.1.2 (`#![forbid(unsafe_code)]`),
+  was tested and rejected. Over our 726 bzip2 inputs it agrees with the
+  oracle on 504 and differs on 222: 144 of 150 mutated streams, 76 of 495
+  truncated prefixes, the concatenated pair (780 bytes against 1480, because
+  `DecoderReader` stops at the first stream), and empty input (upstream
+  outputs nothing; `bzip2-rs` errors). Its `Decoder` buffers a whole block
+  before decoding it. The `bzip2` wrapper has 18 mentions of `unsafe` of its
+  own (`mem.rs`).
+- zstd is `ruzstd` 0.9.0, a safe decoder with 41 mentions of `unsafe` in its
+  ring buffer and decode buffer, and no crate-level `forbid`. Its checksum
+  comes from twox-hash (84 mentions). `libzstd-rs-sys` was tried and dropped:
+  it is a c2rust translation of a libzstd dev snapshot, and it is not what
+  upstream links.
+
+Differences:
+
+- `archive_bzlib_version` reports the backend's `BZ2_bzlibVersion` string,
+  "1.1.0-libbz2-rs-sys-0.2.5", not "1.0.8, 13-Jul-2019".
+- `archive_libzstd_version` reports "0.9.0-ruzstd". ruzstd has no libzstd
+  version, so this is not a libzstd number.
+- zstd output on truncated or corrupt input. ruzstd keeps the last window of
+  decoded output inside the frame until the frame finishes
+  (`decode_buffer.rs`: `read` returns only bytes beyond the window while the
+  frame is open). A failed frame never finishes, so that window is never
+  delivered, and libzstd delivers it. Measured on one zstd frame of a
+  3,000,226-byte text (1.8 MB compressed, window 256 KiB): 160 corrupt or
+  truncated files, all of which error. The port delivers fewer bytes in 70 of
+  them: 55 of 60 truncations and 15 of 100 single-bit flips in the second half
+  of the frame. In total 9,437,184 bytes; the other 90 files are identical.
+  The shortfall is at most the frame's window, or everything decoded so far
+  for a frame smaller than its window: a truncated 720 KB frame with a 2 MiB
+  window gives libzstd's 262,144 bytes against the port's 0, and 97 of 107
+  truncations in a second corpus of small frames show this. The same test on
+  bzip2 (`libbz2-rs-sys`) is identical on all 160 files. The public ruzstd API
+  has no way to drain the open window, so this can only be fixed in ruzstd.
+- zstd error text. Where a ruzstd error class has a libzstd equivalent, the
+  filter reports libzstd's text ("Unknown frame descriptor",
+  "Frame requires too much memory for decoding", "Dictionary mismatch",
+  "Restored data doesn't match checksum"). Otherwise it reports "Data
+  corruption detected". Measured on 1359 zstd inputs (truncations, mutations,
+  skippable frames, reserved bit, trailing bytes): stdout and exit status
+  match in all of them, and 11 differ only on stderr. Random mutations of
+  block contents differ more: of 1,500, stdout differs in 203, stderr in 195
+  and exit status in 47 (42 mutants of a checksum-free stream that libzstd
+  accepts and ruzstd rejects; 5 corrupt empty frames that libzstd rejects and
+  ruzstd accepts with empty output). Of the 11, seven are a corrupt
+  block that ruzstd decodes and then fails the checksum, where libzstd
+  reports "Data corruption detected". Four are malformed blocks that libzstd
+  calls "Dictionary is corrupted", which ruzstd does not separate from other
+  corruption.
+- The filter checks the frame header's reserved bit (0x08) itself, and
+  reports "Unsupported frame parameter", as libzstd does. Ruzstd does not
+  check it.
+- A window log above 31 is refused as "Frame requires too much memory for
+  decoding". This is what libzstd reports for the frames in the corpus.
+- One to three trailing bytes after a frame are "Unknown frame descriptor"
+  unless they are a prefix of a magic number (a regular or skippable one),
+  which is "Truncated zstd input". The filter checks this itself.
+- The filter skips skippable frames and checks each frame's content checksum,
+  since ruzstd does neither. The window limit is libzstd's default, 128 MiB.
+
+Phase 5 needs:
+
+- zstd writing. ruzstd's encoder implements only the Uncompressed and Fastest
+  levels. Default, Better and Best hit `unimplemented!()`, so phase 5 needs
+  another encoder for the default levels.
+- bzip2 writing. The safe `bzip2-rs` has no encoder, so bzip2 writing stays on
+  `bzip2`'s encoder over libbz2-rs-sys unless a safe encoder is found.

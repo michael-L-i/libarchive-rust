@@ -2,6 +2,7 @@
 //! `filter/X.rs`, which exports `support`, the registration function.
 
 pub mod all;
+pub mod bzip2;
 pub mod by_code;
 pub mod compress;
 pub mod grzip;
@@ -14,6 +15,7 @@ pub mod program;
 pub mod rpm;
 pub mod uu;
 pub mod xz;
+pub mod zstd;
 #[cfg(test)]
 mod testing;
 

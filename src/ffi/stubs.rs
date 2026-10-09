@@ -15,21 +15,6 @@ use super::{
 use std::ffi::{c_char, c_int, c_long, c_void};
 
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_compression_bzip2(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_bzip2(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_read_support_filter_zstd(_a0: *mut Archive) -> c_int {
-    ARCHIVE_FATAL
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_7zip(_a0: *mut Archive) -> c_int {
     ARCHIVE_FATAL
 }

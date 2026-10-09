@@ -89,3 +89,16 @@ fn read_all(r: &mut Read, a: &Base) -> Result<Vec<u8>, String> {
         }
     }
 }
+
+/// Deterministic bytes that do not compress well.
+pub fn noise(n: usize) -> Vec<u8> {
+    let mut x = 0x2545_f491_u32;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect()
+}
