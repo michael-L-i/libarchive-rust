@@ -10,6 +10,9 @@ pub(crate) struct Bt4 {
     cyclic_size: i32,
     cyclic_pos: i32,
     lz_pos: i32,
+    cached_distance: i32,
+    cached_pos: i32,
+    cached_len: i32,
 }
 
 const MAX_POS: i32 = 0x7FFFFFFF;
@@ -36,6 +39,9 @@ impl Bt4 {
             cyclic_size,
             cyclic_pos: -1,
             lz_pos: cyclic_size,
+            cached_distance: 0,
+            cached_pos: 0,
+            cached_len: 0,
         }
     }
 
@@ -52,6 +58,7 @@ impl Bt4 {
                 self.hash.normalize(normalization_offset);
                 LzEncoder::normalize(&mut self.tree, normalization_offset);
                 self.lz_pos -= normalization_offset;
+                self.cached_distance = 0;
             }
             self.cyclic_pos += 1;
             if self.cyclic_pos == self.cyclic_size {
@@ -92,17 +99,18 @@ impl Bt4 {
             if encoder.get_byte_by_pos(encoder.read_pos + len - delta)
                 == encoder.get_byte_by_pos(encoder.read_pos + len)
             {
-                // No need to look for longer matches than niceLenLimit
-                // because we only are updating the tree, not returning
-                // matches found to the caller.
-                len = extend_match(
-                    &encoder.buf,
-                    encoder.read_pos,
-                    len + 1,
-                    delta,
-                    nice_len_limit,
-                );
+                len += 1;
+                if delta == self.cached_distance {
+                    // Later equal-distance matches share the already proved suffix.
+                    let prefix = self.cached_len - (self.lz_pos - self.cached_pos);
+                    len = len.max(prefix.min(nice_len_limit));
+                }
+                // Only the tree is updated, so the nice limit is sufficient.
+                len = extend_match(&encoder.buf, encoder.read_pos, len, delta, nice_len_limit);
                 if len == nice_len_limit {
+                    self.cached_distance = delta;
+                    self.cached_pos = self.lz_pos;
+                    self.cached_len = len;
                     self.tree[ptr1 as usize] = self.tree[pair as usize];
                     self.tree[ptr0 as usize] = self.tree[pair as usize + 1];
                     return;

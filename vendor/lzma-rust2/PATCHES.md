@@ -125,3 +125,40 @@ Validation on Apple Silicon, 2026-10-09:
 - Profiles, reference harness and raw timings are retained under sibling
   `diagnostics/round4-lzma-micro`. Integration/held-out archive validation
   remains the root task. No decoder code changes in this patch.
+
+## Reuse proved BT4 skip prefixes
+
+`src/lz/bt4.rs` retains the distance, position and length of the last complete
+skip match in three `i32` fields. When a later tree candidate has the same
+distance, the overlapping suffix is already known equal. After the existing
+first-byte check, extension can start at that proved prefix, clamped to the
+current nice limit. Tree traversal, ordering, depth and match limits are
+unchanged. Buffer slides preserve the relative equality; position normalization
+invalidates the cache before old coordinates can be reused. No absolute end
+position is added, avoiding overflow near the normalization boundary.
+
+Validation on Apple Silicon, 2026-10-09, versus accepted baseline `a0fbedb`:
+
+- Raw preset-6 LZMA2 16 MiB text compression improves 114.115 -> 88.631 ms
+  and 111.378 -> 89.038 ms in separate five-run comparisons (about 20-22%).
+  Source comparisons overlap: 2224.732/2173.242 ms before versus
+  2192.956/2214.983 ms after; a further pair is 2055.496/2053.107 ms.
+  Random is also effectively unchanged; no source/random gain is claimed.
+- Auxiliary counters find 16.77 million useful cached prefixes on text,
+  avoiding 1.04 billion byte comparisons. Source has 12.09 million useful
+  prefixes among 168.08 million tree visits. Keeping the cache lookup behind
+  the existing first-byte test avoids adding work to immediately rejected
+  candidates. A version that looked up the cache first regressed source and
+  was rejected; seeding from longer find-matches proofs added no benefit.
+- All 1,440 XZ/LZMA/LZIP differential streams remain byte-identical across
+  presets 0 through 9, boundary sizes, three data patterns and chunk sizes.
+- A streaming 2,147,614,720-byte case uses only a 64 KiB input block and
+  dictionary, changing one byte per block. It crosses match-finder position
+  normalization after many dictionary and buffer wraps. Both encoders emit
+  exactly 401,263 bytes, SHA-256
+  `5ea1af6a4ff04040a6177b9eff83c0615bc5821fdf637ebf7ecd587ae4049187`.
+- All 27 self-contained vendor tests and vendor Clippy with warnings denied
+  pass; eight BCJ fixture tests require assets omitted from the vendor tree.
+  The changed Rust file passes rustfmt. Integration checks remain separate.
+- Harnesses, raw timings, counters, differential output and rejected variants
+  are retained in sibling `diagnostics/round6-lzma-micro`.
