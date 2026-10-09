@@ -6,6 +6,7 @@ pub mod ar;
 pub mod by_code;
 pub mod cpio;
 pub mod empty;
+pub mod iso9660;
 pub mod mtree;
 pub mod raw;
 pub mod warc;
