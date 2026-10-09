@@ -48,6 +48,8 @@ use crate::entry::{AE_IFDIR, AE_IFLNK, AE_IFMT, AE_IFREG, Dev, Entry, Mode};
 use crate::read::{ARCHIVE_ERRNO_FILE_FORMAT, Data, Format, Read, Reader, Status, Whence};
 use crate::string::{StringConv, conversion_charset_name, conversion_from_charset};
 use crate::util::Error;
+use miniz_oxide::inflate::stream::{InflateState, inflate as mz_inflate};
+use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 use std::collections::VecDeque;
 use std::ffi::c_int;
 use std::sync::{Arc, PoisonError};
@@ -99,6 +101,8 @@ const DR_FLAGS: usize = 25;
 const DR_VOLUME_SEQUENCE_NUMBER: usize = 28;
 const DR_NAME_LEN: usize = 32;
 const DR_NAME: usize = 33;
+
+const ZISOFS_MAGIC: [u8; 8] = [0x37, 0xE4, 0x53, 0x96, 0xC9, 0xDB, 0xD6, 0x07];
 
 /// Bits of `FileInfo::time_is_set`.
 const BIRTHTIME_IS_SET: u8 = 1;
@@ -269,6 +273,11 @@ struct FileInfo {
     symlink: AString,
     /// Non-zero if link continues.
     symlink_continues: bool,
+    /// Set if this file is compressed by paged zlib (zisofs).
+    pz: bool,
+    /// Log2 of block size.
+    pz_log2_bs: u32,
+    pz_uncompressed_size: u64,
     /// Set if this file is multi extent.
     multi_extent: bool,
     contents: Vec<Content>,
@@ -289,6 +298,30 @@ struct Vd {
 enum Pull {
     File(usize),
     Done(Status),
+}
+
+#[derive(Default)]
+struct Zisofs {
+    /// Set if this file is compressed by paged zlib.
+    pz: bool,
+    /// Log2 of block size.
+    pz_log2_bs: u32,
+    pz_uncompressed_size: u64,
+
+    initialized: bool,
+    uncompressed_buffer: Vec<u8>,
+
+    pz_offset: u32,
+    header: [u8; 16],
+    header_avail: usize,
+    header_passed: bool,
+    /// The block pointers read so far.
+    block_pointers: Vec<u8>,
+    block_pointers_size: usize,
+    block_off: usize,
+    block_avail: u32,
+
+    stream: Option<Box<InflateState>>,
 }
 
 struct Iso9660 {
@@ -331,6 +364,7 @@ struct Iso9660 {
 
     entry_sparse_offset: i64,
     entry_bytes_remaining: i64,
+    entry_zisofs: Zisofs,
     /// The extents of the entry being read, and the one in progress.
     entry_contents: Vec<Content>,
     entry_content: Option<usize>,
@@ -368,6 +402,7 @@ pub fn support(r: &mut Read) -> Result<Status, Error> {
         joliet: Vd::default(),
         entry_sparse_offset: 0,
         entry_bytes_remaining: 0,
+        entry_zisofs: Zisofs::default(),
         entry_contents: Vec::new(),
         entry_content: None,
         sconv_utf16be: None,
@@ -768,6 +803,23 @@ fn parse_rockridge_sl1(file: &mut FileInfo, data: &[u8]) {
             _ => return,
         }
         data = rest.get(nlen..).unwrap_or_default();
+    }
+}
+
+/// `parse_rockridge_ZF1`.
+fn parse_rockridge_zf1(file: &mut FileInfo, data: &[u8]) {
+    if data.len() == 12 && data[0] == 0x70 && data[1] == 0x7a {
+        // paged zlib
+        file.pz = true;
+        file.pz_log2_bs = u32::from(byte(data, 3));
+        if !(15..=17).contains(&file.pz_log2_bs) {
+            // TODO: Return an error here instead of silently disabling
+            // zisofs. That requires propagating an error return through
+            // parse_rockridge() and its callers.
+            file.pz = false;
+            return;
+        }
+        file.pz_uncompressed_size = u64::from(le32(data, 4));
     }
 }
 
@@ -1454,6 +1506,7 @@ impl Iso9660 {
                     parse_rockridge_tf1(f, data);
                     self.seen_rockridge = true;
                 }
+                (b'Z', b'F') if version == 1 => parse_rockridge_zf1(f, data),
                 _ => {}
             }
             rest = rest.get(len..).unwrap_or_default();
@@ -1850,6 +1903,157 @@ impl Iso9660 {
     }
 }
 
+impl Iso9660 {
+    /// `zisofs_read_data`.
+    fn zisofs_read_data<'x>(&'x mut self, r: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
+        let later = r.consume_later();
+        let p = match r.read_ahead(1) {
+            Ok(Some(p)) => p,
+            _ => {
+                return Err(Error::fatal(
+                    ARCHIVE_ERRNO_FILE_FORMAT,
+                    "Truncated zisofs file body",
+                ));
+            }
+        };
+        let z = &mut self.entry_zisofs;
+        let bytes_read = p
+            .len()
+            .min(usize::try_from(self.entry_bytes_remaining).unwrap_or(0));
+        let p = p.get(..bytes_read).unwrap_or(p);
+        // What is left of `p`, and how much of it has been taken.
+        let mut avail = bytes_read;
+        let mut uncompressed_size = 0;
+        let format_error = |msg: &str| Error::fatal(ARCHIVE_ERRNO_FILE_FORMAT, msg);
+
+        'next_data: {
+            if !z.initialized {
+                // The block pointers: one for each block, and one more for
+                // the end of the last.
+                let ceil = (z.pz_uncompressed_size + (1u64 << z.pz_log2_bs) - 1) >> z.pz_log2_bs;
+                z.block_pointers_size = usize::try_from((ceil + 1) * 4).unwrap_or(usize::MAX);
+
+                // Allocate uncompressed data buffer.
+                z.uncompressed_buffer.resize(1usize << z.pz_log2_bs, 0);
+
+                // Read the file header, and check the magic code of zisofs.
+                if z.header_avail < z.header.len() {
+                    let xsize = (z.header.len() - z.header_avail).min(avail);
+                    let taken = p.get(bytes_read - avail..bytes_read - avail + xsize);
+                    let to = z.header.get_mut(z.header_avail..z.header_avail + xsize);
+                    if let (Some(from), Some(to)) = (taken, to) {
+                        to.copy_from_slice(from);
+                    }
+                    z.header_avail += xsize;
+                    avail -= xsize;
+                }
+                if !z.header_passed && z.header_avail == z.header.len() {
+                    if z.header[..8] != ZISOFS_MAGIC
+                        || u64::from(le32(&z.header, 8)) != z.pz_uncompressed_size
+                        || z.header[12] != 4
+                        || u32::from(z.header[13]) != z.pz_log2_bs
+                    {
+                        return Err(format_error("Illegal zisofs file body"));
+                    }
+                    z.header_passed = true;
+                }
+                // Read block pointers.
+                if z.header_passed && z.block_pointers.len() < z.block_pointers_size {
+                    let xsize = (z.block_pointers_size - z.block_pointers.len()).min(avail);
+                    let from = bytes_read - avail;
+                    z.block_pointers
+                        .extend_from_slice(p.get(from..from + xsize).unwrap_or_default());
+                    avail -= xsize;
+                    if z.block_pointers.len() == z.block_pointers_size {
+                        // We've got all block pointers and initialize
+                        // related variables.
+                        z.block_off = 0;
+                        z.block_avail = 0;
+                        // Complete a initialization.
+                        z.initialized = true;
+                    }
+                }
+
+                if !z.initialized {
+                    break 'next_data; // We need more data.
+                }
+            }
+
+            // Get block offsets from block pointers.
+            if z.block_avail == 0 {
+                if z.block_off + 4 >= z.block_pointers_size {
+                    // There isn't a pair of offsets.
+                    return Err(format_error("Illegal zisofs block pointers"));
+                }
+                let bst = le32(&z.block_pointers, z.block_off);
+                if u64::from(bst) != u64::from(z.pz_offset) + (bytes_read - avail) as u64 {
+                    // TODO: Should we seek offset of current file by bst ?
+                    return Err(format_error("Illegal zisofs block pointers(cannot seek)"));
+                }
+                let bed = le32(&z.block_pointers, z.block_off + 4);
+                if bed < bst {
+                    return Err(format_error("Illegal zisofs block pointers"));
+                }
+                z.block_avail = bed - bst;
+                z.block_off += 4;
+
+                // Initialize compression library for new block.
+                match &mut z.stream {
+                    Some(stream) => stream.reset(DataFormat::Zlib),
+                    None => z.stream = Some(InflateState::new_boxed(DataFormat::Zlib)),
+                }
+            }
+
+            // Make uncompressed data.
+            if z.block_avail == 0 {
+                z.uncompressed_buffer.fill(0);
+                uncompressed_size = z.uncompressed_buffer.len();
+            } else {
+                let from = bytes_read - avail;
+                let n = avail.min(z.block_avail as usize);
+                let input = p.get(from..from + n).unwrap_or_default();
+                let Some(stream) = z.stream.as_mut() else {
+                    return Err(misc("Can't initialize zisofs decompression"));
+                };
+                let res = mz_inflate(stream, input, &mut z.uncompressed_buffer, MZFlush::None);
+                let failed = |code: i32| misc(format!("zisofs decompression failed ({code})"));
+                match res.status {
+                    // Decompressor made some progress, or found the end of
+                    // the stream.
+                    Ok(MZStatus::Ok | MZStatus::StreamEnd) => {}
+                    Ok(MZStatus::NeedDict) => return Err(failed(2)),
+                    Err(e) => return Err(failed(e as i32)),
+                }
+                if res.bytes_consumed == 0 && res.bytes_written == 0 {
+                    // The stream has ended with block data left over;
+                    // upstream goes on returning empty blocks forever.
+                    return Err(failed(-5));
+                }
+                uncompressed_size = res.bytes_written;
+                avail -= res.bytes_consumed;
+                z.block_avail -= res.bytes_consumed as u32;
+            }
+        }
+
+        // next_data:
+        let consumed = bytes_read - avail;
+        let offset = self.entry_sparse_offset;
+        self.entry_sparse_offset += uncompressed_size as i64;
+        self.entry_bytes_remaining -= consumed as i64;
+        self.current_position += consumed as u64;
+        z.pz_offset = z.pz_offset.wrapping_add(consumed as u32);
+        later.consume(consumed);
+
+        Ok(Data::Block {
+            data: z
+                .uncompressed_buffer
+                .get(..uncompressed_size)
+                .unwrap_or_default(),
+            offset,
+        })
+    }
+}
+
 impl Format for Iso9660 {
     fn name(&self) -> &'static str {
         "iso9660"
@@ -2090,6 +2294,20 @@ impl Format for Iso9660 {
             }
         }
 
+        // Initialize zisofs variables.
+        let z = &mut self.entry_zisofs;
+        z.pz = f.pz;
+        if f.pz {
+            z.initialized = false;
+            z.pz_log2_bs = f.pz_log2_bs;
+            z.pz_uncompressed_size = f.pz_uncompressed_size;
+            z.pz_offset = 0;
+            z.header_avail = 0;
+            z.header_passed = false;
+            z.block_pointers.clear();
+            entry.set_size(f.pz_uncompressed_size as i64);
+        }
+
         self.previous_number = f.number;
         if self.seen_joliet != 0 {
             self.utf16be_previous_path.clone_from(&self.utf16be_path);
@@ -2154,6 +2372,10 @@ impl Format for Iso9660 {
             }
             self.entry_bytes_remaining = content.size as i64;
         }
+        if self.entry_zisofs.pz {
+            return self.zisofs_read_data(r);
+        }
+
         let later = r.consume_later();
         let Some(buff) = r.read_ahead(1)? else {
             return Err(misc("Truncated input file"));
