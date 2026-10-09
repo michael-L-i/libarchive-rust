@@ -214,6 +214,47 @@ Prior report: `../diagnostics/results/before-round4/REPORT.md`. Both builds use
 ordinary release settings; no profile/PGO/target-CPU tuning. Work is committed
 locally. Current `diagnostics/bin/rust-bsdtar` is the verified final release.
 
+## Optimization round 5 checkpoint
+
+Baseline `c1dc8b7` to code `de50d58`: three reviewed Zstandard optimizations.
+The matcher bounds its hash load once and stores relative `u32` positions,
+rebasing only when retained history compacts. Its table shrinks from 512 to
+256 KiB without changing match decisions. Two hot decoder ring appends replace
+runtime division with one bounded subtraction; memory accesses are unchanged.
+
+Release archive creation medians, C / previous Rust / current Rust in ms:
+source 16 MiB 41.8 / 74.8 / 64.8; mixed 16 MiB 32.5 / 49.1 / 44.5;
+random 16 MiB 14.0 / 23.4 / 21.5; compiled 16.2 / 24.6 / 22.0;
+fresh numeric telemetry 20.9 / 30.4 / 27.4. These are roughly 8–13% reductions
+in Rust creation time. Same-input isolated decoding improves about 2%; full
+archive decoding changes are small and often within noise. C remains faster
+on these larger Zstandard workloads and usually compresses them better.
+
+Five LZMA/7zip alternatives were measured and rejected for regressions across
+varied inputs. Existing XZ/7zip code and prior gains remain unchanged. FSE sort,
+hash inlining, bit-refill and batched state-read trials were also reverted.
+Independent agents reviewed each accepted unit; no new unsafe code or C codec
+was added. Original C and pinned upstream remain clean.
+
+Final validation: 380 native tests passed, 1 ignored; strict all-target Clippy,
+rustfmt, diff checks and all 454 public ABI symbols passed. Full release suite:
+926 passed, 184 skipped, zero failures/crashes/timeouts or ratchet regressions
+in 67s, one worker with 30-second process timeouts. Backend checks cover 545
+byte-identical encoded cases, independent C decoding, 175 exact valid/damaged
+decode records, and six buffer tests including 768 overlap/wrap/growth cases.
+
+Twelve Zstandard archive cases include two new inputs withheld from tuning.
+All 12 previous/current Rust archive pairs are byte-identical. The matrix has
+324 timed commands, 108 verified extraction manifests and 72 cross-reader
+checks; the same-C-input matrix adds 360 reader commands and 180 extraction
+manifests. Every check passed. All compute was sequential, builds used one job.
+
+Current separate C/Rust tables and raw-data links: `../diagnostics/results/REPORT.md`.
+Prior comprehensive six-format report: `../diagnostics/results/before-round5/REPORT.md`.
+The final release snapshot is `../diagnostics/bin/rust-round5-final-bsdtar`;
+`rust-bsdtar` points to identical bytes. Work is committed locally, with no
+build, test, benchmark or worker process left running.
+
 ## Earlier checkpoints (historical)
 
 ### Phase 2 checkpoint
