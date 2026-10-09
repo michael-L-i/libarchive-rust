@@ -301,39 +301,43 @@ mod tests {
             std::env::temp_dir().join(format!("libarchive-acl-{}-{unique}", std::process::id()));
         std::fs::create_dir(&root).unwrap();
         let root = std::fs::canonicalize(root).unwrap();
-        let path = root.join("file");
-        // SAFETY: getuid only returns process credentials and takes no pointers.
-        let uid = unsafe { libc::getuid() };
-        let mut entry = Entry::new(None);
-        entry.set_pathname(path.as_os_str().as_bytes());
-        entry.set_mode(libc::S_IFREG);
-        entry.set_size(0);
-        entry.set_uid(uid.into());
-        entry
-            .acl
-            .add_entry(TYPE_ALLOW, READ_DATA | WRITE_DATA, USER, uid as c_int, None);
-        let base = Base::new(WRITE_DISK_MAGIC);
-        let mut disk = crate::write_disk::WriteDisk::default();
-        disk.options = 0x20 | 0x40 | 0x2;
-        assert_eq!(disk.header(&base, &entry), 0);
-        assert_eq!(disk.finish_entry(&base), 0);
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0
-        );
-        let mut restored = Entry::new(None);
-        restored.set_mode(libc::S_IFREG | 0o600);
-        let mut user = super::super::disk::NameLookup::default();
-        let mut group = super::super::disk::NameLookup::default();
-        read(&path, &mut restored, &mut user, &mut group).unwrap();
-        assert!(restored.acl.reset(TYPE_NFS4) > 0);
-        let (code, item) = restored.acl_next(TYPE_NFS4);
-        assert_eq!(code, 0);
-        assert_eq!(
-            (item.tag, item.id, item.type_, item.permset),
-            (USER, uid as c_int, TYPE_ALLOW, READ_DATA | WRITE_DATA)
-        );
+        for filetype in [libc::S_IFREG, libc::S_IFDIR] {
+            let path = root.join(format!("file-{filetype}"));
+            // SAFETY: getuid only returns process credentials and takes no pointers.
+            let uid = unsafe { libc::getuid() };
+            let mut entry = Entry::new(None);
+            entry.set_pathname(path.as_os_str().as_bytes());
+            entry.set_mode(filetype);
+            entry.set_size(0);
+            entry.set_uid(uid.into());
+            entry
+                .acl
+                .add_entry(TYPE_ALLOW, READ_DATA | WRITE_DATA, USER, uid as c_int, None);
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = crate::write_disk::WriteDisk::default();
+            disk.options = 0x20 | 0x40 | 0x2;
+            assert_eq!(disk.header(&base, &entry), 0);
+            assert_eq!(disk.finish_entry(&base), 0);
+            assert_eq!(disk.close(&base), 0);
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0
+            );
+            let mut restored = Entry::new(None);
+            restored.set_mode(filetype | 0o600);
+            let mut user = super::super::disk::NameLookup::default();
+            let mut group = super::super::disk::NameLookup::default();
+            read(&path, &mut restored, &mut user, &mut group).unwrap();
+            assert!(restored.acl.reset(TYPE_NFS4) > 0);
+            let (code, item) = restored.acl_next(TYPE_NFS4);
+            assert_eq!(code, 0);
+            assert_eq!(
+                (item.tag, item.id, item.type_, item.permset),
+                (USER, uid as c_int, TYPE_ALLOW, READ_DATA | WRITE_DATA)
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

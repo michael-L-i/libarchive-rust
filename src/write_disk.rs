@@ -403,7 +403,7 @@ impl WriteDisk {
             if entry.filetype() == libc::S_IFDIR {
                 self.directories.push((entry, target, options));
             } else {
-                let ret = self.restore(a, &entry, &target, options);
+                let ret = self.restore(a, &entry, &mut target, options);
                 if ret < 0 {
                     return ret;
                 }
@@ -413,9 +413,14 @@ impl WriteDisk {
         ARCHIVE_OK
     }
 
-    fn restore(&mut self, a: &Base, entry: &Entry, target: &Target, options: c_int) -> c_int {
+    fn restore(&mut self, a: &Base, entry: &Entry, target: &mut Target, options: c_int) -> c_int {
         if entry.hardlink_is_set() != 0 && (entry.size_is_set() == 0 || entry.size() == 0) {
             return ARCHIVE_OK;
+        }
+        if entry.filetype() == libc::S_IFDIR
+            && let Ok(file) = target.directory_file()
+        {
+            target.retain_file(file);
         }
         let mut ret = ARCHIVE_OK;
         if options & OWNER != 0 {
@@ -525,8 +530,8 @@ impl WriteDisk {
             return crate::archive::ARCHIVE_FATAL;
         }
         let mut ret = self.finish_entry(a);
-        while let Some((entry, target, options)) = self.directories.pop() {
-            ret = ret.min(self.restore(a, &entry, &target, options));
+        while let Some((entry, mut target, options)) = self.directories.pop() {
+            ret = ret.min(self.restore(a, &entry, &mut target, options));
         }
         a.state.set(state::CLOSED);
         ret

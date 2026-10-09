@@ -246,6 +246,21 @@ impl Target {
     pub fn retain_file(&mut self, file: File) {
         self.live = Some(file);
     }
+    pub fn directory_file(&self) -> std::io::Result<File> {
+        // SAFETY: live parent/name; directory-only open never follows a final symlink.
+        let fd = unsafe {
+            libc::openat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful open returns a uniquely owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
     pub fn prepare(
         path: &Path,
         secure: bool,
