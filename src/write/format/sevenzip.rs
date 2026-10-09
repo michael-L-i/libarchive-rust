@@ -248,9 +248,15 @@ impl SevenZip {
                 .dict_size
                 .min(8 << 20) as usize;
             if data.len() <= limit.saturating_sub(self.pending.len()) {
-                self.pending
-                    .try_reserve(data.len())
-                    .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate 7-Zip input"))?;
+                let needed = self.pending.len() + data.len();
+                if needed > self.pending.capacity() {
+                    let capacity = needed
+                        .max(self.pending.capacity().saturating_mul(2))
+                        .min(limit);
+                    self.pending
+                        .try_reserve_exact(capacity - self.pending.len())
+                        .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate 7-Zip input"))?;
+                }
                 self.pending.extend_from_slice(data);
             } else {
                 self.start_coder(None)?;
@@ -799,10 +805,12 @@ mod tests {
             let limit = LzmaOptions::with_preset(0).dict_size as usize;
             let data: Vec<_> = (0..limit).map(|i| (i * 17 % 251) as u8).collect();
             // Separate writes stand in for successive entries in a solid stream.
-            archive.append(&data[..limit / 2]).unwrap();
-            archive.append(&data[limit / 2..]).unwrap();
+            archive.append(&data[..limit / 3]).unwrap();
+            archive.append(&data[limit / 3..2 * limit / 3]).unwrap();
+            archive.append(&data[2 * limit / 3..]).unwrap();
             assert!(archive.coder.is_none());
             assert_eq!(archive.pending.len(), limit);
+            assert_eq!(archive.pending.capacity(), limit);
             archive.append(&data).unwrap();
             assert!(archive.coder.is_some());
             assert_eq!(archive.pending.capacity(), 0);
