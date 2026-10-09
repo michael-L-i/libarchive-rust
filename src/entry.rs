@@ -222,17 +222,17 @@ fn update_utf8(s: &mut MString, cache: &Option<Cache>, v: &[u8]) -> bool {
 /// `makedev`, `major` and `minor` as the platform's `<sys/types.h>` defines
 /// them. libc's types for them differ between platforms.
 #[allow(clippy::unnecessary_cast)]
-fn make_dev(major: Dev, minor: Dev) -> Dev {
+pub(crate) fn make_dev(major: Dev, minor: Dev) -> Dev {
     libc::makedev(major as _, minor as _)
 }
 
 #[allow(clippy::unnecessary_cast)]
-fn dev_major(dev: Dev) -> Dev {
+pub(crate) fn dev_major(dev: Dev) -> Dev {
     libc::major(dev) as Dev
 }
 
 #[allow(clippy::unnecessary_cast)]
-fn dev_minor(dev: Dev) -> Dev {
+pub(crate) fn dev_minor(dev: Dev) -> Dev {
     libc::minor(dev) as Dev
 }
 
