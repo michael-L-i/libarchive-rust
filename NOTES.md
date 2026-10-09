@@ -1695,6 +1695,10 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   contents are read through Rust's file API, with CR/LF or NUL separation;
   no compression or charset conversion is applied to file contents.
 
+- Bare `HHMM` date tokens set hour/minute fields without incrementing
+  upstream's `HaveTime`: alone they resolve to midnight; with a date they
+  supply its time, and a following explicit time can override them.
+
 ## Write compression filters
 
 - gzip (miniz_oxide), bzip2 (crabz2), XZ/LZMA/lzip (lzma-rust2), LZ4
@@ -1736,6 +1740,7 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   and bounds each owned attribute at 64 MiB before allocating. This permits
   writer round trips through small callback blocks without uncontrolled
   allocation from the XML size field.
+
 ## Disk traversal and extraction (`src/read_disk.rs`, `src/write_disk.rs`)
 
 - Disk writes keep each parent directory open and create/open/link children
@@ -1753,13 +1758,6 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   callbacks are recorded without reborrowing the active disk state.
 - Platform calls and client callbacks live only in `src/ffi/disk*.rs`.
   Extended attribute lists are bounded to 1 MiB and individual values to
-
-- Bare `HHMM` date tokens set hour/minute fields without incrementing
-  upstream's `HaveTime`: alone they resolve to midnight; with a date they
-  supply its time, and a following explicit time can override them.
-- ZIP LZMA properties use the safe encoder's actual preset dictionary size.
-  Encryption covers the ZIP-LZMA prefix as well as compressed bytes, including
-  the AES authentication checksum.
   16 MiB before allocating. Darwin ACLs are translated through native ACL
   APIs. Mac metadata uses native `fcopyfile` packing/unpacking; AppleDouble
   entries are merged into their sibling using the same anchored directory.
@@ -1774,6 +1772,7 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   skip holes, while ordinary reads preserve zero bytes. Sparse maps are
   bounded to one million extents. Remote filesystem detection uses native
   `statfs`; synthetic status is unknown (-1) on macOS, as upstream's build.
+
 ## Archive writers
 
 - Writer lifecycle, callback/file/fd/FILE/memory outputs, format/filter options,
@@ -1791,3 +1790,6 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   encryption and WinZip AES. Compression uses the safe filter backends described
   above; compressed bytes can differ from upstream. Passphrase copies are
   cleared on writer destruction.
+- ZIP LZMA properties use the safe encoder's actual preset dictionary size.
+  Encryption covers the ZIP-LZMA prefix as well as compressed bytes, including
+  the AES authentication checksum.
