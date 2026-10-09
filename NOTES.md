@@ -526,6 +526,12 @@ Backends, and why:
   drained in 64 KiB output pieces. Compressed read-ahead is capped at 3 MiB
   per block, including Huffman tables. Concatenated members and trailing
   non-member bytes are supported. This replaces the c2rust libbz2 backend.
+- `bzip2::Decoder` gives the zip, 7zip and xar readers a `BZ2_bzDecompress`
+  step over crabz2's whole-block decoder. It holds the compressed bytes of an
+  unfinished block (at most 3 MiB) and decodes that block again when more
+  input arrives, so a caller that feeds a block in many small pieces does
+  quadratic work; `wanted()` says how much to present to keep it linear.
+  It consumes input only up to the end marker, as libbz2's `total_in` does.
 - zstd is `ruzstd` 0.9.0, a safe decoder with 41 mentions of `unsafe` in its
   ring buffer and decode buffer, and no crate-level `forbid`. Its checksum
   comes from twox-hash (84 mentions). `libzstd-rs-sys` was tried and dropped:
@@ -813,3 +819,21 @@ Phase 5 needs:
   and AES-CTR in all three key sizes updated in pieces of 0 to 70 bytes (every
   partial-block case). All 2,900 outputs matched. The probe is not in the
   repository.
+
+## Time and CRC helpers (`src/time.rs`, `src/crc32.rs`)
+
+### Ported as-is
+
+- `__archive_unix_to_ntfs` passes a signed `secs` to `archive_ckd_add_u64`,
+  which takes `uint64_t`. A negative `secs` (pre-1970, down to the NTFS
+  epoch) becomes a huge unsigned value, the addition overflows and the result
+  is `UINT64_MAX`. Only `secs < -11644473600` returns 0 as intended
+  (archive_time.c).
+- `__archive_dos_to_unix` returns `INT32_MAX` when `mktime` fails, which also
+  swallows a genuine 1969-12-31 23:59:59 UTC result of `-1` (archive_time.c).
+
+### Differences
+
+- `__archive_crc32` is the table implementation upstream uses without zlib;
+  the result is identical to zlib's. There is no NULL-pointer case, as a
+  slice is never null.
