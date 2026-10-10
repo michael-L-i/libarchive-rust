@@ -708,7 +708,11 @@ impl LiteralSubEncoder {
             loop {
                 subencoder_index = symbol >> 8;
                 bit = (symbol >> 7) & 1;
-                rc.encode_bit(&mut self.coder.probs, subencoder_index as _, bit as _)?;
+                rc.encode_bit_unpredictable(
+                    &mut self.coder.probs,
+                    subencoder_index as _,
+                    bit as _,
+                )?;
                 symbol <<= 1;
                 if symbol >= 0x10000 {
                     break;

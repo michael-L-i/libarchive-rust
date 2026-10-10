@@ -162,3 +162,43 @@ Validation on Apple Silicon, 2026-10-09, versus accepted baseline `a0fbedb`:
   The changed Rust file passes rustfmt. Integration checks remain separate.
 - Harnesses, raw timings, counters, differential output and rejected variants
   are retained in sibling `diagnostics/round6-lzma-micro`.
+
+## Normal literal range updates
+
+`src/enc/range_enc.rs` adds masked probability, range and low-word updates
+used only for normal literals in `src/enc/encoder.rs`. Matched literals retain
+the original branch because their predicted prefix is more predictable.
+The mask preserves zero versus any nonzero bit semantics, and all state
+updates finish before the unchanged normalization and writer-error path.
+No preset, probability model, parser, match policy or format changes.
+
+Validation on Apple Silicon, 2026-10-09, versus baseline `fafa7a5`:
+
+- Actual Claude Opus 5.5 proposed selective literal arithmetic; independent
+  implementation and fresh reviews checked arithmetic and writer-error
+  equivalence. A select-expression version was rejected after assembly
+  showed LLVM restoring the bit-dependent branches. Mask arithmetic removes
+  those branches; applying it to matched literals too regressed source and
+  was rejected.
+- Five alternating raw LZMA2 pairs, preset 6: 16 MiB random medians
+  2576.818 -> 2409.469 ms (6.5% faster). Source 2007.898 -> 2010.431 ms
+  and compiled data 624.632 -> 625.474 ms are effectively unchanged.
+  Preset 1 random medians improve 1061.875 -> 823.200 ms (22.5%).
+  Two-pair text and records screens show no material change; no general
+  archive speedup is inferred from these backend measurements.
+- All 1,440 XZ/LZMA/LZIP streams remain byte-identical across presets 0-9,
+  boundary sizes, three data patterns and write chunk sizes. Another 216
+  raw LZMA2 cases match across dictionary sizes, nice lengths, depth limits,
+  preset dictionaries and explicit flushes. Output SHA-256 values are
+  `230abc013cf9f0d83bd9c063b7078deaa357df7e723bfe3c3a93be345a922059`
+  and `fca8a1077de84220920bfda36a3c4017f3e3619e1337de3e989206d4a1b29550`.
+- An independent diagnostic checks 381,504 exact state transitions against
+  unchanged `encode_bit`: every reachable probability, bits 0/1/2/u32::MAX,
+  normalization/carry cases and injected writer failures. Probabilities,
+  range, low, cache, output bytes and error kinds agree in debug builds.
+- All 27 self-contained vendor tests pass; eight BCJ fixture tests require
+  omitted assets. Vendor Clippy with warnings denied and changed-file
+  rustfmt checks pass.
+- Raw samples, source snapshots, assembly, Opus prompts/results and validation
+  harnesses are retained in sibling `diagnostics/round7-lzma-micro`.
+  Integration and held-out archive validation remain separate.

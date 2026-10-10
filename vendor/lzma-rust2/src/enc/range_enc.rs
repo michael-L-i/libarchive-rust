@@ -114,6 +114,31 @@ impl<W: Write> RangeEncoder<W> {
         Ok(())
     }
 
+    // Mask literal-bit updates to avoid unpredictable branches.
+    #[inline(always)]
+    pub(crate) fn encode_bit_unpredictable(
+        &mut self,
+        probs: &mut [u16],
+        index: usize,
+        bit: u32,
+    ) -> crate::Result<()> {
+        let prob = &mut probs[index];
+        let p = *prob;
+        let range = self.range;
+        let bound = (range >> BIT_MODEL_TOTAL_BITS) * (p as u32);
+        let mask = 0u32.wrapping_sub(u32::from(bit != 0));
+        let p0 = p + ((BIT_MODEL_TOTAL.wrapping_sub(p as u32)) >> MOVE_BITS) as u16;
+        let p1 = p - (p >> (MOVE_BITS as u16));
+        *prob = p0 ^ ((p0 ^ p1) & mask as u16);
+        self.low += (bound & mask) as u64;
+        self.range = bound ^ ((bound ^ range.wrapping_sub(bound)) & mask);
+        if self.range & TOP_MASK == 0 {
+            self.range <<= SHIFT_BITS;
+            self.shift_low()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn encode_bit_tree(&mut self, probs: &mut [u16], symbol: u32) -> crate::Result<()> {
         let mut index = 1;
         let mut mask = probs.len() as u32;
