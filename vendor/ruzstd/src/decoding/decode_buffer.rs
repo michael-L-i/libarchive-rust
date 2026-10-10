@@ -55,6 +55,10 @@ impl DecodeBuffer {
         }
     }
 
+    pub(crate) fn history_slices(&self) -> (&[u8], &[u8]) {
+        self.buffer.as_slices()
+    }
+
     pub fn len(&self) -> usize {
         self.buffer.len()
     }

@@ -86,6 +86,32 @@ impl<'s> BitReaderReversed<'s> {
         debug_assert!(self.bits_consumed < 8);
     }
 
+    // A sequence uses at most three refills, each moving at most eight bytes.
+    // Keeping 32 source bytes guarantees that these refills cannot enter the tail.
+    #[inline(always)]
+    pub(crate) fn has_fast_sequence(&self) -> bool {
+        self.index >= 32
+    }
+
+    #[inline(always)]
+    pub(crate) fn refill_sequence(&mut self) {
+        debug_assert!(self.index >= usize::from(self.bits_consumed / 8));
+        self.index -= usize::from(self.bits_consumed / 8);
+        self.bits_consumed &= 7;
+        self.bit_container = u64::from_le_bytes(self.source[self.index..][..8].try_into().unwrap());
+    }
+
+    #[inline(always)]
+    pub(crate) fn read_sequence_bits(&mut self, n: u8) -> u64 {
+        debug_assert!(self.bits_consumed + n <= 64);
+        let value = self
+            .bit_container
+            .wrapping_shr(u32::from(64 - self.bits_consumed - n))
+            & ((1u64 << n) - 1);
+        self.bits_consumed += n;
+        value
+    }
+
     /// Read `n` number of bits from the source. Will read at most 56 bits.
     /// If there are no more bits to be read from the source zero bits will be returned instead.
     #[inline(always)]
@@ -164,6 +190,57 @@ impl<'s> BitReaderReversed<'s> {
 
 #[cfg(test)]
 mod test {
+
+    #[test]
+    fn guarded_sequences_match_general_reader_through_tail() {
+        for len in 0..=128 {
+            let data: alloc::vec::Vec<u8> = (0..len).map(|i| (i * 73 + len * 17) as u8).collect();
+            for prefix in 0..8 {
+                let mut fast = super::BitReaderReversed::new(&data);
+                let mut general = super::BitReaderReversed::new(&data);
+                assert_eq!(fast.get_bits(prefix), general.get_bits(prefix));
+                for sequence in 0..24 {
+                    let (of, ml, ll) = match sequence % 5 {
+                        0 => (31, 16, 16),
+                        1 => (0, 0, 0),
+                        2 => (24, 16, 16),
+                        3 => (5, 7, 3),
+                        _ => (1, 0, 16),
+                    };
+                    let expected = general.get_bits_triple(of, ml, ll);
+                    let actual = if fast.has_fast_sequence() {
+                        fast.refill_sequence();
+                        let result = if of + ml + ll <= 56 {
+                            let values = fast.peek_bits_triple(of + ml + ll, of, ml, ll);
+                            fast.consume(of + ml + ll);
+                            values
+                        } else {
+                            let offset = fast.read_sequence_bits(of);
+                            fast.refill_sequence();
+                            (
+                                offset,
+                                fast.read_sequence_bits(ml),
+                                fast.read_sequence_bits(ll),
+                            )
+                        };
+                        fast.refill_sequence();
+                        for bits in [9, 9, 8] {
+                            assert_eq!(fast.read_sequence_bits(bits), general.get_bits(bits));
+                        }
+                        result
+                    } else {
+                        let result = fast.get_bits_triple(of, ml, ll);
+                        for bits in [9, 9, 8] {
+                            assert_eq!(fast.get_bits(bits), general.get_bits(bits));
+                        }
+                        result
+                    };
+                    assert_eq!(actual, expected);
+                    assert_eq!(fast.bits_remaining(), general.bits_remaining());
+                }
+            }
+        }
+    }
 
     #[test]
     fn it_works() {

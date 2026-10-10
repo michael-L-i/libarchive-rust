@@ -301,3 +301,49 @@ checksum writes and full-block empty terminators are unchanged.
   `archive-screen.*`, alongside the stable `archive-confirm.*` confirmation.
   Packed and split prefix-table matcher trials were rejected because repeated
   inputs regressed. No matcher changes from those trials are included.
+
+## Stage decoded blocks and guard the sequence bitstream fast region
+
+Larger sequence batches execute into a reusable, initialized 128 KiB + 16 byte
+buffer, reading previous output through the ring's immutable history slices.
+The block is appended to the ring once, replacing per-match reserve/wrap work.
+Explicit constant-size copies handle short literals and nonoverlapping matches;
+overlapping matches retain geometric copying. Small batches keep the previous
+executor. Dictionary references, invalid lengths/offsets and oversized blocks
+replay the unchanged executor before any history or offset state is committed,
+preserving error precedence and partial output. Speculative extra bytes remain
+inside initialized scratch and are never included in committed output.
+
+The derived-state sequence decoder uses an inline bit-reader path only while
+at least 32 source bytes remain. A sequence needs at most three eight-byte
+refills; extra values consume at most 31 + 16 + 16 bits and FSE transitions at
+most 9 + 9 + 8 bits. The original reader handles the tail and final sequence,
+including exhaustion and extra-bit checks. Offset codes are still checked before
+reading extra bits; a checked code at most 31 yields an offset in 1..=u32::MAX.
+No new unsafe code, dependencies, checksums or compression behavior are involved.
+
+- Actual Claude Opus 5.5 proposed both structural changes and independently
+  reviewed the production diff with PASS. Prompts, results and actual model
+  usage are retained in sibling `diagnostics/round8-read`.
+- Twenty-one rotating confirmation runs on identical C archives:
+  source 21.539 -> 20.495 ms, mixed 11.609 -> 11.154 ms,
+  compiled 10.710 -> 9.332 ms, records 6.017 -> 5.622 ms,
+  telemetry 9.773 -> 8.108 ms. Sparse C input regresses about 2% (19 us);
+  other smaller workloads fluctuate around baseline;
+  no claim of C parity is made. The block-only intermediate improves compiled
+  and telemetry about 11%; both isolated stages and the unsuccessful first
+  block-copy formulation remain recorded.
+- All 175 valid/truncated/mutated ABI records retain identical status, errno,
+  error text, header count, length and SHA-256. All 11 screening corpus output
+  hashes also match independent C libarchive.
+- Forty-five self-contained vendor tests pass with debug assertions and
+  overflow checks enabled. New checks compare 5,976 sequence decodes against
+  the general decoder, 24,768 reader groups across the guarded/tail boundary,
+  256 generated sequence blocks with wrapped history and repeat offsets, and
+  50 malformed/dictionary/oversized fallback cases including partial state.
+  Existing omitted-fixture and C-zstd-dependent tests are excluded only in
+  the diagnostic copied-source harness; production sources remain intact.
+
+Root all-target and vendor Clippy pass with warnings denied, as do the vendor
+no-default-features build, rustfmt and diff checks. A second fresh final Opus
+review returned PASS; broader archive/oracle validation uses the integration build.

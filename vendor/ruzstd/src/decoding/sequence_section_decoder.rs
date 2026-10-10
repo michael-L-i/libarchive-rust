@@ -220,7 +220,49 @@ fn decode_sequences_without_rle(
     target.clear();
     target.reserve(section.num_sequences as usize);
 
-    for _seq_idx in 0..section.num_sequences {
+    while target.len() + 1 < section.num_sequences as usize && br.has_fast_sequence() {
+        let of_code = of_dec.decode_symbol();
+        if of_code > MAX_OFFSET_CODE {
+            return Err(DecodeSequenceError::UnsupportedOffset {
+                offset_code: of_code,
+            });
+        }
+        br.refill_sequence();
+        let (obits, ml_add, ll_add) = if of_code + ml_state.extra_bits + ll_state.extra_bits <= 56 {
+            let values = br.peek_bits_triple(
+                of_code + ml_state.extra_bits + ll_state.extra_bits,
+                of_code,
+                ml_state.extra_bits,
+                ll_state.extra_bits,
+            );
+            br.consume(of_code + ml_state.extra_bits + ll_state.extra_bits);
+            values
+        } else {
+            let offset = br.read_sequence_bits(of_code);
+            br.refill_sequence();
+            (
+                offset,
+                br.read_sequence_bits(ml_state.extra_bits),
+                br.read_sequence_bits(ll_state.extra_bits),
+            )
+        };
+        target.push(Sequence {
+            ll: ll_state.base + ll_add as u32,
+            ml: ml_state.base + ml_add as u32,
+            of: (1u32 << of_code) + obits as u32,
+        });
+
+        // LL/ML/OF transitions use at most 9 + 9 + 8 bits together.
+        br.refill_sequence();
+        let ll_add = br.read_sequence_bits(ll_state.state_bits);
+        ll_state = scratch.ll_states[usize::from(ll_state.next_base) + ll_add as usize];
+        let ml_add = br.read_sequence_bits(ml_state.state_bits);
+        ml_state = scratch.ml_states[usize::from(ml_state.next_base) + ml_add as usize];
+        let of_add = br.read_sequence_bits(of_dec.state.num_bits);
+        of_dec.state = scratch.offsets.decode[of_dec.state.base_line as usize + of_add as usize];
+    }
+
+    for _seq_idx in target.len()..section.num_sequences as usize {
         let of_code = of_dec.decode_symbol();
         let ll_value = ll_state.base;
         let ml_value = ml_state.base;
@@ -537,4 +579,74 @@ fn test_ll_default() {
     assert!(table.decode[59].symbol == 24);
     assert!(table.decode[59].num_bits == 5);
     assert!(table.decode[59].base_line == 32);
+}
+
+#[test]
+fn guarded_sequence_decoder_matches_general_states_and_errors() {
+    for layout in 0..3 {
+        let mut scratch = FSEScratch::new();
+        let (mut ll, mut ml, mut of) = (
+            Vec::from(LITERALS_LENGTH_DEFAULT_DISTRIBUTION),
+            Vec::from(MATCH_LENGTH_DEFAULT_DISTRIBUTION),
+            Vec::from(OFFSET_DEFAULT_DISTRIBUTION),
+        );
+        if layout != 0 {
+            ll.fill(0);
+            ml.fill(0);
+            of.resize(32, 0);
+            of.fill(0);
+            ll[if layout == 1 { 35 } else { 0 }] = 64;
+            ml[if layout == 1 { 52 } else { 0 }] = 64;
+            of[if layout == 1 { 31 } else { 0 }] = 32;
+        }
+        scratch
+            .literal_lengths
+            .build_from_probabilities(6, &ll)
+            .unwrap();
+        scratch
+            .match_lengths
+            .build_from_probabilities(6, &ml)
+            .unwrap();
+        scratch.offsets.build_from_probabilities(5, &of).unwrap();
+        for len in (0..80).chain([96, 128, 257]) {
+            for seed in 0..8 {
+                let data: Vec<u8> = (0..len)
+                    .map(|i| (i * 73 + seed * 41 + len * 17) as u8)
+                    .collect();
+                for num_sequences in [1, 128, 512] {
+                    let section = SequencesHeader {
+                        num_sequences,
+                        modes: None,
+                    };
+                    let mut fast_reader = BitReaderReversed::new(&data);
+                    let mut general_reader = BitReaderReversed::new(&data);
+                    fast_reader.get_bits(seed as u8);
+                    general_reader.get_bits(seed as u8);
+                    let mut fast = Vec::new();
+                    let mut general = Vec::new();
+                    let result = decode_sequences_without_rle(
+                        &section,
+                        &mut fast_reader,
+                        &mut scratch,
+                        &mut fast,
+                    );
+                    let expected = decode_sequences_with_rle::<false>(
+                        &section,
+                        &mut general_reader,
+                        &scratch,
+                        &mut general,
+                    );
+                    assert_eq!(alloc::format!("{result:?}"), alloc::format!("{expected:?}"));
+                    assert_eq!(
+                        fast_reader.bits_remaining(),
+                        general_reader.bits_remaining()
+                    );
+                    assert_eq!(fast.len(), general.len());
+                    for (a, b) in fast.iter().zip(&general) {
+                        assert_eq!((a.ll, a.ml, a.of), (b.ll, b.ml, b.of));
+                    }
+                }
+            }
+        }
+    }
 }

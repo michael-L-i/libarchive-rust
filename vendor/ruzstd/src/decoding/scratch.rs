@@ -24,6 +24,7 @@ pub struct DecoderScratch {
 
     pub literals_buffer: Vec<u8>,
     pub sequences: Vec<Sequence>,
+    pub(crate) sequence_output: Vec<u8>,
     pub block_content_buffer: Vec<u8>,
 }
 
@@ -49,6 +50,7 @@ impl DecoderScratch {
             block_content_buffer: Vec::new(),
             literals_buffer: Vec::new(),
             sequences: Vec::new(),
+            sequence_output: Vec::new(),
         }
     }
 
