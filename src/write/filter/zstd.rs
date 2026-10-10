@@ -27,7 +27,7 @@
 // Ported from libarchive/archive_write_add_filter_zstd.c.
 
 use super::*;
-use ruzstd::encoding::{CompressionLevel, FrameCompressor, Matcher, Sequence};
+use ruzstd::encoding::{CompressionLevel, FrameCompressor, Matcher, Sequence, StreamCompressor};
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::JoinHandle;
@@ -212,6 +212,16 @@ impl Write for Output {
         Ok(())
     }
 }
+fn block_size(level: i64) -> usize {
+    if level <= 1 {
+        16 * 1024
+    } else if level <= 3 {
+        96 * 1024
+    } else {
+        128 * 1024
+    }
+}
+
 struct Worker {
     tx: Option<SyncSender<Vec<u8>>>,
     rx: Receiver<Vec<u8>>,
@@ -226,13 +236,7 @@ impl Worker {
         let (output, rx) = mpsc::sync_channel(1);
         // Coalesced wakeups cover either resource that can unblock a send.
         let (notify, ready) = mpsc::sync_channel(1);
-        let size = if level <= 1 {
-            16 * 1024
-        } else if level <= 3 {
-            96 * 1024
-        } else {
-            128 * 1024
-        };
+        let size = block_size(level);
         let thread = std::thread::Builder::new()
             .name("archive-zstd-encoder".into())
             .spawn(move || {
@@ -342,9 +346,68 @@ impl Drop for Worker {
     }
 }
 
+// Codec panics keep the worker's error mapping; sink panics still propagate
+// to the archive callback guard just as they do on the threaded path.
+fn encode(
+    sink: &mut dyn Sink,
+    operation: impl FnOnce(&mut dyn FnMut(&[u8]) -> Result<(), Error>) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let mut in_sink = false;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        operation(&mut |data| {
+            in_sink = true;
+            let result = sink.write(data);
+            in_sink = false;
+            result
+        })
+    }));
+    match result {
+        Ok(result) => result,
+        Err(panic) if in_sink => std::panic::resume_unwind(panic),
+        Err(_) => Err(Error::fatal(-1, "Zstd compression failed")),
+    }
+}
+
+enum Encoder {
+    Threaded(Worker),
+    Direct(Box<StreamCompressor<Matches>>),
+    Failed,
+}
+impl Encoder {
+    fn direct(level: i64) -> Result<Self, Error> {
+        std::panic::catch_unwind(|| {
+            let mut encoder =
+                StreamCompressor::new(Matches::new(block_size(level)), CompressionLevel::Fastest);
+            encoder.begin();
+            Self::Direct(Box::new(encoder))
+        })
+        .map_err(|_| Error::fatal(-1, "Zstd compression failed"))
+    }
+    fn write(&mut self, data: &[u8], sink: &mut dyn Sink) -> Result<(), Error> {
+        match self {
+            Self::Threaded(worker) => worker.write(data, sink),
+            Self::Direct(encoder) => {
+                let result = encode(sink, |emit| encoder.write(data, emit));
+                if result.is_err() {
+                    *self = Self::Failed;
+                }
+                result
+            }
+            Self::Failed => Err(Error::fatal(-1, "Zstd compression failed")),
+        }
+    }
+    fn finish(self, sink: &mut dyn Sink) -> Result<(), Error> {
+        match self {
+            Self::Threaded(worker) => worker.finish(sink),
+            Self::Direct(mut encoder) => encode(sink, |emit| encoder.finish(emit)),
+            Self::Failed => Err(Error::fatal(-1, "Zstd compression failed")),
+        }
+    }
+}
+
 pub struct Zstd {
     level: i64,
-    worker: Option<Worker>,
+    encoder: Option<Encoder>,
     frame_per_file: bool,
     min_in: u64,
     max_in: u64,
@@ -357,7 +420,7 @@ impl Default for Zstd {
     fn default() -> Self {
         Self {
             level: 3,
-            worker: None,
+            encoder: None,
             frame_per_file: false,
             min_in: 0,
             max_in: u64::MAX,
@@ -381,15 +444,26 @@ impl Sink for Count<'_> {
 }
 impl Zstd {
     fn start(&mut self) -> Result<(), Error> {
-        if self.worker.is_none() {
-            self.worker = Some(Worker::new(self.level)?);
+        if self.encoder.is_none() {
+            // Framing thresholds retain their existing asynchronous output
+            // accounting. Ordinary single-frame writes need no worker bridge.
+            let direct = !self.frame_per_file
+                && self.min_in == 0
+                && self.max_in == u64::MAX
+                && self.min_out == 0
+                && self.max_out == u64::MAX;
+            self.encoder = Some(if direct {
+                Encoder::direct(self.level)?
+            } else {
+                Encoder::Threaded(Worker::new(self.level)?)
+            });
             self.frame_in = 0;
             self.frame_out = 0;
         }
         Ok(())
     }
     fn finish(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
-        if let Some(worker) = self.worker.take() {
+        if let Some(worker) = self.encoder.take() {
             worker.finish(&mut Count {
                 sink,
                 count: &mut self.frame_out,
@@ -480,7 +554,7 @@ impl Filter for Zstd {
                 .min(65536)
                 .min(usize::try_from(room).unwrap_or(usize::MAX));
             if n > 0 {
-                if let Some(w) = &mut self.worker {
+                if let Some(w) = &mut self.encoder {
                     w.write(
                         &input[..n],
                         &mut Count {
@@ -546,6 +620,61 @@ mod tests {
             })
             .collect()
     }
+    #[test]
+    fn push_encoder_restarts_after_success_and_emit_failure() {
+        let block = 16384;
+        let data = random_bytes(block * 2 + 7);
+        let mut encoder = StreamCompressor::new(Matches::new(block), CompressionLevel::Fastest);
+        for len in [0, block, data.len(), 1] {
+            encoder.begin();
+            let mut actual = Vec::new();
+            encoder.write(&[], |_| Ok::<_, ()>(())).unwrap();
+            for part in data[..len].chunks(511) {
+                encoder
+                    .write(part, |b| {
+                        actual.extend_from_slice(b);
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+            }
+            encoder
+                .finish(|b| {
+                    actual.extend_from_slice(b);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            assert_eq!(actual, compressed(&data[..len], block));
+        }
+        // Fail both the first full block and the separate final checksum write.
+        encoder.begin();
+        assert_eq!(encoder.write(&data, |_| Err(17)), Err(17));
+        encoder.begin();
+        encoder.write(&data[..1], |_| Ok::<_, i32>(())).unwrap();
+        let mut calls = 0;
+        assert_eq!(
+            encoder.finish(|_| {
+                calls += 1;
+                if calls == 2 { Err(23) } else { Ok(()) }
+            }),
+            Err(23)
+        );
+        encoder.begin();
+        let mut actual = Vec::new();
+        encoder
+            .write(&data, |b| {
+                actual.extend_from_slice(b);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        encoder
+            .finish(|b| {
+                actual.extend_from_slice(b);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(actual, compressed(&data, block));
+    }
+
     #[test]
     fn matcher_reuses_previous_blocks_and_expires_old_history() {
         let block = random_bytes(32768);
@@ -750,6 +879,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_and_threaded_encoders_match_at_every_level() {
+        let data = random_bytes(262149);
+        for level in [1, 3, 9] {
+            let mut direct = Encoder::direct(level).unwrap();
+            let mut threaded = Encoder::Threaded(Worker::new(level).unwrap());
+            let mut a = Bytes::default();
+            let mut b = Bytes::default();
+            for part in data.chunks(511) {
+                direct.write(part, &mut a).unwrap();
+                threaded.write(part, &mut b).unwrap();
+            }
+            direct.finish(&mut a).unwrap();
+            threaded.finish(&mut b).unwrap();
+            assert_eq!(a.0, b.0);
+        }
+    }
+
+    #[test]
+    fn sink_panic_keeps_its_original_payload() {
+        struct PanicSink;
+        impl Sink for PanicSink {
+            fn write(&mut self, _: &[u8]) -> Result<(), Error> {
+                std::panic::panic_any(12345u32);
+            }
+        }
+        let mut encoder = Encoder::direct(3).unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            encoder.write(&vec![0; 98304], &mut PanicSink).unwrap();
+        }))
+        .unwrap_err();
+        assert_eq!(panic.downcast_ref::<u32>(), Some(&12345));
+        drop(encoder);
+    }
+
+    #[test]
+    fn uncompressed_custom_matcher_pull_and_push_agree() {
+        for size in [0, 1, 16384, 32769] {
+            let data = random_bytes(size);
+            let mut pull = Vec::new();
+            let mut encoder = FrameCompressor::new_with_matcher(
+                Matches::new(16384),
+                CompressionLevel::Uncompressed,
+            );
+            encoder.set_source(data.as_slice());
+            encoder.set_drain(&mut pull);
+            encoder.compress();
+            let mut encoder =
+                StreamCompressor::new(Matches::new(16384), CompressionLevel::Uncompressed);
+            let mut push = Vec::new();
+            encoder.begin();
+            encoder
+                .write(&data, |b| {
+                    push.extend_from_slice(b);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            encoder
+                .finish(|b| {
+                    push.extend_from_slice(b);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            assert_eq!(pull, push);
+            let mut decoded = Vec::new();
+            ruzstd::decoding::StreamingDecoder::new(push.as_slice())
+                .unwrap()
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, data);
+        }
+    }
+
     struct FailedSink;
     impl Sink for FailedSink {
         fn write(&mut self, _: &[u8]) -> Result<(), Error> {
@@ -757,7 +959,7 @@ mod tests {
         }
     }
     #[test]
-    fn sink_failure_is_preserved_while_worker_is_reaped() {
+    fn sink_failure_is_preserved_when_encoder_is_dropped() {
         let mut filter = Zstd::default();
         let data: Vec<_> = (0..262144usize)
             .map(|n| (n.wrapping_mul(37) >> 5) as u8)

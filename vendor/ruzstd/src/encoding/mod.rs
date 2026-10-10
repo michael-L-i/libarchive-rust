@@ -8,7 +8,7 @@ pub(crate) mod util;
 
 mod frame_compressor;
 mod levels;
-pub use frame_compressor::FrameCompressor;
+pub use frame_compressor::{FrameCompressor, StreamCompressor};
 pub use match_generator::MatchGeneratorDriver;
 
 use crate::io::{Read, Write};

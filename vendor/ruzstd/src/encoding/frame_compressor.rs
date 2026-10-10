@@ -38,10 +38,7 @@ use crate::io::{Read, Write};
 pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     uncompressed_data: Option<R>,
     compressed_data: Option<W>,
-    compression_level: CompressionLevel,
-    state: CompressState<M>,
-    #[cfg(feature = "hash")]
-    hasher: XxHash64,
+    core: StreamCompressor<M>,
 }
 
 pub(crate) struct FseTables {
@@ -72,21 +69,228 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) fse_tables: FseTables,
 }
 
-impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
-    /// Create a new `FrameCompressor`
-    pub fn new(compression_level: CompressionLevel) -> Self {
+/// A push-based Zstd frame encoder.
+///
+/// Call [StreamCompressor::begin] to start a frame, feed data with [StreamCompressor::write]
+/// and end the frame with [StreamCompressor::finish]. Encoded bytes are handed to `emit`;
+/// concatenated, they are identical to [FrameCompressor::compress] output for the same input,
+/// regardless of how the input is chunked.
+///
+/// `write` and `finish` panic unless a frame is open. A frame is closed by `finish` and by any
+/// `emit` error; `begin` always starts a fresh frame. The matcher must hand out non-empty spaces
+/// (at most 128 KiB) for `write` to accept data; with an empty space only an empty frame can be
+/// produced.
+pub struct StreamCompressor<M: Matcher> {
+    state: CompressState<M>,
+    level: CompressionLevel,
+    #[cfg(feature = "hash")]
+    hasher: XxHash64,
+    // Reused across blocks and frames
+    output: Vec<u8>,
+    // The current block, as handed out by the matcher
+    space: Vec<u8>,
+    filled: usize,
+    open: bool,
+}
+
+impl<M: Matcher> StreamCompressor<M> {
+    /// Create a new `StreamCompressor` with the given matcher. No frame is open yet.
+    pub fn new(matcher: M, compression_level: CompressionLevel) -> Self {
         Self {
-            uncompressed_data: None,
-            compressed_data: None,
-            compression_level,
             state: CompressState {
-                matcher: MatchGeneratorDriver::new(1024 * 128, 1),
+                matcher,
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
             },
+            level: compression_level,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
+            output: Vec::with_capacity(1024 * 130),
+            space: Vec::new(),
+            filled: 0,
+            open: false,
         }
+    }
+
+    /// Start a new frame, abandoning any frame still open.
+    ///
+    /// The frame header is buffered and emitted together with the first block.
+    pub fn begin(&mut self) {
+        self.open = false;
+        // Clearing buffers to allow re-using of the compressor
+        self.state.matcher.reset(self.level);
+        self.state.last_huff_table = None;
+        #[cfg(feature = "hash")]
+        {
+            self.hasher = XxHash64::with_seed(0);
+        }
+        self.output.clear();
+        let header = FrameHeader {
+            frame_content_size: None,
+            single_segment: false,
+            content_checksum: cfg!(feature = "hash"),
+            dictionary_id: None,
+            window_size: Some(self.state.matcher.window_size()),
+        };
+        header.serialize(&mut self.output);
+        self.space = self.state.matcher.get_next_space();
+        self.filled = 0;
+        self.open = true;
+    }
+
+    /// Compress `data` into the open frame, emitting every block that fills up.
+    pub fn write<E>(
+        &mut self,
+        mut data: &[u8],
+        mut emit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        assert!(
+            self.open,
+            "StreamCompressor::write called without an open frame"
+        );
+        while !data.is_empty() {
+            let spare = &mut self.space[self.filled..];
+            assert!(!spare.is_empty(), "matcher handed out an empty space");
+            let n = spare.len().min(data.len());
+            spare[..n].copy_from_slice(&data[..n]);
+            data = &data[n..];
+            self.commit(n, &mut emit)?;
+        }
+        Ok(())
+    }
+
+    /// Emit the last block (an empty Raw block if no data is pending) and the checksum.
+    ///
+    /// The frame is closed afterwards, even if `emit` fails.
+    pub fn finish<E>(&mut self, mut emit: impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
+        assert!(
+            self.open,
+            "StreamCompressor::finish called without an open frame"
+        );
+        self.open = false;
+        let mut block = core::mem::take(&mut self.space);
+        block.truncate(self.filled);
+        self.filled = 0;
+        self.encode(block, true);
+        self.flush(&mut emit)?;
+        // Keep the pull encoder's separate final checksum write.
+        #[cfg(feature = "hash")]
+        emit(&(self.hasher.finish() as u32).to_le_bytes())?;
+        Ok(())
+    }
+
+    /// The unfilled rest of the current block
+    pub(crate) fn spare(&mut self) -> &mut [u8] {
+        &mut self.space[self.filled..]
+    }
+
+    /// Mark `n` bytes of [StreamCompressor::spare] as filled, emitting the block if it is full.
+    pub(crate) fn commit<E>(
+        &mut self,
+        n: usize,
+        emit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        assert!(
+            self.open,
+            "StreamCompressor::commit called without an open frame"
+        );
+        self.filled += n;
+        assert!(self.filled <= self.space.len());
+        if n == 0 || self.filled < self.space.len() {
+            return Ok(());
+        }
+        // Stays closed if encoding panics or emitting fails
+        self.open = false;
+        let block = core::mem::take(&mut self.space);
+        self.filled = 0;
+        self.encode(block, false);
+        self.flush(emit)?;
+        self.space = self.state.matcher.get_next_space();
+        self.open = true;
+        Ok(())
+    }
+
+    /// Between frames you can replace the matcher
+    pub fn replace_matcher(&mut self, mut match_generator: M) -> M {
+        core::mem::swap(&mut match_generator, &mut self.state.matcher);
+        match_generator
+    }
+
+    /// Between frames you can replace the compression level
+    pub fn set_compression_level(
+        &mut self,
+        compression_level: CompressionLevel,
+    ) -> CompressionLevel {
+        let old = self.level;
+        self.level = compression_level;
+        old
+    }
+
+    /// Get the current compression level
+    pub fn compression_level(&self) -> CompressionLevel {
+        self.level
+    }
+
+    fn encode(&mut self, block: Vec<u8>, last_block: bool) {
+        // As we read, hash that data too
+        #[cfg(feature = "hash")]
+        self.hasher.write(&block);
+        encode_block(
+            &mut self.state,
+            self.level,
+            block,
+            last_block,
+            &mut self.output,
+        );
+    }
+
+    fn flush<E>(&mut self, mut emit: impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
+        let result = emit(&self.output);
+        self.output.clear();
+        result
+    }
+}
+
+/// Append one encoded block to `output`
+fn encode_block<M: Matcher>(
+    state: &mut CompressState<M>,
+    level: CompressionLevel,
+    block: Vec<u8>,
+    last_block: bool,
+    output: &mut Vec<u8>,
+) {
+    // Special handling is needed for compression of a totally empty file (why you'd want to do that, I don't know)
+    if block.is_empty() {
+        let header = BlockHeader {
+            last_block: true,
+            block_type: crate::blocks::block::BlockType::Raw,
+            block_size: 0,
+        };
+        header.serialize(output);
+        return;
+    }
+    match level {
+        CompressionLevel::Uncompressed => {
+            let header = BlockHeader {
+                last_block,
+                block_type: crate::blocks::block::BlockType::Raw,
+                block_size: block.len().try_into().unwrap(),
+            };
+            // Write the header, then the block
+            header.serialize(output);
+            output.extend_from_slice(&block);
+        }
+        CompressionLevel::Fastest => compress_fastest(state, last_block, block, output),
+        _ => {
+            unimplemented!();
+        }
+    }
+}
+
+impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
+    /// Create a new `FrameCompressor`
+    pub fn new(compression_level: CompressionLevel) -> Self {
+        Self::new_with_matcher(MatchGeneratorDriver::new(1024 * 128, 1), compression_level)
     }
 }
 
@@ -96,14 +300,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         Self {
             uncompressed_data: None,
             compressed_data: None,
-            state: CompressState {
-                matcher,
-                last_huff_table: None,
-                fse_tables: FseTables::new(),
-            },
-            compression_level,
-            #[cfg(feature = "hash")]
-            hasher: XxHash64::with_seed(0),
+            core: StreamCompressor::new(matcher, compression_level),
         }
     }
 
@@ -129,97 +326,18 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
     /// [Read::take] function
     pub fn compress(&mut self) {
-        // Clearing buffers to allow re-using of the compressor
-        self.state.matcher.reset(self.compression_level);
-        self.state.last_huff_table = None;
-        #[cfg(feature = "hash")]
-        {
-            self.hasher = XxHash64::with_seed(0);
-        }
+        let enc = &mut self.core;
+        enc.begin();
         let source = self.uncompressed_data.as_mut().unwrap();
         let drain = self.compressed_data.as_mut().unwrap();
-        // As the frame is compressed, it's stored here
-        let output: &mut Vec<u8> = &mut Vec::with_capacity(1024 * 130);
-        // First write the frame header
-        let header = FrameHeader {
-            frame_content_size: None,
-            single_segment: false,
-            content_checksum: cfg!(feature = "hash"),
-            dictionary_id: None,
-            window_size: Some(self.state.matcher.window_size()),
-        };
-        header.serialize(output);
-        // Now compress block by block
         loop {
-            // Read a single block's worth of uncompressed data from the input
-            let mut uncompressed_data = self.state.matcher.get_next_space();
-            let mut read_bytes = 0;
-            let last_block;
-            'read_loop: loop {
-                let new_bytes = source.read(&mut uncompressed_data[read_bytes..]).unwrap();
-                if new_bytes == 0 {
-                    last_block = true;
-                    break 'read_loop;
-                }
-                read_bytes += new_bytes;
-                if read_bytes == uncompressed_data.len() {
-                    last_block = false;
-                    break 'read_loop;
-                }
-            }
-            uncompressed_data.resize(read_bytes, 0);
-            // As we read, hash that data too
-            #[cfg(feature = "hash")]
-            self.hasher.write(&uncompressed_data);
-            // Special handling is needed for compression of a totally empty file (why you'd want to do that, I don't know)
-            if uncompressed_data.is_empty() {
-                let header = BlockHeader {
-                    last_block: true,
-                    block_type: crate::blocks::block::BlockType::Raw,
-                    block_size: 0,
-                };
-                // Write the header, then the block
-                header.serialize(output);
-                drain.write_all(output).unwrap();
-                output.clear();
+            // Read straight into the current block
+            let read_bytes = source.read(enc.spare()).unwrap();
+            if read_bytes == 0 {
+                enc.finish(|b| drain.write_all(b)).unwrap();
                 break;
             }
-
-            match self.compression_level {
-                CompressionLevel::Uncompressed => {
-                    let header = BlockHeader {
-                        last_block,
-                        block_type: crate::blocks::block::BlockType::Raw,
-                        block_size: read_bytes.try_into().unwrap(),
-                    };
-                    // Write the header, then the block
-                    header.serialize(output);
-                    output.extend_from_slice(&uncompressed_data);
-                }
-                CompressionLevel::Fastest => {
-                    compress_fastest(&mut self.state, last_block, uncompressed_data, output)
-                }
-                _ => {
-                    unimplemented!();
-                }
-            }
-            drain.write_all(output).unwrap();
-            output.clear();
-            if last_block {
-                break;
-            }
-        }
-
-        // If the `hash` feature is enabled, then `content_checksum` is set to true in the header
-        // and a 32 bit hash is written at the end of the data.
-        #[cfg(feature = "hash")]
-        {
-            // Because we only have the data as a reader, we need to read all of it to calculate the checksum
-            // Possible TODO: create a wrapper around self.uncompressed data that hashes the data as it's read?
-            let content_checksum = self.hasher.finish();
-            drain
-                .write_all(&(content_checksum as u32).to_le_bytes())
-                .unwrap();
+            enc.commit(read_bytes, |b| drain.write_all(b)).unwrap();
         }
     }
 
@@ -254,9 +372,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     }
 
     /// Before calling [FrameCompressor::compress] you can replace the matcher
-    pub fn replace_matcher(&mut self, mut match_generator: M) -> M {
-        core::mem::swap(&mut match_generator, &mut self.state.matcher);
-        match_generator
+    pub fn replace_matcher(&mut self, match_generator: M) -> M {
+        self.core.replace_matcher(match_generator)
     }
 
     /// Before calling [FrameCompressor::compress] you can replace the compression level
@@ -264,17 +381,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         &mut self,
         compression_level: CompressionLevel,
     ) -> CompressionLevel {
-        let old = self.compression_level;
-        self.compression_level = compression_level;
-        old
+        self.core.set_compression_level(compression_level)
     }
 
     /// Get the current compression level
     pub fn compression_level(&self) -> CompressionLevel {
-        self.compression_level
+        self.core.compression_level()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use alloc::vec;

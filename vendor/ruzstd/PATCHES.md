@@ -267,3 +267,37 @@ vector headers; small/RLE paths do not allocate derived tables.
 - Raw samples, timing records, ABI checks and the focused Opus review are in
   `diagnostics/round7-zstd-read`; full oracle validation uses the combined
   integration build.
+
+## Share a push encoder with the pull frame compressor
+
+`src/encoding/frame_compressor.rs` exposes `StreamCompressor` and uses the same
+block/frame implementation from `FrameCompressor`. Callers can fill blocks
+incrementally and receive encoded bytes through a fallible callback. The archive
+writer uses this path for default framing, removing its worker thread, channels
+and queued input/output copies. Explicit framing options retain the existing
+worker and its output-count timing. Matching, compression levels, block sizes,
+checksum writes and full-block empty terminators are unchanged.
+
+- Claude Opus 5.5 designed and authored the shared streaming core. A fresh
+  independent Opus review passed; the root bridge and independent validation
+  were implemented locally. Prompts and raw model responses are retained in
+  sibling `diagnostics/round7-zstd`, including an unsuccessful tool-use review
+  attempt and the corrected final review.
+- All 545 frozen fafa7a5 baseline corpus/boundary/history comparisons remain
+  byte-identical for both pull and push, plus 105 push fragmentation cases.
+  Thirteen filter tests pass, covering reset/reuse, first-block and checksum
+  emit errors, original sink panic payload, custom-matcher Uncompressed output,
+  direct/threaded equivalence at levels 1/3/9 and legacy framing. Clippy passes
+  with warnings denied; the vendored no-default-features build also passes.
+  Standalone vendor tests require omitted upstream fixtures and C test support,
+  so validation uses the root and isolated baseline harness instead.
+- Five alternating archive pairs give medians in milliseconds: source
+  64.04 -> 59.98, mixed 43.60 -> 41.24, text 10.18 -> 9.38, random
+  21.11 -> 20.93, small-files 11.29 -> 11.21. All archive bytes match.
+  Median peak RSS falls by about 0.30-0.53 MiB across these inputs. Recorded
+  CPU times have 10 ms precision and do not resolve the small differences.
+- Earlier seven-pair screens experienced unexplained timing inflation; all
+  their raw results remain available as `archive-screen-slow.*` and
+  `archive-screen.*`, alongside the stable `archive-confirm.*` confirmation.
+  Packed and split prefix-table matcher trials were rejected because repeated
+  inputs regressed. No matcher changes from those trials are included.
