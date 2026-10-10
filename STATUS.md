@@ -255,6 +255,51 @@ The final release snapshot is `../diagnostics/bin/rust-round5-final-bsdtar`;
 `rust-bsdtar` points to identical bytes. Work is committed locally, with no
 build, test, benchmark or worker process left running.
 
+## Optimization round 6 checkpoint
+
+Baseline `a0fbedb` to code `d03bfb0`: BT4 skip reuses the proved suffix of
+earlier same-distance matches, preserving exact tree and match decisions.
+The three-integer cache is invalidated at position normalization. Zstandard
+batches three bounded FSE state fields into one bit write and inlines match
+repetition into sequence execution. Each unit received independent review.
+
+Release creation medians, C / previous Rust / current Rust in ms:
+16 MiB repetitive 7zip 91.9 / 136.1 / 112.4 (17.4% Rust improvement);
+16 MiB repetitive XZ 104.4 / 135.9 / 109.6 (19.3%). Rust is within about 5%
+of C on the latter case. Separate document input 7zip improves 122.6 to
+111.7 ms (C 118.5), and zero-heavy 7zip 83.8 to 71.0 ms (C 65.3).
+Random and source LZMA microbenchmarks are essentially unchanged.
+
+Seven-run confirmation resolves noisy creation results: structured-record
+7zip 968.6 to 973.6 ms and telemetry 910.4 to 917.4 ms, both with overlapping
+ranges. No gain is claimed for noisy random 2 MiB 7zip. Source/mixed Zstandard
+encoding improves 4–6% in isolation, but full archive creation changes are
+small/noise-level this round. Isolated decoding improves about 2.5%; all
+end-to-end values and unchanged or slower individual cases are reported.
+
+Validation: 380 native tests passed, 1 ignored; strict all-target Clippy,
+rustfmt, diff and 454 public ABI symbols passed. Full release suite: 926 passed,
+184 skipped, zero failures/crashes/timeouts or ratchet regressions in 67s.
+The run used one worker with 30-second process deadlines. LZMA checks include
+1,440 byte-identical encoded streams, 27 self-contained vendor tests, and an
+exact 2,147,614,720-byte streaming comparison crossing position normalization.
+Zstandard checks include 545 exact encoded cases, independent C decoding,
+15 FSE/bit-writer tests, 175 exact valid/damaged ABI cases and six buffer tests.
+
+The 34-case archive matrix has 918 timed commands, 306 verified extractions,
+204 cross-reader checks and 34 byte-identical retained archive pairs. The same-
+C-input matrix adds 1,020 reader commands and 510 extraction checks. Four
+targeted seven-run confirmations add 84 creation timings; every Rust output
+hash matches across all their repetitions. All checks passed. Original raw
+samples and per-row confirmation provenance are retained. Rejected trials
+were reverted, with evidence preserved outside the packages.
+
+Current tables: `../diagnostics/results/REPORT.md`; previous report:
+`../diagnostics/results/before-round6/REPORT.md`. The current release is
+`../diagnostics/bin/rust-round6-final-bsdtar`, identical to `rust-bsdtar`.
+No new dependency, C codec or unsafe code was added. Original C/upstream remain
+clean. Work is committed locally; no build, test or benchmark remains running.
+
 ## Earlier checkpoints (historical)
 
 ### Phase 2 checkpoint
