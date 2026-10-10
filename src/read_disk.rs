@@ -62,7 +62,7 @@ pub struct ReadDisk {
     sparse: bool,
     extents: VecDeque<(i64, i64)>,
     pub filesystem: c_int,
-    filesystems: Vec<u64>,
+    filesystems: Vec<(u64, Option<(c_int, c_int)>)>,
 }
 
 impl ReadDisk {
@@ -196,20 +196,28 @@ impl ReadDisk {
             }
             self.current_restore = Some(entry.clone_entry());
             let fsid = st.st_dev as u64;
-            self.filesystem = match self.filesystems.iter().position(|&id| id == fsid) {
-                Some(n) => n as c_int,
+            let filesystem = match self.filesystems.iter().position(|&(id, _)| id == fsid) {
+                Some(n) => n,
                 None => {
-                    self.filesystems.push(fsid);
-                    (self.filesystems.len() - 1) as c_int
+                    self.filesystems.push((fsid, None));
+                    self.filesystems.len() - 1
                 }
             };
+            self.filesystem = filesystem as c_int;
             a.disk_filesystem.set(self.filesystem);
-            let (remote, synthetic) = match crate::ffi::disk_sys::filesystem(
-                &path,
-                follow && entry.filetype() != libc::S_IFLNK,
-            ) {
-                Ok(flags) => flags,
-                Err(e) => return io_error(a, e, "statfs failed"),
+            let flags = &mut self.filesystems[filesystem].1;
+            let (remote, synthetic) = match *flags {
+                Some(flags) => flags,
+                None => match crate::ffi::disk_sys::filesystem(
+                    &path,
+                    follow && entry.filetype() != libc::S_IFLNK,
+                ) {
+                    Ok(value) => {
+                        *flags = Some(value);
+                        value
+                    }
+                    Err(e) => return io_error(a, e, "statfs failed"),
+                },
             };
             a.disk_remote.set(remote);
             a.disk_synthetic.set(synthetic);

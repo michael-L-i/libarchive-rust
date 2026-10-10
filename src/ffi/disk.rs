@@ -14,6 +14,14 @@ pub type Cleanup = Option<unsafe extern "C" fn(*mut c_void)>;
 pub type ReadLookup = Option<unsafe extern "C" fn(*mut c_void, i64) -> *const c_char>;
 pub type WriteLookup = Option<unsafe extern "C" fn(*mut c_void, *const c_char, i64) -> i64>;
 
+const LOOKUP_CACHE_SIZE: usize = 127;
+
+struct CachedName {
+    id: libc::id_t,
+    group: bool,
+    name: Option<CString>,
+}
+
 #[derive(Default)]
 pub struct NameLookup {
     data: *mut c_void,
@@ -21,12 +29,31 @@ pub struct NameLookup {
     cleanup: Cleanup,
     pub standard: bool,
     value: Option<CString>,
+    cache: Vec<Option<CachedName>>,
 }
 impl NameLookup {
     pub fn lookup(&mut self, id: i64, group: bool) -> Option<&CStr> {
-        self.value = if self.standard {
-            super::disk_sys::name(id, group)
-        } else if let Some(cb) = self.callback {
+        if self.standard {
+            // Match the uid_t/gid_t conversion in the system lookup and upstream cache.
+            let key = id as libc::id_t;
+            if self.cache.is_empty() {
+                self.cache.resize_with(LOOKUP_CACHE_SIZE, || None);
+            }
+            let slot = key as usize % LOOKUP_CACHE_SIZE;
+            let cached = &mut self.cache[slot];
+            if cached
+                .as_ref()
+                .is_none_or(|c| c.id != key || c.group != group)
+            {
+                *cached = Some(CachedName {
+                    id: key,
+                    group,
+                    name: super::disk_sys::name(id, group),
+                });
+            }
+            return cached.as_ref().and_then(|c| c.name.as_deref());
+        }
+        self.value = if let Some(cb) = self.callback {
             // SAFETY: the setter registers this callback/data for the lookup's lifetime.
             let name = unsafe { cb(self.data, id) };
             // SAFETY: a non-NULL callback result is a NUL-terminated string.
@@ -303,6 +330,7 @@ pub extern "C" fn archive_read_disk_set_standard_lookup(a: *mut Archive) -> c_in
             callback: None,
             cleanup: None,
             value: None,
+            cache: Vec::new(),
         };
         d.group = NameLookup {
             standard: true,
@@ -310,6 +338,7 @@ pub extern "C" fn archive_read_disk_set_standard_lookup(a: *mut Archive) -> c_in
             callback: None,
             cleanup: None,
             value: None,
+            cache: Vec::new(),
         };
         ARCHIVE_OK
     })
@@ -328,6 +357,7 @@ pub extern "C" fn archive_read_disk_set_gname_lookup(
             cleanup,
             standard: false,
             value: None,
+            cache: Vec::new(),
         };
         ARCHIVE_OK
     })
@@ -346,6 +376,7 @@ pub extern "C" fn archive_read_disk_set_uname_lookup(
             cleanup,
             standard: false,
             value: None,
+            cache: Vec::new(),
         };
         ARCHIVE_OK
     })
@@ -732,6 +763,71 @@ mod tests {
         assert_eq!(disk.close(&base), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn standard_name_cache_preserves_collisions_misses_and_native_id_aliases() {
+        use std::os::unix::fs::MetadataExt;
+        let root = directory("names");
+        let metadata = std::fs::metadata(&root).unwrap();
+        let mut cached = NameLookup {
+            standard: true,
+            data: std::ptr::null_mut(),
+            callback: None,
+            cleanup: None,
+            value: None,
+            cache: Vec::new(),
+        };
+        for (group, base) in [
+            (false, i64::from(metadata.uid())),
+            (true, i64::from(metadata.gid())),
+        ] {
+            for id in [
+                base,
+                base,
+                base + 127,
+                base + (1 << 32),
+                0x7fff_fff0,
+                0x7fff_fff0,
+                base,
+            ] {
+                let expected = super::super::disk_sys::name(id, group);
+                assert_eq!(cached.lookup(id, group).map(CStr::to_owned), expected);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_filesystem_flags_match_physical_walk() {
+        let root = directory("statfs");
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/file"), b"x").unwrap();
+        std::os::unix::fs::symlink("/", root.join("dir/link")).unwrap();
+        let disk = archive_read_disk_new();
+        let path = CString::new(root.as_os_str().as_bytes()).unwrap();
+        assert_eq!(archive_read_disk_open(disk, path.as_ptr()), 0);
+        let mut entry = Entry::new(None);
+        let ptr = (&mut entry as *mut Entry).cast();
+        let mut count = 0;
+        while super::super::read::archive_read_next_header2(disk, ptr) == 0 {
+            count += 1;
+            let path = PathBuf::from(std::ffi::OsStr::from_bytes(
+                entry.pathname().unwrap().to_bytes(),
+            ));
+            let (remote, synthetic) = super::super::disk_sys::filesystem(&path, false).unwrap();
+            assert_eq!(archive_read_disk_current_filesystem_is_remote(disk), remote);
+            assert_eq!(
+                archive_read_disk_current_filesystem_is_synthetic(disk),
+                synthetic
+            );
+            if archive_read_disk_can_descend(disk) != 0 {
+                assert_eq!(archive_read_disk_descend(disk), 0);
+            }
+        }
+        assert_eq!(count, 4);
+        assert_eq!(super::super::archive::archive_read_free(disk), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     unsafe extern "C" fn descend_filter(
         a: *mut Archive,
         _data: *mut c_void,

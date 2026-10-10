@@ -1766,6 +1766,13 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 
 ## Disk traversal and extraction (`src/read_disk.rs`, `src/write_disk.rs`)
 
+- Standard read-side uid/gid names use upstream's bounded 127-slot cache,
+  including missing names; custom lookup callbacks remain uncached. Filesystem
+  remote/synthetic flags are cached by the existing device ID, as upstream's
+  filesystem table does. A failed filesystem probe is retried on later entries.
+  Numeric filesystem IDs, symlink handling and write-side owner lookup fallback
+  behavior are unchanged. Real Opus 5.5 design/review and byte-identical
+  six-format many-file measurements are retained in `../diagnostics/round8-system`.
 - Disk writes keep each parent directory open and create/open/link children
   relative to its descriptor. `SECURE_SYMLINKS` opens every ancestor with
   `O_NOFOLLOW`; replacing an ancestor after the check cannot redirect a write.
