@@ -376,13 +376,21 @@ impl Target {
         // SAFETY: valid live descriptor and terminated name.
         result(unsafe { libc::mkdirat(self.parent.as_raw_fd(), self.name.as_ptr(), mode as _) })
     }
-    pub fn open(&self, mode: u32) -> std::io::Result<File> {
+    pub fn open(&self, mode: u32, exclusive: bool) -> std::io::Result<File> {
         // SAFETY: openat returns a new owned descriptor; O_NOFOLLOW rejects final symlinks.
         let fd = unsafe {
             libc::openat(
                 self.parent.as_raw_fd(),
                 self.name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | if exclusive {
+                        libc::O_EXCL
+                    } else {
+                        libc::O_TRUNC
+                    }
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW,
                 mode as libc::c_uint,
             )
         };
@@ -503,6 +511,44 @@ pub fn umask() -> u32 {
 mod tests {
     use super::*;
     #[test]
+    fn exclusive_open_preserves_existing_file_and_symlink() {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "libarchive-exclusive-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        let path = root.join("file");
+        std::fs::write(&path, b"keep").unwrap();
+        let target = Target::prepare(&path, true, false, false).unwrap();
+        assert_eq!(
+            target.open(0o600, true).unwrap_err().raw_os_error(),
+            Some(libc::EEXIST)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("missing", &path).unwrap();
+        assert_eq!(
+            target.open(0o600, true).unwrap_err().raw_os_error(),
+            Some(libc::EEXIST)
+        );
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert!(!root.join("missing").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn secured_target_stays_in_opened_parent_after_symlink_swap() {
         use std::io::Write;
         let unique = std::time::SystemTime::now()
@@ -518,7 +564,11 @@ mod tests {
         let target = Target::prepare(&root.join("parent/file"), true, false, false).unwrap();
         std::fs::rename(root.join("parent"), root.join("original")).unwrap();
         std::os::unix::fs::symlink(root.join("outside"), root.join("parent")).unwrap();
-        target.open(0o600).unwrap().write_all(b"safe").unwrap();
+        target
+            .open(0o600, false)
+            .unwrap()
+            .write_all(b"safe")
+            .unwrap();
         assert_eq!(std::fs::read(root.join("original/file")).unwrap(), b"safe");
         assert!(!root.join("outside/file").exists());
         assert!(Target::prepare(&root.join("parent/other"), true, false, false).is_err());

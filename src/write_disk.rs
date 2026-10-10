@@ -68,6 +68,7 @@ pub struct WriteDisk {
     limit: Option<u64>,
     skipped: bool,
     atomic: Option<Target>,
+    permissions_created: bool,
 }
 
 fn failure(a: &Base, err: std::io::Error, action: &str, path: &Path) -> c_int {
@@ -87,6 +88,7 @@ impl WriteDisk {
         a.clear_error();
         a.state.set(state::HEADER);
         self.skipped = false;
+        self.permissions_created = false;
         let mut entry = entry.clone_entry();
         let Some(name) = entry.pathname().map(|p| p.to_bytes().to_vec()) else {
             return a.raise(Error::new(
@@ -167,7 +169,20 @@ impl WriteDisk {
                 Err(e) => return failure(a, e, "Can't follow directory", &path),
             }
         }
-        if let Ok(existing) = target.stat() {
+        // A successful exclusive create cannot replace an existing inode. Fall back
+        // to the original checks on any error, including a racing creation.
+        let created_file = if hardlink.is_none()
+            && link.is_none()
+            && matches!(entry.filetype(), 0 | libc::S_IFREG)
+            && self.options & 0x40000 == 0
+        {
+            target.open(entry.mode() as u32 & 0o777, true).ok()
+        } else {
+            None
+        };
+        if created_file.is_none()
+            && let Ok(existing) = target.stat()
+        {
             let directory = existing.st_mode & libc::S_IFMT == libc::S_IFDIR;
             if directory && entry.filetype() == libc::S_IFDIR && self.options & PERM == 0 {
                 entry.set_perm(existing.st_mode);
@@ -208,7 +223,14 @@ impl WriteDisk {
         }
         if !self.skipped {
             let hardlink_name = hardlink.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
-            let result = if let Some(source) = hardlink {
+            let result = if let Some(file) = created_file {
+                self.file = Some(file);
+                // On Apple, creation applies the umask without Linux's default-ACL
+                // substitution. Match upstream's creation-time mask for new files.
+                self.permissions_created =
+                    cfg!(target_vendor = "apple") && self.options & PERM == 0;
+                Ok(())
+            } else if let Some(source) = hardlink {
                 Target::prepare(&source, secure, false, false)
                     .and_then(|source| target.hardlink(&source, secure))
             } else if let Some(link) = link {
@@ -240,7 +262,7 @@ impl WriteDisk {
                     }
                 } else {
                     target
-                        .open(entry.mode() as u32 & 0o777)
+                        .open(entry.mode() as u32 & 0o777, false)
                         .map(|file| self.file = Some(file))
                 }
             } else {
@@ -259,7 +281,7 @@ impl WriteDisk {
                 return failure(a, e, "Can't create", &path);
             }
             if self.file.is_none() && entry.hardlink_is_set() != 0 && self.limit != Some(0) {
-                match target.open(entry.mode() as u32 & 0o777) {
+                match target.open(entry.mode() as u32 & 0o777, false) {
                     Ok(file) => self.file = Some(file),
                     Err(e) => return failure(a, e, "Can't open", &path),
                 }
@@ -362,6 +384,7 @@ impl WriteDisk {
             return ARCHIVE_OK;
         };
         a.state.set(state::HEADER);
+        let permissions_created = std::mem::take(&mut self.permissions_created);
         if !self.skipped {
             let file = self.file.take();
             let length = self.limit.unwrap_or(self.max_offset);
@@ -425,7 +448,7 @@ impl WriteDisk {
             if entry.filetype() == libc::S_IFDIR {
                 self.directories.push((entry, target, options));
             } else {
-                let ret = self.restore(a, &entry, &mut target, options);
+                let ret = self.restore(a, &entry, &mut target, options, permissions_created);
                 if ret < 0 {
                     return ret;
                 }
@@ -435,7 +458,14 @@ impl WriteDisk {
         ARCHIVE_OK
     }
 
-    fn restore(&mut self, a: &Base, entry: &Entry, target: &mut Target, options: c_int) -> c_int {
+    fn restore(
+        &mut self,
+        a: &Base,
+        entry: &Entry,
+        target: &mut Target,
+        options: c_int,
+        permissions_created: bool,
+    ) -> c_int {
         if entry.hardlink_is_set() != 0 && (entry.size_is_set() == 0 || entry.size() == 0) {
             return ARCHIVE_OK;
         }
@@ -459,7 +489,7 @@ impl WriteDisk {
                 ret = ARCHIVE_WARN;
             }
         }
-        if entry.filetype() != libc::S_IFLNK || options & PERM != 0 {
+        if !permissions_created && (entry.filetype() != libc::S_IFLNK || options & PERM != 0) {
             let mut mode = if options & PERM != 0 {
                 entry.mode() as u32 & 0o7777
             } else {
@@ -555,7 +585,7 @@ impl WriteDisk {
         }
         let mut ret = self.finish_entry(a);
         while let Some((entry, mut target, options)) = self.directories.pop() {
-            ret = ret.min(self.restore(a, &entry, &mut target, options));
+            ret = ret.min(self.restore(a, &entry, &mut target, options, false));
         }
         a.state.set(state::CLOSED);
         ret
@@ -606,6 +636,52 @@ mod tests {
     impl Drop for Output {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn regular_creation_and_existing_file_modes_preserve_options() {
+        use std::os::unix::fs::PermissionsExt;
+        for options in [0, PERM, UNLINK, NO_OVERWRITE, 0x40000] {
+            for existing in [false, true] {
+                let output = Output::new();
+                if existing {
+                    std::fs::write(output.path(), b"old").unwrap();
+                    std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                }
+                let base = Base::new(WRITE_DISK_MAGIC);
+                let mut disk = WriteDisk::default();
+                disk.options = options;
+                let mut entry = Entry::new(None);
+                entry.set_pathname(output.path().as_os_str().as_bytes());
+                entry.set_mode(libc::S_IFREG | 0o640);
+                entry.set_size(3);
+                assert_eq!(disk.header(&base, &entry), ARCHIVE_OK);
+                assert_eq!(disk.data(&base, b"new"), 3);
+                assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+                let skipped = existing && options == NO_OVERWRITE;
+                assert_eq!(
+                    std::fs::read(output.path()).unwrap(),
+                    if skipped { b"old" } else { b"new" }
+                );
+                let expected = if skipped {
+                    0o600
+                } else if options == PERM {
+                    0o640
+                } else {
+                    0o640 & !crate::ffi::disk_sys::umask()
+                };
+                assert_eq!(
+                    std::fs::metadata(output.path())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o7777,
+                    expected
+                );
+                assert_eq!(disk.close(&base), ARCHIVE_OK);
+            }
         }
     }
 

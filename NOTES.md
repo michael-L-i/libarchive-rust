@@ -1781,6 +1781,23 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   Numeric filesystem IDs, symlink handling and write-side owner lookup fallback
   behavior are unchanged. Real Opus 5.5 design/review and byte-identical
   six-format many-file measurements are retained in `../diagnostics/round8-system`.
+- Ordinary non-atomic regular files first attempt exclusive creation after all
+  path/security checks, like upstream. Success proves the destination was absent
+  and avoids its pre-create stat; any error follows the original existing-file
+  checks. On Apple, new non-PERM files already have their final mode from the
+  kernel's creation-time umask, so permission restoration needs neither another
+  umask query nor chmod. This follows upstream when the caller changes umask
+  between header and finish. Other platforms retain chmod because inherited
+  default ACLs can alter creation modes. Existing files, atomic writes, special
+  permissions, links and deferred directories retain their previous handling.
+  Actual Opus 5.5 design/final review, C ABI mode/status checks and five-rotation
+  six-format extraction results are retained in `../diagnostics/round8-system`.
+- The focused extraction comparisons also record two existing deviations that
+  this optimization leaves unchanged. With NO_OVERWRITE on an existing regular
+  file, Rust reports the supplied byte count and preserves its mode; C reports
+  ARCHIVE_WARN for the attempted data write and restores the archive mode. On
+  Apple, a symlink created from a 0666 entry under umask 022 has mode 0755 here
+  versus 0644 in C. These differences are separate from creation optimization.
 - Disk writes keep each parent directory open and create/open/link children
   relative to its descriptor. `SECURE_SYMLINKS` opens every ancestor with
   `O_NOFOLLOW`; replacing an ancestor after the check cannot redirect a write.
