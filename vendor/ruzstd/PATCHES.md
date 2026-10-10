@@ -231,3 +231,39 @@ state transitions, match choices, compression settings and output are unchanged.
 - Raw profiles and measurements are in sibling `diagnostics/round6-zstd`.
   A separate matcher slice-bounding trial regressed mixed data and was
   discarded. Full integration validation runs on the combined branch.
+
+## Predecode sequence length FSE states
+
+`src/decoding/sequence_section_decoder.rs` resolves literal/match length codes
+into their base lengths and extra-bit widths once per decoded block. Each
+8-byte derived state also keeps the original FSE transition base and bit count,
+removing the dependent symbol-to-length lookup from the per-sequence loop.
+Offsets, bit-reader calls and error checks keep their original order. The RLE
+loop is specialized at compile time for small non-RLE batches, avoiding derived
+tables when the sequence count is below the combined table entry count.
+
+Two vectors in `FSEScratch` retain capacity between blocks. Derived states are
+rebuilt after the original LL/OF/ML initialization, so dictionary copies, table
+reuse and frame resets cannot leave a stale derived table. Raw and dictionary
+length tables enforce accuracy logs at most 9 and maximum symbols 35/52 before
+building entries; predefined tables use log 6. Consequently every entry's code
+has a valid length mapping, and every transition base is below 512 and fits
+exactly in `u16`. The added table storage is at most 8 KiB per decoder, plus two
+vector headers; small/RLE paths do not allocate derived tables.
+
+- Authenticated Claude Opus 5.5 independently proposed this state-table design
+  and analyzed its dependency-chain benefit. Design prompts and actual model
+  usage are retained in sibling `diagnostics/round7-zstd-read`. A fresh
+  Claude Opus 5.5 review of the final code returned PASS with no defects.
+- Twenty-one rotating in-memory ABI runs: 16 MiB source 21.952 -> 21.528 ms,
+  mixed 11.922 -> 11.742 ms (about 2% and 1.5%); small files
+  0.41929 -> 0.41933 ms. Other four inputs are essentially unchanged.
+- Another 84 short inputs span 0 through 128 KiB, four alphabet sizes, and
+  C zstd levels 1/3/9. All output hashes match the baseline and independent
+  C libarchive. Nine rotating batch medians are 7.229 -> 7.175 ms.
+- All 175 valid, truncated and mutated archive cases retain exact status,
+  errno, error text, header count, output length and SHA-256. The initial
+  unspecialized small-batch fallback was slower and was discarded.
+- Raw samples, timing records, ABI checks and the focused Opus review are in
+  `diagnostics/round7-zstd-read`; full oracle validation uses the combined
+  integration build.

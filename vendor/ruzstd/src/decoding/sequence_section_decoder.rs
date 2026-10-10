@@ -40,29 +40,38 @@ pub fn decode_sequences(
     }
 
     if scratch.ll_rle.is_some() || scratch.ml_rle.is_some() || scratch.of_rle.is_some() {
-        decode_sequences_with_rle(section, &mut br, scratch, target)
+        decode_sequences_with_rle::<true>(section, &mut br, scratch, target)
+    } else if (section.num_sequences as usize)
+        < scratch.literal_lengths.decode.len() + scratch.match_lengths.decode.len()
+    {
+        // Small sequence counts don't amortize building both length tables.
+        decode_sequences_with_rle::<false>(section, &mut br, scratch, target)
     } else {
         decode_sequences_without_rle(section, &mut br, scratch, target)
     }
 }
 
-fn decode_sequences_with_rle(
+fn decode_sequences_with_rle<const WITH_RLE: bool>(
     section: &SequencesHeader,
     br: &mut BitReaderReversed<'_>,
     scratch: &FSEScratch,
     target: &mut Vec<Sequence>,
 ) -> Result<(), DecodeSequenceError> {
+    let ll_rle = if WITH_RLE { scratch.ll_rle } else { None };
+    let ml_rle = if WITH_RLE { scratch.ml_rle } else { None };
+    let of_rle = if WITH_RLE { scratch.of_rle } else { None };
+
     let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
     let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
     let mut of_dec = FSEDecoder::new(&scratch.offsets);
 
-    if scratch.ll_rle.is_none() {
+    if ll_rle.is_none() {
         ll_dec.init_state(br)?;
     }
-    if scratch.of_rle.is_none() {
+    if of_rle.is_none() {
         of_dec.init_state(br)?;
     }
-    if scratch.ml_rle.is_none() {
+    if ml_rle.is_none() {
         ml_dec.init_state(br)?;
     }
 
@@ -71,17 +80,17 @@ fn decode_sequences_with_rle(
 
     for _seq_idx in 0..section.num_sequences {
         //get the codes from either the RLE byte or from the decoder
-        let ll_code = if let Some(ll_rle) = scratch.ll_rle {
+        let ll_code = if let Some(ll_rle) = ll_rle {
             ll_rle
         } else {
             ll_dec.decode_symbol()
         };
-        let ml_code = if let Some(ml_rle) = scratch.ml_rle {
+        let ml_code = if let Some(ml_rle) = ml_rle {
             ml_rle
         } else {
             ml_dec.decode_symbol()
         };
-        let of_code = if let Some(of_rle) = scratch.of_rle {
+        let of_code = if let Some(of_rle) = of_rle {
             of_rle
         } else {
             of_dec.decode_symbol()
@@ -126,13 +135,13 @@ fn decode_sequences_with_rle(
             //    br.bits_remaining(),
             //    br.bits_remaining() / 8,
             //);
-            if scratch.ll_rle.is_none() {
+            if ll_rle.is_none() {
                 ll_dec.update_state(br);
             }
-            if scratch.ml_rle.is_none() {
+            if ml_rle.is_none() {
                 ml_dec.update_state(br);
             }
-            if scratch.of_rle.is_none() {
+            if of_rle.is_none() {
                 of_dec.update_state(br);
             }
         }
@@ -151,10 +160,32 @@ fn decode_sequences_with_rle(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct LengthState {
+    base: u32,
+    next_base: u16,
+    state_bits: u8,
+    extra_bits: u8,
+}
+
+impl LengthState {
+    fn new(entry: crate::fse::Entry, lookup: fn(u8) -> (u32, u8)) -> Self {
+        let (base, extra_bits) = lookup(entry.symbol);
+        debug_assert!(entry.base_line <= u32::from(u16::MAX));
+        Self {
+            base,
+            // Sequence length FSE tables have at most 512 states.
+            next_base: entry.base_line as u16,
+            state_bits: entry.num_bits,
+            extra_bits,
+        }
+    }
+}
+
 fn decode_sequences_without_rle(
     section: &SequencesHeader,
     br: &mut BitReaderReversed<'_>,
-    scratch: &FSEScratch,
+    scratch: &mut FSEScratch,
     target: &mut Vec<Sequence>,
 ) -> Result<(), DecodeSequenceError> {
     let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
@@ -165,16 +196,36 @@ fn decode_sequences_without_rle(
     of_dec.init_state(br)?;
     ml_dec.init_state(br)?;
 
+    scratch.ll_states.clear();
+    scratch.ll_states.extend(
+        scratch
+            .literal_lengths
+            .decode
+            .iter()
+            .copied()
+            .map(|entry| LengthState::new(entry, lookup_ll_code)),
+    );
+    scratch.ml_states.clear();
+    scratch.ml_states.extend(
+        scratch
+            .match_lengths
+            .decode
+            .iter()
+            .copied()
+            .map(|entry| LengthState::new(entry, lookup_ml_code)),
+    );
+    let mut ll_state = LengthState::new(ll_dec.state, lookup_ll_code);
+    let mut ml_state = LengthState::new(ml_dec.state, lookup_ml_code);
+
     target.clear();
     target.reserve(section.num_sequences as usize);
 
     for _seq_idx in 0..section.num_sequences {
-        let ll_code = ll_dec.decode_symbol();
-        let ml_code = ml_dec.decode_symbol();
         let of_code = of_dec.decode_symbol();
-
-        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
-        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
+        let ll_value = ll_state.base;
+        let ml_value = ml_state.base;
+        let ll_num_bits = ll_state.extra_bits;
+        let ml_num_bits = ml_state.extra_bits;
 
         if of_code > MAX_OFFSET_CODE {
             return Err(DecodeSequenceError::UnsupportedOffset {
@@ -201,8 +252,10 @@ fn decode_sequences_without_rle(
             //    br.bits_remaining(),
             //    br.bits_remaining() / 8,
             //);
-            ll_dec.update_state(br);
-            ml_dec.update_state(br);
+            let ll_add = br.get_bits(ll_state.state_bits);
+            ll_state = scratch.ll_states[usize::from(ll_state.next_base) + ll_add as usize];
+            let ml_add = br.get_bits(ml_state.state_bits);
+            ml_state = scratch.ml_states[usize::from(ml_state.next_base) + ml_add as usize];
             of_dec.update_state(br);
         }
 

@@ -2,6 +2,7 @@
 
 use super::super::blocks::sequence_section::Sequence;
 use super::decode_buffer::DecodeBuffer;
+use super::sequence_section_decoder::LengthState;
 use crate::decoding::dictionary::Dictionary;
 use crate::fse::FSETable;
 use crate::huff0::HuffmanTable;
@@ -39,6 +40,8 @@ impl DecoderScratch {
                 ll_rle: None,
                 match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
                 ml_rle: None,
+                ll_states: Vec::new(),
+                ml_states: Vec::new(),
             },
             buffer: DecodeBuffer::new(window_size),
             offset_hist: [1, 4, 8],
@@ -103,6 +106,8 @@ pub struct FSEScratch {
     pub ll_rle: Option<u8>,
     pub match_lengths: FSETable,
     pub ml_rle: Option<u8>,
+    pub(crate) ll_states: Vec<LengthState>,
+    pub(crate) ml_states: Vec<LengthState>,
 }
 
 impl FSEScratch {
@@ -114,6 +119,8 @@ impl FSEScratch {
             ll_rle: None,
             match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
             ml_rle: None,
+            ll_states: Vec::new(),
+            ml_states: Vec::new(),
         }
     }
 
