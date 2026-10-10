@@ -944,9 +944,17 @@ Differences:
 
 ### Differences
 
-- `__archive_crc32` is the table implementation upstream uses without zlib;
-  the result is identical to zlib's. There is no NULL-pointer case, as a
-  slice is never null.
+- `__archive_crc32` uses the safe `crc32fast` 1.5.2 API for updates of at least
+  64 bytes on little-endian targets. The already locked test dependency is
+  promoted to a runtime dependency for its runtime-detected ARM CRC and x86
+  carryless-multiply backends; its isolated intrinsic code is unsafe, while
+  this crate adds no unsafe code. Smaller updates (including ZipCrypto) and
+  big-endian targets retain the local slicing-by-eight implementation. The
+  big-endian guard avoids native-word ordering assumptions in the ARM backend.
+  Seeded and incremental results remain identical to zlib; there is no
+  NULL-pointer case because a slice is never null. Independent bitwise tests,
+  actual Opus 5.5 design/final review and separate micro/in-memory archive
+  measurements are retained in `../diagnostics/round8-system`.
 
 ## Crypto (`src/digest.rs`, `src/hmac.rs`, `src/cryptor.rs`)
 

@@ -9,6 +9,7 @@ name = "archive"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+crc32fast = "1.5.2"
 miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
 libc = "0.2"
 lzma-rust2 = { version = "0.21.0", default-features = false, features = ["std", "xz", "lzip", "encoder"] }
@@ -38,7 +39,6 @@ opt-level = 1
 opt-level = 3
 
 [dev-dependencies]
-crc32fast = "1"
 lzma-rust2 = { version = "0.21.0", default-features = false, features = ["std", "xz", "lzip", "encoder"] }
 
 [patch.crates-io]

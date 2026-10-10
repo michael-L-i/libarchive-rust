@@ -26,7 +26,8 @@
 // Ported from libarchive/archive_crc32.c.
 
 //! CRC-32 (the zlib/IEEE polynomial), continued from a previous value.
-//! Upstream uses zlib, or a 256-entry table without it; this is the table.
+//! Bulk little-endian updates use crc32fast; small updates and other targets
+//! retain the local slicing-by-eight implementation.
 
 /// `TABLES[0]` is the usual byte-at-a-time table; `TABLES[k]` is the CRC of
 /// a byte followed by `k` zero bytes, which lets eight bytes go at once.
@@ -62,6 +63,13 @@ const TABLES: [[u32; 256]; 8] = {
 
 /// The CRC-32 of `data`, continued from `crc` (0 to start).
 pub(crate) fn crc32(crc: u32, data: &[u8]) -> u32 {
+    // Keep tiny ZipCrypto updates local. The hardware backend reads native-endian words.
+    #[cfg(target_endian = "little")]
+    if data.len() >= 64 {
+        let mut hasher = crc32fast::Hasher::new_with_initial(crc);
+        hasher.update(data);
+        return hasher.finalize();
+    }
     let at = |k: usize, x: u32| TABLES[k][usize::from(x as u8)];
     let mut c = !crc;
     let mut chunks = data.chunks_exact(8);
@@ -125,5 +133,45 @@ mod tests {
         assert_eq!(crc32(0, &buf[3..131]), bitcrc32(0, &buf[3..131]));
         assert_eq!(crc32(0, &buf), bitcrc32(0, &buf));
         assert_eq!(crc32(0, &buf), crc32fast::hash(&buf));
+    }
+    #[test]
+    fn hardware_dispatch_matches_bitwise_for_seeds_lengths_and_alignments() {
+        let mut state = 0x1234_5678u32;
+        let data: Vec<_> = (0..8216)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        for len in (0..=200).chain([255, 256, 1535, 1536, 1537, 4096, 8192, 8199]) {
+            for offset in 0..16 {
+                let bytes = &data[offset..offset + len];
+                for seed in [0, 1, u32::MAX, 0xCBF4_3926, 0x8000_0000] {
+                    assert_eq!(
+                        crc32(seed, bytes),
+                        bitcrc32(seed, bytes),
+                        "len={len} offset={offset} seed={seed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_across_dispatch_and_hardware_boundaries() {
+        let data: Vec<_> = (0..4096u32).map(|n| (n * 31 + n / 7) as u8).collect();
+        for seed in [0, 1, u32::MAX, 0xCBF4_3926] {
+            let whole = bitcrc32(seed, &data);
+            for split in [
+                0, 1, 63, 64, 65, 127, 128, 1535, 1536, 1537, 4032, 4095, 4096,
+            ] {
+                assert_eq!(crc32(crc32(seed, &data[..split]), &data[split..]), whole);
+            }
+            assert_eq!(
+                data.iter()
+                    .fold(seed, |crc, b| crc32(crc, std::slice::from_ref(b))),
+                whole
+            );
+        }
     }
 }
