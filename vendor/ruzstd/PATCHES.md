@@ -347,3 +347,24 @@ No new unsafe code, dependencies, checksums or compression behavior are involved
 Root all-target and vendor Clippy pass with warnings denied, as do the vendor
 no-default-features build, rustfmt and diff checks. A second fresh final Opus
 review returned PASS; broader archive/oracle validation uses the integration build.
+
+## Round 8: bounded sequence bit output
+
+Sequence encoding batches the existing ordered bit fields into two bounded
+accumulator writes per sequence. It writes into initialized, checked storage
+with eight-byte stores and truncates the final padding. Table logs bound each
+accumulator to fewer than 64 bits. The original writer remains the fallback
+for misalignment and custom matchers reaching the existing code-52 defect;
+compressed bytes, match selection, table selection and compression levels stay
+unchanged. No unsafe code is added.
+
+Actual Claude Opus 5.5 supplied the design and independently approved the final
+implementation after a review found the need to preserve the legacy fallback.
+Artifacts are retained in sibling `diagnostics/round8-encoder`. Validation:
+256 sequence-field comparisons (including maximal table logs, extra bits,
+markers and legacy fallback), 650 frozen encoder/fragmentation comparisons,
+seven archive corpora with exact bytes, and strict root/vendor Clippy.
+Two seven-pair archive screens agree on improvements. Confirmation medians
+(before -> after, ms): source 60.37 -> 55.67, mixed 41.54 -> 39.18, compiled
+20.87 -> 19.78, records 18.69 -> 18.08, text 9.36 -> 8.99. Random is 21.42 ->
+21.63 and documents 9.22 -> 9.02. Full integration results belong in STATUS.md.

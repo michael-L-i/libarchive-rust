@@ -164,6 +164,74 @@ fn encode_sequences(
     ml_table: &FSETable,
     of_table: &FSETable,
 ) {
+    // Custom matchers can reach the legacy code-52 encoding defect. Preserve
+    // that path's exact behavior; the archive matcher caps lengths at 65538.
+    if writer.misaligned() != 0 || sequences.iter().any(|s| s.ml > 65538) {
+        return encode_sequences_legacy(sequences, writer, ll_table, ml_table, of_table);
+    }
+    writer.with_aligned_vec(|output| {
+        // Each sequence contributes at most 26 state bits and 16 + 16 + 31
+        // extra bits. Final states, the end marker and the last store fit in
+        // the remaining 24 bytes. Only initialized, bounds-checked storage is used.
+        let mut bits = SequenceBits::new(output, sequences.len() * 12 + 24);
+        let sequence = sequences[sequences.len() - 1];
+        let (ll_code, ll_extra, ll_width) = encode_literal_length(sequence.ll);
+        let (of_code, of_extra, of_width) = encode_offset(sequence.of);
+        let (ml_code, ml_extra, ml_width) = encode_match_len(sequence.ml);
+        let mut ll_state: &State = ll_table.start_state(ll_code);
+        let mut ml_state: &State = ml_table.start_state(ml_code);
+        let mut of_state: &State = of_table.start_state(of_code);
+        bits.add(ll_extra as u64, ll_width);
+        bits.flush();
+        bits.add(
+            ml_extra as u64 | (of_extra as u64) << ml_width,
+            ml_width + of_width,
+        );
+        bits.flush();
+
+        // Emit the same fields in reverse sequence order, grouping them into
+        // two bounded accumulator writes instead of checking space per field.
+        for sequence in sequences[..sequences.len() - 1].iter().rev() {
+            let (ll_code, ll_extra, ll_width) = encode_literal_length(sequence.ll);
+            let (of_code, of_extra, of_width) = encode_offset(sequence.of);
+            let (ml_code, ml_extra, ml_width) = encode_match_len(sequence.ml);
+            let of_next = of_table.next_state(of_code, of_state.index);
+            let ml_next = ml_table.next_state(ml_code, ml_state.index);
+            let ll_next = ll_table.next_state(ll_code, ll_state.index);
+            let of_width_state = of_next.num_bits as usize;
+            let ml_width_state = ml_next.num_bits as usize;
+            let state_width = of_width_state + ml_width_state + ll_next.num_bits as usize;
+            let state_bits = (of_state.index - of_next.baseline) as u64
+                | ((ml_state.index - ml_next.baseline) as u64) << of_width_state
+                | ((ll_state.index - ll_next.baseline) as u64) << (of_width_state + ml_width_state);
+            bits.add(
+                state_bits | (ll_extra as u64) << state_width,
+                state_width + ll_width,
+            );
+            bits.flush();
+            bits.add(
+                ml_extra as u64 | (of_extra as u64) << ml_width,
+                ml_width + of_width,
+            );
+            bits.flush();
+            of_state = of_next;
+            ml_state = ml_next;
+            ll_state = ll_next;
+        }
+        bits.add(ml_state.index as u64, ml_table.table_size.ilog2() as usize);
+        bits.add(of_state.index as u64, of_table.table_size.ilog2() as usize);
+        bits.add(ll_state.index as u64, ll_table.table_size.ilog2() as usize);
+        bits.finish();
+    });
+}
+
+fn encode_sequences_legacy(
+    sequences: &[crate::blocks::sequence_section::Sequence],
+    writer: &mut BitWriter<&mut Vec<u8>>,
+    ll_table: &FSETable,
+    ml_table: &FSETable,
+    of_table: &FSETable,
+) {
     let sequence = sequences[sequences.len() - 1];
     let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
     let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
@@ -212,6 +280,50 @@ fn encode_sequences(
         writer.write_bits(1u32, 8);
     } else {
         writer.write_bits(1u32, bits_to_fill);
+    }
+}
+
+struct SequenceBits<'a> {
+    output: &'a mut Vec<u8>,
+    position: usize,
+    partial: u64,
+    width: usize,
+}
+
+impl<'a> SequenceBits<'a> {
+    fn new(output: &'a mut Vec<u8>, capacity: usize) -> Self {
+        let position = output.len();
+        output.resize(position + capacity, 0);
+        Self {
+            output,
+            position,
+            partial: 0,
+            width: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn add(&mut self, value: u64, width: usize) {
+        debug_assert!(self.width + width < 64);
+        debug_assert_eq!(value >> width, 0);
+        self.partial |= value << self.width;
+        self.width += width;
+    }
+
+    #[inline(always)]
+    fn flush(&mut self) {
+        self.output[self.position..self.position + 8].copy_from_slice(&self.partial.to_le_bytes());
+        let bytes = self.width / 8;
+        self.position += bytes;
+        self.partial >>= bytes * 8;
+        self.width &= 7;
+    }
+
+    fn finish(mut self) {
+        self.add(1, 1);
+        self.flush();
+        self.output
+            .truncate(self.position + usize::from(self.width != 0));
     }
 }
 
@@ -383,5 +495,72 @@ fn compress_literals(
         Some(new_encoder_table)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod sequence_bits_tests {
+    use super::*;
+    use crate::blocks::sequence_section::Sequence;
+
+    #[test]
+    fn bounded_writer_matches_legacy_fields_and_marker() {
+        for skewed in [false, true] {
+            let table = |symbols: u8, rare: u8, log| {
+                build_table_from_data(
+                    (0..symbols).flat_map(|s| {
+                        core::iter::repeat_n(s, if skewed && s != rare { 16 } else { 1 })
+                    }),
+                    log,
+                    true,
+                )
+            };
+            let ll = table(36, 35, 9);
+            let ml = table(53, 51, 9);
+            let of = table(32, 31, 8);
+            if skewed {
+                assert_eq!((ll.acc_log(), ml.acc_log(), of.acc_log()), (9, 9, 8));
+            }
+            let mut seed = 0x39128391u32;
+            for count in [1, 2, 3, 7, 8, 31, 128, 4096] {
+                for trial in 0..16 {
+                    let mut seq = Vec::new();
+                    for _ in 0..count {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        seq.push(Sequence {
+                            ll: seed & 131071,
+                            ml: 3 + (seed.rotate_left(11) % 65536),
+                            of: seed.rotate_left(23).max(4),
+                        });
+                    }
+                    seq[0] = Sequence {
+                        ll: 131071,
+                        ml: 65538,
+                        of: u32::MAX,
+                    };
+                    // Also preserve legacy custom matcher behavior past code51.
+                    if trial == 15 {
+                        seq[0].ml = 131074;
+                    }
+                    let mut actual = alloc::vec![0xab; trial];
+                    let mut expected = actual.clone();
+                    let mut writer = BitWriter::from(&mut actual);
+                    if trial == 14 {
+                        writer.write_bits(1u8, 1);
+                    }
+                    encode_sequences(&seq, &mut writer, &ll, &ml, &of);
+                    writer.flush();
+                    let mut writer = BitWriter::from(&mut expected);
+                    if trial == 14 {
+                        writer.write_bits(1u8, 1);
+                    }
+                    encode_sequences_legacy(&seq, &mut writer, &ll, &ml, &of);
+                    writer.flush();
+                    assert_eq!(actual, expected, "count={count}, trial={trial}");
+                }
+            }
+        }
     }
 }

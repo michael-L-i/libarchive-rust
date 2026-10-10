@@ -111,6 +111,15 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bit_idx += data.len() * 8;
     }
 
+    /// Append a byte-aligned section while keeping the bit index synchronized.
+    pub(crate) fn with_aligned_vec(&mut self, f: impl FnOnce(&mut Vec<u8>)) {
+        assert_eq!(self.misaligned(), 0);
+        self.flush();
+        let output = self.output.as_mut();
+        f(output);
+        self.bit_idx = output.len() * 8;
+    }
+
     /// Flush temporary internal buffers to the output buffer. Only works if this is currently byte aligned
     pub fn flush(&mut self) {
         assert!(self.bits_in_partial.is_multiple_of(8));
