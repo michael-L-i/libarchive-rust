@@ -300,6 +300,52 @@ Current tables: `../diagnostics/results/REPORT.md`; previous report:
 No new dependency, C codec or unsafe code was added. Original C/upstream remain
 clean. Work is committed locally; no build, test or benchmark remains running.
 
+## Optimization round 7 checkpoint
+
+Baseline `fafa7a5` -> final code `afcf794`. Three isolated specialists used
+actual Claude Opus 5.5 for design and fresh independent review. The accepted
+changes mask range updates for normal LZMA literals, share a direct Zstandard
+frame encoder with the existing pull compressor, and predecode Zstandard
+sequence-length FSE states. Matched LZMA literals and explicit Zstandard framing
+retain their previous paths. No preset, match policy, checksum, dependency or
+unsafe-code policy changed. All rejected trials remain outside the package.
+
+Five rotating release-run archive medians, milliseconds (C / previous Rust /
+current Rust): random 16 MiB 7zip 2636.5 / 2507.9 / 2338.2; random XZ
+2642.0 / 2486.1 / 2329.6; source Zstandard 41.1 / 64.0 / 60.1; mixed Zstandard
+32.5 / 43.8 / 41.1. Default random 7zip/XZ improve 6-7% and are about 11% faster
+than C on these inputs. Repetitive 7zip is unchanged and still trails C.
+
+Separate preset-1 checks preserve the same preset in every variant: random
+7zip 1189.6 / 1072.0 / 857.0 and XZ 1214.3 / 1077.4 / 862.9, about 20% less
+Rust time and 28-29% faster than C. Source/compiled LZMA backend checks are
+neutral. Zstandard decoding improves about 1.5-2% in isolation; end-to-end
+reader changes are smaller. C still leads many workloads; all results remain
+visible in the report. No universal parity claim is made.
+
+Combined validation: 384 native tests passed, 1 ignored; strict all-target
+Clippy, formatting/diff checks and all 454 ABI symbols passed. Full release
+compatibility/front-end suite: 926 passed, 184 skipped, zero failures, crashes,
+timeouts or ratchet regressions in 66 seconds, one worker and 30-second deadlines.
+LZMA checks include 1,656 exact streams, 381,504 arithmetic/error states and
+27 self-contained vendor tests. Zstandard checks include 650 byte-exact encoder
+comparisons, 13 focused lifecycle/error tests, 175 exact valid/damaged decoder
+ABI records and 84 short-input checks against baseline and independent C.
+
+The default 34-case matrix has 1,530 timed commands, 510 verified extractions
+and 204 cross-reader checks. The same-C-input matrix adds 1,020 reader commands
+and 510 verified extractions. Six preset-1 cases add 90 creation timings and
+36 cross-reader extractions. All 40 cases retain identical Rust output across
+all five repetitions. No operation in the final archive matrices has a median regression above 5%;
+smaller neutral/slower measurements remain in the tables. Raw samples, source
+and binary identities, transient timing inflation and rejected trials are retained.
+
+Current report: `../diagnostics/results/REPORT.md`; previous report:
+`../diagnostics/results/before-round7/REPORT.md`. Frozen current release:
+`../diagnostics/bin/rust-round7-final-bsdtar`, identical to `rust-bsdtar`.
+Original C/upstream remain clean. Work is committed locally; no test, build
+or benchmark remains running.
+
 ## Earlier checkpoints (historical)
 
 ### Phase 2 checkpoint
