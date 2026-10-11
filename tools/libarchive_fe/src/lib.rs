@@ -12,5 +12,6 @@ pub mod lafe_err;
 pub mod lafe_explicit_bzero;
 pub mod lafe_setmode;
 pub mod line_reader;
+pub mod passphrase;
 #[allow(unsafe_code)]
 pub mod sys;
