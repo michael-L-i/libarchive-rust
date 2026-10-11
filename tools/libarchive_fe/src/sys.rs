@@ -1,9 +1,11 @@
 //! The libc calls the front-ends make that std has no wrapper for: signal
-//! dispositions, the terminal's echo, the umask, `strerror`, the locale,
-//! `fnmatch`, local time, file times and the user and group databases. This is the only `unsafe` code in
-//! the front-ends; every function here is safe to call.
+//! dispositions, the terminal's echo, the umask, `strerror`, the locale and
+//! its character classes, `fnmatch`, regular expressions, `strtol`, local
+//! time, file times, the user and group databases, the effective user and
+//! `chroot`. This is the only `unsafe` code in the front-ends; every function
+//! here is safe to call.
 
-use std::ffi::{CStr, CString, c_int};
+use std::ffi::{CStr, CString, c_char, c_int, c_long};
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -139,6 +141,163 @@ pub fn fnmatch(pattern: &[u8], name: &[u8], casefold: bool) -> bool {
     let flags = if casefold { libc::FNM_CASEFOLD } else { 0 };
     // SAFETY: both are NUL-terminated strings that outlive the call.
     unsafe { libc::fnmatch(pattern.as_ptr(), name.as_ptr(), flags) == 0 }
+}
+
+/// `isprint(c)` in the current locale.
+pub fn isprint(c: u8) -> bool {
+    // SAFETY: isprint takes any unsigned char's value.
+    unsafe { libc::isprint(c_int::from(c)) != 0 }
+}
+
+/// `isspace(c)` in the current locale.
+pub fn isspace(c: u8) -> bool {
+    // SAFETY: isspace takes any unsigned char's value.
+    unsafe { libc::isspace(c_int::from(c)) != 0 }
+}
+
+unsafe extern "C" {
+    #[link_name = "mbtowc"]
+    fn c_mbtowc(pwc: *mut libc::wchar_t, s: *const c_char, n: usize) -> c_int;
+    // wint_t is int on macOS and unsigned int on glibc: the same register.
+    #[link_name = "iswprint"]
+    fn c_iswprint(wc: libc::wchar_t) -> c_int;
+}
+
+/// `mbtowc(NULL, NULL, 0)`: resets the conversion state, and tells whether
+/// the locale's encoding has shift states.
+pub fn mbtowc_reset() -> bool {
+    // SAFETY: NULL arguments ask only for the reset.
+    unsafe { c_mbtowc(std::ptr::null_mut(), std::ptr::null(), 0) != 0 }
+}
+
+/// `mbtowc(&wc, s, s.len())`: the character `s` starts with and how many
+/// bytes it takes up, or `None` if they are not a valid character.
+pub fn mbtowc(s: &[u8]) -> Option<(libc::wchar_t, usize)> {
+    let mut wc = 0;
+    // SAFETY: `wc` is writable, and mbtowc reads at most `s.len()` bytes
+    // of `s`.
+    let n = unsafe { c_mbtowc(&mut wc, s.as_ptr().cast(), s.len()) };
+    usize::try_from(n).ok().map(|n| (wc, n))
+}
+
+/// `iswprint(wc)` in the current locale.
+pub fn iswprint(wc: libc::wchar_t) -> bool {
+    // SAFETY: iswprint has no memory-safety requirements.
+    unsafe { c_iswprint(wc) != 0 }
+}
+
+/// `nl_langinfo(item)`: the locale's string for `item`.
+pub fn nl_langinfo(item: libc::nl_item) -> Vec<u8> {
+    // SAFETY: nl_langinfo returns a NUL-terminated string (empty for an
+    // unknown item), valid until the next call, which the copy precedes.
+    unsafe { CStr::from_ptr(libc::nl_langinfo(item)) }
+        .to_bytes()
+        .to_vec()
+}
+
+/// `strtol(s, &end, base)` of the C string in `s`: the number it starts
+/// with, and how many bytes that takes up (0 if it doesn't start with one).
+pub fn strtol(s: &[u8], base: c_int) -> (c_long, usize) {
+    let s = s.split(|&b| b == 0).next().unwrap_or_default();
+    let Ok(s) = CString::new(s) else {
+        return (0, 0);
+    };
+    let mut end = s.as_ptr().cast_mut();
+    // SAFETY: `s` is a NUL-terminated string, and strtol points `end`
+    // into it.
+    let n = unsafe { libc::strtol(s.as_ptr(), &mut end, base) };
+    (n, end as usize - s.as_ptr() as usize)
+}
+
+/// `chroot(path)`, or the errno.
+pub fn chroot(path: &Path) -> Result<(), c_int> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+    // SAFETY: `path` is a NUL-terminated string that outlives the call.
+    match unsafe { libc::chroot(path.as_ptr()) } {
+        0 => Ok(()),
+        _ => Err(errno()),
+    }
+}
+
+/// The start of the platform's `regex_t`, up to `re_nsub`, which
+/// `libc::regex_t` keeps private.
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+#[repr(C)]
+struct RegexHead {
+    re_magic: c_int,
+    re_nsub: usize,
+}
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[repr(C)]
+struct RegexHead {
+    buffer: *mut libc::c_void,
+    allocated: usize,
+    used: usize,
+    syntax: libc::c_ulong,
+    fastmap: *mut c_char,
+    translate: *mut libc::c_uchar,
+    re_nsub: usize,
+}
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[repr(C)]
+struct RegexHead {
+    re_nsub: usize,
+}
+
+/// A POSIX regular expression, compiled with `regcomp` and freed with
+/// `regfree`. Boxed, as `regcomp` may point the `regex_t` at itself.
+pub struct Regex(Box<libc::regex_t>);
+
+impl Regex {
+    /// `regcomp(pattern, cflags)` of the C string in `pattern`, or what
+    /// `regerror` says of the failure.
+    pub fn new(pattern: &[u8], cflags: c_int) -> Result<Regex, Vec<u8>> {
+        let pattern = pattern.split(|&b| b == 0).next().unwrap_or_default();
+        let pattern = CString::new(pattern).map_err(|_| Vec::new())?;
+        // SAFETY: a zeroed regex_t (integers and pointers) is a valid one
+        // for regcomp to fill in; `pattern` is NUL-terminated; `buf` is
+        // writable for its length, and regerror writes a NUL-terminated
+        // message into it.
+        unsafe {
+            let mut re = Box::new(std::mem::zeroed::<libc::regex_t>());
+            let r = libc::regcomp(&mut *re, pattern.as_ptr(), cflags);
+            if r == 0 {
+                return Ok(Regex(re));
+            }
+            let mut buf = [0u8; 256];
+            libc::regerror(r, &*re, buf.as_mut_ptr().cast(), buf.len());
+            let msg = CStr::from_bytes_until_nul(&buf).map_or(&[][..], CStr::to_bytes);
+            Err(msg.to_vec())
+        }
+    }
+
+    /// `re_nsub`: the number of subexpressions.
+    pub fn nsub(&self) -> usize {
+        let re: *const libc::regex_t = &*self.0;
+        // SAFETY: `RegexHead` is the start of the platform's regex_t, which
+        // regcomp filled in.
+        unsafe { (*re.cast::<RegexHead>()).re_nsub }
+    }
+
+    /// `regexec(s, N, 0)`: where the match and the first `N - 1`
+    /// subexpressions start and end in `s` (-1 for those that matched
+    /// nothing), or `None` if `s` doesn't match.
+    pub fn exec<const N: usize>(&self, s: &CStr) -> Option<[(isize, isize); N]> {
+        // SAFETY: a zeroed regmatch_t is a valid one; the compiled regex
+        // and `s` outlive the call; regexec writes at most N matches.
+        let mut matches = [unsafe { std::mem::zeroed::<libc::regmatch_t>() }; N];
+        // SAFETY: as above.
+        let r = unsafe { libc::regexec(&*self.0, s.as_ptr(), N, matches.as_mut_ptr(), 0) };
+        (r == 0).then(|| matches.map(|m| (m.rm_so as isize, m.rm_eo as isize)))
+    }
+}
+
+impl Drop for Regex {
+    fn drop(&mut self) {
+        // SAFETY: regcomp compiled the regex, and nothing uses it after
+        // this.
+        unsafe { libc::regfree(&mut *self.0) };
+    }
 }
 
 /// `strftime(format)` of `time` as `localtime(3)` breaks it down: empty if
@@ -407,5 +566,33 @@ mod tests {
     fn tolower_maps_ascii() {
         assert_eq!(tolower(b'Q'), b'q');
         assert_eq!(tolower(b'-'), b'-');
+    }
+
+    #[test]
+    fn regex_matches_and_counts_subexpressions() {
+        let re = Regex::new(b"\\(a*\\)b\\(c\\)*", 0).unwrap();
+        assert_eq!(re.nsub(), 2);
+        let m = re.exec::<4>(c"xaab").unwrap();
+        assert_eq!(m, [(1, 4), (1, 3), (-1, -1), (-1, -1)]);
+        assert!(re.exec::<1>(c"xyz").is_none());
+        let err = Regex::new(b"a\\(", 0).err().unwrap();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn strtol_reports_where_the_number_ends() {
+        assert_eq!(strtol(b"123", 10), (123, 3));
+        assert_eq!(strtol(b" -5x", 10), (-5, 3));
+        assert_eq!(strtol(b"x", 10), (0, 0));
+        assert_eq!(strtol(b"99999999999999999999", 10), (c_long::MAX, 20));
+    }
+
+    #[test]
+    fn ctype_in_the_c_locale() {
+        assert!(isprint(b'a') && !isprint(b'\n') && !isprint(0xe9));
+        assert!(isspace(b'\t') && !isspace(b'a'));
+        assert!(!mbtowc_reset());
+        assert_eq!(mbtowc(b"ab"), Some((libc::wchar_t::from(b'a'), 1)));
+        assert!(iswprint(libc::wchar_t::from(b'a')));
     }
 }
