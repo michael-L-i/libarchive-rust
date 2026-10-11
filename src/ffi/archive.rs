@@ -116,16 +116,10 @@ pub extern "C" fn archive_format(a: *mut Archive) -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_format_name(a: *mut Archive) -> *const c_char {
-    with(a, std::ptr::null(), |h| match h.base.format_name.get() {
-        Some(name) => name.as_ptr(),
-        None => {
-            let buf = h.base.format_name_buf.borrow();
-            if buf.is_empty() {
-                std::ptr::null()
-            } else {
-                buf.as_ptr().cast()
-            }
-        }
+    with(a, std::ptr::null(), |h| {
+        h.base
+            .format_name()
+            .map_or(std::ptr::null(), |name| name.as_ptr().cast())
     })
 }
 
@@ -136,7 +130,7 @@ pub extern "C" fn archive_compression(a: *mut Archive) -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_compression_name(a: *mut Archive) -> *const c_char {
-    with(a, std::ptr::null(), |h| h.filter_name(0))
+    archive_filter_name(a, 0)
 }
 
 /// Number of compressed bytes processed.
@@ -182,7 +176,10 @@ pub extern "C" fn archive_filter_count(a: *mut Archive) -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_filter_name(a: *mut Archive, n: c_int) -> *const c_char {
-    with(a, std::ptr::null(), |h| h.filter_name(n))
+    with(a, std::ptr::null(), |h| {
+        h.filter_name(n)
+            .map_or(std::ptr::null(), |name| name.as_ptr())
+    })
 }
 
 #[unsafe(no_mangle)]

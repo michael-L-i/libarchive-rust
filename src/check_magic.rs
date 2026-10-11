@@ -103,6 +103,25 @@ impl Base {
     }
 }
 
+impl Handle {
+    /// The `archive_check_magic` macro: `f()` if this is a handle of kind
+    /// `magic` in one of `states`, else `fallback`, with the error recorded
+    /// under the name `func`.
+    pub(crate) fn checked<T>(
+        &self,
+        magic: u32,
+        states: u32,
+        func: &str,
+        fallback: T,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        if self.base.check_magic(magic, states, func) == ARCHIVE_FATAL {
+            return fallback;
+        }
+        f()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

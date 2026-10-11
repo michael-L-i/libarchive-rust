@@ -31,7 +31,8 @@
 use crate::archive::*;
 use crate::entry::Entry;
 use crate::util::Error;
-use std::ffi::{c_char, c_int};
+use std::cell::Ref;
+use std::ffi::{CStr, c_int};
 
 impl Handle {
     // The filter getters can be called by a client callback on its own
@@ -54,16 +55,12 @@ impl Handle {
         }
     }
 
-    /// The filter's name, or NULL. The pointer lives as long as the filter.
-    pub fn filter_name(&self, n: c_int) -> *const c_char {
+    /// The filter's name. The name lives as long as the filter.
+    pub fn filter_name(&self, n: c_int) -> Option<Ref<'_, CStr>> {
         match &self.kind {
-            Kind::Read(r) => r.try_borrow().map_or(std::ptr::null(), |r| {
-                r.filter_name(n).map_or(std::ptr::null(), |s| s.as_ptr())
-            }),
-            Kind::Write(w) => w.try_borrow().map_or(std::ptr::null(), |w| {
-                w.filter_name(n).map_or(std::ptr::null(), |s| s.as_ptr())
-            }),
-            _ => std::ptr::null(),
+            Kind::Read(r) => Ref::filter_map(r.try_borrow().ok()?, |r| r.filter_name(n)).ok(),
+            Kind::Write(w) => Ref::filter_map(w.try_borrow().ok()?, |w| w.filter_name(n)).ok(),
+            _ => None,
         }
     }
 
@@ -81,13 +78,20 @@ impl Handle {
     /// `archive_read_next_header2` and the read half of `next_header`:
     /// reads the next header into `entry`.
     pub fn read_next_header2(&self, entry: &mut Entry) -> c_int {
-        match &self.kind {
-            Kind::Read(r) => r
-                .try_borrow_mut()
-                .map_or(ARCHIVE_FATAL, |mut r| r.next_header2(&self.base, entry)),
-            Kind::ReadDisk(r) => r.borrow_mut().next_header2(&self.base, entry),
-            _ => ARCHIVE_FATAL,
+        if let Kind::ReadDisk(r) = &self.kind {
+            return r.borrow_mut().next_header2(&self.base, entry);
         }
+        // The other kinds that are not a read handle fail the check.
+        let states = state::HEADER | state::DATA | state::DATA_RECOVERY;
+        let func = "archive_read_next_header";
+        self.checked(READ_MAGIC, states, func, ARCHIVE_FATAL, || {
+            match &self.kind {
+                Kind::Read(r) => r
+                    .try_borrow_mut()
+                    .map_or(ARCHIVE_FATAL, |mut r| r.next_header2(&self.base, entry)),
+                _ => ARCHIVE_FATAL,
+            }
+        })
     }
 
     /// The entry a read handle reads headers into, or NULL.

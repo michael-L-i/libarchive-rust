@@ -10,37 +10,24 @@ use super::{
     archive_skip_callback, archive_switch_callback, guard,
 };
 use crate::archive::{ARCHIVE_EOF, ARCHIVE_WARN};
-use crate::archive::{Base, Handle, Kind, READ_MAGIC, state};
+use crate::archive::{Handle, Kind, READ_MAGIC, state};
 use crate::entry::Entry;
+use crate::read;
 use crate::read::Data;
 use crate::read::filter::{
-    all as filter_all, by_code as filter_by_code, bzip2 as filter_bzip2, compress, grzip, gzip,
-    lrzip, lz4 as filter_lz4, lzop, none as filter_none, program, rpm, uu as filter_uu,
-    xz as filter_xz, zstd as filter_zstd,
+    bzip2 as filter_bzip2, compress, grzip, gzip, lrzip, lz4 as filter_lz4, lzop, rpm,
+    uu as filter_uu, xz as filter_xz, zstd as filter_zstd,
 };
 use crate::read::format::{
-    all as format_all, ar, by_code as format_by_code, cab, cpio, empty, iso9660, lha, mtree, rar,
-    rar5, raw, sevenzip, tar, warc, xar, zip,
+    ar, cab, cpio, empty, iso9660, lha, mtree, rar, rar5, raw, sevenzip, tar, warc, xar, zip,
 };
-use crate::read::{self, Read, Status};
 use crate::read_add_passphrase::PassphraseCallback;
 use crate::util::Error;
-use crate::{options, read_append_filter, read_data_into_fd, read_set_format, read_set_options};
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
-
-/// Runs `f` on the read state of a handle that has passed its magic check.
-/// A re-entrant call from a client callback finds the state in use and gets
-/// `fallback`.
-pub(super) fn with_read<T>(h: &Handle, fallback: T, f: impl FnOnce(&mut Read) -> T) -> T {
-    match &h.kind {
-        Kind::Read(r) => r.try_borrow_mut().map_or(fallback, |mut r| f(&mut r)),
-        _ => fallback,
-    }
-}
 
 /// The handle's own entry (`a->entry`), which upstream's formats fill in
 /// from the header reads they make in the middle of reading data. Take it
-/// before `with_read`, which holds the read state.
+/// before `Handle::with_read`, which holds the read state.
 // The entry is a separate allocation the handle only points to.
 #[allow(clippy::mut_from_ref)]
 fn own_entry(h: &Handle) -> Option<&mut Entry> {
@@ -53,20 +40,18 @@ fn own_entry(h: &Handle) -> Option<&mut Entry> {
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_new() -> *mut Archive {
     guard(std::ptr::null_mut(), || {
-        Box::into_raw(Box::new(read::new())).cast()
+        let h = read::new();
+        // Like archive_entry_new2: the entry converts text with the
+        // handle's conversions. `archive_free` frees it.
+        let entry = Entry::new(Some(h.base.conv.clone()));
+        h.with_read((), |r| r.entry = Box::into_raw(Box::new(entry)));
+        Box::into_raw(Box::new(h)).cast()
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_none(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_filter_none,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |_h| filter_none::support()
-    )
+    with(a, ARCHIVE_FATAL, Handle::read_support_filter_none)
 }
 
 #[unsafe(no_mangle)]
@@ -74,22 +59,11 @@ pub extern "C" fn archive_read_support_compression_none(a: *mut Archive) -> c_in
     archive_read_support_filter_none(a)
 }
 
-/// Registers a decompression filter's bidder: what the filter exports do.
-/// Registers a filter's bidder, as each `archive_read_support_filter_X` does.
-fn support_filter(h: &Handle, support: filter_all::Support) -> c_int {
-    with_read(h, ARCHIVE_FATAL, |r| code(&h.base, support(r, &h.base)))
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_compress(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_filter_compress,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, compress::support)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("archive_read_support_filter_compress", compress::support)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -99,14 +73,9 @@ pub extern "C" fn archive_read_support_compression_compress(a: *mut Archive) -> 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_rpm(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_filter_rpm,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, rpm::support)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("archive_read_support_filter_rpm", rpm::support)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -116,14 +85,7 @@ pub extern "C" fn archive_read_support_compression_rpm(a: *mut Archive) -> c_int
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_all(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_filter_all,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| filter_all::support(r, &h.base))
-    )
+    with(a, ARCHIVE_FATAL, Handle::read_support_filter_all)
 }
 
 #[unsafe(no_mangle)]
@@ -133,14 +95,9 @@ pub extern "C" fn archive_read_support_compression_all(a: *mut Archive) -> c_int
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_uu(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_filter_uu,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, filter_uu::support)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("archive_read_support_filter_uu", filter_uu::support)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -150,14 +107,9 @@ pub extern "C" fn archive_read_support_compression_uu(a: *mut Archive) -> c_int 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_gzip(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_filter_gzip,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, gzip::support)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("archive_read_support_filter_gzip", gzip::support)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -167,26 +119,16 @@ pub extern "C" fn archive_read_support_compression_gzip(a: *mut Archive) -> c_in
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_lz4(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_filter_lz4,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, filter_lz4::support)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("archive_read_support_filter_lz4", filter_lz4::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_bzip2(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_filter_bzip2,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, filter_bzip2::support)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("archive_read_support_filter_bzip2", filter_bzip2::support)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -196,40 +138,21 @@ pub extern "C" fn archive_read_support_compression_bzip2(a: *mut Archive) -> c_i
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_zstd(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_filter_zstd,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, filter_zstd::support)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("archive_read_support_filter_zstd", filter_zstd::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_by_code(a: *mut Archive, code: c_int) -> c_int {
-    checked!(
-        archive_read_support_filter_by_code,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| filter_by_code::support(
-            r, &h.base, code
-        ))
-    )
+    with(a, ARCHIVE_FATAL, |h| h.read_support_filter_by_code(code))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_xz(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_filter_xz,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, filter_xz::support_xz)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("archive_read_support_filter_xz", filter_xz::support_xz)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -239,14 +162,9 @@ pub extern "C" fn archive_read_support_compression_xz(a: *mut Archive) -> c_int 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_lzma(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_filter_lzma,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, filter_xz::support_lzma)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("archive_read_support_filter_lzma", filter_xz::support_lzma)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -256,14 +174,9 @@ pub extern "C" fn archive_read_support_compression_lzma(a: *mut Archive) -> c_in
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_lzip(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_filter_lzip,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, filter_xz::support_lzip)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("archive_read_support_filter_lzip", filter_xz::support_lzip)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -273,91 +186,22 @@ pub extern "C" fn archive_read_support_compression_lzip(a: *mut Archive) -> c_in
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_all(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_all,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| format_all::support(r, &h.base))
-    )
+    with(a, ARCHIVE_FATAL, Handle::read_support_format_all)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_by_code(a: *mut Archive, code: c_int) -> c_int {
-    checked!(
-        archive_read_support_format_by_code,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| format_by_code::support(
-            r, &h.base, code
-        ))
-    )
+    with(a, ARCHIVE_FATAL, |h| h.read_support_format_by_code(code))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_set_format(a: *mut Archive, code: c_int) -> c_int {
-    // Upstream's first check is the one in support_format_by_code.
-    checked!(
-        archive_read_support_format_by_code,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| read_set_format::set_format(
-            r, &h.base, code
-        ))
-    )
+    with(a, ARCHIVE_FATAL, |h| h.read_set_format(code))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_append_filter(a: *mut Archive, code: c_int) -> c_int {
-    checked!(
-        archive_read_append_filter,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| read_append_filter::append_filter(
-            r, &h.base, code
-        ))
-    )
-}
-
-/// The code a registration function reports: its status, or the failure
-/// recorded on the handle.
-fn code(a: &Base, result: Result<Status, Error>) -> c_int {
-    result.map_or_else(|e| a.raise(e), Status::code)
-}
-
-/// Runs `f` on a read handle in the state to register a bidder, with the
-/// command and signature the program functions take: no signature if it is
-/// NULL. Upstream names `__archive_read_register_bidder` in the magic check
-/// error, because that is the first function to check. A NULL command
-/// crashes upstream; it fails here.
-fn with_program(
-    a: *mut Archive,
-    cmd: *const c_char,
-    signature: *const c_void,
-    len: usize,
-    f: impl FnOnce(&mut Read, &Base, &[u8], &[u8]) -> c_int,
-) -> c_int {
-    checked!(
-        __archive_read_register_bidder,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| {
-            let Some(cmd) = cstr(cmd) else {
-                return ARCHIVE_FATAL;
-            };
-            let signature = bytes(signature, len).unwrap_or_default();
-            with_read(h, ARCHIVE_FATAL, |r| f(r, &h.base, cmd, signature))
-        }
-    )
+    with(a, ARCHIVE_FATAL, |h| h.read_append_filter(code))
 }
 
 #[unsafe(no_mangle)]
@@ -383,8 +227,9 @@ pub extern "C" fn archive_read_support_filter_program_signature(
     signature: *const c_void,
     signature_len: usize,
 ) -> c_int {
-    with_program(a, cmd, signature, signature_len, |r, a, cmd, signature| {
-        code(a, program::support(r, cmd, signature))
+    with(a, ARCHIVE_FATAL, |h| {
+        let signature = bytes(signature, signature_len).unwrap_or_default();
+        h.read_support_filter_program_signature(cstr(cmd), signature)
     })
 }
 
@@ -410,49 +255,31 @@ pub extern "C" fn archive_read_append_filter_program_signature(
     signature: *const c_void,
     signature_len: usize,
 ) -> c_int {
-    with_program(
-        a,
-        cmd,
-        signature,
-        signature_len,
-        read_append_filter::append_filter_program,
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        let signature = bytes(signature, signature_len).unwrap_or_default();
+        h.read_append_filter_program_signature(cstr(cmd), signature)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_grzip(a: *mut Archive) -> c_int {
-    checked!(
-        __archive_read_register_bidder,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, grzip::support)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("__archive_read_register_bidder", grzip::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_lrzip(a: *mut Archive) -> c_int {
-    checked!(
-        __archive_read_register_bidder,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, lrzip::support)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("__archive_read_register_bidder", lrzip::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_filter_lzop(a: *mut Archive) -> c_int {
-    checked!(
-        __archive_read_register_bidder,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| support_filter(h, lzop::support)
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_filter("__archive_read_register_bidder", lzop::support)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -467,7 +294,7 @@ pub extern "C" fn archive_read_set_open_callback(
         state::NEW,
         ARCHIVE_FATAL,
         |h| {
-            with_read(h, ARCHIVE_FATAL, |r| {
+            h.with_read(ARCHIVE_FATAL, |r| {
                 r.callbacks.opener = callback;
                 ARCHIVE_OK
             })
@@ -487,7 +314,7 @@ pub extern "C" fn archive_read_set_read_callback(
         state::NEW,
         ARCHIVE_FATAL,
         |h| {
-            with_read(h, ARCHIVE_FATAL, |r| {
+            h.with_read(ARCHIVE_FATAL, |r| {
                 r.callbacks.reader = callback;
                 ARCHIVE_OK
             })
@@ -507,7 +334,7 @@ pub extern "C" fn archive_read_set_skip_callback(
         state::NEW,
         ARCHIVE_FATAL,
         |h| {
-            with_read(h, ARCHIVE_FATAL, |r| {
+            h.with_read(ARCHIVE_FATAL, |r| {
                 r.callbacks.skipper = callback;
                 ARCHIVE_OK
             })
@@ -527,7 +354,7 @@ pub extern "C" fn archive_read_set_seek_callback(
         state::NEW,
         ARCHIVE_FATAL,
         |h| {
-            with_read(h, ARCHIVE_FATAL, |r| {
+            h.with_read(ARCHIVE_FATAL, |r| {
                 r.callbacks.seeker = callback;
                 ARCHIVE_OK
             })
@@ -547,7 +374,7 @@ pub extern "C" fn archive_read_set_close_callback(
         state::NEW,
         ARCHIVE_FATAL,
         |h| {
-            with_read(h, ARCHIVE_FATAL, |r| {
+            h.with_read(ARCHIVE_FATAL, |r| {
                 r.callbacks.closer = callback;
                 ARCHIVE_OK
             })
@@ -567,7 +394,7 @@ pub extern "C" fn archive_read_set_switch_callback(
         state::NEW,
         ARCHIVE_FATAL,
         |h| {
-            with_read(h, ARCHIVE_FATAL, |r| {
+            h.with_read(ARCHIVE_FATAL, |r| {
                 r.callbacks.switcher = callback;
                 ARCHIVE_OK
             })
@@ -595,7 +422,7 @@ pub extern "C" fn archive_read_set_callback_data2(
         READ_MAGIC,
         state::NEW,
         ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
+        |h| h.with_read(ARCHIVE_FATAL, |r| {
             let data = &mut r.callbacks.data;
             if data.is_empty() {
                 data.push(std::ptr::null_mut());
@@ -625,7 +452,7 @@ pub extern "C" fn archive_read_add_callback_data(
         READ_MAGIC,
         state::NEW,
         ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
+        |h| h.with_read(ARCHIVE_FATAL, |r| {
             let data = &mut r.callbacks.data;
             let index = index as usize;
             if index > data.len() {
@@ -648,7 +475,7 @@ pub extern "C" fn archive_read_append_callback_data(
     client_data: *mut c_void,
 ) -> c_int {
     // The number of nodes, which is where the new one goes.
-    let nodes = with(a, 0, |h| with_read(h, 0, |r| r.callbacks.data.len()));
+    let nodes = with(a, 0, |h| h.with_read(0, |r| r.callbacks.data.len()));
     archive_read_add_callback_data(
         a,
         client_data,
@@ -673,7 +500,7 @@ pub extern "C" fn archive_read_open1(a: *mut Archive) -> c_int {
         state::NEW,
         ARCHIVE_FATAL,
         |h| {
-            with_read(h, ARCHIVE_FATAL, |r| {
+            h.with_read(ARCHIVE_FATAL, |r| {
                 h.base.clear_error();
                 if r.callbacks.reader.is_none() {
                     h.base.set_error(
@@ -741,7 +568,7 @@ pub extern "C" fn archive_read_extract_set_skip_file(a: *mut Archive, dev: i64, 
     with(a, (), |h| {
         let name = "archive_read_extract_set_skip_file";
         if h.base.check_magic(READ_MAGIC, state::ANY, name) == ARCHIVE_OK {
-            with_read(h, (), |r| r.skip_file = Some((dev, ino)));
+            h.with_read((), |r| r.skip_file = Some((dev, ino)));
         }
     });
 }
@@ -759,18 +586,9 @@ pub extern "C" fn archive_read_set_format_option(
     o: *const c_char,
     v: *const c_char,
 ) -> c_int {
-    checked!(
-        archive_read_set_format_option,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            options::set_option(&h.base, cstr(m), cstr(o), cstr(v), &mut |m, o, v| {
-                r.set_format_option(&h.base, m, o, v)
-            })
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_set_format_option(cstr(m), cstr(o), cstr(v))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -780,16 +598,9 @@ pub extern "C" fn archive_read_set_filter_option(
     o: *const c_char,
     v: *const c_char,
 ) -> c_int {
-    checked!(
-        archive_read_set_filter_option,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| options::set_option(&h.base, cstr(m), cstr(o), cstr(v), &mut |m, _, _| {
-            read_set_options::set_filter_option(m)
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_set_filter_option(cstr(m), cstr(o), cstr(v))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -799,50 +610,23 @@ pub extern "C" fn archive_read_set_option(
     o: *const c_char,
     v: *const c_char,
 ) -> c_int {
-    checked!(
-        archive_read_set_option,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            options::set_option(&h.base, cstr(m), cstr(o), cstr(v), &mut |m, o, v| {
-                r.set_option(&h.base, m, o, v)
-            })
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_set_option(cstr(m), cstr(o), cstr(v))
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_set_options(a: *mut Archive, opts: *const c_char) -> c_int {
-    checked!(
-        archive_read_set_options,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            let opts = cstr(opts).unwrap_or_default();
-            options::set_options(&h.base, opts, &mut |m, o, v| r.set_option(&h.base, m, o, v))
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_set_options(cstr(opts).unwrap_or_default())
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_add_passphrase(a: *mut Archive, passphrase: *const c_char) -> c_int {
-    checked!(
-        archive_read_add_passphrase,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            match r.passphrases.add(cstr(passphrase).unwrap_or_default()) {
-                Ok(()) => ARCHIVE_OK,
-                Err(e) => h.base.raise(e),
-            }
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_add_passphrase(cstr(passphrase).unwrap_or_default())
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -851,38 +635,21 @@ pub extern "C" fn archive_read_set_passphrase_callback(
     client_data: *mut c_void,
     callback: archive_passphrase_callback,
 ) -> c_int {
-    checked!(
-        archive_read_set_passphrase_callback,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            r.passphrases
-                .set_callback(callback.map(|callback| -> PassphraseCallback {
-                    Box::new(move || {
-                        // SAFETY: the caller registered the callback to be called
-                        // with this handle and data; the handle owns this
-                        // closure.
-                        let p = unsafe { callback(a, client_data) };
-                        cstr(p).map(<[u8]>::to_vec)
-                    })
-                }));
-            ARCHIVE_OK
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_set_passphrase_callback(callback.map(|callback| -> PassphraseCallback {
+            Box::new(move || {
+                // SAFETY: the caller registered the callback to be called
+                // with this handle and data; the handle owns this closure.
+                let p = unsafe { callback(a, client_data) };
+                cstr(p).map(<[u8]>::to_vec)
+            })
+        }))
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_header_position(a: *mut Archive) -> i64 {
-    checked!(
-        archive_read_header_position,
-        a,
-        READ_MAGIC,
-        state::ANY,
-        i64::from(ARCHIVE_FATAL),
-        |h| h.header_position()
-    )
+    with(a, i64::from(ARCHIVE_FATAL), Handle::read_header_position)
 }
 
 #[unsafe(no_mangle)]
@@ -943,39 +710,27 @@ pub extern "C" fn archive_read_data_block(
     }) {
         return ret;
     }
-    checked!(
-        archive_read_data_block,
-        a,
-        READ_MAGIC,
-        state::DATA,
-        ARCHIVE_FATAL,
-        |h| {
-            let entry = own_entry(h);
-            with_read(h, ARCHIVE_FATAL, |r| {
-                let block = r.read_data_block(&h.base, entry, |data| match data {
-                    Data::Block { data, offset } => {
-                        (data.as_ptr().cast(), data.len(), offset, ARCHIVE_OK)
-                    }
-                    Data::Eof { offset } => (std::ptr::null(), 0, offset, ARCHIVE_EOF),
-                    Data::Warn { offset } => (std::ptr::null(), 0, offset, ARCHIVE_WARN),
-                });
-                match block {
-                    Ok((p, n, o, code)) => {
-                        // The block stays valid until the next read.
-                        put(buff, p);
-                        put(size, n);
-                        put(offset, o);
-                        code
-                    }
-                    Err(code) => {
-                        put(buff, std::ptr::null());
-                        put(size, 0);
-                        code
-                    }
-                }
-            })
+    with(a, ARCHIVE_FATAL, |h| {
+        let block = h.read_data_block(own_entry(h), |data| match data {
+            Data::Block { data, offset } => (data.as_ptr().cast(), data.len(), offset, ARCHIVE_OK),
+            Data::Eof { offset } => (std::ptr::null(), 0, offset, ARCHIVE_EOF),
+            Data::Warn { offset } => (std::ptr::null(), 0, offset, ARCHIVE_WARN),
+        });
+        match block {
+            Ok((p, n, o, code)) => {
+                // The block stays valid until the next read.
+                put(buff, p);
+                put(size, n);
+                put(offset, o);
+                code
+            }
+            Err(code) => {
+                put(buff, std::ptr::null());
+                put(size, 0);
+                code
+            }
         }
-    )
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -993,20 +748,12 @@ pub extern "C" fn archive_read_data(a: *mut Archive, buff: *mut c_void, size: us
             let dest = unsafe { std::slice::from_raw_parts_mut(buff.cast::<u8>(), size) };
             return d.borrow_mut().data(&h.base, dest);
         }
-        // Upstream gets here by way of archive_read_data_block.
-        let name = "archive_read_data_block";
-        if h.base.check_magic(READ_MAGIC, state::DATA, name) == ARCHIVE_FATAL {
-            return fatal;
-        }
         if buff.is_null() || size > isize::MAX as usize {
             return fatal;
         }
         // SAFETY: the caller passes `size` writable bytes at `buff`.
         let dest = unsafe { std::slice::from_raw_parts_mut(buff.cast::<u8>(), size) };
-        {
-            let entry = own_entry(h);
-            with_read(h, fatal, |r| r.read_data(&h.base, entry, dest))
-        }
+        h.read_data(own_entry(h), dest)
     })
 }
 
@@ -1018,17 +765,7 @@ pub extern "C" fn archive_read_data_skip(a: *mut Archive) -> c_int {
     }) {
         return ret;
     }
-    checked!(
-        archive_read_data_skip,
-        a,
-        READ_MAGIC,
-        state::DATA | state::DATA_RECOVERY,
-        ARCHIVE_FATAL,
-        |h| {
-            let entry = own_entry(h);
-            with_read(h, ARCHIVE_FATAL, |r| r.read_data_skip(&h.base, entry))
-        }
-    )
+    with(a, ARCHIVE_FATAL, |h| h.read_data_skip(own_entry(h)))
 }
 
 #[unsafe(no_mangle)]
@@ -1041,7 +778,7 @@ pub extern "C" fn archive_seek_data(a: *mut Archive, offset: i64, whence: c_int)
         i64::from(ARCHIVE_FATAL),
         |h| {
             let entry = own_entry(h);
-            with_read(h, i64::from(ARCHIVE_FATAL), |r| {
+            h.with_read(i64::from(ARCHIVE_FATAL), |r| {
                 r.seek_data(&h.base, entry, offset, whence)
             })
         }
@@ -1092,49 +829,21 @@ pub extern "C" fn archive_read_data_into_fd(a: *mut Archive, fd: c_int) -> c_int
     }) {
         return ret;
     }
-
-    checked!(
-        archive_read_data_into_fd,
-        a,
-        READ_MAGIC,
-        state::DATA,
-        ARCHIVE_FATAL,
-        |h| {
-            let entry = own_entry(h);
-            with_read(h, ARCHIVE_FATAL, |r| {
-                read_data_into_fd::data_into_fd(r, &h.base, entry, Fd(fd))
-            })
-        }
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_data_into_fd(own_entry(h), Fd(fd))
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_next_header2(a: *mut Archive, entry: *mut ArchiveEntry) -> c_int {
-    if let Some(ret) = with(a, None, |h| match &h.kind {
-        Kind::ReadDisk(_) => Some({
-            // SAFETY: entry is a caller-owned live entry or NULL.
-            unsafe { entry.cast::<Entry>().as_mut() }
-                .map_or(ARCHIVE_FATAL, |e| h.read_next_header2(e))
-        }),
-        _ => None,
-    }) {
-        return ret;
-    }
-    checked!(
-        archive_read_next_header,
-        a,
-        READ_MAGIC,
-        state::HEADER | state::DATA | state::DATA_RECOVERY,
-        ARCHIVE_FATAL,
-        |h| {
-            // SAFETY: `entry` is NULL or a live entry the caller owns, which
-            // nothing else uses during the call.
-            match unsafe { entry.cast::<Entry>().as_mut() } {
-                Some(entry) => h.read_next_header2(entry),
-                None => ARCHIVE_FATAL,
-            }
+    with(a, ARCHIVE_FATAL, |h| {
+        // SAFETY: `entry` is NULL or a live entry the caller owns, which
+        // nothing else uses during the call.
+        match unsafe { entry.cast::<Entry>().as_mut() } {
+            Some(entry) => h.read_next_header2(entry),
+            None => ARCHIVE_FATAL,
         }
-    )
+    })
 }
 
 /// Reads the next header into the handle's own entry and returns it, even
@@ -1145,298 +854,163 @@ pub extern "C" fn archive_read_next_header(
     entryp: *mut *mut ArchiveEntry,
 ) -> c_int {
     put(entryp, std::ptr::null_mut());
-    if let Some(ret) = with(a, None, |h| match &h.kind {
-        Kind::ReadDisk(_) => Some({
-            let ptr = h.read_entry();
-            put(entryp, ptr.cast());
-            // SAFETY: handle owns the live entry pointer, used exclusively here.
-            unsafe { ptr.as_mut() }.map_or(ARCHIVE_FATAL, |e| h.read_next_header2(e))
-        }),
-        _ => None,
-    }) {
-        return ret;
-    }
-    let r = checked!(
-        archive_read_next_header,
-        a,
-        READ_MAGIC,
-        state::HEADER | state::DATA | state::DATA_RECOVERY,
-        ARCHIVE_FATAL,
-        |h| {
-            // SAFETY: the handle's entry is a live `Box` leak, only used
-            // through this pointer and the ones handed to the caller.
-            match unsafe { h.read_entry().as_mut() } {
-                Some(e) => h.read_next_header2(e),
-                None => ARCHIVE_FATAL,
-            }
-        }
-    );
-    // The entry comes back even when the header does not.
-    put(
-        entryp,
-        with(a, std::ptr::null_mut(), |h| h.read_entry().cast()),
-    );
-    r
+    with(a, ARCHIVE_FATAL, |h| {
+        let entry = h.read_entry();
+        // SAFETY: the handle's entry is a live `Box` leak, only used through
+        // this pointer and the ones handed to the caller.
+        let r = match unsafe { entry.as_mut() } {
+            Some(e) => h.read_next_header2(e),
+            // Only the read handles have one; the others fail this check.
+            None => h.checked(
+                READ_MAGIC,
+                state::ANY,
+                "archive_read_next_header",
+                ARCHIVE_FATAL,
+                || ARCHIVE_FATAL,
+            ),
+        };
+        // The entry comes back even when the header does not.
+        put(entryp, entry.cast());
+        r
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_ar(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_ar,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            ar::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_ar", ar::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_7zip(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_7zip,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            sevenzip::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_7zip", sevenzip::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_cpio(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_cpio,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            cpio::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_cpio", cpio::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_lha(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_lha,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            lha::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_lha", lha::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_tar(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_tar,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            tar::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_tar", tar::support)
+    })
 }
 
 /// An alias of `archive_read_support_format_tar`.
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_gnutar(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_gnutar,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            tar::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_gnutar", tar::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_rar(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_rar,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            rar::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_rar", rar::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_raw(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_raw,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            raw::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_raw", raw::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_mtree(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_mtree,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            mtree::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_mtree", mtree::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_empty(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_empty,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            empty::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_empty", empty::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_cab(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_cab,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            cab::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_cab", cab::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_iso9660(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_iso9660,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            iso9660::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_iso9660", iso9660::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_warc(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_warc,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            warc::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_warc", warc::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_xar(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_xar,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            xar::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_xar", xar::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_zip(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_zip,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            zip::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_zip", zip::support)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_zip_streamable(a: *mut Archive) -> c_int {
     // Upstream checks the state under the name of the combined export.
-    checked!(
-        archive_read_support_format_zip,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            zip::support_streamable(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_zip", zip::support_streamable)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_zip_seekable(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_zip_seekable,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            zip::support_seekable(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format(
+            "archive_read_support_format_zip_seekable",
+            zip::support_seekable,
+        )
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_support_format_rar5(a: *mut Archive) -> c_int {
-    checked!(
-        archive_read_support_format_rar5,
-        a,
-        READ_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| with_read(h, ARCHIVE_FATAL, |r| {
-            rar5::support(r).map_or_else(|e| h.base.raise(e), |status| status.code())
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_support_format("archive_read_support_format_rar5", rar5::support)
+    })
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use crate::ffi::archive::{archive_error_string, archive_free};
+    use crate::read::{filter::all as filter_all, format::all as format_all};
     use std::ffi::CStr;
 
     pub(in crate::ffi) fn error(a: *mut Archive) -> Option<String> {
@@ -1613,7 +1187,7 @@ pub(super) mod tests {
 
     pub(in crate::ffi) fn register_anything(a: *mut Archive) {
         with(a, (), |h| {
-            with_read(h, (), |r| {
+            h.with_read((), |r| {
                 assert_eq!(r.register_format(Box::new(Anything)).unwrap(), Status::Ok);
             });
         });
@@ -1623,7 +1197,7 @@ pub(super) mod tests {
     pub(in crate::ffi) fn drain(a: *mut Archive) -> Vec<u8> {
         let mut out = Vec::new();
         with(a, (), |h| {
-            with_read(h, (), |r| {
+            h.with_read((), |r| {
                 let mut rd = r.reader(&h.base);
                 loop {
                     let n = {
@@ -1895,7 +1469,7 @@ pub(super) mod tests {
         );
         let mut got = Vec::new();
         with(a, (), |h| {
-            with_read(h, (), |r| {
+            h.with_read((), |r| {
                 r.passphrases.reset();
                 while let Some(p) = r.passphrases.next() {
                     got.push(String::from_utf8_lossy(&p).into_owned());

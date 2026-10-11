@@ -151,6 +151,17 @@ impl Base {
         });
         (!msg.is_empty()).then_some(msg)
     }
+
+    /// `archive_format_name`: the static name a format set, or the
+    /// formatted one in `format_name_buf`, without its NUL. Either is
+    /// followed by a NUL, so `as_ptr()` is a C string.
+    pub fn format_name(&self) -> Option<Ref<'_, [u8]>> {
+        let buf = self.format_name_buf.borrow();
+        match self.format_name.get() {
+            Some(name) => Some(Ref::map(buf, |_| name.to_bytes())),
+            None => Ref::filter_map(buf, |b| b.split_last().map(|(_, name)| name)).ok(),
+        }
+    }
 }
 
 #[cfg(test)]

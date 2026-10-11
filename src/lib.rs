@@ -6,6 +6,9 @@
     allow(clippy::useless_conversion, clippy::unnecessary_cast)
 )]
 
+mod api;
+pub use api::*;
+
 mod acl;
 mod archive;
 mod blake2s_ref;

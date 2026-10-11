@@ -1212,8 +1212,9 @@ pub struct Read {
     read_data: ReadData,
     /// The entry `archive_read_next_header` hands out: a raw pointer from
     /// `Box::into_raw`, so the `&mut Entry` C calls derive never aliases a
-    /// live `Box`. `archive_free` takes it back with `take_entry`.
-    entry: *mut Entry,
+    /// live `Box`. `archive_read_new` makes it, and `archive_free` takes it
+    /// back with `take_entry`; NULL for a handle that is not C's.
+    pub(crate) entry: *mut Entry,
     /// The device and inode extraction must not overwrite, as the client or
     /// `archive_read_extract_set_skip_file` set it.
     pub(crate) skip_file: Option<(i64, i64)>,
@@ -1223,19 +1224,11 @@ pub struct Read {
     pub(crate) callbacks: crate::ffi::client::Callbacks,
 }
 
-/// `archive_read_new`.
+/// `archive_read_new`, without the entry `archive_read_next_header` uses.
 pub fn new() -> Handle {
-    let base = Base::new(READ_MAGIC);
-    // Like archive_entry_new2: the entry converts text with the handle's
-    // conversions.
-    let entry = Box::into_raw(Box::new(Entry::new(Some(base.conv.clone()))));
-    let read = Read {
-        entry,
-        ..Read::default()
-    };
     Handle {
-        base,
-        kind: Kind::Read(RefCell::new(read)),
+        base: Base::new(READ_MAGIC),
+        kind: Kind::Read(RefCell::new(Read::default())),
     }
 }
 

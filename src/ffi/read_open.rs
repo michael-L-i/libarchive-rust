@@ -7,30 +7,14 @@
 //! name themselves in the error if not, so the checks here carry the name of
 //! the first callback upstream sets.
 
+use super::archive::with;
 use super::client::UserMem;
-use super::read::with_read;
 use super::sys::{CFile, Fd};
 use super::{ARCHIVE_FATAL, Archive};
-use crate::archive::{Handle, READ_MAGIC, state};
-use crate::read::Client;
-use crate::read_open_fd::ReadFd;
 use crate::read_open_file::ReadFile;
-use crate::read_open_filename::Filenames;
-use crate::read_open_memory::Memory;
 use crate::string::MString;
 use crate::util::Error;
 use std::ffi::{CStr, c_char, c_int, c_void};
-
-use super::archive::with;
-
-/// `archive_read_open1` for a native client, after the state check that the
-/// first `archive_read_set_*_callback` call upstream makes.
-fn open(h: &Handle, first_callback: &str, client: Box<dyn Client>) -> c_int {
-    if h.base.check_magic(READ_MAGIC, state::NEW, first_callback) == ARCHIVE_FATAL {
-        return ARCHIVE_FATAL;
-    }
-    with_read(h, ARCHIVE_FATAL, |r| r.open(&h.base, client))
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_open_memory(
@@ -60,26 +44,13 @@ pub extern "C" fn archive_read_open_memory2(
                 .base
                 .raise(Error::fatal(libc::EINVAL, "Invalid memory block"));
         };
-        open(
-            h,
-            "archive_read_set_open_callback",
-            Box::new(Memory::new(mem, read_size)),
-        )
+        h.read_open_memory(mem, read_size)
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_open_fd(a: *mut Archive, fd: c_int, block_size: usize) -> c_int {
-    with(a, ARCHIVE_FATAL, |h| {
-        h.base.clear_error();
-        match ReadFd::new(Fd(fd), block_size) {
-            Ok((client, skip_file)) => {
-                with_read(h, (), |r| r.skip_file = skip_file.or(r.skip_file));
-                open(h, "archive_read_set_read_callback", Box::new(client))
-            }
-            Err(e) => h.base.raise(e),
-        }
-    })
+    with(a, ARCHIVE_FATAL, |h| h.read_open_fd(Fd(fd), block_size))
 }
 
 #[unsafe(no_mangle)]
@@ -96,8 +67,8 @@ pub extern "C" fn archive_read_open_FILE(a: *mut Archive, file: *mut libc::FILE)
         let file = unsafe { CFile::new(file) };
         match ReadFile::new(file) {
             Ok((client, skip_file)) => {
-                with_read(h, (), |r| r.skip_file = skip_file.or(r.skip_file));
-                open(h, "archive_read_set_read_callback", Box::new(client))
+                h.with_read((), |r| r.skip_file = skip_file.or(r.skip_file));
+                h.read_open("archive_read_set_read_callback", Box::new(client))
             }
             Err(e) => h.base.raise(e),
         }
@@ -136,12 +107,7 @@ unsafe fn names(filenames: *const *const c_char) -> Vec<Option<Vec<u8>>> {
 
 fn open_names(a: *mut Archive, names: Vec<Option<Vec<u8>>>, block_size: usize) -> c_int {
     with(a, ARCHIVE_FATAL, |h| {
-        h.base.clear_error();
-        open(
-            h,
-            "archive_read_add_callback_data",
-            Box::new(Filenames::new(names, block_size)),
-        )
+        h.read_open_filenames(names, block_size)
     })
 }
 
@@ -209,11 +175,7 @@ pub extern "C" fn archive_read_open_filename_w(
                 }
             }
         };
-        open(
-            h,
-            "archive_read_add_callback_data",
-            Box::new(Filenames::new(vec![name], block_size)),
-        )
+        h.read_open_filenames(vec![name], block_size)
     })
 }
 
@@ -307,9 +269,8 @@ mod tests {
         // A regular file is not to be overwritten by extraction.
         let a = new();
         archive_read_open_fd(a, f.as_raw_fd(), 5);
-        assert!(with(a, false, |h| with_read(h, false, |r| r
-            .skip_file()
-            .is_some())));
+        assert!(with(a, false, |h| h
+            .with_read(false, |r| r.skip_file().is_some())));
         assert_eq!(archive_free(a), ARCHIVE_OK);
         let a = new();
         assert_eq!(archive_read_open_fd(a, -1, 5), ARCHIVE_FATAL);
