@@ -37,9 +37,6 @@ use crate::hmac::HmacSha1;
 use crate::string::StringConv;
 use crate::util::Error;
 use crate::write::{Filter, Format, Sink};
-use miniz_oxide::deflate::core::{
-    CompressorOxide, TDEFLFlush, TDEFLStatus, compress, create_comp_flags_from_zip_params,
-};
 use std::ffi::{CStr, c_int};
 use std::io::Read;
 use std::sync::Arc;
@@ -74,7 +71,6 @@ struct Member {
     packed: u64,
     crc: u32,
     encoder: Option<Box<dyn Filter>>,
-    deflate: Option<Box<CompressorOxide>>,
     skip_lzma: usize,
     cipher: Cipher,
     ae2: bool,
@@ -193,39 +189,10 @@ impl Member {
             skip: &mut self.skip_lzma,
             cipher: &mut self.cipher,
         };
-        if let Some(encoder) = self.encoder.as_mut() {
-            return if finish {
-                encoder.close(&mut sink)
-            } else {
-                encoder.write(input, &mut sink)
-            };
-        }
-        if let Some(state) = self.deflate.as_mut() {
-            let mut input = input;
-            let mut out = [0u8; 65536];
-            loop {
-                let (status, used, n) = compress(
-                    state,
-                    input,
-                    &mut out,
-                    if finish {
-                        TDEFLFlush::Finish
-                    } else {
-                        TDEFLFlush::None
-                    },
-                );
-                sink.write(&out[..n])?;
-                input = &input[used..];
-                if status == TDEFLStatus::Done || (!finish && input.is_empty() && n < out.len()) {
-                    break;
-                }
-                if used == 0 && n == 0 || !matches!(status, TDEFLStatus::Okay | TDEFLStatus::Done) {
-                    return Err(Error::fatal(-1, "ZIP compression failed"));
-                }
-            }
-            Ok(())
-        } else {
-            sink.write(input)
+        match self.encoder.as_mut() {
+            Some(encoder) if finish => encoder.close(&mut sink),
+            Some(encoder) => encoder.write(input, &mut sink),
+            None => sink.write(input),
         }
     }
 }
@@ -487,7 +454,6 @@ impl Format for Zip {
             packed: 0,
             crc,
             encoder: None,
-            deflate: None,
             skip_lzma: 0,
             cipher: Cipher::None,
             ae2,
@@ -537,9 +503,7 @@ impl Format for Zip {
             }
         }
         if method == 8 {
-            member.deflate = Some(Box::new(CompressorOxide::new(
-                create_comp_flags_from_zip_params(i32::from(self.level), -15, 0),
-            )));
+            member.encoder = Some(Box::new(crate::write::filter::gzip::Gzip::raw(self.level)));
         } else if method != 0 {
             let code = match method {
                 12 => 2,

@@ -44,7 +44,7 @@ pub(crate) fn failed(e: deflate::Error) -> Error {
 enum Wrap {
     /// The gzip filter's header and trailer.
     Gzip,
-    /// None: 7-Zip's deflate coder.
+    /// None: 7-Zip's and ZIP's deflate coders.
     Raw,
 }
 
