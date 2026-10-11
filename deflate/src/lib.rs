@@ -239,7 +239,6 @@ impl Deflate {
             window_size: 2 * w_size,
             prev: Box::new([0; 1 << 15]),
             head: vec![0; 1 << hash_bits],
-            ins_h: 0,
             hash_mask: (1 << hash_bits) - 1,
             hash_shift: hash_bits.div_ceil(MIN_MATCH as u32),
             block_start: 0,
@@ -331,8 +330,6 @@ struct State {
     /// Heads of the hash chains or NIL.
     head: Vec<u16>,
 
-    /// hash index of string to be inserted
-    ins_h: usize,
     /// hash_size-1
     hash_mask: usize,
     /// Number of bits by which ins_h must be shifted at each input step. It
@@ -414,7 +411,6 @@ impl State {
         self.match_length = MIN_MATCH - 1;
         self.prev_length = MIN_MATCH - 1;
         self.match_available = false;
-        self.ins_h = 0;
     }
 
     /// In order to simplify the code, particularly on 16 bit machines, match
@@ -423,25 +419,47 @@ impl State {
         self.w_size - MIN_LOOKAHEAD
     }
 
-    /// Update a hash value with the given input byte
-    /// IN  assertion: all calls to UPDATE_HASH are made with consecutive input
-    ///    characters, so that a running hash key can be computed from the
-    ///    previous key instead of complete recalculation each time.
-    fn update_hash(&mut self, c: u8) {
-        self.ins_h = ((self.ins_h << self.hash_shift) ^ usize::from(c)) & self.hash_mask;
+    /// The hash key of the string whose first MIN_MATCH bytes are s. zlib
+    /// keeps a running key, ins_h, updated with each input byte (UPDATE_HASH).
+    /// Older bytes are shifted out of it after MIN_MATCH updates, as
+    /// hash_shift * MIN_MATCH is at least hash_bits, and every INSERT_STRING
+    /// follows updates with the string's first bytes, so the key is that of
+    /// those bytes alone. Computing it from them gives zlib's keys without
+    /// the serial dependency.
+    fn hash(s: &[u8], shift: u32, mask: usize) -> usize {
+        let [a, b, c] = [s[0], s[1], s[2]].map(usize::from);
+        ((a << (2 * shift)) ^ (b << shift) ^ c) & mask
     }
 
     /// Insert string str in the dictionary and return the previous head of the
     /// hash chain (the most recent string with same hash key).
-    /// IN  assertion: all calls to INSERT_STRING are made with consecutive
-    ///    input characters and the first MIN_MATCH bytes of str are valid
-    ///    (except for the last MIN_MATCH-1 bytes of the input file).
+    /// IN  assertion: the first MIN_MATCH bytes of str are valid (except for
+    ///    the last MIN_MATCH-1 bytes of the input file).
     fn insert_string(&mut self, str: usize) -> u16 {
-        self.update_hash(self.window[str + (MIN_MATCH - 1)]);
-        let head = self.head[self.ins_h];
+        let h = Self::hash(
+            &self.window[str..str + MIN_MATCH],
+            self.hash_shift,
+            self.hash_mask,
+        );
+        let head = self.head[h];
         self.prev[str & self.w_mask] = head;
-        self.head[self.ins_h] = str as u16;
+        self.head[h] = str as u16;
         head
+    }
+
+    /// INSERT_STRING for each of strs in turn.
+    fn insert_strings(&mut self, strs: std::ops::Range<usize>) {
+        if strs.is_empty() {
+            return;
+        }
+        let strings = self.window[strs.start..strs.end + MIN_MATCH - 1].windows(MIN_MATCH);
+        let (head, prev) = (&mut self.head, &mut *self.prev);
+        let (shift, mask, wmask) = (self.hash_shift, self.hash_mask, self.w_mask & 0x7fff);
+        for (str, s) in strs.zip(strings) {
+            let h = Self::hash(s, shift, mask);
+            prev[str & wmask] = head[h];
+            head[h] = str as u16;
+        }
     }
 
     /// Slide the hash table when sliding the window down (could be avoided
@@ -765,15 +783,12 @@ impl State {
             self.window[at..at + buf.len()].copy_from_slice(buf);
             self.lookahead += buf.len();
 
-            // Initialize the hash value now that we have some input:
+            // Insert the strings left at the end of the window now that we
+            // have some input:
             if self.lookahead + self.insert >= MIN_MATCH {
                 let mut str = self.strstart - self.insert;
-                self.ins_h = usize::from(self.window[str]);
-                self.update_hash(self.window[str + 1]);
                 while self.insert != 0 {
-                    self.update_hash(self.window[str + MIN_MATCH - 1]);
-                    self.prev[str & self.w_mask] = self.head[self.ins_h];
-                    self.head[self.ins_h] = str as u16;
+                    self.insert_string(str);
                     str += 1;
                     self.insert -= 1;
                     if self.lookahead + self.insert < MIN_MATCH {
@@ -781,9 +796,6 @@ impl State {
                     }
                 }
             }
-            // If the whole input has less than MIN_MATCH bytes, ins_h is
-            // garbage, but this is not important since only literal bytes will
-            // be emitted.
 
             if self.lookahead >= MIN_LOOKAHEAD || strm.avail_in() == 0 {
                 break;
@@ -1022,26 +1034,15 @@ impl State {
                 // length is not too large. This saves time but degrades
                 // compression.
                 if self.match_length <= self.max_lazy_match && self.lookahead >= MIN_MATCH {
-                    self.match_length -= 1; // string at strstart already in table
-                    loop {
-                        self.strstart += 1;
-                        self.insert_string(self.strstart);
-                        // strstart never exceeds WSIZE-MAX_MATCH, so there are
-                        // always MIN_MATCH bytes ahead.
-                        self.match_length -= 1;
-                        if self.match_length == 0 {
-                            break;
-                        }
-                    }
-                    self.strstart += 1;
+                    // The string at strstart is already in the table. strstart
+                    // never exceeds WSIZE-MAX_MATCH, so there are always
+                    // MIN_MATCH bytes ahead.
+                    self.insert_strings(self.strstart + 1..self.strstart + self.match_length);
+                    self.strstart += self.match_length;
+                    self.match_length = 0;
                 } else {
                     self.strstart += self.match_length;
                     self.match_length = 0;
-                    self.ins_h = usize::from(self.window[self.strstart]);
-                    self.update_hash(self.window[self.strstart + 1]);
-                    // If lookahead < MIN_MATCH, ins_h is garbage, but it does
-                    // not matter since it will be recomputed at next deflate
-                    // call.
                 }
             } else {
                 // No match, output a literal byte
@@ -1125,20 +1126,11 @@ impl State {
                 // not enough lookahead, the last two strings are not inserted
                 // in the hash table.
                 self.lookahead -= self.prev_length - 1;
-                self.prev_length -= 2;
-                loop {
-                    self.strstart += 1;
-                    if self.strstart <= max_insert {
-                        self.insert_string(self.strstart);
-                    }
-                    self.prev_length -= 1;
-                    if self.prev_length == 0 {
-                        break;
-                    }
-                }
+                let end = self.strstart + self.prev_length - 2;
+                self.insert_strings(self.strstart + 1..min(end, max_insert) + 1);
                 self.match_available = false;
                 self.match_length = MIN_MATCH - 1;
-                self.strstart += 1;
+                self.strstart = end + 1;
 
                 if bflush {
                     self.flush_block_only(strm, false);
