@@ -29,6 +29,7 @@ impl BitWriter<Vec<u8>> {
 
 impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// Initialize a new writer.
+    #[cfg(test)]
     pub fn from(mut output: V) -> BitWriter<V> {
         BitWriter {
             bit_idx: output.as_mut().len() * 8,
@@ -41,15 +42,6 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// Get the current index. Can be used to reset to this index or to later change the bits at this index
     pub fn index(&self) -> usize {
         self.bit_idx + self.bits_in_partial
-    }
-
-    /// Reset to an index. Currently only supports resetting to a byte aligned index
-    pub fn reset_to(&mut self, index: usize) {
-        assert!(index.is_multiple_of(8));
-        self.partial = 0;
-        self.bits_in_partial = 0;
-        self.bit_idx = index;
-        self.output.as_mut().resize(index / 8, 0);
     }
 
     /// Change the bits at the index. `bits` contains the ǹum_bits` new bits that should be written
@@ -99,25 +91,6 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             self.output.as_mut()[idx] &= 0xFFu8 << num_bits;
             self.output.as_mut()[idx] |= bits as u8;
         }
-    }
-
-    /// Simply append bytes to the buffer. Only works if the buffer was already byte aligned
-    pub fn append_bytes(&mut self, data: &[u8]) {
-        if self.misaligned() != 0 {
-            panic!("Don't append bytes when writer is misaligned")
-        }
-        self.flush();
-        self.output.as_mut().extend_from_slice(data);
-        self.bit_idx += data.len() * 8;
-    }
-
-    /// Append a byte-aligned section while keeping the bit index synchronized.
-    pub(crate) fn with_aligned_vec(&mut self, f: impl FnOnce(&mut Vec<u8>)) {
-        assert_eq!(self.misaligned(), 0);
-        self.flush();
-        let output = self.output.as_mut();
-        f(output);
-        self.bit_idx = output.len() * 8;
     }
 
     /// Flush temporary internal buffers to the output buffer. Only works if this is currently byte aligned

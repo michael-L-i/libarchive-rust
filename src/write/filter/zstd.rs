@@ -27,148 +27,11 @@
 // Ported from libarchive/archive_write_add_filter_zstd.c.
 
 use super::*;
-use ruzstd::encoding::{CompressionLevel, FrameCompressor, Matcher, Sequence, StreamCompressor};
+use ruzstd::encoding::{CompressionLevel, FrameCompressor, StreamCompressor};
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::JoinHandle;
 
-// Keep history across blocks: tar headers and small files often repeat beyond
-// the block boundary. A fixed table avoids allocating and hashing a map for
-// every block, while the advertised window bounds both memory and offsets.
-const WINDOW: usize = 1024 * 1024;
-const HASH_BITS: usize = 16;
-struct Matches {
-    size: usize,
-    data: Vec<u8>,
-    start: usize,
-    positions: Vec<u32>,
-    space: Vec<u8>,
-}
-impl Matches {
-    fn new(size: usize) -> Self {
-        Self {
-            size,
-            data: Vec::with_capacity(2 * WINDOW + size),
-            start: 0,
-            positions: vec![0; 1 << HASH_BITS],
-            space: Vec::new(),
-        }
-    }
-    fn key(data: &[u8]) -> usize {
-        // A fifth byte separates common four-byte text prefixes.
-        let word = data
-            .first_chunk::<8>()
-            .map_or(0, |bytes| u64::from_le_bytes(*bytes));
-        ((word << 24).wrapping_mul(0xcf1bbcdcb7a56463) >> (64 - HASH_BITS)) as usize
-    }
-    fn remember(&mut self, at: usize) {
-        if at + 8 <= self.data.len() {
-            self.positions[Self::key(&self.data[at..])] = at as u32 + 1;
-        }
-    }
-}
-impl Matcher for Matches {
-    fn get_next_space(&mut self) -> Vec<u8> {
-        let mut space = std::mem::take(&mut self.space);
-        space.resize(self.size, 0);
-        space
-    }
-    fn get_last_space(&mut self) -> &[u8] {
-        &self.data[self.start..]
-    }
-    fn commit_space(&mut self, mut data: Vec<u8>) {
-        // Retain an extra window before compacting, amortizing the history
-        // copy across many blocks. Match offsets still cannot exceed WINDOW.
-        let remove = if self.data.len() >= 2 * WINDOW {
-            self.data.len() - WINDOW
-        } else {
-            0
-        };
-        if remove != 0 {
-            self.data.copy_within(remove.., 0);
-            self.data.truncate(self.data.len() - remove);
-            // Zero denotes an absent key; removed history expires to zero.
-            for position in &mut self.positions {
-                *position = position.saturating_sub(remove as u32);
-            }
-        }
-        self.start = self.data.len();
-        self.data.extend_from_slice(&data);
-        data.clear();
-        self.space = data;
-        // Include keys straddling the previous block boundary.
-        for at in self.start.saturating_sub(7)..self.start {
-            self.remember(at);
-        }
-    }
-    fn skip_matching(&mut self) {
-        // ruzstd skips matching for RLE blocks, but subsequent blocks may
-        // still reference their bytes.
-        if self.start + 8 <= self.data.len() {
-            self.remember(self.start);
-            self.remember(self.data.len() - 8);
-        }
-    }
-    fn reset(&mut self, _: CompressionLevel) {
-        self.data.clear();
-        self.positions.fill(0);
-        self.start = 0;
-    }
-    fn window_size(&self) -> u64 {
-        WINDOW as u64
-    }
-    fn start_matching(&mut self, mut emit: impl for<'a> FnMut(Sequence<'a>)) {
-        let mut literal = self.start;
-        // ruzstd's FSE builder cannot encode a literal-length alphabet
-        // containing only symbol zero. One leading literal keeps that table
-        // valid even when the entire block repeats earlier history.
-        self.remember(literal);
-        let mut at = literal + usize::from(literal < self.data.len());
-        let mut misses = 0usize;
-        while at + 8 <= self.data.len() {
-            let key = Self::key(&self.data[at..]);
-            let position = self.positions[key];
-            self.positions[key] = at as u32 + 1;
-            let prior = position
-                .checked_sub(1)
-                .map(|p| p as usize)
-                .filter(|&p| p < at && at - p <= WINDOW);
-            if let Some(prev) = prior.filter(|&p| self.data[p..p + 4] == self.data[at..at + 4]) {
-                // ruzstd 0.9's code-52 extra-bit baseline is incorrect;
-                // splitting very long matches avoids that malformed encoding.
-                let limit = (self.data.len() - at).min(65538);
-                let mut n = 4;
-                while n + 8 <= limit
-                    && self.data[prev + n..prev + n + 8] == self.data[at + n..at + n + 8]
-                {
-                    n += 8;
-                }
-                while n < limit && self.data[prev + n] == self.data[at + n] {
-                    n += 1;
-                }
-                emit(Sequence::Triple {
-                    literals: &self.data[literal..at],
-                    offset: at - prev,
-                    match_len: n,
-                });
-                misses = 0;
-                at += n;
-                literal = at;
-                // Seed the tail without hashing every byte of long matches.
-                self.remember(at.saturating_sub(2));
-                self.remember(at.saturating_sub(1));
-            } else {
-                // Back off only after sustained misses, and bound the stride so
-                // repeated regions can quickly restart dense matching.
-                misses += 1;
-                at += (1 + (misses >> 6)).min(16);
-            }
-        }
-        emit(Sequence::Literals {
-            literals: &self.data[literal..],
-        });
-    }
-}
 struct Input {
     rx: Receiver<Vec<u8>>,
     data: Vec<u8>,
@@ -212,16 +75,6 @@ impl Write for Output {
         Ok(())
     }
 }
-fn block_size(level: i64) -> usize {
-    if level <= 1 {
-        16 * 1024
-    } else if level <= 3 {
-        96 * 1024
-    } else {
-        128 * 1024
-    }
-}
-
 struct Worker {
     tx: Option<SyncSender<Vec<u8>>>,
     rx: Receiver<Vec<u8>>,
@@ -230,21 +83,21 @@ struct Worker {
     pending: Vec<u8>,
     chunk_size: usize,
 }
+/// Input batches handed to the worker thread.
+const CHUNK_SIZE: usize = 65536;
+
 impl Worker {
-    fn new(level: i64) -> Result<Self, Error> {
+    fn new(level: i64, window_log: Option<u32>) -> Result<Self, Error> {
         let (tx, input) = mpsc::sync_channel(1);
         let (output, rx) = mpsc::sync_channel(1);
         // Coalesced wakeups cover either resource that can unblock a send.
         let (notify, ready) = mpsc::sync_channel(1);
-        let size = block_size(level);
         let thread = std::thread::Builder::new()
             .name("archive-zstd-encoder".into())
             .spawn(move || {
                 std::panic::catch_unwind(|| {
-                    let mut encoder = FrameCompressor::new_with_matcher(
-                        Matches::new(size),
-                        CompressionLevel::Fastest,
-                    );
+                    let mut encoder = FrameCompressor::new(compression_level(level));
+                    encoder.set_window_log(window_log);
                     encoder.set_source(Input {
                         rx: input,
                         data: Vec::new(),
@@ -265,8 +118,8 @@ impl Worker {
             rx,
             thread: Some(thread),
             ready,
-            pending: Vec::with_capacity(size.min(65536)),
-            chunk_size: size.min(65536),
+            pending: Vec::with_capacity(CHUNK_SIZE),
+            chunk_size: CHUNK_SIZE,
         })
     }
     fn drain(&self, sink: &mut dyn Sink) -> Result<(), Error> {
@@ -370,14 +223,19 @@ fn encode(
 
 enum Encoder {
     Threaded(Worker),
-    Direct(Box<StreamCompressor<Matches>>),
+    Direct(Box<StreamCompressor>),
     Failed,
 }
+fn compression_level(level: i64) -> CompressionLevel {
+    // Options are range checked: -131072..=22.
+    CompressionLevel::Level(level as i32)
+}
+
 impl Encoder {
-    fn direct(level: i64) -> Result<Self, Error> {
+    fn direct(level: i64, window_log: Option<u32>) -> Result<Self, Error> {
         std::panic::catch_unwind(|| {
-            let mut encoder =
-                StreamCompressor::new(Matches::new(block_size(level)), CompressionLevel::Fastest);
+            let mut encoder = StreamCompressor::new(compression_level(level));
+            encoder.set_window_log(window_log);
             encoder.begin();
             Self::Direct(Box::new(encoder))
         })
@@ -407,6 +265,8 @@ impl Encoder {
 
 pub struct Zstd {
     level: i64,
+    /// `long`: libzstd's `ZSTD_c_windowLog`.
+    window_log: Option<u32>,
     encoder: Option<Encoder>,
     frame_per_file: bool,
     min_in: u64,
@@ -420,6 +280,7 @@ impl Default for Zstd {
     fn default() -> Self {
         Self {
             level: 3,
+            window_log: None,
             encoder: None,
             frame_per_file: false,
             min_in: 0,
@@ -453,9 +314,9 @@ impl Zstd {
                 && self.min_out == 0
                 && self.max_out == u64::MAX;
             self.encoder = Some(if direct {
-                Encoder::direct(self.level)?
+                Encoder::direct(self.level, self.window_log)?
             } else {
-                Encoder::Threaded(Worker::new(self.level)?)
+                Encoder::Threaded(Worker::new(self.level, self.window_log)?)
             });
             self.frame_in = 0;
             self.frame_out = 0;
@@ -521,6 +382,7 @@ impl Filter for Zstd {
                 if !(10..=31).contains(&n) {
                     return Err(invalid("long out of range"));
                 }
+                self.window_log = Some(n as u32);
             }
             b"frame-per-file" => self.frame_per_file = true,
             b"min-frame-in" => self.min_in = size(value, "min-frame-in invalid")?,
@@ -590,23 +452,32 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
 
-    fn compressed(data: &[u8], block_size: usize) -> Vec<u8> {
+    fn compressed(data: &[u8], level: i32) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut encoder =
-            FrameCompressor::new_with_matcher(Matches::new(block_size), CompressionLevel::Fastest);
+        let mut encoder = FrameCompressor::new(CompressionLevel::Level(level));
         encoder.set_source(data);
         encoder.set_drain(&mut out);
         encoder.compress();
         out
     }
-    fn roundtrip(data: &[u8], block_size: usize) -> usize {
-        let encoded = compressed(data, block_size);
+    fn decoded(encoded: &[u8]) -> Vec<u8> {
+        // Level 22's 128 MiB window, like the archive reader.
+        let mut decoder = ruzstd::decoding::FrameDecoder::new();
+        decoder.set_max_window_size(1 << 27);
         let mut decoded = Vec::new();
-        ruzstd::decoding::StreamingDecoder::new(encoded.as_slice())
+        ruzstd::decoding::StreamingDecoder::new_with_decoder(encoded, decoder)
             .unwrap()
             .read_to_end(&mut decoded)
             .unwrap();
-        assert_eq!(decoded, data);
+        decoded
+    }
+    fn roundtrip(data: &[u8], level: i32) -> usize {
+        let encoded = compressed(data, level);
+        assert!(
+            decoded(&encoded) == data,
+            "level {level}, {} bytes",
+            data.len()
+        );
         encoded.len()
     }
     fn random_bytes(len: usize) -> Vec<u8> {
@@ -620,11 +491,58 @@ mod tests {
             })
             .collect()
     }
+    /// Words from a small vocabulary with numbers, like logs or source.
+    fn text(len: usize) -> Vec<u8> {
+        const WORDS: [&[u8]; 12] = [
+            b"archive ",
+            b"entry ",
+            b"header ",
+            b"size ",
+            b"the ",
+            b"of ",
+            b"and ",
+            b"compress ",
+            b"block ",
+            b"window ",
+            b"match ",
+            b"literal ",
+        ];
+        let mut state = 0x9E3779B9u32;
+        let mut out = Vec::with_capacity(len + 16);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            out.extend_from_slice(WORDS[state as usize % WORDS.len()]);
+            if state.is_multiple_of(7) {
+                out.extend_from_slice(format!("{}\n", state % 1000).as_bytes());
+            }
+        }
+        out.truncate(len);
+        out
+    }
+    /// Frame blocks as (type, decoded size): 0 raw, 1 RLE, 2 compressed.
+    fn blocks(frame: &[u8]) -> Vec<(u8, usize)> {
+        assert_eq!(&frame[..5], &[0x28, 0xB5, 0x2F, 0xFD, 4]);
+        let mut at = 6;
+        let mut blocks = Vec::new();
+        loop {
+            let header = u32::from_le_bytes([frame[at], frame[at + 1], frame[at + 2], 0]);
+            let (kind, size) = ((header >> 1 & 3) as u8, (header >> 3) as usize);
+            blocks.push((kind, size));
+            at += 3 + if kind == 1 { 1 } else { size };
+            if header & 1 == 1 {
+                assert_eq!(at + 4, frame.len());
+                return blocks;
+            }
+        }
+    }
+
     #[test]
     fn push_encoder_restarts_after_success_and_emit_failure() {
-        let block = 16384;
+        let block = 131072;
         let data = random_bytes(block * 2 + 7);
-        let mut encoder = StreamCompressor::new(Matches::new(block), CompressionLevel::Fastest);
+        let mut encoder = StreamCompressor::new(CompressionLevel::Level(3));
         for len in [0, block, data.len(), 1] {
             encoder.begin();
             let mut actual = Vec::new();
@@ -643,7 +561,7 @@ mod tests {
                     Ok::<_, ()>(())
                 })
                 .unwrap();
-            assert_eq!(actual, compressed(&data[..len], block));
+            assert_eq!(actual, compressed(&data[..len], 3));
         }
         // Fail both the first full block and the separate final checksum write.
         encoder.begin();
@@ -672,24 +590,91 @@ mod tests {
                 Ok::<_, ()>(())
             })
             .unwrap();
-        assert_eq!(actual, compressed(&data, block));
+        assert_eq!(actual, compressed(&data, 3));
     }
 
     #[test]
-    fn matcher_reuses_previous_blocks_and_expires_old_history() {
+    fn every_level_round_trips() {
+        let mut data = text(300_000);
+        data.extend_from_slice(&random_bytes(150_000));
+        data.extend_from_slice(&[0; 140_000]);
+        data.extend_from_slice(&text(200_000));
+        let mut sizes = Vec::new();
+        for level in [-131072, -1000, -5, -1, 0].into_iter().chain(1..=22) {
+            sizes.push((level, roundtrip(&data, level)));
+        }
+        // Stronger strategies compress this better than the fastest ones.
+        let size = |l| sizes.iter().find(|&&(level, _)| level == l).unwrap().1;
+        assert!(size(3) < size(1) && size(9) < size(3) && size(1) < size(-5));
+        assert_eq!(size(0), size(3));
+    }
+
+    #[test]
+    fn edge_inputs_round_trip() {
+        let patterns: [fn(usize) -> Vec<u8>; 4] = [
+            |n| vec![0; n],
+            random_bytes,
+            |n| b"abcd".iter().copied().cycle().take(n).collect(),
+            text,
+        ];
+        let sizes = [
+            0, 1, 2, 6, 7, 8, 15, 16, 17, 255, 256, 1023, 1024, 16383, 16384, 131071, 131072,
+            131073, 262143, 262144, 262145, 393221,
+        ];
+        for level in [-3, 1, 3, 5, 6, 8] {
+            for pattern in patterns {
+                for size in sizes {
+                    roundtrip(&pattern(size), level);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_matches_use_the_largest_length_codes() {
+        // Matches far longer than 65538 bytes need match length code 52.
+        let pattern = random_bytes(1024);
+        let data: Vec<u8> = pattern.iter().copied().cycle().take(1 << 20).collect();
+        for level in [-1, 1, 3, 5, 7, 12] {
+            assert!(roundtrip(&data, level) < 2048, "level {level}");
+        }
+        // And literal runs beyond 65535 bytes before a match.
+        let mut data = random_bytes(100_000);
+        data.extend_from_within(..20_000);
+        roundtrip(&data, 3);
+    }
+
+    #[test]
+    fn matches_reach_back_through_the_window_and_no_further() {
         let block = random_bytes(32768);
         let mut data = block.clone();
         data.extend_from_slice(&block);
         data.extend_from_slice(&block);
-        assert!(roundtrip(&data, 32768) < block.len() + 2048);
-        // Force history compaction and then repeat across that boundary.
-        let mut data = random_bytes(2 * WINDOW + 32768);
-        let tail = data[data.len() - 32768..].to_vec();
-        data.extend_from_slice(&tail);
-        assert!(roundtrip(&data, 32768) < data.len() - 30000);
+        assert!(roundtrip(&data, 3) < block.len() + 2048);
+        // Level 1's 512 KiB window, counted from the end of each block as in
+        // libzstd. Zeros between the repeats keep the search from skipping
+        // ahead, and history beyond twice the window is discarded first.
+        for (gap, compressible) in [(300 * 1024, true), (500 * 1024, false)] {
+            let repeated = random_bytes(64 * 1024);
+            let mut data = text(700 * 1024);
+            data.extend_from_slice(&repeated);
+            data.resize(data.len() + gap, 0);
+            data.extend_from_slice(&repeated);
+            let size = roundtrip(&data, 1);
+            let (without, with) = (
+                compressed(&data[..data.len() - repeated.len()], 1).len(),
+                size,
+            );
+            assert_eq!(
+                with < without + 4096,
+                compressible,
+                "gap {gap}: {without} -> {with}"
+            );
+        }
     }
+
     #[test]
-    fn matcher_resumes_dense_search_after_incompressible_regions() {
+    fn search_resumes_dense_after_incompressible_regions() {
         let mut data = random_bytes(65536);
         for _ in 0..2048 {
             data.extend_from_slice(b"a repeated sentence after random bytes.\n");
@@ -698,74 +683,46 @@ mod tests {
         for _ in 0..2048 {
             data.extend_from_slice(b"a second repeated sentence after random bytes.\n");
         }
-        assert!(roundtrip(&data, 98304) < 103000);
-    }
-
-    #[test]
-    fn matcher_handles_overlap_short_tails_and_skipped_rle_blocks() {
-        for length in [0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 31, 1023, 4097, 65539] {
-            let data: Vec<_> = b"abcd".iter().copied().cycle().take(length).collect();
-            roundtrip(&data, 16384);
-        }
-        let data: Vec<_> = b"abcd".iter().copied().cycle().take(400003).collect();
-        roundtrip(&data, 131072);
-        let mut data = vec![b'x'; 32768];
-        data.extend_from_slice(&[b'x'; 16384]);
-        data.extend_from_slice(&random_bytes(16384));
-        assert!(roundtrip(&data, 32768) < 17000);
-    }
-    #[test]
-    #[ignore = "Set LIBARCHIVE_ZSTD_DECODER to an independent bsdcat executable"]
-    fn matcher_frames_decode_with_independent_backend() {
-        use std::io::{Seek, SeekFrom};
-        use std::process::{Command, Stdio};
-        let decoder = std::env::var_os("LIBARCHIVE_ZSTD_DECODER")
-            .expect("LIBARCHIVE_ZSTD_DECODER must name an independent bsdcat executable");
-        let mut data = random_bytes(WINDOW + 65536);
-        let repeated = data[data.len() - 65536..].to_vec();
-        data.extend_from_slice(&repeated);
-        data.extend_from_slice(&[0; 65536]);
-        data.extend_from_slice(b"abcdabcdabcdabcdx");
-        let periodic: Vec<_> = b"abcd".iter().copied().cycle().take(400003).collect();
-        for (data, block_size) in [(data.as_slice(), 65536), (periodic.as_slice(), 131072)] {
-            let encoded = compressed(data, block_size);
-            let mut input = crate::write::temp_file().unwrap();
-            input.write_all(&encoded).unwrap();
-            input.seek(SeekFrom::Start(0)).unwrap();
-            let result = Command::new(&decoder)
-                .stdin(input)
-                .stdout(Stdio::piped())
-                .output()
-                .unwrap();
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-            assert_eq!(result.stdout, data);
+        for level in [1, 3, 5, 9] {
+            assert!(roundtrip(&data, level) < 101_000, "level {level}");
         }
     }
 
     #[test]
-    fn raw_literals_preserve_huffman_table_for_later_blocks() {
-        let size = 16384;
+    fn raw_blocks_keep_the_previous_entropy_tables() {
+        // A raw middle block must not replace the tables the decoder holds:
+        // the last block may reuse the first block's Huffman table.
+        let size = 131072;
         let mut data = random_bytes(size * 3);
-        for byte in &mut data[..size] {
+        let (first, rest) = data.split_at_mut(size);
+        for byte in first.iter_mut().chain(&mut rest[size..]) {
             *byte %= 127;
         }
-        for byte in &mut data[2 * size..] {
-            *byte %= 127;
-        }
-        // The middle block needs raw literals; the last block can still use
-        // the Huffman table established by the first block.
-        assert!(roundtrip(&data, size) < data.len() - 2000);
+        let encoded = compressed(&data, 3);
+        assert!(decoded(&encoded) == data);
+        // The last block is empty.
+        let kinds: Vec<u8> = blocks(&encoded).iter().map(|b| b.0).collect();
+        assert!(
+            kinds.len() > 3 && kinds[0] == 2 && kinds.contains(&0) && kinds[kinds.len() - 2] == 2
+        );
+        assert!(encoded.len() < data.len() - 2 * 15_000);
     }
 
     #[test]
-    fn matcher_frame_reset_discards_previous_positions() {
-        let block = random_bytes(8192);
-        let mut encoder =
-            FrameCompressor::new_with_matcher(Matches::new(8192), CompressionLevel::Fastest);
+    fn repeated_blocks_after_the_first_are_rle() {
+        let mut data = random_bytes(1000);
+        data.extend_from_slice(&[7; 131072 * 3]);
+        for level in [-1, 1, 3, 6] {
+            let encoded = compressed(&data, level);
+            assert_eq!(decoded(&encoded), data);
+            assert_eq!(blocks(&encoded)[1..], [(1, 131072), (1, 131072), (1, 1000)]);
+        }
+    }
+
+    #[test]
+    fn frame_reset_discards_previous_positions() {
+        let block = text(300_000);
+        let mut encoder = FrameCompressor::new(CompressionLevel::Level(5));
         let mut first = Vec::new();
         encoder.set_source(block.as_slice());
         encoder.set_drain(&mut first);
@@ -775,6 +732,99 @@ mod tests {
         encoder.set_drain(&mut second);
         encoder.compress();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn long_option_sets_the_window() {
+        let mut data = text(70_000);
+        data.extend_from_slice(&random_bytes(5000));
+        data.extend_from_within(..3000);
+        for (log, block) in [(10, 1024), (12, 4096), (17, 131072), (23, 131072)] {
+            let mut filter = Zstd::default();
+            filter
+                .options(b"long", Some(log.to_string().as_bytes()))
+                .unwrap();
+            let mut out = Bytes::default();
+            filter.write(&data, &mut out).unwrap();
+            filter.close(&mut out).unwrap();
+            assert_eq!(out.0[5], (log - 10) << 3);
+            assert!(decoded(&out.0) == data);
+            let blocks = blocks(&out.0);
+            assert_eq!(blocks.len() > 1, block < data.len());
+            assert!(
+                blocks
+                    .iter()
+                    .all(|&(kind, size)| kind == 1 || size <= block)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "Set LIBARCHIVE_ZSTD_DECODER to an independent bsdcat executable"]
+    fn frames_decode_with_independent_backend() {
+        use std::io::{Seek, SeekFrom};
+        use std::process::{Command, Stdio};
+        let decoder = std::env::var_os("LIBARCHIVE_ZSTD_DECODER")
+            .expect("LIBARCHIVE_ZSTD_DECODER must name an independent bsdcat executable");
+        let mut data = random_bytes(3 << 20);
+        let repeated = data[data.len() - 65536..].to_vec();
+        data.extend_from_slice(&repeated);
+        data.extend_from_slice(&[0; 300_000]);
+        data.extend_from_slice(&text(500_000));
+        data.extend_from_slice(b"abcdabcdabcdabcdx");
+        let periodic: Vec<_> = b"abcd".iter().copied().cycle().take(400003).collect();
+        for level in [-5, 1, 3, 5, 7, 12, 19] {
+            for data in [data.as_slice(), periodic.as_slice()] {
+                let encoded = compressed(data, level);
+                let mut input = crate::write::temp_file().unwrap();
+                input.write_all(&encoded).unwrap();
+                input.seek(SeekFrom::Start(0)).unwrap();
+                let result = Command::new(&decoder)
+                    .stdin(input)
+                    .stdout(Stdio::piped())
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert!(result.stdout == data, "level {level}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Streams 4.5 GiB to exercise index overflow correction"]
+    fn indices_are_corrected_beyond_3500_mib() {
+        // Three 512 KiB segments, repeated within level 3's 2 MiB window.
+        let segments: Vec<Vec<u8>> = (0..3)
+            .map(|k| {
+                let mut segment = random_bytes(512 * 1024 + k);
+                segment.truncate(512 * 1024);
+                segment[..8].copy_from_slice(&(k as u64).to_le_bytes());
+                segment
+            })
+            .collect();
+        let count = 9 * 1024;
+        let mut encoder = StreamCompressor::new(CompressionLevel::Level(3));
+        let mut encoded = Vec::new();
+        let mut emit = |b: &[u8]| {
+            encoded.extend_from_slice(b);
+            Ok::<_, ()>(())
+        };
+        encoder.begin();
+        for n in 0..count {
+            encoder.write(&segments[n % 3], &mut emit).unwrap();
+        }
+        encoder.finish(&mut emit).unwrap();
+        let mut decoder = ruzstd::decoding::StreamingDecoder::new(encoded.as_slice()).unwrap();
+        let mut segment = vec![0; 512 * 1024];
+        for n in 0..count {
+            decoder.read_exact(&mut segment).unwrap();
+            assert!(segment == segments[n % 3], "segment {n}");
+        }
+        assert_eq!(decoder.read(&mut segment).unwrap(), 0);
     }
 
     #[test]
@@ -883,8 +933,8 @@ mod tests {
     fn direct_and_threaded_encoders_match_at_every_level() {
         let data = random_bytes(262149);
         for level in [1, 3, 9] {
-            let mut direct = Encoder::direct(level).unwrap();
-            let mut threaded = Encoder::Threaded(Worker::new(level).unwrap());
+            let mut direct = Encoder::direct(level, None).unwrap();
+            let mut threaded = Encoder::Threaded(Worker::new(level, None).unwrap());
             let mut a = Bytes::default();
             let mut b = Bytes::default();
             for part in data.chunks(511) {
@@ -905,9 +955,9 @@ mod tests {
                 std::panic::panic_any(12345u32);
             }
         }
-        let mut encoder = Encoder::direct(3).unwrap();
+        let mut encoder = Encoder::direct(3, None).unwrap();
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            encoder.write(&vec![0; 98304], &mut PanicSink).unwrap();
+            encoder.write(&vec![0; 131072], &mut PanicSink).unwrap();
         }))
         .unwrap_err();
         assert_eq!(panic.downcast_ref::<u32>(), Some(&12345));
@@ -915,19 +965,15 @@ mod tests {
     }
 
     #[test]
-    fn uncompressed_custom_matcher_pull_and_push_agree() {
-        for size in [0, 1, 16384, 32769] {
+    fn uncompressed_pull_and_push_agree() {
+        for size in [0, 1, 16384, 131073] {
             let data = random_bytes(size);
             let mut pull = Vec::new();
-            let mut encoder = FrameCompressor::new_with_matcher(
-                Matches::new(16384),
-                CompressionLevel::Uncompressed,
-            );
+            let mut encoder = FrameCompressor::new(CompressionLevel::Uncompressed);
             encoder.set_source(data.as_slice());
             encoder.set_drain(&mut pull);
             encoder.compress();
-            let mut encoder =
-                StreamCompressor::new(Matches::new(16384), CompressionLevel::Uncompressed);
+            let mut encoder = StreamCompressor::new(CompressionLevel::Uncompressed);
             let mut push = Vec::new();
             encoder.begin();
             encoder

@@ -1960,3 +1960,33 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - Archives of directory trees can still differ from upstream: Rust
   `read_disk` visits a directory's entries in a different order than C, so
   the encoder sees different input (the many-files benchmark).
+
+## Zstd writer encoder (`src/write/filter/zstd.rs`, vendored ruzstd)
+
+The filter compresses with a safe port of libzstd 1.5.7's compressor in the
+vendored ruzstd (`vendor/ruzstd/PATCHES.md`), replacing the earlier bounded
+single-hash matcher. Levels and options keep libarchive's meaning.
+
+### Differences
+
+- Compressed bytes differ from libzstd's; sizes are within about 1% (level
+  3: 0.72% smaller to equal on the benchmark tars). libzstd's streaming
+  buffer wraps and matches across the wrap with its external-dictionary
+  variants; the port keeps one contiguous window, so candidates near the
+  wrap differ. A new offset equal to a repeat offset is coded as a repeat
+  code, which libzstd's matchers do not do.
+- Levels 13-22 do not use libzstd's binary-tree or optimal parsers: they
+  keep libzstd's windows and table sizes and search with lazy2 (at most 64
+  candidates). They compress about like level 12, not like libzstd's
+  levels 13-22.
+- The row match finder computes hashes when used rather than eight positions
+  ahead (libzstd uses that cache to prefetch); the positions searched are the
+  same. Its hash salt is the one a fresh libzstd context uses for its first
+  frame; libzstd changes it on each reuse.
+- `threads` is still accepted and ignored: compression is single threaded.
+- `long=N` now sets the window log as libarchive's `ZSTD_c_windowLog` call
+  does (it was accepted and ignored). As with libzstd, frames with a window
+  above 2^27 are refused by default decoders, including this port's reader.
+- A frame ended before any input has the usual window descriptor and no
+  content size; libzstd, given only `ZSTD_e_end`, writes a single-segment
+  header with content size 0. Both decode to nothing.

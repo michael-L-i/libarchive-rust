@@ -545,3 +545,55 @@ p, p+1, ... in table order, and state n reads `log + 1 - highbit(n)` bits from
 `(n << bits) - size`. An exhaustive test compares both formulas for every
 accuracy log up to 9, probability and state. Predefined distributions are no
 longer copied into new vectors per block. All 2256 archive cases match.
+
+## Round 12: port of libzstd 1.5.7's compressor
+
+The encoder in `src/encoding/` is replaced by a safe port of libzstd 1.5.7's
+compressor, as used for streams of unknown size:
+
+- `params.rs`: `ZSTD_defaultCParameters` row 0 (sources over 256 KiB or of
+  unknown size) and negative-level acceleration. Levels 13-22 keep their
+  window, hash and search parameters but use lazy2: the binary-tree and
+  optimal parsers are not ported.
+- `fast.rs`, `double_fast.rs`, `lazy.rs`: `ZSTD_compressBlock_fast`,
+  `_doubleFast` and `_lazy_generic` (greedy, lazy, lazy2 with the row match
+  finder and libzstd's hash salt) for a contiguous window.
+- `fse.rs`, `huf.rs`, `literals.rs`, `sequences.rs`: histograms, FSE
+  normalization, table descriptions and encoding, Huffman tree building with
+  libzstd's sort and height limit, table reuse and validation, raw and RLE
+  literals, `ZSTD_selectEncodingType` (predefined, RLE, repeat or new FSE
+  tables) and the sequence bit stream.
+- `pre_split.rs`: `ZSTD_optimalBlockSize` / `ZSTD_splitBlock`.
+- `frame_compressor.rs`: the streaming frame layer: 128 KiB blocks (or the
+  window, if smaller), `ZSTD_compressBlock_internal`'s raw and RLE fallbacks,
+  index overflow correction past 3500 MiB, the frame header and checksum.
+
+Repeat codes are assigned while entropy coding from the decoder's exact
+repeat-offset history, so a match finder's own bookkeeping can never yield
+a wrong offset. Entropy tables and repeat offsets are committed only when a
+compressed block is emitted, as in libzstd; raw and RLE blocks leave both as
+the decoder has them. This resolves two defects of the old encoder: it
+replaced its Huffman table even when the frame layer then stored the block
+raw, so a later block could reuse a table the decoder never saw, and it
+encoded match length code 52 with the wrong baseline (its matcher split
+matches at 65538 bytes to avoid it). Neither workaround remains.
+
+Public API: `CompressionLevel::Default`, `Better` and `Best` now work (levels
+3, 7, 11) and `CompressionLevel::Level(i32)` takes any zstd level.
+`StreamCompressor`/`FrameCompressor` no longer take a `Matcher`, and
+`set_window_log` overrides the window like `ZSTD_c_windowLog`. The `Matcher`
+trait, `Sequence` and `MatchGeneratorDriver` are removed. The old
+`fse_encoder`, `huff0_encoder` and `BitWriter` remain only for the decoder's
+round-trip tests and `fuzz_exports`; helpers only the old block encoder used
+are deleted. The sections above about the old encoder (literal size checks,
+direct FSE state lookup, the archive matcher, batched and bounded sequence
+bits) no longer apply; the push `StreamCompressor` API is kept.
+
+No unsafe code is added. Validation (2026-10-11): `zstd -d` (libzstd 1.5.7)
+and ruzstd decode every level from -5 to 22 and -131072 on two inputs, 528
+edge cases (sizes 0 through 393221 around block boundaries, zeros, random,
+periodic and text data at levels -3, 1, 3, 5, 6 and 8), and window logs 10,
+12, 17 and 23, byte for byte. A 4.5 GiB stream exercises overflow correction
+(opt-in root test). Sizes at level 3 on the eight benchmark tars are within
+-0.72% to 0% of libzstd's streaming output (text and random are equal).
+Evidence: sibling `diagnostics/round12-zstd-enc`.

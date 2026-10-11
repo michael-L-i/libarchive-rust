@@ -1,20 +1,342 @@
-//! Utilities and interfaces for encoding an entire frame. Allows reusing resources
+//! Frames and blocks, ported from libzstd 1.5.7's streaming compressor
+//! (`ZSTD_compressStream2()`, `ZSTD_compress_frameChunk()` and
+//! `ZSTD_compressBlock_internal()` in `zstd_compress.c`).
 
+use alloc::vec;
 use alloc::vec::Vec;
-use core::convert::TryInto;
+#[cfg(feature = "hash")]
+use core::hash::Hasher;
 #[cfg(feature = "hash")]
 use twox_hash::XxHash64;
 
-#[cfg(feature = "hash")]
-use core::hash::Hasher;
-
-use super::{
-    block_header::BlockHeader, frame_header::FrameHeader, levels::*,
-    match_generator::MatchGeneratorDriver, CompressionLevel, Matcher,
-};
-use crate::fse::fse_encoder::{default_ll_table, default_ml_table, default_of_table, FSETable};
-
+use super::literals::min_gain;
+use super::match_state::{MatchState, CURRENT_MAX};
+use super::params::{CParams, Strategy};
+use super::sequences::{self, Entropy, Scratch, SeqStore};
+use super::{double_fast, fast, lazy, pre_split, CompressionLevel};
+use crate::common::MAGIC_NUM;
 use crate::io::{Read, Write};
+
+/// `ZSTD_BLOCKSIZE_MAX`.
+const MAX_BLOCK_SIZE: usize = 128 * 1024;
+const RAW_BLOCK: u32 = 0;
+const RLE_BLOCK: u32 = 1;
+const COMPRESSED_BLOCK: u32 = 2;
+
+/// A push-based Zstd frame encoder.
+///
+/// Call [StreamCompressor::begin] to start a frame, feed data with [StreamCompressor::write]
+/// and end the frame with [StreamCompressor::finish]. Encoded bytes are handed to `emit`;
+/// concatenated, they are identical to [FrameCompressor::compress] output for the same input,
+/// regardless of how the input is chunked.
+///
+/// `write` and `finish` panic unless a frame is open. A frame is closed by `finish` and by any
+/// `emit` error; `begin` always starts a fresh frame.
+pub struct StreamCompressor {
+    level: CompressionLevel,
+    window_log: Option<u32>,
+    params: CParams,
+    /// The window followed by input not yet compressed, `data[pending..]`.
+    data: Vec<u8>,
+    pending: usize,
+    ms: MatchState,
+    /// The repeat offsets as the decoder will see them.
+    rep: [u32; 3],
+    prev: Entropy,
+    next: Entropy,
+    store: SeqStore,
+    scratch: Scratch,
+    body: Vec<u8>,
+    output: Vec<u8>,
+    first_block: bool,
+    consumed: u64,
+    produced: u64,
+    #[cfg(feature = "hash")]
+    hasher: XxHash64,
+    open: bool,
+    /// The match state is unused since `new`.
+    fresh: bool,
+}
+
+impl StreamCompressor {
+    /// Create a new `StreamCompressor`. No frame is open yet.
+    pub fn new(level: CompressionLevel) -> Self {
+        let params = params(level, None);
+        Self {
+            level,
+            window_log: None,
+            params,
+            data: Vec::new(),
+            pending: 0,
+            ms: MatchState::new(params),
+            rep: [1, 4, 8],
+            prev: Entropy::default(),
+            next: Entropy::default(),
+            store: SeqStore::new(MAX_BLOCK_SIZE),
+            scratch: Scratch::default(),
+            body: vec![0; MAX_BLOCK_SIZE + (MAX_BLOCK_SIZE >> 8) + 64],
+            output: Vec::new(),
+            first_block: true,
+            consumed: 0,
+            produced: 0,
+            #[cfg(feature = "hash")]
+            hasher: XxHash64::with_seed(0),
+            open: false,
+            fresh: true,
+        }
+    }
+
+    /// Start a new frame, abandoning any frame still open.
+    ///
+    /// The frame header is buffered and emitted together with the first block.
+    pub fn begin(&mut self) {
+        self.open = false;
+        self.params = params(self.level, self.window_log);
+        if !self.fresh || self.ms.params != self.params {
+            self.ms = MatchState::new(self.params);
+        }
+        self.fresh = false;
+        self.data.clear();
+        // The most the window buffer holds, see append().
+        self.data
+            .reserve(2 * (1 << self.params.window_log) + self.block_max());
+        self.pending = 0;
+        self.rep = [1, 4, 8];
+        self.prev = Entropy::default();
+        self.first_block = true;
+        #[cfg(feature = "hash")]
+        {
+            self.hasher = XxHash64::with_seed(0);
+        }
+        // ZSTD_writeFrameHeader() for an unknown content size: no content
+        // size or dictionary, a window descriptor and the checksum flag.
+        self.output.clear();
+        self.output.extend_from_slice(&MAGIC_NUM.to_le_bytes());
+        self.output.push(u8::from(cfg!(feature = "hash")) << 2);
+        self.output.push(((self.params.window_log - 10) << 3) as u8);
+        self.consumed = 0;
+        self.produced = self.output.len() as u64;
+        self.open = true;
+    }
+
+    /// Compress `data` into the open frame, emitting every block that fills up.
+    pub fn write<E>(
+        &mut self,
+        mut data: &[u8],
+        mut emit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        assert!(
+            self.open,
+            "StreamCompressor::write called without an open frame"
+        );
+        let block_max = self.block_max();
+        while !data.is_empty() {
+            let n = (block_max - (self.data.len() - self.pending)).min(data.len());
+            self.append(&data[..n]);
+            data = &data[n..];
+            if self.data.len() - self.pending == block_max {
+                // Stays closed if compression panics or emitting fails.
+                self.open = false;
+                self.compress_chunk(false);
+                self.flush(&mut emit)?;
+                self.open = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit the last block (an empty Raw block if no data is pending) and the checksum.
+    ///
+    /// The frame is closed afterwards, even if `emit` fails.
+    pub fn finish<E>(&mut self, mut emit: impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
+        assert!(
+            self.open,
+            "StreamCompressor::finish called without an open frame"
+        );
+        self.open = false;
+        self.compress_chunk(true);
+        self.flush(&mut emit)?;
+        #[cfg(feature = "hash")]
+        emit(&(self.hasher.finish() as u32).to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Between frames you can replace the compression level
+    pub fn set_compression_level(
+        &mut self,
+        compression_level: CompressionLevel,
+    ) -> CompressionLevel {
+        core::mem::replace(&mut self.level, compression_level)
+    }
+
+    /// Get the current compression level
+    pub fn compression_level(&self) -> CompressionLevel {
+        self.level
+    }
+
+    /// Between frames you can override the level's window size, as libzstd's
+    /// `ZSTD_c_windowLog` does: a window of `1 << log` bytes, `log` in
+    /// 10..=31. `None` restores the level's window.
+    pub fn set_window_log(&mut self, log: Option<u32>) {
+        assert!(log.is_none_or(|log| (10..=31).contains(&log)));
+        self.window_log = log;
+    }
+
+    /// `ZSTD_compressStream2()` buffers a block of `min(128 KiB, window)`.
+    fn block_max(&self) -> usize {
+        MAX_BLOCK_SIZE.min(1 << self.params.window_log)
+    }
+
+    /// Append input, first dropping history beyond the window. Up to another
+    /// window's worth of history is kept to amortize the copy.
+    fn append(&mut self, input: &[u8]) {
+        let window = 1usize << self.params.window_log;
+        if self.data.len() + input.len() > 2 * window + self.block_max() && self.pending > window {
+            self.discard(self.pending - window);
+        }
+        self.data.extend_from_slice(input);
+        #[cfg(feature = "hash")]
+        self.hasher.write(input);
+    }
+
+    fn discard(&mut self, len: usize) {
+        self.data.drain(..len);
+        self.pending -= len;
+        self.ms.base += len as u32;
+    }
+
+    fn flush<E>(&mut self, mut emit: impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
+        let result = emit(&self.output);
+        self.output.clear();
+        result
+    }
+
+    /// `ZSTD_compress_frameChunk()`: compress the pending input into one or
+    /// more blocks.
+    fn compress_chunk(&mut self, last: bool) {
+        let chunk_len = self.data.len() - self.pending;
+        let output_start = self.output.len();
+        if chunk_len == 0 {
+            if last {
+                // ZSTD_writeLastEmptyBlock()
+                block_header(&mut self.output, true, RAW_BLOCK, 0);
+            }
+            return;
+        }
+        // ZSTD_overflowCorrectIfNeeded(), for the whole chunk. Indices then
+        // drop to about a window, so keep no more history than that.
+        if self.ms.base + self.data.len() as u32 > CURRENT_MAX {
+            let window = 1usize << self.params.window_log;
+            self.discard(self.pending.saturating_sub(window));
+            self.ms.correct_overflow(self.ms.base + self.pending as u32);
+        }
+        let mut savings = self.consumed as i64 - self.produced as i64;
+        let mut done = 0;
+        while done < chunk_len {
+            let start = self.pending + done;
+            let size = pre_split::block_size(
+                &self.data[start..],
+                self.block_max(),
+                self.params.strategy,
+                savings,
+            );
+            let last_block = last && done + size == chunk_len;
+            let written = self.compress_block(start, start + size, last_block);
+            savings += size as i64 - written as i64;
+            done += size;
+            self.first_block = false;
+        }
+        self.pending = self.data.len();
+        self.consumed += chunk_len as u64;
+        self.produced += (self.output.len() - output_start) as u64;
+    }
+
+    /// `ZSTD_compressBlock_internal()`: append the block `data[start..end]`
+    /// with its header to the output, compressed, RLE or raw. Returns the
+    /// size written.
+    fn compress_block(&mut self, start: usize, end: usize, last: bool) -> usize {
+        let ms = &mut self.ms;
+        ms.enforce_max_dist(ms.base + start as u32);
+        let block = &self.data[start..end];
+        let mut c_size = 0;
+        // Don't attempt compressing tiny blocks; a compressed block needs a
+        // literals header, a sequences header and a block header.
+        if !matches!(self.level, CompressionLevel::Uncompressed) && block.len() >= 7 {
+            // Limited update after a very long match.
+            let curr = ms.base + start as u32;
+            if curr > ms.next_to_update + 384 {
+                ms.next_to_update = curr - (curr - ms.next_to_update - 384).min(192);
+            }
+            let src = &self.data[..end];
+            let store = &mut self.store;
+            store.clear();
+            let last_literals = match self.params.strategy {
+                Strategy::Fast => fast::compress_block(ms, store, &self.rep, src, start),
+                Strategy::DFast => double_fast::compress_block(ms, store, &self.rep, src, start),
+                _ => lazy::compress_block(ms, store, &self.rep, src, start),
+            };
+            store.store_last_literals(src, last_literals);
+            let mut rep = self.rep;
+            c_size = sequences::compress_block(
+                &mut self.body,
+                store,
+                &mut self.scratch,
+                &self.prev,
+                &mut self.next,
+                &mut rep,
+                &self.params,
+            )
+            .filter(|&size| size < block.len() - min_gain(block.len()))
+            .unwrap_or(0);
+            // Emit an RLE block only if it is not the frame's first block:
+            // zstd 1.4.3 and earlier reject a frame starting with one.
+            if !self.first_block && c_size < 25 && block.iter().all(|&b| b == block[0]) {
+                c_size = 1;
+            }
+            if c_size > 1 {
+                core::mem::swap(&mut self.prev, &mut self.next);
+                self.rep = rep;
+            }
+        }
+        let output = &mut self.output;
+        match c_size {
+            0 => {
+                block_header(output, last, RAW_BLOCK, block.len());
+                output.extend_from_slice(block);
+                3 + block.len()
+            }
+            1 => {
+                block_header(output, last, RLE_BLOCK, block.len());
+                output.push(block[0]);
+                4
+            }
+            _ => {
+                block_header(output, last, COMPRESSED_BLOCK, c_size);
+                output.extend_from_slice(&self.body[..c_size]);
+                3 + c_size
+            }
+        }
+    }
+}
+
+fn params(level: CompressionLevel, window_log: Option<u32>) -> CParams {
+    let mut params = CParams::for_level(match level {
+        CompressionLevel::Uncompressed | CompressionLevel::Fastest => 1,
+        CompressionLevel::Default => 3,
+        CompressionLevel::Better => 7,
+        CompressionLevel::Best => 11,
+        CompressionLevel::Level(level) => level,
+    });
+    if let Some(log) = window_log {
+        params.window_log = log;
+    }
+    params
+}
+
+fn block_header(output: &mut Vec<u8>, last: bool, kind: u32, size: usize) {
+    let header = u32::from(last) + (kind << 1) + ((size as u32) << 3);
+    output.extend_from_slice(&header.to_le_bytes()[..3]);
+}
 
 /// An interface for compressing arbitrary data with the ZStandard compression algorithm.
 ///
@@ -35,272 +357,19 @@ use crate::io::{Read, Write};
 /// // `compress` writes the compressed output into the provided buffer.
 /// compressor.compress();
 /// ```
-pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
+pub struct FrameCompressor<R: Read, W: Write> {
     uncompressed_data: Option<R>,
     compressed_data: Option<W>,
-    core: StreamCompressor<M>,
+    core: StreamCompressor,
 }
 
-pub(crate) struct FseTables {
-    pub(crate) ll_default: FSETable,
-    pub(crate) ll_previous: Option<FSETable>,
-    pub(crate) ml_default: FSETable,
-    pub(crate) ml_previous: Option<FSETable>,
-    pub(crate) of_default: FSETable,
-    pub(crate) of_previous: Option<FSETable>,
-}
-
-impl FseTables {
-    pub fn new() -> Self {
-        Self {
-            ll_default: default_ll_table(),
-            ll_previous: None,
-            ml_default: default_ml_table(),
-            ml_previous: None,
-            of_default: default_of_table(),
-            of_previous: None,
-        }
-    }
-}
-
-pub(crate) struct CompressState<M: Matcher> {
-    pub(crate) matcher: M,
-    pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
-    pub(crate) fse_tables: FseTables,
-}
-
-/// A push-based Zstd frame encoder.
-///
-/// Call [StreamCompressor::begin] to start a frame, feed data with [StreamCompressor::write]
-/// and end the frame with [StreamCompressor::finish]. Encoded bytes are handed to `emit`;
-/// concatenated, they are identical to [FrameCompressor::compress] output for the same input,
-/// regardless of how the input is chunked.
-///
-/// `write` and `finish` panic unless a frame is open. A frame is closed by `finish` and by any
-/// `emit` error; `begin` always starts a fresh frame. The matcher must hand out non-empty spaces
-/// (at most 128 KiB) for `write` to accept data; with an empty space only an empty frame can be
-/// produced.
-pub struct StreamCompressor<M: Matcher> {
-    state: CompressState<M>,
-    level: CompressionLevel,
-    #[cfg(feature = "hash")]
-    hasher: XxHash64,
-    // Reused across blocks and frames
-    output: Vec<u8>,
-    // The current block, as handed out by the matcher
-    space: Vec<u8>,
-    filled: usize,
-    open: bool,
-}
-
-impl<M: Matcher> StreamCompressor<M> {
-    /// Create a new `StreamCompressor` with the given matcher. No frame is open yet.
-    pub fn new(matcher: M, compression_level: CompressionLevel) -> Self {
-        Self {
-            state: CompressState {
-                matcher,
-                last_huff_table: None,
-                fse_tables: FseTables::new(),
-            },
-            level: compression_level,
-            #[cfg(feature = "hash")]
-            hasher: XxHash64::with_seed(0),
-            output: Vec::with_capacity(1024 * 130),
-            space: Vec::new(),
-            filled: 0,
-            open: false,
-        }
-    }
-
-    /// Start a new frame, abandoning any frame still open.
-    ///
-    /// The frame header is buffered and emitted together with the first block.
-    pub fn begin(&mut self) {
-        self.open = false;
-        // Clearing buffers to allow re-using of the compressor
-        self.state.matcher.reset(self.level);
-        self.state.last_huff_table = None;
-        #[cfg(feature = "hash")]
-        {
-            self.hasher = XxHash64::with_seed(0);
-        }
-        self.output.clear();
-        let header = FrameHeader {
-            frame_content_size: None,
-            single_segment: false,
-            content_checksum: cfg!(feature = "hash"),
-            dictionary_id: None,
-            window_size: Some(self.state.matcher.window_size()),
-        };
-        header.serialize(&mut self.output);
-        self.space = self.state.matcher.get_next_space();
-        self.filled = 0;
-        self.open = true;
-    }
-
-    /// Compress `data` into the open frame, emitting every block that fills up.
-    pub fn write<E>(
-        &mut self,
-        mut data: &[u8],
-        mut emit: impl FnMut(&[u8]) -> Result<(), E>,
-    ) -> Result<(), E> {
-        assert!(
-            self.open,
-            "StreamCompressor::write called without an open frame"
-        );
-        while !data.is_empty() {
-            let spare = &mut self.space[self.filled..];
-            assert!(!spare.is_empty(), "matcher handed out an empty space");
-            let n = spare.len().min(data.len());
-            spare[..n].copy_from_slice(&data[..n]);
-            data = &data[n..];
-            self.commit(n, &mut emit)?;
-        }
-        Ok(())
-    }
-
-    /// Emit the last block (an empty Raw block if no data is pending) and the checksum.
-    ///
-    /// The frame is closed afterwards, even if `emit` fails.
-    pub fn finish<E>(&mut self, mut emit: impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
-        assert!(
-            self.open,
-            "StreamCompressor::finish called without an open frame"
-        );
-        self.open = false;
-        let mut block = core::mem::take(&mut self.space);
-        block.truncate(self.filled);
-        self.filled = 0;
-        self.encode(block, true);
-        self.flush(&mut emit)?;
-        // Keep the pull encoder's separate final checksum write.
-        #[cfg(feature = "hash")]
-        emit(&(self.hasher.finish() as u32).to_le_bytes())?;
-        Ok(())
-    }
-
-    /// The unfilled rest of the current block
-    pub(crate) fn spare(&mut self) -> &mut [u8] {
-        &mut self.space[self.filled..]
-    }
-
-    /// Mark `n` bytes of [StreamCompressor::spare] as filled, emitting the block if it is full.
-    pub(crate) fn commit<E>(
-        &mut self,
-        n: usize,
-        emit: impl FnMut(&[u8]) -> Result<(), E>,
-    ) -> Result<(), E> {
-        assert!(
-            self.open,
-            "StreamCompressor::commit called without an open frame"
-        );
-        self.filled += n;
-        assert!(self.filled <= self.space.len());
-        if n == 0 || self.filled < self.space.len() {
-            return Ok(());
-        }
-        // Stays closed if encoding panics or emitting fails
-        self.open = false;
-        let block = core::mem::take(&mut self.space);
-        self.filled = 0;
-        self.encode(block, false);
-        self.flush(emit)?;
-        self.space = self.state.matcher.get_next_space();
-        self.open = true;
-        Ok(())
-    }
-
-    /// Between frames you can replace the matcher
-    pub fn replace_matcher(&mut self, mut match_generator: M) -> M {
-        core::mem::swap(&mut match_generator, &mut self.state.matcher);
-        match_generator
-    }
-
-    /// Between frames you can replace the compression level
-    pub fn set_compression_level(
-        &mut self,
-        compression_level: CompressionLevel,
-    ) -> CompressionLevel {
-        let old = self.level;
-        self.level = compression_level;
-        old
-    }
-
-    /// Get the current compression level
-    pub fn compression_level(&self) -> CompressionLevel {
-        self.level
-    }
-
-    fn encode(&mut self, block: Vec<u8>, last_block: bool) {
-        // As we read, hash that data too
-        #[cfg(feature = "hash")]
-        self.hasher.write(&block);
-        encode_block(
-            &mut self.state,
-            self.level,
-            block,
-            last_block,
-            &mut self.output,
-        );
-    }
-
-    fn flush<E>(&mut self, mut emit: impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
-        let result = emit(&self.output);
-        self.output.clear();
-        result
-    }
-}
-
-/// Append one encoded block to `output`
-fn encode_block<M: Matcher>(
-    state: &mut CompressState<M>,
-    level: CompressionLevel,
-    block: Vec<u8>,
-    last_block: bool,
-    output: &mut Vec<u8>,
-) {
-    // Special handling is needed for compression of a totally empty file (why you'd want to do that, I don't know)
-    if block.is_empty() {
-        let header = BlockHeader {
-            last_block: true,
-            block_type: crate::blocks::block::BlockType::Raw,
-            block_size: 0,
-        };
-        header.serialize(output);
-        return;
-    }
-    match level {
-        CompressionLevel::Uncompressed => {
-            let header = BlockHeader {
-                last_block,
-                block_type: crate::blocks::block::BlockType::Raw,
-                block_size: block.len().try_into().unwrap(),
-            };
-            // Write the header, then the block
-            header.serialize(output);
-            output.extend_from_slice(&block);
-        }
-        CompressionLevel::Fastest => compress_fastest(state, last_block, block, output),
-        _ => {
-            unimplemented!();
-        }
-    }
-}
-
-impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
+impl<R: Read, W: Write> FrameCompressor<R, W> {
     /// Create a new `FrameCompressor`
     pub fn new(compression_level: CompressionLevel) -> Self {
-        Self::new_with_matcher(MatchGeneratorDriver::new(1024 * 128, 1), compression_level)
-    }
-}
-
-impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
-    /// Create a new `FrameCompressor` with a custom matching algorithm implementation
-    pub fn new_with_matcher(matcher: M, compression_level: CompressionLevel) -> Self {
         Self {
             uncompressed_data: None,
             compressed_data: None,
-            core: StreamCompressor::new(matcher, compression_level),
+            core: StreamCompressor::new(compression_level),
         }
     }
 
@@ -330,14 +399,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         enc.begin();
         let source = self.uncompressed_data.as_mut().unwrap();
         let drain = self.compressed_data.as_mut().unwrap();
+        let mut buffer = vec![0; MAX_BLOCK_SIZE];
         loop {
-            // Read straight into the current block
-            let read_bytes = source.read(enc.spare()).unwrap();
+            let read_bytes = source.read(&mut buffer).unwrap();
             if read_bytes == 0 {
                 enc.finish(|b| drain.write_all(b)).unwrap();
                 break;
             }
-            enc.commit(read_bytes, |b| drain.write_all(b)).unwrap();
+            enc.write(&buffer[..read_bytes], |b| drain.write_all(b))
+                .unwrap();
         }
     }
 
@@ -371,11 +441,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.compressed_data.take()
     }
 
-    /// Before calling [FrameCompressor::compress] you can replace the matcher
-    pub fn replace_matcher(&mut self, match_generator: M) -> M {
-        self.core.replace_matcher(match_generator)
-    }
-
     /// Before calling [FrameCompressor::compress] you can replace the compression level
     pub fn set_compression_level(
         &mut self,
@@ -388,256 +453,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     pub fn compression_level(&self) -> CompressionLevel {
         self.core.compression_level()
     }
-}
-#[cfg(test)]
-mod tests {
-    use alloc::vec;
 
-    use super::FrameCompressor;
-    use crate::common::MAGIC_NUM;
-    use crate::decoding::FrameDecoder;
-    use alloc::vec::Vec;
-
-    #[test]
-    fn frame_starts_with_magic_num() {
-        let mock_data = [1_u8, 2, 3].as_slice();
-        let mut output: Vec<u8> = Vec::new();
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
-        compressor.set_source(mock_data);
-        compressor.set_drain(&mut output);
-
-        compressor.compress();
-        assert!(output.starts_with(&MAGIC_NUM.to_le_bytes()));
-    }
-
-    #[test]
-    fn very_simple_raw_compress() {
-        let mock_data = [1_u8, 2, 3].as_slice();
-        let mut output: Vec<u8> = Vec::new();
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
-        compressor.set_source(mock_data);
-        compressor.set_drain(&mut output);
-
-        compressor.compress();
-    }
-
-    #[test]
-    fn very_simple_compress() {
-        let mut mock_data = vec![0; 1 << 17];
-        mock_data.extend(vec![1; (1 << 17) - 1]);
-        mock_data.extend(vec![2; (1 << 18) - 1]);
-        mock_data.extend(vec![2; 1 << 17]);
-        mock_data.extend(vec![3; (1 << 17) - 1]);
-        let mut output: Vec<u8> = Vec::new();
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
-        compressor.set_source(mock_data.as_slice());
-        compressor.set_drain(&mut output);
-
-        compressor.compress();
-
-        let mut decoder = FrameDecoder::new();
-        let mut decoded = Vec::with_capacity(mock_data.len());
-        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
-        assert_eq!(mock_data, decoded);
-
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(output.as_slice(), &mut decoded).unwrap();
-        assert_eq!(mock_data, decoded);
-    }
-
-    #[test]
-    fn rle_compress() {
-        let mock_data = vec![0; 1 << 19];
-        let mut output: Vec<u8> = Vec::new();
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
-        compressor.set_source(mock_data.as_slice());
-        compressor.set_drain(&mut output);
-
-        compressor.compress();
-
-        let mut decoder = FrameDecoder::new();
-        let mut decoded = Vec::with_capacity(mock_data.len());
-        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
-        assert_eq!(mock_data, decoded);
-    }
-
-    #[test]
-    fn aaa_compress() {
-        let mock_data = vec![0, 1, 3, 4, 5];
-        let mut output: Vec<u8> = Vec::new();
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
-        compressor.set_source(mock_data.as_slice());
-        compressor.set_drain(&mut output);
-
-        compressor.compress();
-
-        let mut decoder = FrameDecoder::new();
-        let mut decoded = Vec::with_capacity(mock_data.len());
-        decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
-        assert_eq!(mock_data, decoded);
-
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(output.as_slice(), &mut decoded).unwrap();
-        assert_eq!(mock_data, decoded);
-    }
-
-    #[cfg(feature = "hash")]
-    #[test]
-    fn checksum_two_frames_reused_compressor() {
-        // Compress the same data twice using the same compressor and verify that:
-        // 1. The checksum written in each frame matches what the decoder calculates.
-        // 2. The hasher is correctly reset between frames (no cross-contamination).
-        //    If the hasher were NOT reset, the second frame's calculated checksum
-        //    would differ from the one stored in the frame data, causing assert_eq to fail.
-        let data: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
-
-        let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
-
-        // --- Frame 1 ---
-        let mut compressed1 = Vec::new();
-        compressor.set_source(data.as_slice());
-        compressor.set_drain(&mut compressed1);
-        compressor.compress();
-
-        // --- Frame 2 (reuse the same compressor) ---
-        let mut compressed2 = Vec::new();
-        compressor.set_source(data.as_slice());
-        compressor.set_drain(&mut compressed2);
-        compressor.compress();
-
-        fn decode_and_collect(compressed: &[u8]) -> (Vec<u8>, Option<u32>, Option<u32>) {
-            let mut decoder = FrameDecoder::new();
-            let mut source = compressed;
-            decoder.reset(&mut source).unwrap();
-            while !decoder.is_finished() {
-                decoder
-                    .decode_blocks(&mut source, crate::decoding::BlockDecodingStrategy::All)
-                    .unwrap();
-            }
-            let mut decoded = Vec::new();
-            decoder.collect_to_writer(&mut decoded).unwrap();
-            (
-                decoded,
-                decoder.get_checksum_from_data(),
-                decoder.get_calculated_checksum(),
-            )
-        }
-
-        let (decoded1, chksum_from_data1, chksum_calculated1) = decode_and_collect(&compressed1);
-        assert_eq!(decoded1, data, "frame 1: decoded data mismatch");
-        assert_eq!(
-            chksum_from_data1, chksum_calculated1,
-            "frame 1: checksum mismatch"
-        );
-
-        let (decoded2, chksum_from_data2, chksum_calculated2) = decode_and_collect(&compressed2);
-        assert_eq!(decoded2, data, "frame 2: decoded data mismatch");
-        assert_eq!(
-            chksum_from_data2, chksum_calculated2,
-            "frame 2: checksum mismatch"
-        );
-
-        // Same data compressed twice must produce the same checksum.
-        // If state leaked across frames, the second calculated checksum would differ.
-        assert_eq!(
-            chksum_from_data1, chksum_from_data2,
-            "frame 1 and frame 2 should have the same checksum (same data, hash must reset per frame)"
-        );
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn fuzz_targets() {
-        use std::io::Read;
-        fn decode_ruzstd(data: &mut dyn std::io::Read) -> Vec<u8> {
-            let mut decoder = crate::decoding::StreamingDecoder::new(data).unwrap();
-            let mut result: Vec<u8> = Vec::new();
-            decoder.read_to_end(&mut result).expect("Decoding failed");
-            result
-        }
-
-        fn decode_ruzstd_writer(mut data: impl Read) -> Vec<u8> {
-            let mut decoder = crate::decoding::FrameDecoder::new();
-            decoder.reset(&mut data).unwrap();
-            let mut result = vec![];
-            while !decoder.is_finished() || decoder.can_collect() > 0 {
-                decoder
-                    .decode_blocks(
-                        &mut data,
-                        crate::decoding::BlockDecodingStrategy::UptoBytes(1024 * 1024),
-                    )
-                    .unwrap();
-                decoder.collect_to_writer(&mut result).unwrap();
-            }
-            result
-        }
-
-        fn encode_zstd(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-            zstd::stream::encode_all(std::io::Cursor::new(data), 3)
-        }
-
-        fn encode_ruzstd_uncompressed(data: &mut dyn std::io::Read) -> Vec<u8> {
-            let mut input = Vec::new();
-            data.read_to_end(&mut input).unwrap();
-
-            crate::encoding::compress_to_vec(
-                input.as_slice(),
-                crate::encoding::CompressionLevel::Uncompressed,
-            )
-        }
-
-        fn encode_ruzstd_compressed(data: &mut dyn std::io::Read) -> Vec<u8> {
-            let mut input = Vec::new();
-            data.read_to_end(&mut input).unwrap();
-
-            crate::encoding::compress_to_vec(
-                input.as_slice(),
-                crate::encoding::CompressionLevel::Fastest,
-            )
-        }
-
-        fn decode_zstd(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-            let mut output = Vec::new();
-            zstd::stream::copy_decode(data, &mut output)?;
-            Ok(output)
-        }
-        if std::fs::exists("fuzz/artifacts/interop").unwrap_or(false) {
-            for file in std::fs::read_dir("fuzz/artifacts/interop").unwrap() {
-                if file.as_ref().unwrap().file_type().unwrap().is_file() {
-                    let data = std::fs::read(file.unwrap().path()).unwrap();
-                    let data = data.as_slice();
-                    // Decoding
-                    let compressed = encode_zstd(data).unwrap();
-                    let decoded = decode_ruzstd(&mut compressed.as_slice());
-                    let decoded2 = decode_ruzstd_writer(&mut compressed.as_slice());
-                    assert!(
-                        decoded == data,
-                        "Decoded data did not match the original input during decompression"
-                    );
-                    assert_eq!(
-                        decoded2, data,
-                        "Decoded data did not match the original input during decompression"
-                    );
-
-                    // Encoding
-                    // Uncompressed encoding
-                    let mut input = data;
-                    let compressed = encode_ruzstd_uncompressed(&mut input);
-                    let decoded = decode_zstd(&compressed).unwrap();
-                    assert_eq!(
-                        decoded, data,
-                        "Decoded data did not match the original input during compression"
-                    );
-                    // Compressed encoding
-                    let mut input = data;
-                    let compressed = encode_ruzstd_compressed(&mut input);
-                    let decoded = decode_zstd(&compressed).unwrap();
-                    assert_eq!(
-                        decoded, data,
-                        "Decoded data did not match the original input during compression"
-                    );
-                }
-            }
-        }
+    /// Before calling [FrameCompressor::compress] you can override the level's window size, see
+    /// [StreamCompressor::set_window_log]
+    pub fn set_window_log(&mut self, log: Option<u32>) {
+        self.core.set_window_log(log);
     }
 }

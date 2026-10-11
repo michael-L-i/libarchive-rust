@@ -426,28 +426,34 @@ fn next_position(mut p: usize, table_size: usize) -> usize {
     p
 }
 
+#[cfg(test)]
 const ML_DIST: &[i32] = &[
     1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
 ];
 
+#[cfg(test)]
 const LL_DIST: &[i32] = &[
     4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
     -1, -1, -1, -1,
 ];
 
+#[cfg(test)]
 const OF_DIST: &[i32] = &[
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];
 
+#[cfg(test)]
 pub(crate) fn default_ml_table() -> FSETable {
     build_table_from_probabilities(ML_DIST, 6)
 }
 
+#[cfg(test)]
 pub(crate) fn default_ll_table() -> FSETable {
     build_table_from_probabilities(LL_DIST, 6)
 }
 
+#[cfg(test)]
 pub(crate) fn default_of_table() -> FSETable {
     build_table_from_probabilities(OF_DIST, 5)
 }

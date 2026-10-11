@@ -31,58 +31,6 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         Self::encode_stream(self.table, self.writer, data);
     }
 
-    /// Encodes the data using the provided table in 4 concatenated streams
-    /// Writes
-    /// * Table description
-    /// * Jumptable
-    /// * Encoded data in 4 streams, each padded to fill the last byte
-    pub fn encode4x(&mut self, data: &[u8], with_table: bool) {
-        assert!(data.len() >= 4);
-
-        // Split data in 4 equally sized parts (the last one might be a bit smaller than the rest)
-        let split_size = data.len().div_ceil(4);
-        let src1 = &data[..split_size];
-        let src2 = &data[split_size..split_size * 2];
-        let src3 = &data[split_size * 2..split_size * 3];
-        let src4 = &data[split_size * 3..];
-
-        // Write table description
-        if with_table {
-            self.write_table();
-        }
-
-        // Reserve space for the jump table, will be changed later
-        let size_idx = self.writer.index();
-        self.writer.write_bits(0u16, 16);
-        self.writer.write_bits(0u16, 16);
-        self.writer.write_bits(0u16, 16);
-
-        // Write the 4 streams, noting the sizes of the encoded streams
-        let index_before = self.writer.index();
-        Self::encode_stream(self.table, self.writer, src1);
-        let size1 = (self.writer.index() - index_before) / 8;
-
-        let index_before = self.writer.index();
-        Self::encode_stream(self.table, self.writer, src2);
-        let size2 = (self.writer.index() - index_before) / 8;
-
-        let index_before = self.writer.index();
-        Self::encode_stream(self.table, self.writer, src3);
-        let size3 = (self.writer.index() - index_before) / 8;
-
-        Self::encode_stream(self.table, self.writer, src4);
-
-        // Sanity check, if this doesn't hold we produce a broken stream
-        assert!(size1 <= u16::MAX as usize);
-        assert!(size2 <= u16::MAX as usize);
-        assert!(size3 <= u16::MAX as usize);
-
-        // Update the jumptable with the real sizes
-        self.writer.change_bits(size_idx, size1 as u16, 16);
-        self.writer.change_bits(size_idx + 16, size2 as u16, 16);
-        self.writer.change_bits(size_idx + 32, size3 as u16, 16);
-    }
-
     /// Encode one stream and pad it to fill the last byte
     fn encode_stream<VV: AsMut<Vec<u8>>>(
         table: &HuffmanTable,
@@ -251,14 +199,6 @@ impl HuffmanTable {
         }
 
         table
-    }
-
-    pub(crate) fn encoded_bits(&self, counts: &[usize]) -> usize {
-        self.codes
-            .iter()
-            .zip(counts)
-            .map(|((_, bits), count)| *bits as usize * count)
-            .sum()
     }
 
     pub fn can_encode(&self, other: &Self) -> Option<usize> {

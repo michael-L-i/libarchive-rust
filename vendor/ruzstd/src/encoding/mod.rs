@@ -1,15 +1,22 @@
-//! Structures and utilities used for compressing/encoding data into the Zstd format.
+//! Structures and utilities used for compressing/encoding data into the Zstandard format.
+//!
+//! The compressor is a port of libzstd 1.5.7's: its compression level
+//! parameters, the fast, double fast, greedy, lazy and lazy2 block
+//! compressors, block splitting, and the Huffman and FSE entropy stages.
 
-pub(crate) mod block_header;
-pub(crate) mod blocks;
-pub(crate) mod frame_header;
-pub(crate) mod match_generator;
-pub(crate) mod util;
-
+mod double_fast;
+mod fast;
 mod frame_compressor;
-mod levels;
+mod fse;
+mod huf;
+mod lazy;
+mod literals;
+mod match_state;
+mod params;
+mod pre_split;
+mod sequences;
+
 pub use frame_compressor::{FrameCompressor, StreamCompressor};
-pub use match_generator::MatchGeneratorDriver;
 
 use crate::io::{Read, Write};
 use alloc::vec::Vec;
@@ -48,72 +55,18 @@ pub enum CompressionLevel {
     /// This level does not compress the data at all, and simply wraps
     /// it in a Zstandard frame.
     Uncompressed,
-    /// This level is roughly equivalent to Zstd compression level 1
+    /// Zstd compression level 1.
     Fastest,
-    /// This level is roughly equivalent to Zstd level 3,
-    /// or the one used by the official compressor when no level
-    /// is specified.
-    ///
-    /// UNIMPLEMENTED
+    /// Zstd compression level 3, the one used by the official compressor
+    /// when no level is specified.
     Default,
-    /// This level is roughly equivalent to Zstd level 7.
-    ///
-    /// UNIMPLEMENTED
+    /// Zstd compression level 7.
     Better,
-    /// This level is roughly equivalent to Zstd level 11.
-    ///
-    /// UNIMPLEMENTED
+    /// Zstd compression level 11.
     Best,
-}
-
-/// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm
-/// making their own tradeoffs between runtime, memory usage and compression ratio
-///
-/// This trait operates on buffers that represent the chunks of data the matching algorithm wants to work on.
-/// Each one of these buffers is referred to as a *space*. One or more of these buffers represent the window
-/// the decoder will need to decode the data again.
-///
-/// This library asks the Matcher for a new buffer using `get_next_space` to allow reusing of allocated buffers when they are no longer part of the
-/// window of data that is being used for matching.
-///
-/// The library fills the buffer with data that is to be compressed and commits them back to the matcher using `commit_space`.
-///
-/// Then it will either call `start_matching` or, if the space is deemed not worth compressing, `skip_matching` is called.
-///
-/// This is repeated until no more data is left to be compressed.
-pub trait Matcher {
-    /// Get a space where we can put data to be matched on. Will be encoded as one block. The maximum allowed size is 128 kB.
-    fn get_next_space(&mut self) -> alloc::vec::Vec<u8>;
-    /// Get a reference to the last commited space
-    fn get_last_space(&mut self) -> &[u8];
-    /// Commit a space to the matcher so it can be matched against
-    fn commit_space(&mut self, space: alloc::vec::Vec<u8>);
-    /// Just process the data in the last commited space for future matching
-    fn skip_matching(&mut self);
-    /// Process the data in the last commited space for future matching AND generate matches for the data
-    fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
-    /// Reset this matcher so it can be used for the next new frame
-    fn reset(&mut self, level: CompressionLevel);
-    /// The size of the window the decoder will need to execute all sequences produced by this matcher
-    ///
-    /// May change after a call to reset with a different compression level
-    fn window_size(&self) -> u64;
-}
-
-#[derive(PartialEq, Eq, Debug)]
-/// Sequences that a [`Matcher`] can produce
-pub enum Sequence<'data> {
-    /// Is encoded as a sequence for the decoder sequence execution.
-    ///
-    /// First the literals will be copied to the decoded data,
-    /// then `match_len` bytes are copied from `offset` bytes back in the decoded data
-    Triple {
-        literals: &'data [u8],
-        offset: usize,
-        match_len: usize,
-    },
-    /// This is returned as the last sequence in a block
-    ///
-    /// These literals will just be copied at the end of the sequence execution by the decoder
-    Literals { literals: &'data [u8] },
+    /// A zstd compression level, with zstd's meaning: up to 22, 0 for the
+    /// default (3), and negative levels trade ratio for speed. Levels above
+    /// 12 keep their window and table sizes but search like level 12, with
+    /// the lazy2 strategy.
+    Level(i32),
 }

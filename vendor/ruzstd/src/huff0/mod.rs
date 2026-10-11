@@ -4,6 +4,8 @@
 /// will start with the same sequence of bits.
 mod huff0_decoder;
 pub use huff0_decoder::*;
+// The old encoder now only serves round-trip tests.
+#[cfg(any(test, feature = "fuzz_exports"))]
 pub mod huff0_encoder;
 
 /// Only needed for testing.

@@ -16,6 +16,8 @@ mod fse_decoder;
 
 pub use fse_decoder::*;
 
+// The old encoder now only serves round-trip tests.
+#[cfg(any(test, feature = "fuzz_exports"))]
 pub mod fse_encoder;
 
 #[test]
