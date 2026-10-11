@@ -49,10 +49,11 @@ impl<'a> BitStream<'a> {
     #[inline(always)]
     pub(crate) fn flush(&mut self) {
         let bytes = (self.nbits >> 3) as usize;
-        if let Some(window) = self.out.get_mut(self.pos..self.pos + 8) {
-            window.copy_from_slice(&self.container.to_le_bytes());
-        }
-        self.pos = (self.pos + bytes).min(self.end);
+        // The position never passes `end`; clamping shows the compiler that
+        // the write is in bounds.
+        let pos = self.pos.min(self.end);
+        self.out[pos..pos + 8].copy_from_slice(&self.container.to_le_bytes());
+        self.pos = (pos + bytes).min(self.end);
         self.nbits &= 7;
         self.container >>= bytes * 8;
     }

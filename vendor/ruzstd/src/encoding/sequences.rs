@@ -19,11 +19,14 @@ const ML_FSE_LOG: u32 = 9;
 const OFF_FSE_LOG: u32 = 8;
 const LONG_NB_SEQ: usize = 0x7F00;
 
+/// Extra bits per literal length code. Like `ML_BITS`, padded to 64
+/// entries so that masked codes index it without bounds checks.
 #[rustfmt::skip]
-const LL_BITS: [u8; MAX_LL as usize + 1] = [
+const LL_BITS: [u8; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12,
-    13, 14, 15, 16,
+    13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 #[rustfmt::skip]
 const LL_DEFAULT_NORM: [i16; MAX_LL as usize + 1] = [
@@ -33,11 +36,11 @@ const LL_DEFAULT_NORM: [i16; MAX_LL as usize + 1] = [
 ];
 const LL_DEFAULT_NORM_LOG: u32 = 6;
 #[rustfmt::skip]
-const ML_BITS: [u8; MAX_ML as usize + 1] = [
+const ML_BITS: [u8; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11,
-    12, 13, 14, 15, 16,
+    12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 #[rustfmt::skip]
 const ML_DEFAULT_NORM: [i16; MAX_ML as usize + 1] = [
@@ -537,18 +540,18 @@ fn encode_sequences(dst: &mut [u8], scratch: &Scratch, tables: &Entropy) -> Opti
     let (lit_len, ml_base, off_base) = scratch.values[last];
     bits.add(
         u64::from(lit_len),
-        u32::from(LL_BITS[ll_codes[last] as usize]),
+        u32::from(LL_BITS[ll_codes[last] as usize & 63]),
     );
     bits.add(
         u64::from(ml_base),
-        u32::from(ML_BITS[ml_codes[last] as usize]),
+        u32::from(ML_BITS[ml_codes[last] as usize & 63]),
     );
     bits.add(u64::from(off_base), u32::from(of_codes[last]));
     bits.flush();
     for i in (0..last).rev() {
         let (llc, mlc, ofc) = (ll_codes[i], ml_codes[i], of_codes[i]);
-        let ll_bits = u32::from(LL_BITS[llc as usize]);
-        let ml_bits = u32::from(ML_BITS[mlc as usize]);
+        let ll_bits = u32::from(LL_BITS[llc as usize & 63]);
+        let ml_bits = u32::from(ML_BITS[mlc as usize & 63]);
         let of_bits = u32::from(ofc);
         let (lit_len, ml_base, off_base) = scratch.values[i];
         of.encode(&mut bits, &mut of_state, ofc);

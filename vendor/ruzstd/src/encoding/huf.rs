@@ -247,10 +247,10 @@ impl<'a> HufStream<'a> {
     fn flush(&mut self) {
         let count = self.container.count;
         let bits = self.container.bits.checked_shr(64 - count).unwrap_or(0);
-        if let Some(window) = self.out.get_mut(self.pos..self.pos + 8) {
-            window.copy_from_slice(&bits.to_le_bytes());
-        }
-        self.pos = (self.pos + (count >> 3) as usize).min(self.end);
+        // As in `BitStream::flush()`, the clamp only drops the bounds check.
+        let pos = self.pos.min(self.end);
+        self.out[pos..pos + 8].copy_from_slice(&bits.to_le_bytes());
+        self.pos = (pos + (count >> 3) as usize).min(self.end);
         self.container.count &= 7;
     }
 
