@@ -4,8 +4,8 @@ Vendored from the published miniz_oxide 0.9.1 crate, upstream revision
 `4e582392df3a739d2b0dfd2c537dc33e8942be38` (repository path `miniz_oxide`).
 Original crate SHA-256:
 `b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c`.
-All package files match the published crate except `src/inflate/core.rs` and
-this note; packaging metadata and the library's standalone lockfile are omitted.
+All package files match the published crate except `src/inflate/core.rs`,
+`src/deflate/core.rs`, and this note; packaging metadata and the library's standalone lockfile are omitted.
 The existing version, features, dependencies and license files are preserved.
 
 ## Enable existing bulk match copies on AArch64
@@ -117,3 +117,27 @@ All 16 decoded archive hashes agree with baseline and C. The subsequent
 21-rotation confirmation shows text gzip 2.216 -> 1.265 ms (42.9%), text
 ZIP 2.577 -> 1.620 ms (37.1%), and documents 3.4-4.6% faster. Other cases
 range from 0.6% slower to 1.6% faster.
+
+## Stable Deflate insertion buffer borrows
+
+`compress_normal` borrows the dictionary, chain and hash backing arrays once
+per insertion batch. The existing byte loop, indices and update order stay
+identical. On AArch64 this removes three repeated Box-pointer loads from the
+hot insertion iteration. No state, allocation, preset, probe limit, unsafe
+code, or encoded-byte changes are introduced.
+
+A fresh actual Claude Opus 5.5 review returned PASS for correctness. All
+3,296 baseline comparisons preserve exact encoded bytes, return statuses and
+consumed/written counts across levels 0-10, five strategies, fragmented
+input/output, Sync/Full flush, callback failure, reset, and midstream level
+switches. All 30 vendor tests, no-default-features, rustfmt and diff checks
+pass. Standalone vendor Clippy passes with warnings denied and only the five
+previously documented upstream lint categories allowed on the command line.
+
+Seven rotating native confirmation pairs show text compression improving
+10.145 -> 9.638 ms (5.0%); random is 0.65% slower and records 0.59% faster.
+The initial eight-corpus screen found the other workloads close to neutral.
+These are raw level-six encoder timings, not end-to-end archive results.
+Frozen binaries, assembly, exact-stream harness, raw timing samples, actual
+Opus design/final review records, and rejected chain-table experiments remain
+in sibling `diagnostics/round10-deflate`.
