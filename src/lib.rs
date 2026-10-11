@@ -1,4 +1,10 @@
 #![deny(unsafe_code)]
+// mode_t and dev_t are 16 and 32 bits on Apple platforms but 32 and 64 bits
+// on Linux, so widening conversions macOS needs are no-ops elsewhere.
+#![cfg_attr(
+    not(target_vendor = "apple"),
+    allow(clippy::useless_conversion, clippy::unnecessary_cast)
+)]
 
 mod acl;
 mod archive;
