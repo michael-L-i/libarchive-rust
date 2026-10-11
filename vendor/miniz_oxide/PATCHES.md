@@ -4,8 +4,9 @@ Vendored from the published miniz_oxide 0.9.1 crate, upstream revision
 `4e582392df3a739d2b0dfd2c537dc33e8942be38` (repository path `miniz_oxide`).
 Original crate SHA-256:
 `b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c`.
-All package files match the published crate except `src/inflate/core.rs`
-and this note; packaging metadata and the library's standalone lockfile are omitted.
+All package files match the published crate except `src/inflate/core.rs`,
+`src/serde/big_array.rs`, and this note; packaging metadata and the library's
+standalone lockfile are omitted.
 The existing version, features, dependencies and license files are preserved.
 
 ## Enable existing bulk match copies on AArch64
@@ -159,3 +160,18 @@ baseline, assembly, exact-trace harness, raw samples and actual Opus records
 are retained in sibling `diagnostics/round11-inflate`. The marginal leaf-only
 inlining trial and the earlier, slower long-match guard are preserved there
 as separate experiments.
+
+## Pre-decoded literal/length and distance tables
+
+The 10-bit fast lookup table plus code tree is replaced by libdeflate-style
+decode tables: 11 main bits for literal/length codes, 8 for distances and 7
+for code length codes, with subtables for longer codewords (sized by zlib's
+`enough`: 2342 and 402 entries). Each entry holds the bits to consume
+(codeword plus extra bits), the codeword length, and the literal, length or
+distance base; literal/length entries also keep their symbol for the state
+machine. Tables are built by sorting symbols by codeword and doubling the
+table, as libdeflate does. Code validation is unchanged, and the unused half
+of a one-codeword (or empty) code still decodes as miniz's one-bit invalid
+symbol. Serialized decoders carry the new tables; `big_array` gains their
+lengths and drops the two old ones. No unsafe code; no output, status or
+consumption change (see the round-twelve section below for evidence).

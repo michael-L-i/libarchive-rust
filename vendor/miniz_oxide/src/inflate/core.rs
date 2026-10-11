@@ -41,83 +41,220 @@ use serde::{Deserialize, Serialize};
 
 pub const TINFL_LZ_DICT_SIZE: usize = 32_768;
 
-/// A struct containing huffman code lengths and the huffman code tree used by the decompressor.
-#[cfg_attr(not(feature = "rustc-dep-of-std"), derive(Clone))]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-struct HuffmanTable {
-    /// Fast lookup table for shorter huffman codes.
-    ///
-    /// See `HuffmanTable::fast_lookup`.
-    #[cfg_attr(feature = "serde", serde(with = "BigArray"))]
-    pub look_up: [i16; FAST_LOOKUP_SIZE as usize],
-    /// Full huffman tree.
-    ///
-    /// Positive values are edge nodes/symbols, negative values are
-    /// parent nodes/references to other nodes.
-    #[cfg_attr(feature = "serde", serde(with = "BigArray"))]
-    pub tree: [i16; MAX_HUFF_TREE_SIZE],
+/// Number of low bit buffer bits that index each main decode table. Longer
+/// codes continue in subtables.
+const LITLEN_TABLE_BITS: u32 = 11;
+const DIST_TABLE_BITS: u32 = 8;
+const HUFFLEN_TABLE_BITS: u32 = 7;
+/// Main table plus the most subtable space a complete code can need, as
+/// computed by zlib's `enough` for 288 symbols and 11 bits, and for 32
+/// symbols and 8 bits, both with codes of up to 15 bits.
+const LITLEN_TABLE_SIZE: usize = 2342;
+const DIST_TABLE_SIZE: usize = 402;
+const HUFFLEN_TABLE_SIZE: usize = 1 << HUFFLEN_TABLE_BITS;
+
+// Decode table entries, after libdeflate's. Bits 0-7 hold the bits decoding
+// the entry consumes: the codeword length plus a length's or distance's extra
+// bits, or for a subtable pointer the main table bits. Bits 8-11 hold the
+// codeword length (in a subtable, the bits past the main table; for a
+// pointer, the subtable bits). Bits 16 and up hold the literal, the base, the
+// code length symbol or the subtable start. Literal/length entries other than
+// literals keep their symbol minus 256 in bits 25-29.
+/// A subtable pointer, the end of block or an invalid symbol.
+const ENTRY_EXCEPTIONAL: u32 = 1 << 15;
+const ENTRY_SUBTABLE: u32 = 1 << 14;
+const ENTRY_END_OF_BLOCK: u32 = 1 << 13;
+const ENTRY_LITERAL: u32 = 1 << 31;
+/// Fills the codespace an incomplete code leaves unused: a one-bit invalid
+/// literal/length (symbol 286) or distance, as miniz has always decoded it.
+const INVALID_ENTRY: u32 = ENTRY_EXCEPTIONAL | 30 << 25 | 1 << 8 | 1;
+
+/// The parts of each symbol's entry that do not depend on its code.
+const LITLEN_ENTRIES: [u32; MAX_HUFF_SYMBOLS_0] = {
+    let mut entries = [0; MAX_HUFF_SYMBOLS_0];
+    let mut symbol = 0;
+    while symbol < MAX_HUFF_SYMBOLS_0 {
+        entries[symbol] = if symbol < 256 {
+            ENTRY_LITERAL | (symbol as u32) << 16
+        } else if symbol == 256 {
+            ENTRY_EXCEPTIONAL | ENTRY_END_OF_BLOCK
+        } else if symbol < 286 {
+            let i = symbol - 257;
+            (LENGTH_BASE[i] as u32) << 16 | ((symbol - 256) as u32) << 25 | LENGTH_EXTRA[i] as u32
+        } else {
+            // 286 and 287 only occur in the fixed code and are invalid.
+            ENTRY_EXCEPTIONAL | ((symbol - 256) as u32) << 25
+        };
+        symbol += 1;
+    }
+    entries
+};
+const DIST_ENTRIES: [u32; MAX_HUFF_SYMBOLS_1] = {
+    let mut entries = [ENTRY_EXCEPTIONAL; MAX_HUFF_SYMBOLS_1];
+    let mut symbol = 0;
+    while symbol < 30 {
+        entries[symbol] = (DIST_BASE[symbol] as u32) << 16
+            | num_extra_bits_for_distance_code(symbol as u8) as u32;
+        symbol += 1;
+    }
+    entries
+};
+const HUFFLEN_ENTRIES: [u32; MAX_HUFF_SYMBOLS_2] = {
+    let mut entries = [0; MAX_HUFF_SYMBOLS_2];
+    let mut symbol = 0;
+    while symbol < MAX_HUFF_SYMBOLS_2 {
+        entries[symbol] = (symbol as u32) << 16;
+        symbol += 1;
+    }
+    entries
+};
+
+/// The literal/length symbol of a resolved entry.
+#[inline]
+const fn litlen_symbol(entry: u32) -> u32 {
+    if entry & ENTRY_LITERAL != 0 {
+        (entry >> 16) & 0xff
+    } else {
+        256 + ((entry >> 25) & 31)
+    }
 }
 
-impl HuffmanTable {
-    const fn new() -> HuffmanTable {
-        HuffmanTable {
-            look_up: [0; FAST_LOOKUP_SIZE as usize],
-            tree: [0; MAX_HUFF_TREE_SIZE],
+/// Looks up the code at the bottom of `bit_buf`, resolving any subtable, and
+/// returns its entry and full codeword length. Bits past the buffered ones
+/// must be zero; the entry is then right whenever its length is buffered.
+#[inline]
+fn lookup(table: &[u32], table_bits: u32, bit_buf: BitBuffer) -> (u32, u32) {
+    let index = (bit_buf & ((1 << table_bits) - 1)) as usize;
+    let entry = table.get(index).copied().unwrap_or(INVALID_ENTRY);
+    if entry & ENTRY_SUBTABLE == 0 {
+        return (entry, (entry >> 8) & 15);
+    }
+    let sub_bits = (entry >> 8) & 15;
+    let index = (entry >> 16) as usize + ((bit_buf >> table_bits) & ((1 << sub_bits) - 1)) as usize;
+    let entry = table.get(index).copied().unwrap_or(INVALID_ENTRY);
+    (entry, table_bits + ((entry >> 8) & 15))
+}
+
+/// Builds the decode table of the canonical code `code_sizes`, whose
+/// per-length `counts` are validated: the code is `complete`, or else has at
+/// most one codeword, of length 1. Uses libdeflate's method: a codeword no
+/// longer than the main table is stored once while the table is as long as
+/// the codeword, then replicated by doubling the table.
+fn build_table(
+    table: &mut [u32],
+    table_bits: u32,
+    code_sizes: &[u8],
+    counts: &[u16; 16],
+    entries: &[u32],
+    complete: bool,
+) -> Option<()> {
+    // Sort the symbols by codeword length, then by symbol: codeword order.
+    let mut offsets = [0u16; 16];
+    for len in 1..15 {
+        offsets[len + 1] = offsets[len] + counts[len];
+    }
+    let mut sorted = [0u16; MAX_HUFF_SYMBOLS_0];
+    for (symbol, &len) in code_sizes.iter().enumerate() {
+        if len != 0 {
+            let offset = offsets.get_mut(usize::from(len))?;
+            *sorted.get_mut(usize::from(*offset))? = symbol as u16;
+            *offset += 1;
         }
     }
+    let mut sorted = sorted.iter().map(|&symbol| usize::from(symbol));
+    let mut next_entry = |len: u32| Some(entries.get(sorted.next()?)? + (len << 8) + len);
 
-    /// Look for a symbol in the fast lookup table.
-    /// The symbol is stored in the lower 9 bits, the length in the next 6.
-    /// If the returned value is negative, the code wasn't found in the
-    /// fast lookup table and the full tree has to be traversed to find the code.
-    #[inline]
-    const fn fast_lookup(&self, bit_buf: BitBuffer) -> i16 {
-        self.look_up[(bit_buf & (FAST_LOOKUP_SIZE - 1) as BitBuffer) as usize]
+    let main = table.get_mut(..1 << table_bits)?;
+    if !complete {
+        main.fill(INVALID_ENTRY);
+        if counts[1] == 1 {
+            let entry = next_entry(1)?;
+            main.iter_mut().step_by(2).for_each(|e| *e = entry);
+        }
+        return Some(());
     }
 
-    /// Get the symbol and the code length from the huffman tree.
-    #[inline]
-    fn tree_lookup(&self, fast_symbol: i32, bit_buf: BitBuffer, mut code_len: u8) -> (i32, u32) {
-        let mut symbol = fast_symbol;
-        // We step through the tree until we encounter a positive value, which indicates a
-        // symbol.
+    // `codeword` is bit-reversed, as codes are read from the low bits up.
+    let mut codeword = 0usize;
+    let mut len = 1;
+    while counts[len as usize] == 0 {
+        len += 1;
+    }
+    let mut count = counts[len as usize];
+    let mut table_end = 1usize << len;
+    while len <= table_bits {
         loop {
-            // symbol here indicates the position of the left (0) node, if the next bit is 1
-            // we add 1 to the lookup position to get the right node.
-            let tree_index = (!symbol + ((bit_buf >> code_len) & 1) as i32) as usize;
-
-            // Use get here to avoid generatic panic code.
-            // The init_tree code should prevent this from actually going out of bounds
-            // but if there were somehow a bug with that
-            // we would at worst end up with corrupted output in release mode.
-            debug_assert!(tree_index < self.tree.len());
-            symbol = i32::from(self.tree.get(tree_index).copied().unwrap_or(i16::MAX));
-            code_len += 1;
-            if symbol >= 0 {
+            *main.get_mut(codeword)? = next_entry(len)?;
+            if codeword == table_end - 1 {
+                // The last codeword, all ones.
+                while table_end < main.len() {
+                    main.copy_within(..table_end, table_end);
+                    table_end <<= 1;
+                }
+                return Some(());
+            }
+            // Increment the codeword in canonical (reversed) bit order.
+            let bit = 1 << (usize::BITS - 1 - (codeword ^ (table_end - 1)).leading_zeros());
+            codeword = (codeword & (bit - 1)) | bit;
+            count -= 1;
+            if count == 0 {
                 break;
             }
         }
-        // Note: Using a u8 for code_len inside this function seems to improve performance, but changing it
-        // in localvars seems to worsen things so we convert it to a u32 here.
-        (symbol, u32::from(code_len))
+        loop {
+            len += 1;
+            if len <= table_bits {
+                main.copy_within(..table_end, table_end);
+                table_end <<= 1;
+            }
+            count = *counts.get(len as usize)?;
+            if count != 0 {
+                break;
+            }
+        }
     }
 
-    #[inline]
-    /// Look up a symbol and code length from the bits in the provided bit buffer.
-    ///
-    /// Returns Some(symbol, length) on success,
-    /// None if the length is 0.
-    ///
-    /// It's possible we could avoid checking for 0 if we can guarantee a sane table.
-    /// TODO: Check if a smaller type for code_len helps performance.
-    fn lookup(&self, bit_buf: BitBuffer) -> (i32, u32) {
-        let symbol = self.fast_lookup(bit_buf).into();
-        if symbol >= 0 {
-            let length = (symbol >> 9) as u32;
-            (symbol, length)
-        } else {
-            // We didn't get a symbol from the fast lookup table, so check the tree instead.
-            self.tree_lookup(symbol, bit_buf, FAST_LOOKUP_BITS)
+    // Longer codewords go to subtables, each sized to hold every codeword
+    // sharing its main table prefix.
+    let main_mask = (1 << table_bits) - 1;
+    table_end = 1 << table_bits;
+    let mut prefix = usize::MAX;
+    let mut start = 0;
+    loop {
+        if codeword & main_mask != prefix {
+            prefix = codeword & main_mask;
+            start = table_end;
+            let mut sub_bits = len - table_bits;
+            let mut used = u32::from(count);
+            while used < 1 << sub_bits {
+                sub_bits += 1;
+                used = (used << 1) + u32::from(*counts.get((table_bits + sub_bits) as usize)?);
+            }
+            table_end = start + (1 << sub_bits);
+            *table.get_mut(prefix)? = (start as u32) << 16
+                | ENTRY_EXCEPTIONAL
+                | ENTRY_SUBTABLE
+                | sub_bits << 8
+                | table_bits;
+        }
+        let entry = next_entry(len - table_bits)?;
+        let stride = 1 << (len - table_bits);
+        for slot in table
+            .get_mut(start + (codeword >> table_bits)..table_end)?
+            .iter_mut()
+            .step_by(stride)
+        {
+            *slot = entry;
+        }
+        if codeword == (1 << len) - 1 {
+            return Some(());
+        }
+        let bit = 1 << (usize::BITS - 1 - (codeword ^ ((1 << len) - 1)).leading_zeros());
+        codeword = (codeword & (bit - 1)) | bit;
+        count -= 1;
+        while count == 0 {
+            len += 1;
+            count = *counts.get(len as usize)?;
         }
     }
 }
@@ -130,11 +267,6 @@ const MAX_HUFF_SYMBOLS_0: usize = 288;
 const MAX_HUFF_SYMBOLS_1: usize = 32;
 /// The length of the last (huffman code length) huffman table.
 const MAX_HUFF_SYMBOLS_2: usize = 19;
-/// The maximum length of a code that can be looked up in the fast lookup table.
-const FAST_LOOKUP_BITS: u8 = 10;
-/// The size of the fast lookup table.
-const FAST_LOOKUP_SIZE: u16 = 1 << FAST_LOOKUP_BITS;
-const MAX_HUFF_TREE_SIZE: usize = MAX_HUFF_SYMBOLS_0 * 2;
 const LITLEN_TABLE: usize = 0;
 const DIST_TABLE: usize = 1;
 const HUFFLEN_TABLE: usize = 2;
@@ -287,8 +419,13 @@ pub struct DecompressorOxide {
     table_sizes: [u16; MAX_HUFF_TABLES],
     /// Buffer of input data.
     bit_buf: BitBuffer,
-    /// Huffman tables.
-    tables: [HuffmanTable; MAX_HUFF_TABLES],
+    /// Decode tables.
+    #[cfg_attr(feature = "serde", serde(with = "BigArray"))]
+    litlen_table: [u32; LITLEN_TABLE_SIZE],
+    #[cfg_attr(feature = "serde", serde(with = "BigArray"))]
+    dist_table: [u32; DIST_TABLE_SIZE],
+    #[cfg_attr(feature = "serde", serde(with = "BigArray"))]
+    huff_table: [u32; HUFFLEN_TABLE_SIZE],
 
     #[cfg_attr(feature = "serde", serde(with = "BigArray"))]
     code_size_literal: [u8; MAX_HUFF_SYMBOLS_0],
@@ -336,6 +473,16 @@ impl DecompressorOxide {
             Some(self.z_adler32)
         } else {
             None
+        }
+    }
+
+    /// Looks up the code at the bottom of `bit_buf` in the given table.
+    #[inline]
+    fn lookup(&self, table: usize, bit_buf: BitBuffer) -> (u32, u32) {
+        match table {
+            LITLEN_TABLE => lookup(&self.litlen_table, LITLEN_TABLE_BITS, bit_buf),
+            DIST_TABLE => lookup(&self.dist_table, DIST_TABLE_BITS, bit_buf),
+            _ => lookup(&self.huff_table, HUFFLEN_TABLE_BITS, bit_buf),
         }
     }
 
@@ -415,12 +562,9 @@ impl Default for DecompressorOxide {
             num_extra: 0,
             table_sizes: [0; MAX_HUFF_TABLES],
             bit_buf: 0,
-            // TODO:(oyvindln) Check that copies here are optimized out in release mode.
-            tables: [
-                HuffmanTable::new(),
-                HuffmanTable::new(),
-                HuffmanTable::new(),
-            ],
+            litlen_table: [0; LITLEN_TABLE_SIZE],
+            dist_table: [0; DIST_TABLE_SIZE],
+            huff_table: [0; HUFFLEN_TABLE_SIZE],
             code_size_literal: [0; MAX_HUFF_SYMBOLS_0],
             code_size_dist: [0; MAX_HUFF_SYMBOLS_1],
             code_size_huffman: [0; MAX_HUFF_SYMBOLS_2],
@@ -622,7 +766,7 @@ enum Action {
     End(TINFLStatus),
 }
 
-/// Try to decode the next huffman code, and puts it in the counter field of the decompressor
+/// Try to decode the next huffman code, and pass its decode table entry to `f`
 /// if successful.
 ///
 /// # Returns
@@ -637,7 +781,7 @@ fn decode_huffman_code<F>(
     f: F,
 ) -> Action
 where
-    F: FnOnce(&mut DecompressorOxide, &mut LocalVars, i32) -> Action,
+    F: FnOnce(&mut DecompressorOxide, &mut LocalVars, u32) -> Action,
 {
     // As the huffman codes can be up to 15 bits long we need at least 15 bits
     // ready in the bit buffer to start decoding the next huffman code.
@@ -657,28 +801,8 @@ where
             //  * until the */
             // /* bit buffer contains >=15 bits (deflate's max. Huffman code size). */
             loop {
-                let mut temp = i32::from(r.tables[table].fast_lookup(l.bit_buf));
-                if temp >= 0 {
-                    let code_len = (temp >> 9) as u32;
-                    // TODO: Is there any point to check for code_len != 0 here still?
-                    if (code_len != 0) && (l.num_bits >= code_len) {
-                        break;
-                    }
-                } else if l.num_bits > FAST_LOOKUP_BITS.into() {
-                    let mut code_len = u32::from(FAST_LOOKUP_BITS);
-                    loop {
-                        temp = i32::from(
-                            r.tables[table].tree
-                                [(!temp + ((l.bit_buf >> code_len) & 1) as i32) as usize],
-                        );
-                        code_len += 1;
-                        if temp >= 0 || l.num_bits < code_len + 1 {
-                            break;
-                        }
-                    }
-                    if temp >= 0 {
-                        break;
-                    }
+                if r.lookup(table, l.bit_buf).1 <= l.num_bits {
+                    break;
                 }
 
                 // TODO: miniz jumps straight to here after getting here again after failing to read
@@ -712,25 +836,10 @@ where
     }
 
     // We now have at least 15 bits in the input buffer.
-    let mut symbol = i32::from(r.tables[table].fast_lookup(l.bit_buf));
-    let code_len;
-    // If the symbol was found in the fast lookup table.
-    if symbol >= 0 {
-        // Get the length value from the top bits.
-        // As we shift down the sign bit, converting to an unsigned value
-        // shouldn't overflow.
-        code_len = (symbol >> 9) as u32;
-        // Mask out the length value.
-        symbol &= 511;
-    } else {
-        let res = r.tables[table].tree_lookup(symbol, l.bit_buf, FAST_LOOKUP_BITS);
-        symbol = res.0;
-        code_len = res.1;
-    };
-
+    let (entry, code_len) = r.lookup(table, l.bit_buf);
     l.bit_buf >>= code_len;
     l.num_bits -= code_len;
-    f(r, l, symbol)
+    f(r, l, entry)
 }
 
 /// Try to read one byte from `in_iter` and call `f` with the read byte as an argument,
@@ -819,92 +928,41 @@ fn start_static_table(r: &mut DecompressorOxide) {
     r.code_size_dist[0..32].fill(5);
 }
 
-#[cfg(any(
-    feature = "rustc-dep-of-std",
-    not(feature = "with-alloc"),
-    target_arch = "aarch64",
-    target_arch = "arm64ec",
-    target_arch = "loongarch64"
-))]
-#[inline]
-const fn reverse_bits(n: u16) -> u16 {
-    // Lookup is not used when building as part of std to avoid wasting space
-    // for lookup table in every rust binary
-    // as it's only used for backtraces in the cold path
-    // - see #152
-
-    // armv7 and newer, and loongarch have a cpu instruction for bit reversal so
-    // it's preferable to just use that on those architectures.
-
-    // Also disable lookup table when not using the alloc feature as
-    // we probably don't want to waste space for a lookup table in an environment
-    // without an allocator.
-    n.reverse_bits()
-}
-
-#[cfg(all(
-    not(any(
-        feature = "rustc-dep-of-std",
-        target_arch = "aarch64",
-        target_arch = "arm64ec",
-        target_arch = "loongarch64"
-    )),
-    feature = "with-alloc"
-))]
-fn reverse_bits(n: u16) -> u16 {
-    static REVERSED_BITS_LOOKUP: [u16; 512] = {
-        let mut table = [0; 512];
-
-        let mut i = 0;
-        while i < 512 {
-            table[i] = (i as u16).reverse_bits();
-            i += 1;
-        }
-
-        table
-    };
-
-    REVERSED_BITS_LOOKUP[n as usize]
-}
-
 fn init_tree(r: &mut DecompressorOxide, l: &mut LocalVars) -> Option<Action> {
     loop {
         let bt = r.block_type as usize;
 
-        let code_sizes = match bt {
-            LITLEN_TABLE => &mut r.code_size_literal[..],
-            DIST_TABLE => &mut r.code_size_dist,
-            HUFFLEN_TABLE => &mut r.code_size_huffman,
+        let (code_sizes, table, table_bits, entries): (&[u8], &mut [u32], _, &[u32]) = match bt {
+            LITLEN_TABLE => (
+                &r.code_size_literal,
+                &mut r.litlen_table,
+                LITLEN_TABLE_BITS,
+                &LITLEN_ENTRIES,
+            ),
+            DIST_TABLE => (
+                &r.code_size_dist,
+                &mut r.dist_table,
+                DIST_TABLE_BITS,
+                &DIST_ENTRIES,
+            ),
+            HUFFLEN_TABLE => (
+                &r.code_size_huffman,
+                &mut r.huff_table,
+                HUFFLEN_TABLE_BITS,
+                &HUFFLEN_ENTRIES,
+            ),
             _ => return None,
         };
-        let table = &mut r.tables[bt];
 
         let mut total_symbols = [0u16; 16];
-        // Next code - we use the odd length here to simplify a loop later.
-        let mut next_code = [0u32; 17];
-        const INVALID_CODE: i16 = (1 << 9) | 286;
-        // Set the values in the fast table to return a
-        // non-zero length and an invalid symbol instead of zero
-        // so that we do not have to have a check for a zero
-        // code length in the hot code path later
-        // and can instead error out on the invalid symbol check
-        // on bogus input.
-        table.look_up.fill(INVALID_CODE);
-        // If we are initializing the huffman code length we can skip
-        // this since these codes can't be longer than 3 bits
-        // and thus only use the fast table and this table won't be accessed so
-        // there is no point clearing it.
-        // TODO: Avoid creating this table at all.
-        if bt != HUFFLEN_TABLE {
-            table.tree.fill(0);
-        }
 
         let table_size = r.table_sizes[bt] as usize;
         if table_size > code_sizes.len() {
             return None;
         }
+        let code_sizes = &code_sizes[..table_size];
 
-        for &code_size in &code_sizes[..table_size] {
+        for &code_size in code_sizes {
             let cs = code_size as usize;
             // Code sizes are limited to max 15 according to the
             // deflate spec.
@@ -921,18 +979,12 @@ fn init_tree(r: &mut DecompressorOxide, l: &mut LocalVars) -> Option<Action> {
         // is not over-subscribed at any step (matching zlib's inftrees.c).
         {
             let mut left = 1i32;
-            for (i, (&ts, next)) in total_symbols
-                .iter()
-                .zip(next_code[1..].iter_mut())
-                .enumerate()
-                .skip(1)
-            {
+            for (i, &ts) in total_symbols.iter().enumerate().skip(1) {
                 if ts > 0 {
                     max_code_len = i as u32;
                 }
                 total += u32::from(ts);
                 total <<= 1;
-                *next = total;
 
                 left <<= 1;
                 left -= i32::from(ts);
@@ -959,72 +1011,14 @@ fn init_tree(r: &mut DecompressorOxide, l: &mut LocalVars) -> Option<Action> {
             return Some(Action::Jump(BadTotalSymbols));
         }
 
-        let mut tree_next = -1;
-        for symbol_index in 0..table_size {
-            // Code sizes are limited to 15 according to the spec
-            // It's already checked earlier but the compiler might not be smart enough to know that.
-            let code_size = code_sizes[symbol_index] & 15;
-            if code_size == 0 {
-                continue;
-            }
-
-            let cur_code = next_code[code_size as usize];
-            next_code[code_size as usize] += 1;
-
-            let n = (cur_code & (u32::MAX >> (32 - code_size))) as u16;
-
-            let mut rev_code = if n < 512 {
-                // Using a lookup table
-                // for a small speedup here,
-                // Seems to only really make a difference on very short
-                // inputs however.
-                // 512 seems to be around a sweet spot.
-                reverse_bits(n)
-            } else {
-                n.reverse_bits()
-            } >> (16 - code_size);
-
-            if code_size <= FAST_LOOKUP_BITS {
-                let k = (i16::from(code_size) << 9) | symbol_index as i16;
-                while rev_code < FAST_LOOKUP_SIZE {
-                    table.look_up[rev_code as usize] = k;
-                    rev_code += 1 << code_size;
-                }
-                continue;
-            }
-
-            let mut tree_cur = table.look_up[(rev_code & (FAST_LOOKUP_SIZE - 1)) as usize];
-            if tree_cur == INVALID_CODE {
-                table.look_up[(rev_code & (FAST_LOOKUP_SIZE - 1)) as usize] = tree_next;
-                tree_cur = tree_next;
-                tree_next -= 2;
-            }
-
-            rev_code >>= FAST_LOOKUP_BITS - 1;
-            for _ in FAST_LOOKUP_BITS + 1..code_size {
-                rev_code >>= 1;
-                tree_cur -= (rev_code & 1) as i16;
-                let tree_index = (-tree_cur - 1) as usize;
-                if tree_index >= table.tree.len() {
-                    return None;
-                }
-                if table.tree[tree_index] == 0 {
-                    table.tree[tree_index] = tree_next;
-                    tree_cur = tree_next;
-                    tree_next -= 2;
-                } else {
-                    tree_cur = table.tree[tree_index];
-                }
-            }
-
-            rev_code >>= 1;
-            tree_cur -= (rev_code & 1) as i16;
-            let tree_index = (-tree_cur - 1) as usize;
-            if tree_index >= table.tree.len() {
-                return None;
-            }
-            table.tree[tree_index] = symbol_index as i16;
-        }
+        build_table(
+            table,
+            table_bits,
+            code_sizes,
+            &total_symbols,
+            entries,
+            total == 65_536,
+        )?;
 
         if r.block_type == HUFFLEN_TABLE as u8 {
             l.counter = 0;
@@ -1318,8 +1312,8 @@ fn decompress_fast(
 
             fill_bit_buffer(&mut l, in_iter);
 
-            let (symbol, code_len) = r.tables[LITLEN_TABLE].lookup(l.bit_buf);
-            l.counter = symbol as u32;
+            let (entry, code_len) = r.lookup(LITLEN_TABLE, l.bit_buf);
+            l.counter = litlen_symbol(entry);
             l.bit_buf >>= code_len;
             l.num_bits -= code_len;
 
@@ -1333,14 +1327,15 @@ fn decompress_fast(
                     fill_bit_buffer(&mut l, in_iter);
                 }
 
-                let (symbol, code_len) = r.tables[LITLEN_TABLE].lookup(l.bit_buf);
+                let (entry, code_len) = r.lookup(LITLEN_TABLE, l.bit_buf);
+                let symbol = litlen_symbol(entry);
                 l.bit_buf >>= code_len;
                 l.num_bits -= code_len;
                 // The previous symbol was a literal, so write it directly and check
                 // the next one.
                 out_buf.write_byte(l.counter as u8);
                 if (symbol & 256) != 0 {
-                    l.counter = symbol as u32;
+                    l.counter = symbol;
                     // The symbol is a length value.
                     break;
                 } else {
@@ -1387,17 +1382,16 @@ fn decompress_fast(
                 fill_bit_buffer(&mut l, in_iter);
             }
 
-            let (mut symbol, code_len) = r.tables[DIST_TABLE].lookup(l.bit_buf);
-            symbol &= 511;
+            let (entry, code_len) = r.lookup(DIST_TABLE, l.bit_buf);
             l.bit_buf >>= code_len;
             l.num_bits -= code_len;
-            if symbol > 29 {
+            if entry & ENTRY_EXCEPTIONAL != 0 {
                 state.begin(InvalidDist);
                 break 'o TINFLStatus::Failed;
             }
 
-            l.num_extra = num_extra_bits_for_distance_code(symbol as u8);
-            l.dist = u32::from(DIST_BASE[symbol as usize]);
+            l.num_extra = ((entry & 0xff) - ((entry >> 8) & 15)) as u8;
+            l.dist = entry >> 16;
 
             if l.num_extra != 0 {
                 fill_bit_buffer(&mut l, in_iter);
@@ -1744,8 +1738,8 @@ pub fn decompress_with_limit(
                 if l.counter < u32::from(r.table_sizes[LITLEN_TABLE]) + u32::from(r.table_sizes[DIST_TABLE]) {
                     decode_huffman_code(
                         r, &mut l, HUFFLEN_TABLE,
-                        flags, &mut in_iter, |r, l, symbol| {
-                            l.dist = symbol as u32;
+                        flags, &mut in_iter, |r, l, entry| {
+                            l.dist = entry >> 16;
                             if l.dist < 16 {
                                 r.len_codes[l.counter as usize & LEN_CODES_MASK] = l.dist as u8;
                                 l.counter += 1;
@@ -1819,8 +1813,8 @@ pub fn decompress_with_limit(
                         LITLEN_TABLE,
                         flags,
                         &mut in_iter,
-                        |_r, l, symbol| {
-                            l.counter = symbol as u32;
+                        |_r, l, entry| {
+                            l.counter = litlen_symbol(entry);
                             Action::Jump(WriteSymbol)
                         },
                     )
@@ -1848,9 +1842,9 @@ pub fn decompress_with_limit(
                 } else {
                     fill_bit_buffer(&mut l, &mut in_iter);
 
-                    let (symbol, code_len) = r.tables[LITLEN_TABLE].lookup(l.bit_buf);
+                    let (entry, code_len) = r.lookup(LITLEN_TABLE, l.bit_buf);
 
-                    l.counter = symbol as u32;
+                    l.counter = litlen_symbol(entry);
                     l.bit_buf >>= code_len;
                     l.num_bits -= code_len;
 
@@ -1864,7 +1858,8 @@ pub fn decompress_with_limit(
                             fill_bit_buffer(&mut l, &mut in_iter);
                         }
 
-                        let (symbol, code_len) = r.tables[LITLEN_TABLE].lookup(l.bit_buf);
+                        let (entry, code_len) = r.lookup(LITLEN_TABLE, l.bit_buf);
+                        let symbol = litlen_symbol(entry);
 
                             l.bit_buf >>= code_len;
                             l.num_bits -= code_len;
@@ -1872,7 +1867,7 @@ pub fn decompress_with_limit(
                             // the next one.
                             out_buf.write_byte(l.counter as u8);
                             if (symbol & 256) != 0 {
-                                l.counter = symbol as u32;
+                                l.counter = symbol;
                                 // The symbol is a length value.
                                 Action::Jump(HuffDecodeOuterLoop1)
                             } else {
@@ -1938,20 +1933,13 @@ pub fn decompress_with_limit(
             DecodeDistance => generate_state!(state, 'state_machine, {
                 // Try to read a huffman code from the input buffer and look up what
                 // length code the decoded symbol refers to.
-                decode_huffman_code(r, &mut l, DIST_TABLE, flags, &mut in_iter, |_r, l, symbol| {
-                    // # Optimizaton - transform the value into usize here before the check so
-                    // the compiler can optimize the bounds check later - ideally it should
-                    // know that the value can't be negative from earlier in the
-                    // decode_huffman_code function but it seems it may not be able
-                    // to make the assumption that it can't be negative and thus
-                    // overflow if it's converted after the check.
-                    let symbol = symbol as usize;
-                    if symbol > 29 {
+                decode_huffman_code(r, &mut l, DIST_TABLE, flags, &mut in_iter, |_r, l, entry| {
+                    if entry & ENTRY_EXCEPTIONAL != 0 {
                         // Invalid distance code.
                         return Action::Jump(InvalidDist)
                     }
-                    l.num_extra = num_extra_bits_for_distance_code(symbol as u8);
-                    l.dist = u32::from(DIST_BASE[symbol]);
+                    l.num_extra = ((entry & 0xff) - ((entry >> 8) & 15)) as u8;
+                    l.dist = entry >> 16;
                     if l.num_extra != 0 {
                         // ReadEXTRA_BITS_DISTACNE
                         Action::Jump(ReadExtraBitsDistance)
@@ -2190,6 +2178,104 @@ mod test {
         }
     }
 
+    #[test]
+    fn decode_tables_match_canonical_codes() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize % n
+        };
+        for round in 0..300 {
+            let (symbols, bits, entries): (usize, u32, &[u32]) = match round % 3 {
+                0 => (286, LITLEN_TABLE_BITS, &LITLEN_ENTRIES),
+                1 => (30, DIST_TABLE_BITS, &DIST_ENTRIES),
+                _ => (19, HUFFLEN_TABLE_BITS, &HUFFLEN_ENTRIES),
+            };
+            let max_len = if bits == HUFFLEN_TABLE_BITS { 7 } else { 15 };
+            // Split random leaves of a code tree, mostly the deepest one, to
+            // get complete codes with long codewords; occasionally keep a
+            // single 1-bit codeword or none, which only literal/length and
+            // distance codes may have.
+            let mut sizes = alloc::vec![0u8; symbols];
+            let used = match random(20) {
+                0 if bits != HUFFLEN_TABLE_BITS => 0,
+                1 if bits != HUFFLEN_TABLE_BITS => 1,
+                _ => 2 + random(symbols - 1),
+            };
+            let mut leaves = alloc::vec![if used == 1 { 1u8 } else { 0 }];
+            while used > 1 && leaves.len() < used {
+                let i = if random(4) == 0 {
+                    random(leaves.len())
+                } else {
+                    (0..leaves.len()).max_by_key(|&i| leaves[i]).unwrap()
+                };
+                if leaves[i] < max_len {
+                    leaves[i] += 1;
+                    leaves.push(leaves[i]);
+                } else if leaves.iter().all(|&l| l == max_len) {
+                    break;
+                }
+            }
+            for &len in leaves.iter().take(used) {
+                let mut symbol = random(symbols);
+                while sizes[symbol] != 0 {
+                    symbol = (symbol + 1) % symbols;
+                }
+                sizes[symbol] = len;
+            }
+            let mut counts = [0u16; 16];
+            sizes.iter().for_each(|&l| counts[l as usize] += 1);
+            let complete = (1..16)
+                .map(|l| u32::from(counts[l]) << (16 - l))
+                .sum::<u32>()
+                == 65536;
+            let mut table = alloc::vec![0u32; LITLEN_TABLE_SIZE];
+            build_table(&mut table, bits, &sizes, &counts, entries, complete).unwrap();
+
+            // Canonical codewords, most significant bit first (RFC 1951).
+            let mut next = [0u32; 16];
+            let mut code = 0;
+            for len in 1..16 {
+                code = (code + u32::from(counts[len - 1]) * u32::from(len > 1)) << 1;
+                next[len] = code;
+            }
+            let mut reference = alloc::vec![(INVALID_ENTRY, 1); 1 << 15];
+            for (symbol, &len) in sizes.iter().enumerate() {
+                if len == 0 {
+                    continue;
+                }
+                let codeword = next[len as usize];
+                next[len as usize] += 1;
+                let reversed = (codeword.reverse_bits() >> (32 - len)) as usize;
+                for slot in reference.iter_mut().skip(reversed).step_by(1 << len) {
+                    *slot = (entries[symbol], u32::from(len));
+                }
+            }
+            for (bit_buf, &(entry, len)) in reference.iter().enumerate() {
+                let (actual, actual_len) = lookup(&table, bits, bit_buf as BitBuffer);
+                assert_eq!(actual_len, len, "round {round} bits {bit_buf:#x}");
+                // Entries agree apart from their codeword length fields,
+                // which subtables count from the end of the main table.
+                assert_eq!(
+                    actual & !0xfff,
+                    entry & !0xfff,
+                    "round {round} bits {bit_buf:#x}"
+                );
+                let extra = (entry & 0xff).wrapping_sub((entry >> 8) & 15) & 0xff;
+                let code_part = if actual_len > bits && len > bits {
+                    len - bits
+                } else {
+                    len
+                };
+                if entry != INVALID_ENTRY {
+                    assert_eq!(actual & 0xfff, code_part << 8 | (code_part + extra));
+                }
+            }
+        }
+    }
+
     //TODO: Fix these.
 
     fn tinfl_decompress_oxide<'i>(
@@ -2261,9 +2347,14 @@ mod test {
         assert_eq!(b_status.0, TINFLStatus::Done);
     }
 
-    fn masked_lookup(table: &HuffmanTable, bit_buf: BitBuffer) -> (i32, u32) {
-        let ret = table.lookup(bit_buf);
-        (ret.0 & 511, ret.1)
+    fn litlen_lookup(d: &DecompressorOxide, bit_buf: BitBuffer) -> (u32, u32) {
+        let (entry, len) = d.lookup(LITLEN_TABLE, bit_buf);
+        (litlen_symbol(entry), len)
+    }
+
+    fn dist_lookup(d: &DecompressorOxide, bit_buf: BitBuffer) -> (u32, u32, u32) {
+        let (entry, len) = d.lookup(DIST_TABLE, bit_buf);
+        (entry >> 16, (entry & 0xff) - len, len)
     }
 
     #[test]
@@ -2279,21 +2370,20 @@ mod test {
             num_extra: d.num_extra,
         };
         init_tree(&mut d, &mut l).unwrap();
-        let llt = &d.tables[LITLEN_TABLE];
-        let dt = &d.tables[DIST_TABLE];
-        assert_eq!(masked_lookup(llt, 0b00001100), (0, 8));
-        assert_eq!(masked_lookup(llt, 0b00011110), (72, 8));
-        assert_eq!(masked_lookup(llt, 0b01011110), (74, 8));
-        assert_eq!(masked_lookup(llt, 0b11111101), (143, 8));
-        assert_eq!(masked_lookup(llt, 0b000010011), (144, 9));
-        assert_eq!(masked_lookup(llt, 0b111111111), (255, 9));
-        assert_eq!(masked_lookup(llt, 0b00000000), (256, 7));
-        assert_eq!(masked_lookup(llt, 0b1110100), (279, 7));
-        assert_eq!(masked_lookup(llt, 0b00000011), (280, 8));
-        assert_eq!(masked_lookup(llt, 0b11100011), (287, 8));
+        assert_eq!(litlen_lookup(&d, 0b00001100), (0, 8));
+        assert_eq!(litlen_lookup(&d, 0b00011110), (72, 8));
+        assert_eq!(litlen_lookup(&d, 0b01011110), (74, 8));
+        assert_eq!(litlen_lookup(&d, 0b11111101), (143, 8));
+        assert_eq!(litlen_lookup(&d, 0b000010011), (144, 9));
+        assert_eq!(litlen_lookup(&d, 0b111111111), (255, 9));
+        assert_eq!(litlen_lookup(&d, 0b00000000), (256, 7));
+        assert_eq!(litlen_lookup(&d, 0b1110100), (279, 7));
+        assert_eq!(litlen_lookup(&d, 0b00000011), (280, 8));
+        assert_eq!(litlen_lookup(&d, 0b11100011), (287, 8));
 
-        assert_eq!(masked_lookup(dt, 0), (0, 5));
-        assert_eq!(masked_lookup(dt, 20), (5, 5));
+        // Symbols 0 and 5: bases 1 and 7, with 0 and 1 extra bits.
+        assert_eq!(dist_lookup(&d, 0), (1, 0, 5));
+        assert_eq!(dist_lookup(&d, 20), (7, 1, 5));
     }
 
     // Only run this test with alloc enabled as it uses a larger buffer.
@@ -2464,14 +2554,6 @@ mod test {
         };
         //println!("status {:?}", status);
         assert!(status != BadTotalSymbols);
-    }
-
-    #[test]
-    fn reverse_bits_lookup() {
-        use super::reverse_bits;
-        for i in 0..512 {
-            assert_eq!(reverse_bits(i), i.reverse_bits());
-        }
     }
 
     #[cfg(feature = "with-alloc")]
