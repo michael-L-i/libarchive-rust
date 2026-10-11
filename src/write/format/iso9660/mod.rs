@@ -939,6 +939,10 @@ impl Iso9660 {
                     })?,
                 ));
             }
+            // extra_close_record() pads the record to an even length.
+            if !out.len().is_multiple_of(2) {
+                out.push(0);
+            }
         }
         out[0] = out.len() as u8;
         Ok(out)
@@ -2020,6 +2024,34 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn rock_ridge_directory_records_have_even_length() {
+        struct Image(Vec<u8>);
+        impl Sink for Image {
+            fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+                self.0.extend_from_slice(data);
+                Ok(())
+            }
+        }
+        let base = Base::new(crate::archive::WRITE_MAGIC);
+        let mut iso = Iso9660::default();
+        let mut image = Image(Vec::new());
+        let mut d = Entry::new(None);
+        d.set_pathname(b"d");
+        d.set_mode(0o40755);
+        iso.header(&base, &mut d, &mut image).unwrap();
+        iso.close(&mut image).unwrap();
+        let pvd = &image.0[16 * BLOCK..17 * BLOCK];
+        let root = u32::from_le_bytes(pvd[158..162].try_into().unwrap()) as usize;
+        let mut lengths = Vec::new();
+        let mut at = root * BLOCK;
+        while image.0[at] != 0 {
+            lengths.push(image.0[at]);
+            at += image.0[at] as usize;
+        }
+        assert_eq!(lengths.len(), 3);
+        assert!(lengths.iter().all(|n| n.is_multiple_of(2)), "{lengths:?}");
     }
     #[test]
     fn joliet_name_comes_from_the_pathname_as_given() {
