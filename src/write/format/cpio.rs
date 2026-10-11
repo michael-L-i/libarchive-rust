@@ -27,7 +27,7 @@
 
 // Ported from libarchive/archive_write_set_format_cpio_newc.c.
 use crate::archive::*;
-use crate::entry::Entry;
+use crate::entry::{Dev, Entry};
 use crate::string::StringConv;
 use crate::util::Error;
 use crate::write::{Format, Sink, zeros};
@@ -39,7 +39,7 @@ pub struct Cpio {
     remaining: u64,
     padding: u64,
     next: u32,
-    inos: BTreeMap<(i32, i32, i64), u32>,
+    inos: BTreeMap<(Dev, Dev, i64), u32>,
     conv: Option<Arc<StringConv>>,
 }
 impl Cpio {
@@ -168,11 +168,14 @@ impl Cpio {
                     },
                 ));
             }
+            // The header's fields are 16 bits; mode_t is too on macOS only.
+            #[allow(clippy::unnecessary_cast)]
+            let mode = e.mode() as u16;
             for v in [
                 0o70707,
                 e.dev() as u16,
                 ino as u16,
-                e.mode(),
+                mode,
                 e.uid() as u16,
                 e.gid() as u16,
                 e.nlink() as u16,
