@@ -41,7 +41,11 @@ pub use crate::matching::{
 pub use entry::{ArchiveEntry, ArchiveEntryLinkresolver};
 pub use matching::ArchiveMatch;
 pub use read::ArchiveRead;
-pub use read_disk::ArchiveReadDisk;
+pub use read_disk::{
+    ARCHIVE_READDISK_HONOR_NODUMP, ARCHIVE_READDISK_MAC_COPYFILE, ARCHIVE_READDISK_NO_ACL,
+    ARCHIVE_READDISK_NO_FFLAGS, ARCHIVE_READDISK_NO_SPARSE, ARCHIVE_READDISK_NO_TRAVERSE_MOUNTS,
+    ARCHIVE_READDISK_NO_XATTR, ARCHIVE_READDISK_RESTORE_ATIME, ArchiveReadDisk, ReadDiskView,
+};
 pub use write::ArchiveWrite;
 pub use write_disk::{
     ARCHIVE_EXTRACT_ACL, ARCHIVE_EXTRACT_CLEAR_NOCHANGE_FFLAGS, ARCHIVE_EXTRACT_FFLAGS,

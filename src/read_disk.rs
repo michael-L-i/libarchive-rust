@@ -27,7 +27,8 @@
 
 // Ported from libarchive/archive_read_disk_posix.c.
 
-use crate::archive::{ARCHIVE_EOF, ARCHIVE_FAILED, ARCHIVE_OK, Base, state};
+use crate::api::read_disk::DiskMatcher;
+use crate::archive::{ARCHIVE_EOF, ARCHIVE_FAILED, ARCHIVE_OK, Base, Handle, state};
 use crate::entry::Entry;
 use crate::util::Error;
 use std::collections::VecDeque;
@@ -42,15 +43,23 @@ type Ancestors = Vec<(u64, u64)>;
 /// A path to visit, whether it is the root, and its ancestors.
 type Pending = (PathBuf, bool, Ancestors);
 
+/// `archive_read_disk_set_metadata_filter_callback`'s filter: whether to
+/// return the entry. Through `Base` it can ask to descend into it.
+pub type MetadataFilter = Box<dyn FnMut(&Base, &mut Entry) -> bool>;
+
+/// `archive_read_disk_set_matching`'s callback, which sees each entry the
+/// match handle excludes.
+pub type ExcludedCallback = Box<dyn FnMut(&Base, &mut Entry)>;
+
 #[derive(Default)]
 pub struct ReadDisk {
     pub symlinks: u8,
     pub behavior: c_int,
     pub user: crate::ffi::disk::NameLookup,
     pub group: crate::ffi::disk::NameLookup,
-    pub metadata_filter: crate::ffi::disk::MetadataFilter,
-    pub matching: Option<crate::ffi::matching::MatchingHandle>,
-    pub excluded: crate::ffi::disk::ExcludedCallback,
+    pub metadata_filter: Option<MetadataFilter>,
+    pub matching: Option<DiskMatcher>,
+    pub excluded: Option<ExcludedCallback>,
     /// The entry `archive_read_next_header` hands to C, which
     /// `archive_read_disk_new` makes and `archive_free` frees; NULL for a
     /// handle that is not C's.
@@ -183,22 +192,10 @@ impl ReadDisk {
             entry.set_pathname(path.as_os_str().as_bytes());
             self.current = Some(path.clone());
             self.ancestors = ancestors;
-            if let Some(m) = self.matching {
-                let excluded = m.path_excluded(entry);
-                if excluded < 0 {
-                    m.copy_error(a);
-                    return excluded;
-                }
-                if excluded != 0 {
-                    self.excluded.call(entry);
-                    if a.disk_descend_requested.take() {
-                        let ret = self.descend(a);
-                        if ret < 0 {
-                            return ret;
-                        }
-                    }
-                    continue;
-                }
+            match self.excluded(a, entry, |m, e| m.match_path_excluded(Some(e))) {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(r) => return r,
             }
             let follow = self.symlinks == 1 || (self.symlinks == 2 && root);
             let mut st = match crate::ffi::disk_sys::stat(&path, -1, follow) {
@@ -260,22 +257,10 @@ impl ReadDisk {
             if self.behavior & 2 != 0 && st.st_flags & libc::UF_NODUMP != 0 {
                 continue;
             }
-            if let Some(m) = self.matching {
-                let excluded = m.time_excluded(entry);
-                if excluded < 0 {
-                    m.copy_error(a);
-                    return excluded;
-                }
-                if excluded != 0 {
-                    self.excluded.call(entry);
-                    if a.disk_descend_requested.take() {
-                        let ret = self.descend(a);
-                        if ret < 0 {
-                            return ret;
-                        }
-                    }
-                    continue;
-                }
+            match self.excluded(a, entry, |m, e| m.match_time_excluded(Some(e))) {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(r) => return r,
             }
             if let Some(name) = self.user.lookup(entry.uid(), false) {
                 entry.set_uname(name.to_bytes());
@@ -283,24 +268,12 @@ impl ReadDisk {
             if let Some(name) = self.group.lookup(entry.gid(), true) {
                 entry.set_gname(name.to_bytes());
             }
-            if let Some(m) = self.matching {
-                let excluded = m.owner_excluded(entry);
-                if excluded < 0 {
-                    m.copy_error(a);
-                    return excluded;
-                }
-                if excluded != 0 {
-                    self.excluded.call(entry);
-                    if a.disk_descend_requested.take() {
-                        let ret = self.descend(a);
-                        if ret < 0 {
-                            return ret;
-                        }
-                    }
-                    continue;
-                }
+            match self.excluded(a, entry, |m, e| m.match_owner_excluded(Some(e))) {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(r) => return r,
             }
-            let include = self.metadata_filter.apply(entry);
+            let include = self.metadata_filter.as_mut().is_none_or(|f| f(a, entry));
             if a.disk_descend_requested.take() {
                 let ret = self.descend(a);
                 if ret < 0 {
@@ -335,6 +308,38 @@ impl ReadDisk {
             a.state.set(state::DATA);
             return ARCHIVE_OK;
         }
+    }
+    /// Whether the match handle's `test` excludes `entry`, after the
+    /// excluded callback has seen it and the walk has descended into it if
+    /// the callback asked; or the failure, recorded.
+    fn excluded(
+        &mut self,
+        a: &Base,
+        entry: &mut Entry,
+        test: impl FnOnce(&Handle, &mut Entry) -> c_int,
+    ) -> Result<bool, c_int> {
+        let Some(m) = &self.matching else {
+            return Ok(false);
+        };
+        let m = m.handle();
+        match test(m, entry) {
+            0 => return Ok(false),
+            r if r < 0 => {
+                a.copy_error(&m.base);
+                return Err(r);
+            }
+            _ => {}
+        }
+        if let Some(excluded) = &mut self.excluded {
+            excluded(a, entry);
+        }
+        if a.disk_descend_requested.take() {
+            let r = self.descend(a);
+            if r < 0 {
+                return Err(r);
+            }
+        }
+        Ok(true)
     }
     fn restore_current(&mut self, a: &Base) {
         if self.behavior & 1 != 0

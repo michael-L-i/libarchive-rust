@@ -40,6 +40,7 @@ fn entry<'a>(e: *mut ArchiveEntry) -> Option<&'a mut Entry> {
     // else uses during the call.
     unsafe { e.cast::<Entry>().as_mut() }
 }
+/// A match handle C lends a disk reader (`archive_read_disk_set_matching`).
 #[derive(Clone, Copy)]
 pub(crate) struct MatchingHandle(*mut Archive);
 impl MatchingHandle {
@@ -49,21 +50,11 @@ impl MatchingHandle {
             (h.base.magic == MATCH_MAGIC).then_some(Self(p))
         })
     }
-    pub(crate) fn copy_error(self, dest: &Base) {
-        with(self.0, (), |h| dest.copy_error(&h.base));
-    }
-    pub(crate) fn path_excluded(self, e: &mut Entry) -> c_int {
-        with(self.0, ARCHIVE_FATAL, |h| h.match_path_excluded(Some(e)))
-    }
-    pub(crate) fn time_excluded(self, e: &mut Entry) -> c_int {
-        operation(self.0, "archive_match_time_excluded_ae", |_, m| {
-            Ok(m.time_excluded(e))
-        })
-    }
-    pub(crate) fn owner_excluded(self, e: &mut Entry) -> c_int {
-        operation(self.0, "archive_match_owner_excluded_ae", |_, m| {
-            Ok(m.owner_excluded(e))
-        })
+    pub(crate) fn handle(&self) -> &Handle {
+        // SAFETY: `new` checked that this is a live handle, which the C
+        // caller keeps alive while the disk reader uses it; handles are only
+        // ever borrowed shared.
+        unsafe { &*self.0.cast::<Handle>() }
     }
 }
 #[unsafe(no_mangle)]

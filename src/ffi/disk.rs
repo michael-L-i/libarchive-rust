@@ -2,12 +2,12 @@
 
 use super::archive::with;
 use super::{Archive, ArchiveEntry, guard};
+use crate::api::read_disk::DiskMatcher;
 use crate::archive::{self, ARCHIVE_FATAL, ARCHIVE_OK, Base, Handle, Kind};
 use crate::entry::Entry;
+use crate::read_disk::{ExcludedCallback, MetadataFilter};
 use crate::{read_disk, write_disk};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
 use std::rc::Rc;
 
 pub type Cleanup = Option<unsafe extern "C" fn(*mut c_void)>;
@@ -345,61 +345,30 @@ pub extern "C" fn archive_read_disk_entry_from_file(
     fd: c_int,
     st: *const libc::stat,
 ) -> c_int {
-    read(a, ARCHIVE_FATAL, |base, d| {
+    with(a, ARCHIVE_FATAL, |h| {
         // SAFETY: entry is NULL or live and exclusively borrowed during call.
         let Some(entry) = (unsafe { entry.cast::<Entry>().as_mut() }) else {
             return ARCHIVE_FATAL;
         };
-        let source = entry
-            .sourcepath()
-            .map(|p| p.to_bytes().to_vec())
-            .or_else(|| entry.pathname().map(|p| p.to_bytes().to_vec()));
-        let Some(path) = source.map(|p| PathBuf::from(std::ffi::OsStr::from_bytes(&p))) else {
-            return ARCHIVE_FATAL;
-        };
         // SAFETY: optional stat pointer is readable during call.
-        if let Some(st) = unsafe { st.as_ref() } {
-            entry.copy_stat(st);
-        } else {
-            let stat = match super::disk_sys::stat(&path, fd, d.symlinks != 0) {
-                Ok(s) => s,
-                Err(e) => return read_disk::io_error(base, e, "Can't stat"),
-            };
-            entry.copy_stat(&stat);
-        }
-        d.fill_metadata(base, entry, &path)
+        let st = unsafe { st.as_ref() };
+        h.read_disk_entry_from_file(entry, fd, st)
     })
 }
 
-pub type MetadataCallback =
-    Option<unsafe extern "C" fn(*mut Archive, *mut c_void, *mut ArchiveEntry) -> c_int>;
-#[derive(Default)]
-pub struct MetadataFilter {
-    archive: *mut Archive,
-    data: *mut c_void,
-    callback: MetadataCallback,
-}
-impl MetadataFilter {
-    pub fn apply(&self, entry: &mut Entry) -> bool {
-        self.callback.is_none_or(|callback| {
-            // SAFETY: caller registers the callback/data; the entry remains live during call.
-            unsafe { callback(self.archive, self.data, (entry as *mut Entry).cast()) != 0 }
-        })
-    }
-}
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_set_metadata_filter_callback(
     a: *mut Archive,
-    callback: MetadataCallback,
+    callback: Option<unsafe extern "C" fn(*mut Archive, *mut c_void, *mut ArchiveEntry) -> c_int>,
     data: *mut c_void,
 ) -> c_int {
-    read(a, ARCHIVE_FATAL, |_, d| {
-        d.metadata_filter = MetadataFilter {
-            archive: a,
-            data,
-            callback,
-        };
-        ARCHIVE_OK
+    let filter = callback.map(|callback| -> MetadataFilter {
+        // SAFETY: the caller registered the callback to be called with
+        // `data`; the entry is live for the call.
+        Box::new(move |_, entry| unsafe { callback(a, data, (entry as *mut Entry).cast()) != 0 })
+    });
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_disk_set_metadata_filter_callback(filter)
     })
 }
 #[unsafe(no_mangle)]
@@ -415,31 +384,16 @@ pub extern "C" fn archive_read_disk_set_matching(
         let Some(m) = super::matching::MatchingHandle::new(matching) else {
             return ARCHIVE_FATAL;
         };
-        Some(m)
+        Some(DiskMatcher::Lent(m))
     };
-    read(a, ARCHIVE_FATAL, |_, d| {
-        d.matching = matching;
-        d.excluded = ExcludedCallback {
-            archive: a,
-            data,
-            callback: excluded,
-        };
-        ARCHIVE_OK
+    let excluded = excluded.map(|excluded| -> ExcludedCallback {
+        // SAFETY: the caller registered the callback to be called with
+        // `data`; the entry is live for the call.
+        Box::new(move |_, entry| unsafe { excluded(a, data, (entry as *mut Entry).cast()) })
+    });
+    with(a, ARCHIVE_FATAL, |h| {
+        h.read_disk_set_matching(matching, excluded)
     })
-}
-#[derive(Default)]
-pub struct ExcludedCallback {
-    archive: *mut Archive,
-    data: *mut c_void,
-    callback: Option<unsafe extern "C" fn(*mut Archive, *mut c_void, *mut ArchiveEntry)>,
-}
-impl ExcludedCallback {
-    pub fn call(&self, entry: &mut Entry) {
-        if let Some(cb) = self.callback {
-            // SAFETY: callback/data registered by caller; entry borrowed for this call only.
-            unsafe { cb(self.archive, self.data, (entry as *mut Entry).cast()) };
-        }
-    }
 }
 
 pub type Progress = Option<unsafe extern "C" fn(*mut c_void)>;
@@ -565,6 +519,8 @@ pub extern "C" fn archive_read_extract2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
     fn directory(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
