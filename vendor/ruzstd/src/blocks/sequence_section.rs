@@ -12,36 +12,6 @@ pub struct SequencesHeader {
     pub modes: Option<CompressionModes>,
 }
 
-/// A sequence represents potentially redundant data, and it can be broken up into 2 steps:
-/// - A copy step, where data is copied from the literals section to the decompressed output
-/// - A *match* copy step that copies data from within the previously decompressed output.
-///
-/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#sequence-execution>
-#[derive(Clone, Copy)]
-pub struct Sequence {
-    /// Literal length, or the number of bytes to be copied from the literals section
-    /// in the copy step.
-    pub ll: u32,
-    /// The length of the match to make during the match copy step.
-    pub ml: u32,
-    /// How far back to go in the decompressed data to read from the match copy step.
-    /// If this value is greater than 3, then the offset is `of -3`. If `of` is from 1-3,
-    /// then it has special handling:
-    ///
-    /// The first 3 values define 3 different repeated offsets, with 1 referring to the most
-    /// recent, 2 the second recent, and so on. When the current sequence has a literal length of 0,
-    /// then the repeated offsets are shifted by 1. So an offset value of 1 refers to 2, 2 refers to 3,
-    /// and 3 refers to the most recent offset minus one. If that value is equal to zero, the data
-    /// is considered corrupted.
-    pub of: u32,
-}
-
-impl core::fmt::Display for Sequence {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
-        write!(f, "LL: {}, ML: {}, OF: {}", self.ll, self.ml, self.of)
-    }
-}
-
 /// This byte defines the compression mode of each symbol type
 #[derive(Copy, Clone)]
 pub struct CompressionModes(u8);
