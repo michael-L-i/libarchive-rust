@@ -1,6 +1,7 @@
 //! `archive_entry_*`: the description of one archive member, and the
 //! resolver that pairs up hard links.
 
+use super::Archive;
 use crate::entry::{Dev, Entry, Mode};
 use crate::entry_link_resolver::LinkResolver;
 use crate::string::until_nul;
@@ -22,6 +23,12 @@ impl ArchiveEntry {
     /// `archive_entry_new`.
     pub fn new() -> Self {
         ArchiveEntry(Box::new(Entry::new(None)))
+    }
+
+    /// `archive_entry_new2`: an entry that converts text with the
+    /// conversions of `a`, as the entry a reader reads into does.
+    pub fn new2(a: &Archive) -> Self {
+        ArchiveEntry(Box::new(Entry::new(Some(a.h.base.conv.clone()))))
     }
 
     /// `archive_entry_atime`.
@@ -319,6 +326,15 @@ mod tests {
         assert_eq!(e.strmode(), b"-rw-r--r-- ");
         assert_eq!((e.atime(), e.atime_nsec(), e.nlink()), (0, 0, 0));
         assert_eq!((e.rdevmajor(), e.rdevminor()), (0, 0));
+    }
+
+    #[test]
+    fn new2_shares_the_handles_conversions() {
+        let a = crate::api::ArchiveRead::new();
+        let e = ArchiveEntry::new2(&a);
+        let cache = e.0.cache.as_ref().unwrap();
+        assert!(std::sync::Arc::ptr_eq(cache, &a.h.base.conv));
+        assert!(ArchiveEntry::new().0.cache.is_none());
     }
 
     #[test]
