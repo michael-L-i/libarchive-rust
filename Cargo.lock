@@ -176,6 +176,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "libarchive-fe"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "libarchive-rust"
 version = "0.1.0"
 dependencies = [
