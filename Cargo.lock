@@ -182,6 +182,7 @@ dependencies = [
  "aes",
  "crabz2",
  "crc32fast",
+ "deflate",
  "hmac",
  "libc",
  "lz4_flex",

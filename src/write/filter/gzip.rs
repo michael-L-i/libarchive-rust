@@ -26,17 +26,39 @@
 // Ported from libarchive/archive_write_add_filter_gzip.c.
 
 use super::*;
-use miniz_oxide::deflate::core::{
-    CompressorOxide, TDEFLFlush, TDEFLStatus, compress, create_comp_flags_from_zip_params,
-};
+use deflate::{Deflate, Flush, Status};
+
+/// Upstream's error for a failed deflate() call.
+pub(crate) fn failed(e: deflate::Error) -> Error {
+    Error::fatal(
+        -1,
+        format!(
+            "GZip compression failed: deflate() call returned status {}",
+            e.code()
+        ),
+    )
+}
+
+/// What frames the deflate stream.
+#[derive(Clone, Copy, PartialEq)]
+enum Wrap {
+    /// The gzip filter's header and trailer.
+    Gzip,
+    /// None: 7-Zip's deflate coder.
+    Raw,
+}
+
 pub struct Gzip {
     level: u8,
     timestamp: bool,
     filename: Vec<u8>,
-    state: Option<Box<CompressorOxide>>,
+    wrap: Wrap,
+    state: Option<Deflate>,
+    /// The compressed buffer and how much of it is filled.
+    compressed: Vec<u8>,
+    used: usize,
     crc: u32,
     size: u32,
-    raw: bool,
 }
 impl Default for Gzip {
     fn default() -> Self {
@@ -44,84 +66,122 @@ impl Default for Gzip {
             level: 6,
             timestamp: true,
             filename: Vec::new(),
+            wrap: Wrap::Gzip,
             state: None,
+            compressed: Vec::new(),
+            used: 0,
             crc: 0,
             size: 0,
-            raw: false,
         }
     }
 }
 impl Gzip {
+    /// A raw deflate stream, buffered like 7-Zip's coders.
     pub(crate) fn raw(level: u8) -> Self {
         Self {
             level,
-            raw: true,
+            wrap: Wrap::Raw,
             ..Self::default()
         }
     }
-    fn start(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
+    fn start(&mut self, sink: &dyn Sink) -> Result<(), Error> {
         if self.state.is_some() {
             return Ok(());
         }
-        let time = if self.timestamp {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as u32
-        } else {
-            0
+        let size = match self.wrap {
+            Wrap::Gzip => {
+                // Buffer size should be a multiple number of the of bytes per
+                // block for performance.
+                let (bs, bpb) = (65536, sink.bytes_per_block());
+                if bpb > bs {
+                    bpb
+                } else if bpb != 0 {
+                    bs - bs % bpb
+                } else {
+                    bs
+                }
+            }
+            // 7-Zip's write buffer, 512 * 20 * 6.
+            Wrap::Raw => 61440,
         };
-        let mut header = vec![0x1f, 0x8b, 8, if self.filename.is_empty() { 0 } else { 8 }];
-        header.extend_from_slice(&time.to_le_bytes());
-        header.push(if self.level == 9 {
-            2
-        } else if self.level == 1 {
-            4
-        } else {
-            0
-        });
-        header.push(3);
-        if !self.filename.is_empty() {
-            header.extend_from_slice(&self.filename);
-            header.push(0)
+        if self.compressed.try_reserve_exact(size).is_err() {
+            return Err(Error::fatal(
+                libc::ENOMEM,
+                "Can't allocate data for compression buffer",
+            ));
         }
-        if !self.raw {
-            sink.write(&header)?;
+        if self.wrap == Wrap::Gzip {
+            // Prime output buffer with a gzip header.
+            let time = if self.timestamp {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as u32
+            } else {
+                0
+            };
+            let flags = if self.filename.is_empty() { 0 } else { 8 };
+            self.compressed.extend_from_slice(&[0x1f, 0x8b, 8, flags]);
+            self.compressed.extend_from_slice(&time.to_le_bytes());
+            self.compressed.push(match self.level {
+                9 => 2,
+                1 => 4,
+                _ => 0,
+            });
+            self.compressed.push(3); // OS=Unix
+            if !self.filename.is_empty() {
+                self.compressed.extend_from_slice(&self.filename);
+                self.compressed.push(0);
+            }
         }
-        self.state = Some(Box::new(CompressorOxide::new(
-            create_comp_flags_from_zip_params(i32::from(self.level), -15, 0),
-        )));
+        self.used = self.compressed.len();
+        self.compressed.resize(size.max(self.used), 0);
+        self.state = Some(Deflate::new(i32::from(self.level), -15, 8).ok_or_else(|| {
+            Error::fatal(
+                -1,
+                "Internal error initializing compression library: invalid setup parameter",
+            )
+        })?);
         Ok(())
     }
-    fn encode(&mut self, mut input: &[u8], finish: bool, sink: &mut dyn Sink) -> Result<(), Error> {
+    /// Push input data through the compressor, writing full output blocks as
+    /// necessary.
+    fn drive(
+        &mut self,
+        mut input: &[u8],
+        finishing: bool,
+        sink: &mut dyn Sink,
+    ) -> Result<(), Error> {
         self.start(sink)?;
         let state = self
             .state
             .as_mut()
             .ok_or_else(|| Error::fatal(libc::EINVAL, "Missing gzip encoder"))?;
-        let mut out = [0; 65536];
+        let flush = if finishing {
+            Flush::Finish
+        } else {
+            Flush::None
+        };
         loop {
-            let (status, used, n) = compress(
-                state,
-                input,
-                &mut out,
-                if finish {
-                    TDEFLFlush::Finish
-                } else {
-                    TDEFLFlush::None
-                },
-            );
-            sink.write(&out[..n])?;
-            input = &input[used..];
-            if status == TDEFLStatus::Done || (!finish && input.is_empty() && n < out.len()) {
-                break;
+            if self.used == self.compressed.len() {
+                sink.write(&self.compressed)?;
+                self.used = 0;
             }
-            if (used == 0 && n == 0) || (status != TDEFLStatus::Okay && status != TDEFLStatus::Done)
-            {
-                return Err(Error::fatal(-1, "GZip compression failed"));
+            // If there's nothing to do, we're done.
+            if !finishing && input.is_empty() {
+                return Ok(());
+            }
+            match state.deflate(input, &mut self.compressed[self.used..], flush) {
+                Ok((status, consumed, produced)) => {
+                    input = &input[consumed..];
+                    self.used += produced;
+                    if status == Status::StreamEnd || (!finishing && input.is_empty()) {
+                        return Ok(());
+                    }
+                }
+                Err(e) => return Err(failed(e)),
             }
         }
-        Ok(())
     }
 }
 impl Filter for Gzip {
@@ -144,15 +204,20 @@ impl Filter for Gzip {
         Ok(ARCHIVE_OK)
     }
     fn write(&mut self, input: &[u8], sink: &mut dyn Sink) -> Result<(), Error> {
-        self.crc = crate::crc32::crc32(self.crc, input);
-        self.size = self.size.wrapping_add(input.len() as u32);
-        self.encode(input, false, sink)
+        if self.wrap == Wrap::Gzip {
+            self.crc = crate::crc32::crc32(self.crc, input);
+            self.size = self.size.wrapping_add(input.len() as u32);
+        }
+        self.drive(input, false, sink)
     }
     fn close(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
-        self.encode(&[], true, sink)?;
-        if self.raw {
+        self.drive(&[], true, sink)?;
+        // Write the last compressed data.
+        sink.write(&self.compressed[..self.used])?;
+        if self.wrap != Wrap::Gzip {
             return Ok(());
         }
+        // Build and write out 8-byte trailer.
         sink.write(&self.crc.to_le_bytes())?;
         sink.write(&self.size.to_le_bytes())
     }

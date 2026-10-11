@@ -45,6 +45,11 @@ pub trait Sink {
         Ok(())
     }
     fn free(&mut self) {}
+    /// archive_write_get_bytes_per_block() of the archive a filter writes
+    /// to, or 0 outside a write pipeline.
+    fn bytes_per_block(&self) -> usize {
+        0
+    }
 }
 
 pub trait Filter {
@@ -169,6 +174,9 @@ struct Pipeline<'a> {
     output: &'a mut Blocking,
 }
 impl Sink for Pipeline<'_> {
+    fn bytes_per_block(&self) -> usize {
+        self.output.block
+    }
     fn position(&self) -> u64 {
         self.bytes
             .first()
