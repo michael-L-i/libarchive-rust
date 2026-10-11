@@ -14,6 +14,17 @@ pub fn strerror(code: c_int) -> Vec<u8> {
     CStr::from_bytes_until_nul(&buf).map_or_else(|_| buf.to_vec(), |m| m.to_bytes().to_vec())
 }
 
+/// The file mode creation mask. `umask(2)` reads it only by replacing it,
+/// so it is set to 0 and back.
+pub fn umask() -> libc::mode_t {
+    // SAFETY: umask has no memory-safety requirements.
+    unsafe {
+        let mask = libc::umask(0);
+        libc::umask(mask);
+        mask
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
