@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Build build/port with profile-guided optimization: an instrumented build-port, a training
+# run, then build-port again using the merged profile.
+# Usage: scripts/build-pgo
+# The training corpus is deliberately not the benchmark's: upstream's source tree and test
+# fixtures, upstream's C libarchive.a and seeded random bytes, each written and read in
+# every common format by our bsdtar, and read again from archives the C bsdtar wrote.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+pgo="$root/build/pgo"
+host=$(rustc -vV | sed -n 's/^host: //p')
+profdata="$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
+[ -x "$profdata" ] || { echo "llvm-profdata missing: rustup component add llvm-tools" >&2; exit 1; }
+c_tar="$root/build/oracle/bin/bsdtar"
+[ -x "$c_tar" ] || { echo "run scripts/build-oracle first" >&2; exit 1; }
+
+rm -rf "$pgo"; mkdir -p "$pgo/profiles" "$pgo/corpus"
+
+# 1. Instrumented build. A separate target dir keeps the normal build's cache intact. rustc
+# links its profiler runtime into Rust executables but not into a staticlib, so the C
+# relinks get it explicitly.
+runtime=$(ls "$(rustc --print sysroot)/lib/rustlib/$host/lib/"libprofiler_builtins-*.rlib)
+CARGO_TARGET_DIR="$root/target/pgo-generate" RUSTFLAGS="-Cprofile-generate=$pgo/profiles" \
+  PORT_LDFLAGS="$runtime" "$root/scripts/build-port" --release >/dev/null
+echo "built instrumented port"
+
+# 2. Training.
+rsync -a --exclude .git "$root/upstream/libarchive/" "$pgo/corpus/upstream/"
+cp "$root/build/oracle/libarchive/libarchive.a" "$pgo/corpus/"
+python3 -I -c 'import random, sys; sys.stdout.buffer.write(random.Random(7).randbytes(4 << 20))' \
+  >"$pgo/corpus/random.bin"
+formats=(
+  "--format=ustar" "--format=pax" "--format=cpio" "--format=zip" "--format=7zip"
+  "--format=ustar -z" "--format=ustar -z --options=gzip:compression-level=9"
+  "--format=ustar -j" "--format=ustar -J" "--format=ustar -J --options=xz:compression-level=1"
+  "--format=ustar --lzma" "--format=ustar --lz4" "--format=ustar --zstd"
+  "--format=ustar --zstd --options=zstd:compression-level=9"
+  "--format=zip --options=zip:compression=store"
+)
+rust_tar="$root/build/port/bin/bsdtar"
+work="$pgo/work"; i=0
+for f in "${formats[@]}"; do
+  read -ra flags <<<"$f"
+  for tool in "$rust_tar" "$c_tar"; do
+    rm -rf "$work"; mkdir -p "$work/out"
+    "$tool" "${flags[@]}" -cf "$work/archive" -C "$pgo/corpus" .
+    "$rust_tar" -tvf "$work/archive" >/dev/null
+    "$rust_tar" -xf "$work/archive" -C "$work/out"
+    i=$((i + 1))
+  done
+done
+rm -rf "$work"
+echo "trained on $i archives"
+
+# 3. Optimized build from the merged profile.
+"$profdata" merge -o "$pgo/merged.profdata" "$pgo/profiles"
+CARGO_TARGET_DIR="$root/target/pgo-use" RUSTFLAGS="-Cprofile-use=$pgo/merged.profdata" \
+  "$root/scripts/build-port" --release

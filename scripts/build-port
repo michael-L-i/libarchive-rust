@@ -91,6 +91,8 @@ relink() {
     args+=("$w"); prev=$w
   done
   if [ "$name" = libarchive_test ]; then args+=("$out/skipped_tests.o"); fi
+  # Extra linker inputs, e.g. scripts/build-pgo's profiler runtime.
+  read -ra extra <<<"${PORT_LDFLAGS-}"; args+=(${extra[@]+"${extra[@]}"})
   (cd "$dir/../.." && "${args[@]}") >>"$log" 2>&1 || { tail -20 "$log" >&2; exit 1; }
 }
 relink "$tbld/$objdir" libarchive_test
