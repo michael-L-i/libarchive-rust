@@ -189,3 +189,40 @@ boundaries and then returns whole buffered bytes to the input, so the state
 machine resumes at the same bit position; consumed counts, statuses and
 partial output before errors are unchanged. Match copies keep the existing
 exact helpers.
+
+## Exact chunked match copies in the fast loop
+
+Matches whose source is 16 or more bytes back, or does not overlap the
+destination, are copied in the fast loop without writing past the match,
+since bytes there are live ring-buffer history. The first 16 bytes are a
+masked read-modify-write that stores bytes past the match back unchanged;
+longer matches continue in 64-, 32- or 16-byte chunks no wider than the
+distance, then one 16-byte chunk ending exactly at the match end. A source
+that wraps to the end of the ring, past the match, takes the same path
+inline (about a fifth of matches in source-code gzip). Shorter overlapping
+distances keep `transfer`, and other wrapped sources `apply_match`.
+
+Round-twelve evidence, kept in sibling `diagnostics/round12-inflate`: all
+31 vendor tests pass (release and debug), including new tests comparing
+every decode table entry with a brute-force canonical decoder for random
+complete codes of up to 15 bits and for one- and zero-codeword codes, and
+copy tests checking whole buffers around overlapping and wrapped sources.
+A new comparator against the frozen previous decoder generates random
+DEFLATE (dynamic codes with long codewords, fixed blocks with symbols
+286/287 and distances 30/31, stored blocks, too-far distances), compressed
+data at every level, benchmark slices, and truncated and bit-flipped
+variants; 117,354 streams gave 1,059,762 identical traces of output bytes
+and per-call consumed/written/status counts through the streaming API at
+six chunkings, the first-call Finish path, limited non-wrapping core calls
+and wrapping rings of 256 bytes to 32 KiB. It catches each injected fault
+tried in the new paths. All eight benchmark payloads decode identically.
+
+Decoder alone, raw DEFLATE of the C-written gzip benchmarks through 64 KiB
+streaming calls, median per-iteration instructions and cycles over five
+rotated runs on a loaded M5 Pro (previous decoder -> this one; Apple zlib):
+source 184.2M -> 141.1M instructions, 91.1M -> 51.3M cycles (zlib 48.0M);
+mixed 68.8M -> 43.7M cycles (42.3M); compiled 38.7M -> 23.6M (23.4M);
+records 24.7M -> 15.8M (14.0M); documents 12.4M -> 10.0M (10.0M); text
+3.77M -> 2.77M (3.33M); many-files 4.87M -> 3.49M (3.10M). Random, almost
+all stored blocks, retires 2% fewer instructions; its 2-3M-cycle runs are
+within noise. These are backend measurements, not extraction times.

@@ -1303,41 +1303,58 @@ fn litlen_exit(entry: u32) -> (TINFLStatus, State) {
     }
 }
 
-// Called only for disjoint, exact-length slices between three and 32 bytes.
+/// Masks selecting the low `n` bytes of a little-endian `u128`.
+const HEAD_MASKS: [u128; 17] = {
+    let mut masks = [0; 17];
+    let mut n = 1;
+    while n <= 16 {
+        masks[n] = u128::MAX >> (128 - 8 * n);
+        n += 1;
+    }
+    masks
+};
+
 #[inline(always)]
-fn copy_short_disjoint(dst: &mut [u8], src: &[u8]) {
-    let len = src.len();
-    let dst = &mut dst[..len];
-    if len <= 4 {
-        dst[..2].copy_from_slice(&src[..2]);
-        dst[len - 2..].copy_from_slice(&src[len - 2..]);
-    } else if len <= 8 {
-        dst[..4].copy_from_slice(&src[..4]);
-        dst[len - 4..].copy_from_slice(&src[len - 4..]);
-    } else if len <= 16 {
-        dst[..8].copy_from_slice(&src[..8]);
-        dst[len - 8..].copy_from_slice(&src[len - 8..]);
-    } else {
-        dst[..16].copy_from_slice(&src[..16]);
-        dst[len - 16..].copy_from_slice(&src[len - 16..]);
+fn load16(out: &[u8], at: usize) -> u128 {
+    u128::from_le_bytes(out[at..at + 16].try_into().unwrap_or_default())
+}
+
+/// Copies `width` bytes at a time from `source + i` to `pos + i` while more
+/// than `width` bytes of `len` remain.
+#[inline(always)]
+fn copy_chunks<const WIDTH: usize>(
+    out: &mut [u8],
+    source: usize,
+    pos: usize,
+    len: usize,
+    i: &mut usize,
+) {
+    while len - *i > WIDTH {
+        out.copy_within(source + *i..source + *i + WIDTH, pos + *i);
+        *i += WIDTH;
     }
 }
 
-/// Copies a match whose source lies wholly before `pos`, overlapping the
-/// destination byte by byte as LZ77 requires.
+/// Copies a `len`-byte match from `source` to `pos` without writing past it.
+/// Each chunk reads completed bytes: chunks are no wider than `step`, the
+/// distance back to the source, or `usize::MAX` if the source does not
+/// overlap the destination; `step` is at least 16. The first chunk needs 16
+/// bytes in bounds at both ends even for shorter matches.
 #[inline(always)]
-fn copy_match(out: &mut [u8], pos: usize, dist: usize, len: usize) {
-    let source = pos - dist;
-    if dist < len {
-        transfer(out, source, pos, len, usize::MAX);
-        return;
-    }
-    let (history, output) = out.split_at_mut(pos);
-    let source = &history[source..source + len];
-    if len <= 32 {
-        copy_short_disjoint(output, source);
-    } else {
-        output[..len].copy_from_slice(source);
+fn copy_match(out: &mut [u8], source: usize, pos: usize, len: usize, step: usize) {
+    // Bytes of the first chunk past the match are written back unchanged.
+    let mask = HEAD_MASKS[cmp::min(len, 16)];
+    let head = (load16(out, source) & mask) | (load16(out, pos) & !mask);
+    out[pos..pos + 16].copy_from_slice(&head.to_le_bytes());
+    if len > 16 {
+        let mut i = 16;
+        if step >= 64 {
+            copy_chunks::<64>(out, source, pos, len, &mut i);
+        } else if step >= 32 {
+            copy_chunks::<32>(out, source, pos, len, &mut i);
+        }
+        copy_chunks::<16>(out, source, pos, len, &mut i);
+        out.copy_within(source + len - 16..source + len, pos + len - 16);
     }
 }
 
@@ -1468,12 +1485,25 @@ fn decompress_fast(
             entry = litlen[(bit_buf & litlen_mask) as usize];
             refill(&mut bit_buf, &mut bits_left, window, &mut used);
 
-            if dist <= pos {
-                copy_match(out, pos, dist, len);
+            // The copy's source, and how far back it is if it overlaps the
+            // destination; 0 leaves the copy to `apply_match`.
+            let (source, step) = if dist <= pos {
+                (pos - dist, if dist >= len { usize::MAX } else { dist })
             } else if flags & TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF != 0 || dist > out.len() {
                 // We encountered a distance that refers a position before
                 // the start of the decoded data, so we can't continue.
                 break 'iteration Some((TINFLStatus::Failed, DistanceOutOfBounds));
+            } else if dist >= pos + cmp::max(len, 16) && out.len() - dist >= len {
+                // The source wraps to the end of the ring buffer, past the
+                // match.
+                (pos + out.len() - dist, usize::MAX)
+            } else {
+                (0, 0)
+            };
+            if step >= 16 {
+                copy_match(out, source, pos, len, step);
+            } else if step != 0 {
+                transfer(out, source, pos, len, usize::MAX);
             } else {
                 apply_match(out, pos, dist, len, out_buf_size_mask);
             }
@@ -2225,22 +2255,28 @@ mod test {
     use super::*;
 
     #[test]
-    fn short_disjoint_copies_preserve_surrounding_bytes() {
-        for len in 3..=32 {
-            for source in 0..10 {
-                for dist in [len, len + 1, 64] {
-                    let position = source + dist;
-                    let mut actual = [0u8; 160];
-                    for (i, byte) in actual.iter_mut().enumerate() {
-                        *byte = (i as u8).wrapping_mul(37).wrapping_add(11);
+    fn copy_match_writes_only_the_match() {
+        let mut lens: alloc::vec::Vec<usize> = (3..=40).collect();
+        lens.extend([47, 48, 63, 64, 65, 79, 80, 81, 127, 128, 129, 200, 257, 258]);
+        for &len in &lens {
+            for dist in [16, 17, 31, 32, 33, 63, 64, 65, 100, 255, len, len + 1, 1000] {
+                // A source before the destination, overlapping it unless
+                // dist >= len, and one after it as in a wrapped ring buffer.
+                for after in [false, true] {
+                    if after && dist < len {
+                        continue;
                     }
-                    let mut expected = actual;
+                    let pos = if after { 20 } else { 1100 };
+                    let source = if after { pos + dist } else { pos - dist };
+                    let step = if dist >= len { usize::MAX } else { dist };
+                    let mut expected: alloc::vec::Vec<u8> =
+                        (0..1400).map(|i| (i * 37 + 11) as u8).collect();
+                    let mut actual = expected.clone();
                     for i in 0..len {
-                        expected[position + i] = expected[source + i];
+                        expected[pos + i] = expected[source + i];
                     }
-                    let (history, output) = actual.split_at_mut(position);
-                    copy_short_disjoint(&mut output[..len], &history[source..source + len]);
-                    assert_eq!(actual, expected, "len={len} source={source} dist={dist}");
+                    copy_match(&mut actual, source, pos, len, step);
+                    assert_eq!(actual, expected, "len={len} dist={dist} after={after}");
                 }
             }
         }
