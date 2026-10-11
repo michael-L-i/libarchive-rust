@@ -472,6 +472,63 @@ regressions. Extra Zstandard periodic-copy/repcode branches were removed
 because the smaller accepted copy change performed better. Original C and
 pinned upstream remain clean. No work was pushed.
 
+## Performance round 11 checkpoint
+
+Four reviewed units are integrated at `a8135f1`: fixed eight-step LZMA
+literal loops, exact short DEFLATE matches inside the fast decoder,
+sixteen-byte CRC64 checksum steps, and guarded four-stream Huffman literal
+decoding with inline transitions. All codec code remains safe Rust;
+compression presets, output bytes and ABI are unchanged. The CRC64
+read-only table grows by 16 KiB; other CPU-cache behavior is unmeasured.
+
+Focused in-memory archive checks show XZ text/random/source decoding gains
+of 34/29/15% from CRC64; many files improve 13%. Zstandard compiled/records/
+source gains are 24/16/8%. Native DEFLATE gains 4-6% on varied data with text
+unchanged. Literal-loop LZMA gains are 10% records, 5% documents, 3% mixed;
+source/compiled native medians varied and were slightly slower in final
+confirmation. These results are separate from full archive operations.
+
+The unchanged 96-case, five-rotation matrix records 24 wins, 25 ties and
+47 losses against C. Prior Rust in the same run records 22 wins, 20 ties
+and 54 losses. Majority wins remain unachieved. Complete XZ extraction
+improves 11-19% for text, random, source and records, and 6% for mixed and
+documents. 7zip records improve 8%; Zstandard compiled extraction improves
+14%. The equal-weight geometric mean across all 96 Rust times improves 1.7%.
+All 48 writer streams remain byte-identical; all 720 timed extractions and
+288 cross-reader checks match manifests.
+
+One full-matrix case is more than 5% slower: text gzip extraction (+5.9%).
+A scoped 15-rotation confirmation measures a smaller 3.0% slowdown (0.24 ms);
+text ZIP is 1.1% slower and random gzip 1.1% faster. This small tradeoff is
+documented, with the original table and score preserved.
+
+Full C/Rust timing, size and RSS tables are in sibling
+`diagnostics/results/REPORT.md`, raw data in `round11-final.json`, and logs
+in `round11-integration/`. Frozen round-ten binaries are the before baseline.
+The single-worker full benchmark completed in 349 seconds.
+
+Combined verification: 393 native tests pass, one opt-in test ignored;
+strict all-target Clippy, formatting, no-default Zstandard and all 454 ABI
+symbols pass. Upstream/front-end suites: 926 pass, 184 skip, zero failures,
+crashes, timeouts or ratchet regressions, 69 seconds with one worker.
+Unit checks include 14,400 exact XZ/LZMA1 records spanning over 31 million
+process calls; 1,760 exact DEFLATE traces and 39 encoder identities; 51
+Zstandard vendor tests and 175 ABI records; independent bitwise CRC
+references, 48 valid/damaged ABI records and eighteen exact writer runs.
+All four units have fresh actual Claude Opus 5.5 final review.
+
+Fixed-tree LZMA inlining and standalone DEFLATE leaf inlining were rejected
+for marginal gains. The first short kernel slowed text; the retained simpler
+slice structure resolves it. Interleaved Huffman decoding needed explicit
+transition inlining to keep lanes independent. One high-effort Opus call
+timed out; a narrower consultation succeeded and final reviews passed.
+
+During this round the workspace moved from `port-rs-lib` to
+`port-rs-libarchive`. Worktree and generated compile-command paths were
+repaired. An interrupted CRC screen was repeated with full raw samples;
+source and benchmark artifacts were preserved. Original C and pinned
+upstream remain clean. No work was pushed.
+
 ## Earlier checkpoints (historical)
 
 ### Phase 2 checkpoint
