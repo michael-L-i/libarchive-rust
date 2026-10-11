@@ -1,3 +1,6 @@
 /target
 /build
 /.claude/worktrees
+/bench/work/
+/bench/out/
+/bench/__pycache__/
