@@ -109,8 +109,9 @@ c_deps=$(cargo tree $tools -e normal,build --prefix none | grep -E '^(cc|cmake|l
 if [ -n "$c_deps" ]; then echo "the Rust front-ends must contain no C, but they build with:" >&2; echo "$c_deps" >&2; exit 1; fi
 cargo build $rel $tools >>"$log" 2>&1 || { tail -30 "$log" >&2; exit 1; }
 for t in tar cpio cat unzip; do
-  if [[ " ${RUST_TOOLS[*]} " == *" bsd$t "* ]]; then cp "$tdir/bsd$t" "$out/bin/"
-  else cp "$out/c-bin/bsd$t" "$out/bin/"; fi
+  if [[ " ${RUST_TOOLS[*]} " == *" bsd$t "* ]]; then src="$tdir/bsd$t"; else src="$out/c-bin/bsd$t"; fi
+  # Replace, not overwrite: macOS kills a signed binary rewritten in place.
+  cp "$src" "$out/bin/bsd$t.tmp" && mv -f "$out/bin/bsd$t.tmp" "$out/bin/bsd$t"
 done
 
 echo "${#excluded[@]} test files turned into skips ($nskip tests)"
