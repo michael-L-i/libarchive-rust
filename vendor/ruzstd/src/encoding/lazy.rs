@@ -178,8 +178,10 @@ fn find_best_match<const MLS: u32, const ROW_LOG: u32>(
     let tag = hash as u8;
     let head = u32::from(rows.tags[row]) & Rows::<MLS, ROW_LOG>::MASK;
     let mut matches = rows.match_mask(row, tag, head);
-    let mut candidates = [0u32; 64];
-    let mut found = 0;
+    // libzstd gathers the candidates, then checks them; as checking only
+    // reads the input, both happen in one pass here.
+    let mut ml = 3;
+    let mut off_base = NO_OFFSET;
     while matches > 0 && attempts > 0 {
         let pos = (head + matches.trailing_zeros()) & Rows::<MLS, ROW_LOG>::MASK;
         matches &= matches - 1;
@@ -190,17 +192,7 @@ fn find_best_match<const MLS: u32, const ROW_LOG: u32>(
         if index < low_limit {
             break;
         }
-        candidates[found] = index;
-        found += 1;
         attempts -= 1;
-    }
-    // Insert ip too, saving an iteration of the next update.
-    rows.insert(hash, next_to_update);
-    ms.next_to_update = next_to_update + 1;
-
-    let mut ml = 3;
-    let mut off_base = NO_OFFSET;
-    for &index in &candidates[..found] {
         debug_assert!(index < curr);
         let m = (index - base) as usize;
         // Read 4 bytes ending where a longer match would.
@@ -215,6 +207,9 @@ fn find_best_match<const MLS: u32, const ROW_LOG: u32>(
             }
         }
     }
+    // Insert ip too, saving an iteration of the next update.
+    rows.insert(hash, next_to_update);
+    ms.next_to_update = next_to_update + 1;
     (ml, off_base)
 }
 

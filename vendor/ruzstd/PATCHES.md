@@ -633,3 +633,8 @@ Instruction counts are per compression of the benchmark tars in
   table match check instead of reading them again: -1.5% to -3%
   instructions at level 1. (Reusing them for the repeat offset check too
   cost 4-7% more cycles at levels 2 and -5, so that one is read again.)
+- The row search checks each candidate as it takes it from the row,
+  instead of gathering them into a zeroed 64-entry buffer first (libzstd
+  gathers them to prefetch). The checks only read the input and the row
+  is updated after both either way, so the result is the same: -2% to -3%
+  instructions at level 5, -5% to -7% at level 9.
