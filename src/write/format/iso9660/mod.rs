@@ -160,7 +160,7 @@ impl Default for Iso9660 {
             limit_dirs: true,
             allow_vernum: true,
             zisofs: false,
-            compression: 6,
+            compression: 9,
             strings,
             boot: Boot {
                 filename: Vec::new(),
@@ -1366,7 +1366,6 @@ impl Format for Iso9660 {
             b"rockridge" => self.rr != 2,
             b"zisofs" | b"boot-info-table" | b"boot" => value.is_some(),
             b"iso-level" => self.level != 1,
-            b"compression-level" => self.compression != 6,
             _ => true,
         };
         if changed {
