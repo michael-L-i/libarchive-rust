@@ -63,6 +63,57 @@ use crate::archive::{
 use std::cell::Ref;
 use std::ffi::c_int;
 
+// The `ARCHIVE_FILTER_*` codes of `Archive::filter_code`, and the
+// `ARCHIVE_FORMAT_*` codes of `Archive::format`.
+pub const ARCHIVE_FILTER_NONE: c_int = 0;
+pub const ARCHIVE_FILTER_GZIP: c_int = 1;
+pub const ARCHIVE_FILTER_BZIP2: c_int = 2;
+pub const ARCHIVE_FILTER_COMPRESS: c_int = 3;
+pub const ARCHIVE_FILTER_PROGRAM: c_int = 4;
+pub const ARCHIVE_FILTER_LZMA: c_int = 5;
+pub const ARCHIVE_FILTER_XZ: c_int = 6;
+pub const ARCHIVE_FILTER_UU: c_int = 7;
+pub const ARCHIVE_FILTER_RPM: c_int = 8;
+pub const ARCHIVE_FILTER_LZIP: c_int = 9;
+pub const ARCHIVE_FILTER_LRZIP: c_int = 10;
+pub const ARCHIVE_FILTER_LZOP: c_int = 11;
+pub const ARCHIVE_FILTER_GRZIP: c_int = 12;
+pub const ARCHIVE_FILTER_LZ4: c_int = 13;
+pub const ARCHIVE_FILTER_ZSTD: c_int = 14;
+pub const ARCHIVE_FORMAT_BASE_MASK: c_int = 0xff0000;
+pub const ARCHIVE_FORMAT_CPIO: c_int = 0x10000;
+pub const ARCHIVE_FORMAT_CPIO_POSIX: c_int = 0x10001;
+pub const ARCHIVE_FORMAT_CPIO_BIN_LE: c_int = 0x10002;
+pub const ARCHIVE_FORMAT_CPIO_BIN_BE: c_int = 0x10003;
+pub const ARCHIVE_FORMAT_CPIO_SVR4_NOCRC: c_int = 0x10004;
+pub const ARCHIVE_FORMAT_CPIO_SVR4_CRC: c_int = 0x10005;
+pub const ARCHIVE_FORMAT_CPIO_AFIO_LARGE: c_int = 0x10006;
+pub const ARCHIVE_FORMAT_CPIO_PWB: c_int = 0x10007;
+pub const ARCHIVE_FORMAT_SHAR: c_int = 0x20000;
+pub const ARCHIVE_FORMAT_SHAR_BASE: c_int = 0x20001;
+pub const ARCHIVE_FORMAT_SHAR_DUMP: c_int = 0x20002;
+pub const ARCHIVE_FORMAT_TAR: c_int = 0x30000;
+pub const ARCHIVE_FORMAT_TAR_USTAR: c_int = 0x30001;
+pub const ARCHIVE_FORMAT_TAR_PAX_INTERCHANGE: c_int = 0x30002;
+pub const ARCHIVE_FORMAT_TAR_PAX_RESTRICTED: c_int = 0x30003;
+pub const ARCHIVE_FORMAT_TAR_GNUTAR: c_int = 0x30004;
+pub const ARCHIVE_FORMAT_ISO9660: c_int = 0x40000;
+pub const ARCHIVE_FORMAT_ISO9660_ROCKRIDGE: c_int = 0x40001;
+pub const ARCHIVE_FORMAT_ZIP: c_int = 0x50000;
+pub const ARCHIVE_FORMAT_EMPTY: c_int = 0x60000;
+pub const ARCHIVE_FORMAT_AR: c_int = 0x70000;
+pub const ARCHIVE_FORMAT_AR_GNU: c_int = 0x70001;
+pub const ARCHIVE_FORMAT_AR_BSD: c_int = 0x70002;
+pub const ARCHIVE_FORMAT_MTREE: c_int = 0x80000;
+pub const ARCHIVE_FORMAT_RAW: c_int = 0x90000;
+pub const ARCHIVE_FORMAT_XAR: c_int = 0xa0000;
+pub const ARCHIVE_FORMAT_LHA: c_int = 0xb0000;
+pub const ARCHIVE_FORMAT_CAB: c_int = 0xc0000;
+pub const ARCHIVE_FORMAT_RAR: c_int = 0xd0000;
+pub const ARCHIVE_FORMAT_7ZIP: c_int = 0xe0000;
+pub const ARCHIVE_FORMAT_WARC: c_int = 0xf0000;
+pub const ARCHIVE_FORMAT_RAR_V5: c_int = 0x100000;
+
 /// `ARCHIVE_OK` and the other codes an `archive_*` function returns. The
 /// order is the codes', so `r < Status::Ok` and `r <= Status::Warn` read
 /// as they do in C.
