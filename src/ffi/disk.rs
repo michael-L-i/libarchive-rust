@@ -511,7 +511,8 @@ pub extern "C" fn archive_read_extract2(
                 // A NULL entry crashes upstream; it fails here.
                 None => (ARCHIVE_FATAL, false),
             };
-            h.read_extract2_data(super::read::own_entry(h), d, r, copy)
+            let own = super::read::own_entry(h);
+            h.read_extract2_data(own, d, (r, copy), &mut || h.read_extract_progress())
         })
     })
 }

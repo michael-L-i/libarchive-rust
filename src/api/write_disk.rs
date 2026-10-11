@@ -173,7 +173,12 @@ mod tests {
         assert_eq!(a.open_memory(b"extracted".as_slice()), Status::Ok);
         let blocks = Rc::new(Cell::new(0));
         let counter = Rc::clone(&blocks);
-        a.extract_set_progress_callback(move || counter.set(counter.get() + 1));
+        let name = path.as_os_str().as_bytes().to_vec();
+        a.extract_set_progress_callback(move |a, e| {
+            assert_eq!(a.file_count(), 1);
+            assert_eq!(e.pathname(), Some(name.as_slice()));
+            counter.set(counter.get() + 1);
+        });
         let mut entry = ArchiveEntry::new();
         assert_eq!(a.next_header2(&mut entry), Status::Ok);
         entry.set_pathname(Some(path.as_os_str().as_bytes()));

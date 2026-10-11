@@ -32,7 +32,6 @@ use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::rc::Rc;
 
 /// A registration's code: its status, or its failure, recorded.
 fn code(a: &Base, result: Result<read::Status, Error>) -> c_int {
@@ -320,6 +319,9 @@ impl Handle {
     }
 }
 
+/// `ArchiveRead::extract_set_progress_callback`'s callback.
+type Progress = Box<dyn FnMut(&Archive, &mut ArchiveEntry)>;
+
 /// A handle that reads an archive: `archive_read_new`.
 pub struct ArchiveRead {
     a: Archive,
@@ -330,6 +332,8 @@ pub struct ArchiveRead {
     block: Vec<u8>,
     /// What `open_fd` was given, kept open while the handle may read it.
     fds: Vec<Box<dyn AsFd>>,
+    /// The progress callback of `extract2`.
+    progress: Option<Progress>,
 }
 
 /// The `archive_read_support_*` methods that register one filter or
@@ -355,6 +359,7 @@ impl ArchiveRead {
             entry,
             block: Vec::new(),
             fds: Vec::new(),
+            progress: None,
         }
     }
 
@@ -633,17 +638,25 @@ impl ArchiveRead {
     /// `next_header2` into an entry of your own: the handle's own entry
     /// can't be lent to a call on the handle.
     pub fn extract2(&mut self, entry: &mut ArchiveEntry, dest: &mut ArchiveWriteDisk) -> Status {
-        let (r, copy) = self.a.h.read_extract2_header(&mut entry.0, &dest.h);
+        let header = self.a.h.read_extract2_header(&mut entry.0, &dest.h);
         let own = Some(&mut *self.entry.0);
-        Status::from_code(self.a.h.read_extract2_data(own, &dest.h, r, copy))
+        let a = &self.a;
+        let mut progress = || {
+            if let Some(progress) = &mut self.progress {
+                progress(a, entry);
+            }
+        };
+        Status::from_code(a.h.read_extract2_data(own, &dest.h, header, &mut progress))
     }
 
     /// `archive_read_extract_set_progress_callback`: `progress` runs after
-    /// each block `extract2` writes.
-    pub fn extract_set_progress_callback(&mut self, progress: impl Fn() + 'static) {
-        self.a
-            .h
-            .read_extract_set_progress_callback(Some(Rc::new(progress)));
+    /// each block `extract2` writes, with this handle and the entry being
+    /// extracted, which C's client data would point to.
+    pub fn extract_set_progress_callback(
+        &mut self,
+        progress: impl FnMut(&Archive, &mut ArchiveEntry) + 'static,
+    ) {
+        self.progress = Some(Box::new(progress));
     }
 
     /// `archive_read_header_position`: the offset of the last header in

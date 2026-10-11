@@ -71,8 +71,8 @@ impl Handle {
         }
     }
 
-    /// Runs the progress callback, which may call back into the handle: the
-    /// read state isn't borrowed while it runs.
+    /// Runs the C progress callback, which may call back into the handle:
+    /// the read state isn't borrowed while it runs.
     pub(crate) fn read_extract_progress(&self) {
         let progress = match &self.kind {
             Kind::Read(r) => r
@@ -110,16 +110,21 @@ impl Handle {
     }
 
     /// The rest of `archive_read_extract2`: pours the data into the entry
-    /// if `copy`, reading with the handle's own entry `own`, and finishes
-    /// it. `r` is what `read_extract2_header` returned.
+    /// if `copy`, reading with the handle's own entry `own` and calling
+    /// `progress` after each block, and finishes it. `r` is what
+    /// `read_extract2_header` returned.
     pub(crate) fn read_extract2_data(
         &self,
         own: Option<&mut Entry>,
         dest: &Handle,
-        r: c_int,
-        copy: bool,
+        (r, copy): (c_int, bool),
+        progress: &mut dyn FnMut(),
     ) -> c_int {
-        let r = if copy { self.copy_data(own, dest) } else { r };
+        let r = if copy {
+            self.copy_data(own, dest, progress)
+        } else {
+            r
+        };
         let r2 = dest.write_finish_entry().max(ARCHIVE_WARN);
         // Use the first message.
         if r2 != ARCHIVE_OK && r == ARCHIVE_OK {
@@ -129,7 +134,12 @@ impl Handle {
         r.min(r2)
     }
 
-    fn copy_data(&self, mut own: Option<&mut Entry>, dest: &Handle) -> c_int {
+    fn copy_data(
+        &self,
+        mut own: Option<&mut Entry>,
+        dest: &Handle,
+        progress: &mut dyn FnMut(),
+    ) -> c_int {
         loop {
             let block = self.read_data_block(own.as_deref_mut(), |data| match data {
                 Data::Block { data, offset } => Ok(dest.write_data_block(data, offset)),
@@ -147,7 +157,7 @@ impl Handle {
                 self.base.copy_error(&dest.base);
                 return r;
             }
-            self.read_extract_progress();
+            progress();
         }
     }
 }
