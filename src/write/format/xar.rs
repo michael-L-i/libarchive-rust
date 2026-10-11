@@ -949,6 +949,18 @@ impl Format for Xar {
                 sink.write(&buf[..n])?;
             }
         }
+        // Upstream copies the heap from the end of the TOC checksum's slot
+        // for the whole heap's length, running that many bytes into the
+        // compressed TOC it stored after the heap.
+        let overrun = compressed
+            .get(..self.toc_sum.size() as usize)
+            .ok_or_else(|| {
+                Error::fatal(
+                    crate::read::ARCHIVE_ERRNO_FILE_FORMAT,
+                    "Truncated xar archive",
+                )
+            })?;
+        sink.write(overrun)?;
         Ok(())
     }
     fn options(&mut self, _a: &Base, key: &[u8], value: Option<&[u8]>) -> Result<i32, Error> {
@@ -1122,6 +1134,31 @@ mod tests {
             ]
             .concat()
         );
+    }
+    #[test]
+    fn heap_copy_runs_into_the_compressed_toc() {
+        // Upstream's xar_close() copies the heap from the TOC checksum's
+        // size for the heap's whole length, so the archive ends with the
+        // first checksum-size bytes of the compressed TOC.
+        for sum in [Checksum::None, Checksum::Sha1, Checksum::Md5] {
+            let a = Base::new(WRITE_MAGIC);
+            let mut xar = Xar {
+                toc_sum: sum,
+                ..Xar::default()
+            };
+            let mut out = Output::default();
+            let mut e = Entry::new(None);
+            e.set_pathname(b"file");
+            e.set_mode(libc::S_IFREG | 0o644);
+            e.set_size(3);
+            xar.header(&a, &mut e, &mut out).unwrap();
+            xar.data(b"abc", &mut out).unwrap();
+            xar.close(&mut out).unwrap();
+            let toc = u64::from_be_bytes(out.0[8..16].try_into().unwrap()) as usize;
+            let n = sum.size() as usize;
+            assert_eq!(&out.0[out.0.len() - n..], &out.0[28..28 + n]);
+            assert_eq!(out.0.len(), 28 + toc + n + 11 + n);
+        }
     }
     #[test]
     fn invalid_utf8_path_returns_warning_without_panicking() {
