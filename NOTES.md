@@ -1990,3 +1990,11 @@ single-hash matcher. Levels and options keep libarchive's meaning.
 - A frame ended before any input has the usual window descriptor and no
   content size; libzstd, given only `ZSTD_e_end`, writes a single-segment
   header with content size 0. Both decode to nothing.
+
+## Fuzzing (`fuzz/`)
+
+- Decompression bombs are unbounded, as upstream. A 293-byte gzip found by
+  `filter_gzip` stores gzip headers whose content is again such a gzip, so
+  each of the (up to 25) nested filter layers multiplies the output; upstream
+  `bsdcat` writes gigabytes from it too. The harness stops reading entry data
+  after 1 MiB per input instead of the library imposing a limit.

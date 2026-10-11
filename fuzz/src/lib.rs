@@ -93,11 +93,24 @@ pub fn run(data: &[u8], setups: &[Setup]) {
         }
         if archive_read_open_memory(a, data.as_ptr().cast(), data.len()) == 0 {
             let mut buf = vec![0u8; 1 << 16];
+            // Upstream has no output limit either: a tiny gzip can expand
+            // through the 25 filter layers it may nest into without end, so
+            // stop reading after 1 MiB of data.
+            let mut budget: usize = 1 << 20;
             let mut e = std::ptr::null_mut();
             // ARCHIVE_OK 0, ARCHIVE_WARN -20 continue; RETRY -10 and FATAL -30 stop.
             while matches!(archive_read_next_header(a, &mut e), 0 | -20) {
                 touch(e);
-                while archive_read_data(a, buf.as_mut_ptr().cast(), buf.len()) > 0 {}
+                loop {
+                    let n = archive_read_data(a, buf.as_mut_ptr().cast(), buf.len());
+                    budget = budget.saturating_sub(usize::try_from(n).unwrap_or(0));
+                    if n <= 0 || budget == 0 {
+                        break;
+                    }
+                }
+                if budget == 0 {
+                    break;
+                }
             }
         }
         std::hint::black_box(archive_error_string(a));
