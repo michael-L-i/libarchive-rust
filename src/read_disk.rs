@@ -37,7 +37,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-type Pending = (PathBuf, bool, Vec<(u64, u64)>);
+/// The (dev, ino) of each directory above a path, which catch symlink loops.
+type Ancestors = Vec<(u64, u64)>;
+/// A path to visit, whether it is the root, and its ancestors.
+type Pending = (PathBuf, bool, Ancestors);
 
 #[derive(Default)]
 pub struct ReadDisk {
@@ -52,9 +55,15 @@ pub struct ReadDisk {
     /// `archive_read_disk_new` makes and `archive_free` frees; NULL for a
     /// handle that is not C's.
     pub(crate) entry: *mut Entry,
-    pending: Vec<Pending>,
+    /// The path `open` was given, until it is visited.
+    root: Option<PathBuf>,
+    /// Directories `descend` asked for, read once `reading` is done, the most
+    /// recent first: upstream's tree stack.
+    descents: Vec<(PathBuf, Ancestors)>,
+    /// The directory whose entries are being visited, in readdir order.
+    reading: Option<(fs::ReadDir, PathBuf, Ancestors)>,
     current: Option<PathBuf>,
-    ancestors: Vec<(u64, u64)>,
+    ancestors: Ancestors,
     current_restore: Option<Entry>,
     directory_restore: Vec<(PathBuf, Entry)>,
     can_descend: bool,
@@ -82,12 +91,9 @@ impl ReadDisk {
         std::mem::replace(&mut self.entry, std::ptr::null_mut())
     }
     pub fn open(&mut self, a: &Base, path: &[u8]) -> c_int {
-        self.pending.clear();
-        self.pending.push((
-            PathBuf::from(std::ffi::OsStr::from_bytes(path)),
-            true,
-            Vec::new(),
-        ));
+        self.root = Some(PathBuf::from(std::ffi::OsStr::from_bytes(path)));
+        self.descents.clear();
+        self.reading = None;
         a.state.set(state::HEADER);
         ARCHIVE_OK
     }
@@ -100,27 +106,44 @@ impl ReadDisk {
         let Some(path) = &self.current else {
             return ARCHIVE_OK;
         };
-        let iter = match fs::read_dir(path) {
-            Ok(i) => i,
-            Err(e) => return io_error(a, e, "Can't open directory"),
-        };
         if self.behavior & 1 != 0
             && let Some(entry) = &self.current_restore
         {
             self.directory_restore
                 .push((path.clone(), entry.clone_entry()));
         }
-        let mut children = Vec::new();
-        for child in iter {
-            match child {
-                Ok(c) => children.push(c.path()),
-                Err(e) => return io_error(a, e, "Can't read directory"),
+        self.descents.push((path.clone(), self.ancestors.clone()));
+        ARCHIVE_OK
+    }
+    /// The next path to visit, in upstream's `tree_next` order: the root,
+    /// then each directory's entries as readdir returns them, a directory
+    /// that `descend` asked for being read only after the one being read,
+    /// the most recent request first. A directory that can't be read is
+    /// skipped and fails the call that reaches it, as TREE_ERROR_DIR does.
+    fn next_path(&mut self, a: &Base) -> Result<Option<Pending>, c_int> {
+        if let Some(root) = self.root.take() {
+            return Ok(Some((root, true, Vec::new())));
+        }
+        loop {
+            if let Some((dir, path, ancestors)) = &mut self.reading {
+                match dir.next() {
+                    Some(Ok(child)) => return Ok(Some((child.path(), false, ancestors.clone()))),
+                    Some(Err(e)) => {
+                        let path = std::mem::take(path);
+                        self.reading = None;
+                        return Err(couldnt_visit(a, &path, e));
+                    }
+                    None => self.reading = None,
+                }
+            }
+            let Some((path, ancestors)) = self.descents.pop() else {
+                return Ok(None);
+            };
+            match fs::read_dir(&path) {
+                Ok(dir) => self.reading = Some((dir, path, ancestors)),
+                Err(e) => return Err(couldnt_visit(a, &path, e)),
             }
         }
-        for path in children.into_iter().rev() {
-            self.pending.push((path, false, self.ancestors.clone()));
-        }
-        ARCHIVE_OK
     }
     pub fn next_header2(&mut self, a: &Base, entry: &mut Entry) -> c_int {
         if a.check_magic(
@@ -141,9 +164,13 @@ impl ReadDisk {
             self.can_descend = false;
             a.disk_can_descend.set(false);
             a.disk_descend_requested.set(false);
-            let Some((path, root, ancestors)) = self.pending.pop() else {
-                a.state.set(state::EOF);
-                return ARCHIVE_EOF;
+            let (path, root, ancestors) = match self.next_path(a) {
+                Ok(Some(next)) => next,
+                Ok(None) => {
+                    a.state.set(state::EOF);
+                    return ARCHIVE_EOF;
+                }
+                Err(ret) => return ret,
             };
             if self.behavior & 4 != 0
                 && path
@@ -443,10 +470,21 @@ impl ReadDisk {
         while let Some((path, entry)) = self.directory_restore.pop() {
             let _ = crate::ffi::disk_sys::restore_times(&path, &entry);
         }
-        self.pending.clear();
+        self.root = None;
+        self.descents.clear();
+        self.reading = None;
         a.state.set(state::CLOSED);
         ARCHIVE_OK
     }
+}
+
+fn couldnt_visit(a: &Base, path: &Path, e: std::io::Error) -> c_int {
+    let msg = [path.as_os_str().as_bytes(), b": Couldn't visit directory"].concat();
+    a.raise(Error::new(
+        ARCHIVE_FAILED,
+        e.raw_os_error().unwrap_or(libc::EIO),
+        msg,
+    ))
 }
 
 pub fn io_error(a: &Base, e: std::io::Error, msg: &str) -> c_int {
@@ -455,4 +493,64 @@ pub fn io_error(a: &Base, e: std::io::Error, msg: &str) -> c_int {
         e.raw_os_error().unwrap_or(libc::EIO),
         msg,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::READ_DISK_MAGIC;
+
+    /// Every path the walk yields, descending into every directory, as
+    /// bsdtar does.
+    fn walk(root: &Path) -> Vec<PathBuf> {
+        let a = Base::new(READ_DISK_MAGIC);
+        let mut disk = ReadDisk::new();
+        let mut entry = Entry::new(None);
+        assert_eq!(disk.open(&a, root.as_os_str().as_bytes()), ARCHIVE_OK);
+        let mut seen = Vec::new();
+        while disk.next_header2(&a, &mut entry) == ARCHIVE_OK {
+            let path = entry
+                .pathname()
+                .map(|p| p.to_bytes().to_vec())
+                .unwrap_or_default();
+            seen.push(PathBuf::from(std::ffi::OsStr::from_bytes(&path)));
+            if a.disk_can_descend.get() {
+                assert_eq!(disk.descend(&a), ARCHIVE_OK);
+            }
+        }
+        seen
+    }
+
+    fn readdir(path: &Path) -> Vec<PathBuf> {
+        fs::read_dir(path)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect()
+    }
+
+    #[test]
+    fn directories_are_read_after_their_parent_most_recent_first() {
+        let root = std::env::temp_dir().join(format!("libarchive-walk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for dir in ["a/x", "b", "c"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in ["f", "a/1", "a/x/2", "b/3", "c/4"] {
+            fs::write(root.join(file), b"").unwrap();
+        }
+        // The root, its entries, then each directory descended into, the
+        // last one listed first, each expanded in full before the next.
+        let mut expected = vec![root.clone()];
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for child in readdir(&dir) {
+                if child.is_dir() {
+                    stack.push(child.clone());
+                }
+                expected.push(child);
+            }
+        }
+        assert_eq!(walk(&root), expected);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
