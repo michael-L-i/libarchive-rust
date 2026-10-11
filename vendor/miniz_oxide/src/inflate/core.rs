@@ -1106,9 +1106,23 @@ fn transfer(
     // can do slightly better than the naive case by copying everything at once
     } else if not_wrapping && out_pos > source_pos && (out_pos - source_pos >= 4) {
         let end_pos = cmp::min(end_pos, out_slice.len().saturating_sub(3));
+        // Each chunk reads completed history: its width does not exceed
+        // the match distance. Leave the existing four-byte/tail handling.
+        if source_diff >= 64 {
+            while end_pos.saturating_sub(out_pos) >= 64 {
+                out_slice.copy_within(source_pos..source_pos + 64, out_pos);
+                source_pos += 64;
+                out_pos += 64;
+            }
+        }
+        if source_diff >= 32 {
+            while end_pos.saturating_sub(out_pos) >= 32 {
+                out_slice.copy_within(source_pos..source_pos + 32, out_pos);
+                source_pos += 32;
+                out_pos += 32;
+            }
+        }
         if source_diff >= 16 {
-            // Each chunk reads completed history: its width does not exceed
-            // the match distance. Leave the existing four-byte/tail handling.
             while end_pos.saturating_sub(out_pos) >= 16 {
                 out_slice.copy_within(source_pos..source_pos + 16, out_pos);
                 source_pos += 16;
@@ -2419,10 +2433,10 @@ mod test {
     #[cfg(feature = "with-alloc")]
     #[test]
     fn bulk_matches_preserve_wrapping_and_overlap_bytes() {
-        for size in [8usize, 16, 32, 64, 128, 32768] {
+        for size in [8usize, 16, 32, 33, 64, 100, 128, 1000, 32768] {
             for out_pos in [0, 1, 3, 7, size / 2, size.saturating_sub(258), size - 1] {
                 for dist in [
-                    1usize, 2, 3, 4, 7, 15, 16, 17, 31, 32, 33, 63, 64, 255, 256, size,
+                    1usize, 2, 3, 4, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 256, size,
                 ] {
                     if dist > size {
                         continue;
@@ -2435,26 +2449,29 @@ mod test {
                             continue;
                         }
                         for mask in [size - 1, usize::MAX] {
+                            if mask != usize::MAX && !size.is_power_of_two() {
+                                continue;
+                            }
                             if mask == usize::MAX && dist > out_pos {
                                 continue;
                             }
                             let mut expected: alloc::vec::Vec<u8> =
                                 (0..size).map(|i| (i * 73 + dist * 19) as u8).collect();
                             let mut actual = expected.clone();
-                            let mut scalar = expected.clone();
+                            let mut copied = expected.clone();
                             for i in 0..length {
                                 expected[out_pos + i] =
                                     expected[(out_pos + i).wrapping_sub(dist) & mask];
                             }
                             apply_match(&mut actual, out_pos, dist, length, mask);
                             transfer(
-                                &mut scalar,
+                                &mut copied,
                                 out_pos.wrapping_sub(dist) & mask,
                                 out_pos,
                                 length,
                                 mask,
                             );
-                            assert_eq!(scalar, expected);
+                            assert_eq!(copied, expected);
                             assert_eq!(
                                 actual, expected,
                                 "size={size} out={out_pos} distance={dist} length={length} mask={mask}"

@@ -85,3 +85,35 @@ to 1.4% faster. These are backend measurements, not full extraction times.
 Both attempted macOS sampling profiles were denied by the OS; their logs,
 raw measurements, frozen baseline hash, and actual Claude Opus 5.5 design
 and fresh final reviews are retained in sibling `diagnostics/round9-deflate`.
+
+## Wider exact overlapping match copies
+
+Extend the contiguous backward-match path with guarded 64- and 32-byte
+chunks before its existing 16-byte loop. Chunk widths never exceed the
+match distance, so each copy reads completed history and preserves byte-
+serial LZ77 semantics. All copies stay within the existing clamped bound;
+the four-byte loop and tail preserve partial-buffer behavior. No state,
+allocation, encoder, refill, checksum, or unsafe-code changes are added.
+
+Bounded macOS sampling identified match transfer as roughly 55% of the
+repetitive gzip decode samples. Thirteen rotating four-way measurements
+compare the frozen round-nine decoder, 32-byte and 64-byte variants, and C
+on identical C archives. The retained 64-byte variant improves repetitive
+gzip/ZIP decoding by 42%/36% and documents by 4-5%; the other twelve cases
+vary within 2.1%. Against 32-byte chunks alone, the additional 64-byte path
+saves 3.5-4.7% on repetitive data with other cases within 1.2%. These are
+backend measurements, not complete extraction times.
+
+Fresh actual Claude Opus 5.5 review returns PASS. The byte-reference test
+now includes non-power-of-two output lengths and distance 65, retaining
+full-buffer comparisons around chunk, wrap and tail boundaries. Design,
+review, sampling and timing artifacts are retained under sibling
+`diagnostics/round10-copy` and `diagnostics/round10-adapter`.
+
+Acceptance checks pass: 30 vendor tests, 1,760 exact valid/truncated/mutated
+stream/core output/status/consumption traces, 39 unchanged encoder streams,
+root release all-target strict Clippy, vendor no-default build and rustfmt.
+All 16 decoded archive hashes agree with baseline and C. The subsequent
+21-rotation confirmation shows text gzip 2.216 -> 1.265 ms (42.9%), text
+ZIP 2.577 -> 1.620 ms (37.1%), and documents 3.4-4.6% faster. Other cases
+range from 0.6% slower to 1.6% faster.
