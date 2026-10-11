@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Build the Rust port and relink upstream's test program and front-end tools against it.
+# Build the Rust port and its front-ends, and relink upstream's test program and C front-ends against it.
 # Usage: scripts/build-port [--release]
-# Outputs under build/port/: bin/{libarchive_test,bsdtar,bsdcpio,bsdcat,bsdunzip}, skipped_tests.c, build.log.
+# Outputs under build/port/: bin/{libarchive_test,bsdtar,bsdcpio,bsdcat,bsdunzip}, c-bin/ (upstream's C
+# front-ends relinked against ours, for reference), skipped_tests.c, build.log. bin/ holds the Rust
+# front-end where one is ported (RUST_TOOLS) and the relinked C one otherwise.
 # bsdtar_test, bsdcpio_test, bsdcat_test and bsdunzip_test are NOT relinked: they link no libarchive
 # (only their own objects); they drive a tool binary given with -p, so point them at build/port/bin/<tool>.
 set -euo pipefail
@@ -13,7 +15,8 @@ log="$out/build.log"
 profile=debug; rel=""
 [ "${1:-}" = "--release" ] && { profile=release; rel=--release; }
 tdir="${CARGO_TARGET_DIR:-$root/target}/$profile"
-mkdir -p "$out/bin"; : > "$log"
+mkdir -p "$out/bin" "$out/c-bin"; : > "$log"
+RUST_TOOLS=(bsdcat)
 
 case "$(uname)" in
   Darwin) ext=dylib
@@ -78,30 +81,37 @@ case "$(uname)" in
   *)      as_needed=-Wl,--as-needed ;;
 esac
 
-# relink <CMakeFiles/x.dir with link.txt; links run from two levels up> <name>: swap oracle libarchive.a for ours, redirect -o, drop excluded objects.
+# relink <CMakeFiles/x.dir with link.txt; links run from two levels up> <output>: swap oracle libarchive.a for ours, redirect -o, drop excluded objects.
 relink() {
-  local dir=$1 name=$2 args=() prev= w ws
+  local dir=$1 output=$2 args=() prev= w ws
   read -ra ws <<<"$(cat "$dir/link.txt")"
   args+=("${ws[0]}" "$as_needed"); ws=("${ws[@]:1}")
   for w in "${ws[@]}"; do
-    if [ "$prev" = -o ]; then w="$out/bin/$name"
+    if [ "$prev" = -o ]; then w=$output
     elif [[ $w == *libarchive.a ]]; then args+=("$ours" "${native[@]}"); prev=$w; continue
     elif [[ " ${excluded[*]-} " == *" $w "* ]]; then prev=$w; continue
     fi
     args+=("$w"); prev=$w
   done
-  if [ "$name" = libarchive_test ]; then args+=("$out/skipped_tests.o"); fi
+  if [ "$(basename "$output")" = libarchive_test ]; then args+=("$out/skipped_tests.o"); fi
   # Extra linker inputs, e.g. scripts/build-pgo's profiler runtime.
   read -ra extra <<<"${PORT_LDFLAGS-}"; args+=(${extra[@]+"${extra[@]}"})
   (cd "$dir/../.." && "${args[@]}") >>"$log" 2>&1 || { tail -20 "$log" >&2; exit 1; }
 }
-relink "$tbld/$objdir" libarchive_test
+relink "$tbld/$objdir" "$out/bin/libarchive_test"
 
-# 4. Front-end tools (their link lines also carry upstream's libarchive_fe objects).
-relink "$ora/tar/CMakeFiles/bsdtar.dir" bsdtar
-relink "$ora/cpio/CMakeFiles/bsdcpio.dir" bsdcpio
-relink "$ora/cat/CMakeFiles/bsdcat.dir" bsdcat
-relink "$ora/unzip/CMakeFiles/bsdunzip.dir" bsdunzip
+# 4. Front-end tools: upstream's C ones relinked (their link lines also carry upstream's
+# libarchive_fe objects), and the Rust ones, which must contain no C: nothing they are built from
+# may compile C (variadic.c is libarchive-capi's).
+for t in tar cpio cat unzip; do relink "$ora/$t/CMakeFiles/bsd$t.dir" "$out/c-bin/bsd$t"; done
+tools=$(printf -- '-p %s ' "${RUST_TOOLS[@]}")
+c_deps=$(cargo tree $tools -e normal,build --prefix none | grep -E '^(cc|cmake|libarchive-capi) ' | sort -u || true)
+if [ -n "$c_deps" ]; then echo "the Rust front-ends must contain no C, but they build with:" >&2; echo "$c_deps" >&2; exit 1; fi
+cargo build $rel $tools >>"$log" 2>&1 || { tail -30 "$log" >&2; exit 1; }
+for t in tar cpio cat unzip; do
+  if [[ " ${RUST_TOOLS[*]} " == *" bsd$t "* ]]; then cp "$tdir/bsd$t" "$out/bin/"
+  else cp "$out/c-bin/bsd$t" "$out/bin/"; fi
+done
 
 echo "${#excluded[@]} test files turned into skips ($nskip tests)"
-echo "binaries: $out/bin/{libarchive_test,bsdtar,bsdcpio,bsdcat,bsdunzip}"
+echo "binaries: $out/bin/{libarchive_test,bsdtar,bsdcpio,bsdcat,bsdunzip} (Rust: ${RUST_TOOLS[*]}); C reference tools: $out/c-bin"
