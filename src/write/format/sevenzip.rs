@@ -77,7 +77,7 @@ enum Coder {
     Ppmd(Box<Ppmd7>, Ppmd7RangeEnc),
 }
 impl Coder {
-    fn new(codec: u32, level: i64, input_size: Option<usize>) -> Result<(Self, Vec<u8>), Error> {
+    fn new(codec: u32, level: i64) -> Result<(Self, Vec<u8>), Error> {
         let l = level.clamp(0, 9) as u8;
         let mut props = Vec::new();
         let coder = match codec {
@@ -98,20 +98,18 @@ impl Coder {
                 Self::Filter(f)
             }
             LZMA => {
-                let mut options = LzmaOptions::with_preset(l.into());
+                let options = LzmaOptions::with_preset(l.into());
                 props.push(((options.pb * 5 + options.lp) * 9 + options.lc) as u8);
                 props.extend_from_slice(&options.dict_size.to_le_bytes());
-                limit_dictionary(&mut options, input_size);
                 Self::Lzma(LzmaWriter::new_no_header(Vec::new(), &options, true).map_err(io_error)?)
             }
             LZMA2 => {
-                let mut options = Lzma2Options::with_preset(l.into());
+                let options = Lzma2Options::with_preset(l.into());
                 let dict = options.lzma_options.dict_size;
                 let property = (0u8..=39)
                     .find(|&p| dict <= (2 | u32::from(p & 1)) << (p / 2 + 11))
                     .ok_or_else(|| Error::fatal(libc::EINVAL, "Invalid LZMA2 dictionary"))?;
                 props.push(property);
-                limit_dictionary(&mut options.lzma_options, input_size);
                 Self::Lzma2(Lzma2Writer::new(Vec::new(), options))
             }
             PPMD => {
@@ -172,16 +170,6 @@ impl Coder {
         }
     }
 }
-// Once the entire stream is known, no match can reach beyond its input.
-// Keep the preset dictionary in the archive properties for compatibility.
-fn limit_dictionary(options: &mut LzmaOptions, input_size: Option<usize>) {
-    if let Some(size) = input_size {
-        options.dict_size = options
-            .dict_size
-            .min(u32::try_from(size).unwrap_or(u32::MAX).max(4096));
-    }
-}
-
 pub struct SevenZip {
     files: Vec<FileInfo>,
     current: Option<usize>,
@@ -189,7 +177,6 @@ pub struct SevenZip {
     codec: u32,
     level: i64,
     coder: Option<Coder>,
-    pending: Option<Spool>,
     properties: Vec<u8>,
     spool: Option<Spool>,
 }
@@ -202,7 +189,6 @@ impl Default for SevenZip {
             codec: LZMA,
             level: 6,
             coder: None,
-            pending: None,
             properties: Vec::new(),
             spool: None,
         }
@@ -220,14 +206,9 @@ impl SevenZip {
                     ),
                 ));
             }
-            if self.codec == LZMA || self.codec == LZMA2 {
-                self.pending = Some(Spool {
-                    file: crate::write::temp_file()?,
-                    len: 0,
-                });
-            } else {
-                self.start_coder(None)?;
-            }
+            let (coder, props) = Coder::new(self.codec, self.level)?;
+            self.coder = Some(coder);
+            self.properties = props;
             self.spool = Some(Spool {
                 file: crate::write::temp_file()?,
                 len: 0,
@@ -235,43 +216,8 @@ impl SevenZip {
         }
         Ok(())
     }
-    fn start_coder(&mut self, input_size: Option<usize>) -> Result<(), Error> {
-        let (mut coder, props) = Coder::new(self.codec, self.level, input_size)?;
-        if let (Some(mut pending), Some(spool)) = (self.pending.take(), &mut self.spool) {
-            pending.file.rewind().map_err(io_error)?;
-            let mut buffer = [0; 65536];
-            loop {
-                let n = pending.file.read(&mut buffer).map_err(io_error)?;
-                if n == 0 {
-                    break;
-                }
-                coder.write(&buffer[..n], spool)?;
-            }
-        }
-        self.coder = Some(coder);
-        self.properties = props;
-        Ok(())
-    }
     fn append(&mut self, data: &[u8]) -> Result<(), Error> {
-        if self.coder.is_none() && self.spool.is_some() && !data.is_empty() {
-            // A solid stream may span many entries. Wait for its total size,
-            // but bound staging even at presets with very large dictionaries.
-            let limit = LzmaOptions::with_preset(self.level.clamp(0, 9) as u32)
-                .dict_size
-                .min(8 << 20) as usize;
-            let pending = self
-                .pending
-                .as_mut()
-                .ok_or_else(|| Error::fatal(libc::EIO, "Missing 7-Zip input spool"))?;
-            if data.len() <= limit.saturating_sub(pending.len as usize) {
-                pending.write(data)?;
-            } else {
-                self.start_coder(None)?;
-                if let (Some(coder), Some(spool)) = (&mut self.coder, &mut self.spool) {
-                    coder.write(data, spool)?;
-                }
-            }
-        } else if let (Some(coder), Some(spool)) = (&mut self.coder, &mut self.spool) {
+        if let (Some(coder), Some(spool)) = (&mut self.coder, &mut self.spool) {
             coder.write(data, spool)?;
         }
         if let Some(file) = self.current.and_then(|i| self.files.get_mut(i)) {
@@ -622,9 +568,6 @@ impl Format for SevenZip {
         Ok(())
     }
     fn close(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
-        if self.coder.is_none() && self.spool.is_some() {
-            self.start_coder(Some(self.pending.as_ref().map_or(0, |p| p.len as usize)))?;
-        }
         if let (Some(coder), Some(spool)) = (self.coder.take(), self.spool.as_mut()) {
             coder.finish(spool)?;
         }
@@ -646,8 +589,7 @@ impl Format for SevenZip {
         let mut encoded_header = Vec::new();
         if files.len() > 1 && self.codec != COPY {
             let header_codec = if self.codec == LZMA2 { LZMA2 } else { LZMA };
-            let (mut coder, props) =
-                Coder::new(header_codec, self.level.clamp(0, 9), Some(header.len()))?;
+            let (mut coder, props) = Coder::new(header_codec, self.level.clamp(0, 9))?;
             struct VecSink<'a>(&'a mut Vec<u8>);
             impl Sink for VecSink<'_> {
                 fn write(&mut self, data: &[u8]) -> Result<(), Error> {
@@ -737,16 +679,14 @@ mod tests {
     }
 
     #[test]
-    fn sized_coders_preserve_properties_and_roundtrip() {
+    fn coders_roundtrip() {
         for codec in [LZMA, LZMA2] {
             for size in [0, 1, 4095, 4096, 4097, 65537] {
                 let data: Vec<_> = (0..size).map(|i| (i * 37 % 251) as u8).collect();
-                let (mut coder, props) = Coder::new(codec, 0, Some(size)).unwrap();
+                let (mut coder, props) = Coder::new(codec, 0).unwrap();
                 let mut encoded = Bytes(Vec::new());
                 coder.write(&data, &mut encoded).unwrap();
                 coder.finish(&mut encoded).unwrap();
-                let (_, original_props) = Coder::new(codec, 0, None).unwrap();
-                assert_eq!(props, original_props);
                 assert_eq!(decode(codec, &props, &encoded.0, size), data);
             }
         }
@@ -784,9 +724,7 @@ mod tests {
                 );
                 expected.extend(padded);
             }
-            assert!(archive.coder.is_none());
             archive.close(&mut output).unwrap();
-            assert!(archive.pending.is_none());
             let packed = archive.spool.as_ref().unwrap().len as usize;
             assert_eq!(
                 decode(
@@ -796,43 +734,6 @@ mod tests {
                     expected.len()
                 ),
                 expected
-            );
-        }
-    }
-
-    #[test]
-    fn solid_staging_flushes_once_at_dictionary_boundary() {
-        for codec in [LZMA, LZMA2] {
-            let mut archive = SevenZip {
-                codec,
-                level: 0,
-                ..SevenZip::default()
-            };
-            archive.initialize().unwrap();
-            let limit = LzmaOptions::with_preset(0).dict_size as usize;
-            let data: Vec<_> = (0..limit).map(|i| (i * 17 % 251) as u8).collect();
-            // Separate writes stand in for successive entries in a solid stream.
-            archive.append(&data[..limit / 3]).unwrap();
-            archive.append(&data[limit / 3..2 * limit / 3]).unwrap();
-            archive.append(&data[2 * limit / 3..]).unwrap();
-            assert!(archive.coder.is_none());
-            assert_eq!(archive.pending.as_ref().unwrap().len, limit as u64);
-            archive.append(&data).unwrap();
-            assert!(archive.coder.is_some());
-            assert!(archive.pending.is_none());
-            archive
-                .coder
-                .take()
-                .unwrap()
-                .finish(archive.spool.as_mut().unwrap())
-                .unwrap();
-            let spool = archive.spool.as_mut().unwrap();
-            spool.file.rewind().unwrap();
-            let mut encoded = Vec::new();
-            spool.file.read_to_end(&mut encoded).unwrap();
-            assert_eq!(
-                decode(codec, &archive.properties, &encoded, limit * 2),
-                data.repeat(2)
             );
         }
     }
