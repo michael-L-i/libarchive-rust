@@ -4,7 +4,7 @@
 //! the front-ends; every function here is safe to call.
 
 use std::ffi::{CStr, CString, c_int};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -198,6 +198,16 @@ pub fn lutimens_now(path: &Path, sec: i64, nsec: i64) -> Result<(), c_int> {
             libc::AT_SYMLINK_NOFOLLOW,
         )
     } {
+        0 => Ok(()),
+        _ => Err(errno()),
+    }
+}
+
+/// `close(fd)`, which std's drop of a descriptor does not report, or the
+/// errno.
+pub fn close(fd: OwnedFd) -> Result<(), c_int> {
+    // SAFETY: `fd` is open and this is its only owner; it is not used again.
+    match unsafe { libc::close(fd.into_raw_fd()) } {
         0 => Ok(()),
         _ => Err(errno()),
     }
