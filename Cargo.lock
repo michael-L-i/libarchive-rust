@@ -47,6 +47,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsdtar"
+version = "0.1.0"
+dependencies = [
+ "libarchive-fe",
+ "libarchive-rust",
+ "libc",
+]
+
+[[package]]
 name = "bsdunzip"
 version = "0.1.0"
 dependencies = [

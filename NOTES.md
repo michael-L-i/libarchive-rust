@@ -2117,3 +2117,44 @@ single-hash matcher. Levels and options keep libarchive's meaning.
   the library's disk writer, after it creates the FIFO.
 - `Output` is `cpio->archive`, which is a `struct archive` that is a writer
   in `-o` mode and a disk writer in `-p` mode.
+
+## bsdtar (`tools/tar/`) and the write and read-disk API
+
+### Ported as-is
+
+- `add_substitution` copies the replacement of a `-s` rule dropping one
+  backslash before each character, and `apply_substitution` then looks for
+  `\1`..`\9`, `\~` and `\\` in what is left, so a single backslash escapes
+  nothing: `-s '/\(a\)\(b\)/\2\1/'` rewrites "abc" to "21c", and a
+  back-reference takes two backslashes (`\\2`). C bsdtar does the same at
+  the pin.
+- `read_archive` reports a failed `--fast-read` count with the reader's
+  error message, not the match handle's; and "Unexpected end of filename
+  list" after a trailing `-C` in a `-T` list prints whatever errno holds.
+
+### Differences
+
+- `pathcmp` is not ported: nothing in tar/ calls it at the pin.
+- Standard output is Rust's line-buffered one where C's is fully buffered
+  when it is not a terminal. The bytes are the same; when standard output
+  and standard error are the same file, a newline that C holds back until
+  its next `fflush` (`-t` printing an entry, then a warning) comes before
+  the warning here.
+- `-tv`'s `strftime` buffer is 64 bytes, where upstream's is 100; a longer
+  date (no locale makes one) would print as "-- -- ----".
+- The SIGINFO/SIGUSR1 progress report during `-x` divides by the bytes
+  read, as upstream does; with none read yet it reports 0% where upstream
+  would divide by zero.
+- `-x`, `-t` and `@archive` read headers into an entry of their own
+  (`next_header2` with `ArchiveEntry::new2`) instead of the reader's
+  `a->entry`, as the Rust API must to hand the entry back to the reader
+  (`extract2`) or read data while it is borrowed. The only format that
+  writes `a->entry` while reading data, multivolume RAR, updates the
+  reader's entry instead of the one bsdtar holds, which bsdtar only uses
+  afterwards for an error message.
+- The typed `ArchiveRead::extract_set_progress_callback` closure gets the
+  reader and the entry being extracted (what C's client data points to),
+  since a closure can't hold either while `extract2` borrows them.
+- `ArchiveReadDisk`'s metadata filter and excluded callback get the entry
+  as an `ArchiveEntry` by moving the reader's `Entry` into one for the
+  call and back.

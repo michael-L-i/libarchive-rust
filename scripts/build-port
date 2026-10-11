@@ -16,7 +16,7 @@ profile=debug; rel=""
 [ "${1:-}" = "--release" ] && { profile=release; rel=--release; }
 tdir="${CARGO_TARGET_DIR:-$root/target}/$profile"
 mkdir -p "$out/bin" "$out/c-bin"; : > "$log"
-RUST_TOOLS=(bsdcat bsdcpio bsdunzip)
+RUST_TOOLS=(bsdcat bsdcpio bsdtar bsdunzip)
 
 case "$(uname)" in
   Darwin) ext=dylib

@@ -1,0 +1,15 @@
+[package]
+name = "bsdtar"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "bsdtar: creates, lists, updates and extracts archives (upstream's tar/)"
+
+[[bin]]
+name = "bsdtar"
+path = "src/bsdtar.rs"
+
+[dependencies]
+libarchive-fe = { path = "../libarchive_fe" }
+libarchive-rust = { path = "../.." }
+libc = "0.2"
