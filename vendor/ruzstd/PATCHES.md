@@ -640,3 +640,25 @@ Instruction counts are per compression of the benchmark tars in
   instructions at level 5, -5% to -7% at level 9.
 - The fast and double fast catch-up loops read bytes through `Input`
   too: -0.5% instructions at level 3.
+
+Result, against libzstd 1.5.7 driven the same way (medians of five
+interleaved runs; before -> after, instructions / cycles):
+
+| level | source | compiled | records | mixed |
+|---|---|---|---|---|
+| 1 | 1.26x/1.17x -> 1.10x/1.12x | 1.22x/1.18x -> 1.05x/1.11x | 1.25x/1.20x -> 1.08x/1.12x | 1.15x/1.15x -> 1.03x/1.09x |
+| 3 | 1.23x/1.12x -> 1.10x/1.08x | 1.26x/1.27x -> 1.10x/1.18x | 1.23x/1.20x -> 1.08x/1.15x | 1.14x/1.09x -> 1.03x/1.06x |
+| 5 | 1.14x/1.17x -> 1.08x/1.16x | 1.17x/1.24x -> 1.13x/1.15x | 1.15x/1.27x -> 1.11x/1.22x | 1.13x/1.20x -> 1.07x/1.15x |
+
+On text, documents, many-files and random, levels 1 and 3 take 0.92x to
+1.10x libzstd's instructions. The compressor is still slower than
+libzstd on the inputs above. Most of what remains is per sequence:
+assigning repeat codes from the decoder's history at entropy coding costs
+about 20 instructions per sequence that libzstd's `ZSTD_seqToCodes()`
+does not spend, and the output depends on it. The search loops are now
+about libzstd's length in instructions. Tried and dropped for costing
+more than they saved: masked row indices in the row search (the
+compiler kept the bounds checks), `Input` reads in the row search, a
+bound check at the top of the double fast loop, a preallocated sequence
+buffer, a 16-byte chunked literal copy, and an inline first word in
+`count()`. Evidence: sibling `diagnostics/round13-zstd-speed`.
