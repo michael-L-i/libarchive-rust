@@ -45,7 +45,7 @@ set_formats! {
     CPIO_NEWC: "archive_write_set_format_cpio_newc" => Cpio::new(0x10004);
     // archive_write_set_format_cpio is this one.
     CPIO_ODC: "archive_write_set_format_cpio_odc" => Cpio::new(0x10001);
-    CPIO_PWB: "archive_write_set_format_cpio_binary" => Cpio::new(0x10006);
+    CPIO_PWB: "archive_write_set_format_cpio_binary" => Cpio::new(0x10007);
     GNUTAR: "archive_write_set_format_gnutar" => Tar::new(0x30004);
     ISO9660: "archive_write_set_format_iso9660" => Iso9660::default();
     MTREE: "archive_write_set_format_mtree" => Mtree::new(false);
@@ -67,7 +67,7 @@ const FORMAT_CODES: [(c_int, SetFormat); 20] = [
     (0xe0000, SetFormat::SEVENZIP),
     (0x10000, SetFormat::CPIO_ODC),
     (0x10002, SetFormat::CPIO_BIN),
-    (0x10006, SetFormat::CPIO_PWB),
+    (0x10007, SetFormat::CPIO_PWB),
     (0x10001, SetFormat::CPIO_ODC),
     (0x10004, SetFormat::CPIO_NEWC),
     (0x40000, SetFormat::ISO9660),
@@ -807,6 +807,9 @@ mod tests {
         assert_eq!(a.format(), 0x30003);
         assert_eq!(a.set_format(0x10000), Status::Ok);
         assert_eq!(a.format_name().as_deref(), Some(b"POSIX cpio".as_slice()));
+        assert_eq!(a.set_format(0x10007), Status::Ok);
+        assert_eq!(a.format_name().as_deref(), Some(b"PWB cpio".as_slice()));
+        assert_eq!(a.format(), 0x10007);
         assert_eq!(a.set_format_by_name(b"zip"), Status::Ok);
         assert_eq!(a.format(), 0x50000);
         assert_eq!(a.set_format_filter_by_ext(b"x.tar.xz"), Status::Ok);

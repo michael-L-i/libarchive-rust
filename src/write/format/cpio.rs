@@ -88,7 +88,7 @@ impl Cpio {
         let ino = self.inode(e)?;
         let align = match self.variant {
             0x10004 => 4,
-            0x10002 | 0x10006 => 2,
+            0x10002 | 0x10007 => 2,
             _ => 1,
         };
         let mut h = Vec::new();
@@ -152,7 +152,7 @@ impl Cpio {
         } else {
             if size < 0
                 || size
-                    > if self.variant == 0x10006 {
+                    > if self.variant == 0x10007 {
                         0xffffff
                     } else {
                         i32::MAX as i64
@@ -161,7 +161,7 @@ impl Cpio {
                 return Err(Error::new(
                     ARCHIVE_FAILED,
                     libc::ERANGE,
-                    if self.variant == 0x10006 {
+                    if self.variant == 0x10007 {
                         "File is too large for PWB binary cpio format"
                     } else {
                         "File is too large for binary cpio format"
@@ -213,7 +213,7 @@ impl Format for Cpio {
         match self.variant {
             0x10004 => c"SVR4 cpio nocrc",
             0x10001 => c"POSIX cpio",
-            0x10006 => c"PWB cpio",
+            0x10007 => c"PWB cpio",
             _ => c"7th Edition cpio",
         }
     }
