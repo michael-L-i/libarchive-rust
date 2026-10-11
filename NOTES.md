@@ -1896,3 +1896,28 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   declared body but no bytes written is not zero-filled or registered as
   file content. An unwritten boot image therefore fails while emitting
   the image, after the volume descriptors.
+
+## Deflate compressor (`deflate/`)
+
+- Writers compress with the `deflate` crate, a safe port of zlib 1.2.12's
+  deflate.c and trees.c, instead of miniz_oxide (the "gzip (miniz_oxide)"
+  line under Write compression filters predates it); miniz_oxide still
+  inflates. Apple's /usr/lib/libz.1.dylib (1.2.12) emits the same bytes as
+  vanilla zlib 1.2.12 for the benchmark datasets at levels 0-9, so C
+  bsdtar's tar.gz and ZIP data is reproduced byte for byte.
+- Not ported, since libarchive does not use them: the gzip wrapper,
+  strategies other than the default, deflateSetDictionary, deflateParams,
+  deflatePrime, deflateBound, deflateCopy and detect_data_type (it only sets
+  strm->data_type). zlib's high_water zeroing is unnecessary: the window
+  starts zeroed, and bytes past the input never change the output.
+- The hash key is computed from each string's three bytes instead of
+  zlib's running ins_h; with hash_shift * MIN_MATCH >= hash_bits the keys
+  are the same.
+- Upstream bug, not ported: zisofs_write_to_temp() stops calling deflate()
+  once a block's input is consumed, even when the block's output did not
+  fit the write buffer, so C truncates the zlib stream of a block whenever
+  the buffer fills inside it (8 of 128 blocks of a 4 MiB file, each a
+  prefix of the complete stream). The port writes complete blocks; the
+  other blocks match C's.
+- Unchanged here: the gzip filter writes any original-filename, where
+  upstream ignores one of 32K or more with a warning.
