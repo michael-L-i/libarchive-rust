@@ -264,6 +264,7 @@ pub enum DecompressBlockError {
     SequencesHeaderParseError(SequencesHeaderParseError),
     DecodeSequenceError(DecodeSequenceError),
     ExecuteSequencesError(ExecuteSequencesError),
+    BlockTooLarge,
 }
 
 #[cfg(feature = "std")]
@@ -300,6 +301,9 @@ impl core::fmt::Display for DecompressBlockError {
             DecompressBlockError::SequencesHeaderParseError(e) => write!(f, "{e:?}"),
             DecompressBlockError::DecodeSequenceError(e) => write!(f, "{e:?}"),
             DecompressBlockError::ExecuteSequencesError(e) => write!(f, "{e:?}"),
+            DecompressBlockError::BlockTooLarge => {
+                write!(f, "Block decompresses to more than 128 KiB")
+            }
         }
     }
 }
@@ -347,6 +351,7 @@ pub enum DecodeBlockContentError {
     ExpectedHeaderOfPreviousBlock,
     ReadError { step: BlockType, source: Error },
     DecompressBlockError(DecompressBlockError),
+    DecodeBufferError(DecodeBufferError),
 }
 
 #[cfg(feature = "std")]
@@ -355,6 +360,7 @@ impl std::error::Error for DecodeBlockContentError {
         match self {
             DecodeBlockContentError::ReadError { step: _, source } => Some(source),
             DecodeBlockContentError::DecompressBlockError(source) => Some(source),
+            DecodeBlockContentError::DecodeBufferError(source) => Some(source),
             _ => None,
         }
     }
@@ -378,6 +384,7 @@ impl core::fmt::Display for DecodeBlockContentError {
                 write!(f, "Error while reading bytes for {step}: {source}",)
             }
             DecodeBlockContentError::DecompressBlockError(e) => write!(f, "{e:?}"),
+            DecodeBlockContentError::DecodeBufferError(e) => write!(f, "{e}"),
         }
     }
 }
@@ -388,11 +395,18 @@ impl From<DecompressBlockError> for DecodeBlockContentError {
     }
 }
 
+impl From<DecodeBufferError> for DecodeBlockContentError {
+    fn from(val: DecodeBufferError) -> Self {
+        Self::DecodeBufferError(val)
+    }
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DecodeBufferError {
     NotEnoughBytesInDictionary { got: usize, need: usize },
     OffsetTooBig { offset: usize, buf_len: usize },
+    OutOfMemory,
 }
 
 #[cfg(feature = "std")]
@@ -409,6 +423,9 @@ impl core::fmt::Display for DecodeBufferError {
             }
             DecodeBufferError::OffsetTooBig { offset, buf_len } => {
                 write!(f, "offset: {offset} bigger than buffer: {buf_len}",)
+            }
+            DecodeBufferError::OutOfMemory => {
+                write!(f, "Could not allocate the decode buffer")
             }
         }
     }

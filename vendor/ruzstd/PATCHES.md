@@ -460,3 +460,48 @@ unchanged: 2256 valid, truncated, bit-flipped and overwritten archive cases
 match the baseline through the ABI (sibling `diagnostics/round12-zstd-dec`).
 `bsdtar -xOf` of the eight common C tar.zst archives touches about 340 fewer
 pages (~940 to ~600 page reclaims) and peak RSS falls from ~11.7 to ~6.4 MiB.
+
+## Round 12: decode sequences straight into the window
+
+The decoder's output buffer (`decode_buffer.rs`) is now a ring of blocks over
+a safe `Vec<u8>`, replacing `ringbuffer.rs` and its unsafe code. It is sized
+once per frame, from the window: the window, one block of collectable output
+and two blocks of room (`ZSTD_decodingBufferSize_min` plus one block), and is
+touched lazily, so a small stream touches only what it decodes. Each block is
+decoded into contiguous memory followed by 64 bytes of slack; when the next
+block does not fit before the end, decoding continues at the start, and the
+data is two segments, as libzstd's prefix and `extDict`. Callers that let more
+than a window plus a block accumulate make it grow, copying once.
+
+Sequences are decoded and executed in one loop, after
+`ZSTD_decompressSequences_body`: no `Vec<Sequence>`, no staging block, no
+second pass. Per-mode tables pack each state's value base, extra bits and FSE
+transition into 8 bytes (`ZSTD_seqSymbol`); they are rebuilt only when a mode
+changes them, RLE modes are one-entry tables, and states are masked to the
+table size. The bit reader, states and repeat offsets stay in registers: the
+stream start and the tail reader take and return them by value. A sequence
+refills once, and once more only when its extra bits exceed 30. Literal and
+match copies move 16-byte chunks, then 64-byte steps, into the slack; matches
+closer than 16 bytes spread their period over a chunk first. A match reaching
+past the segment continues in the older one or the dictionary, out of line.
+
+Behavior, for libarchive's callers, which collect after each block:
+
+- Output bytes, offsets accepted, error classes and partial output are
+  unchanged, with one exception: a block that decompresses to more than
+  128 KiB (literals or sequences) now fails as corrupt. ruzstd accepted it and
+  grew its buffer without bound; the format forbids it and libzstd rejects it.
+- Matches may reach back the window from a block's start, plus the block, as
+  before; for callers that collect later the reach is now capped at the
+  window instead of everything uncollected. Only invalid offsets differ.
+- An error leaves the block's output and the offsets uncommitted.
+- The checksum is hashed as each block is decoded instead of as it is
+  collected; it is read only after everything is collected, so it is equal.
+
+Validation: 2256 valid, truncated, bit-flipped and overwritten archive cases
+through the ABI match the baseline except 8 whose blocks exceed 128 KiB (all
+`BlockTooLarge`; libzstd rejects them as well). 49 self-contained vendor tests
+pass with debug assertions and overflow checks, including chunked copies
+against byte-at-a-time LZ77, joins of the older segment and the dictionary,
+repeat offsets, and ring wrapping without growth. Upstream zstd, zip and 7zip
+tests and `diff-cat` agree. Evidence: sibling `diagnostics/round12-zstd-dec`.

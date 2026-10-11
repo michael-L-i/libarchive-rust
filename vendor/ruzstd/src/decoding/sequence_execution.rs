@@ -1,442 +1,331 @@
-use super::scratch::DecoderScratch;
-use crate::decoding::errors::ExecuteSequencesError;
+//! The copies that execute a sequence, after `ZSTD_execSequence`. A block is
+//! decoded into a ring with slack after it (see
+//! [DecodeBuffer](super::decode_buffer::DecodeBuffer)), so copies move whole
+//! 16-byte chunks, then 64-byte steps, and may write up to 63 bytes past
+//! their end. Those bytes are overwritten by the next copy or lie beyond the
+//! block.
 
-/// Take the provided decoder and execute the sequences stored within
-pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequencesError> {
-    if scratch.sequences.len() >= 32 && execute_block(scratch) {
-        return Ok(());
-    }
-    execute_sequences_general(scratch)
-}
+use crate::decoding::errors::{DecodeBufferError, ExecuteSequencesError};
+use core::ops::Range;
 
-fn execute_sequences_general(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequencesError> {
-    let mut literals_copy_counter = 0;
-    let old_buffer_size = scratch.buffer.len();
-    let mut seq_sum = 0;
+const CHUNK: usize = 16;
+/// Longer runs continue in wider steps.
+const WIDE: usize = 64;
 
-    for idx in 0..scratch.sequences.len() {
-        let seq = scratch.sequences[idx];
-
-        if seq.ll > 0 {
-            let high = literals_copy_counter + seq.ll as usize;
-            if high > scratch.literals_buffer.len() {
-                return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                    wanted: high,
-                    have: scratch.literals_buffer.len(),
-                });
-            }
-            let literals = &scratch.literals_buffer[literals_copy_counter..high];
-            literals_copy_counter += seq.ll as usize;
-
-            scratch.buffer.push(literals);
-        }
-
-        let actual_offset = do_offset_history(seq.of, seq.ll, &mut scratch.offset_hist);
-        if actual_offset == 0 {
-            return Err(ExecuteSequencesError::ZeroOffset);
-        }
-        if seq.ml > 0 {
-            scratch
-                .buffer
-                .repeat(actual_offset as usize, seq.ml as usize)?;
-        }
-
-        seq_sum += seq.ml;
-        seq_sum += seq.ll;
-    }
-    if literals_copy_counter < scratch.literals_buffer.len() {
-        let rest_literals = &scratch.literals_buffer[literals_copy_counter..];
-        scratch.buffer.push(rest_literals);
-        seq_sum += rest_literals.len() as u32;
-    }
-
-    let diff = scratch.buffer.len() - old_buffer_size;
-    assert!(
-        seq_sum as usize == diff,
-        "Seq_sum: {} is different from the difference in buffersize: {}",
-        seq_sum,
-        diff
-    );
-    Ok(())
-}
-
-// Stage an ordinary block contiguously, then append it to the history once. Failure
-// leaves the history and offsets untouched so the general executor retains its
-// error ordering and partial-output behavior, including dictionary matches.
-fn execute_block(scratch: &mut DecoderScratch) -> bool {
-    const BLOCK_SIZE: usize = 128 * 1024;
-    const COPY_SIZE: usize = 16;
-    const SHORT_COPY_LIMIT: usize = 64;
-    let output = &mut scratch.sequence_output;
-    output.resize(BLOCK_SIZE + COPY_SIZE, 0);
-    let (history1, history2) = scratch.buffer.history_slices();
-    let history_len = history1.len() + history2.len();
-    let literals = &scratch.literals_buffer;
-    let mut offsets = scratch.offset_hist;
-    let mut written = 0usize;
-    let mut literal_pos = 0usize;
-
-    for seq in &scratch.sequences {
-        let ll = seq.ll as usize;
-        let ml = seq.ml as usize;
-        let Some(literal_end) = literal_pos.checked_add(ll) else {
-            return false;
-        };
-        let Some(match_start) = written.checked_add(ll) else {
-            return false;
-        };
-        let Some(end) = match_start.checked_add(ml) else {
-            return false;
-        };
-        if literal_end > literals.len() || end > BLOCK_SIZE {
-            return false;
-        }
-        if ll != 0 {
-            // Padding permits rounded writes; the literal input still needs real slack.
-            let rounded = (ll + COPY_SIZE - 1) & !(COPY_SIZE - 1);
-            if ll <= SHORT_COPY_LIMIT && literals.len() - literal_pos >= rounded {
-                let dst = &mut output[written..written + rounded];
-                let src = &literals[literal_pos..literal_pos + rounded];
-                for (d, s) in dst
-                    .chunks_exact_mut(COPY_SIZE)
-                    .zip(src.chunks_exact(COPY_SIZE))
-                {
-                    d.copy_from_slice(s);
-                }
-            } else {
-                output[written..match_start].copy_from_slice(&literals[literal_pos..literal_end]);
-            }
-        }
-        literal_pos = literal_end;
-        written = match_start;
-        let offset = do_offset_history(seq.of, seq.ll, &mut offsets) as usize;
-        if offset == 0 || offset > history_len + written {
-            return false;
-        }
-
-        if offset > written {
-            let mut source = history_len - (offset - written);
-            let mut remaining = ml.min(history_len - source);
-            if source < history1.len() {
-                let count = remaining.min(history1.len() - source);
-                copy_history(output, written, history1, source, count);
-                written += count;
-                remaining -= count;
-                source = 0;
-            } else {
-                source -= history1.len();
-            }
-            if remaining != 0 {
-                copy_history(output, written, history2, source, remaining);
-                written += remaining;
-            }
-        }
-        if written < end {
-            let length = end - written;
-            if length <= SHORT_COPY_LIMIT && offset >= COPY_SIZE {
-                while written < end {
-                    let source = written - offset;
-                    output.copy_within(source..source + COPY_SIZE, written);
-                    written += COPY_SIZE;
-                }
-            } else {
-                let source = written - offset;
-                while written < end {
-                    let count = (end - written).min(written - source);
-                    output.copy_within(source..source + count, written);
-                    written += count;
-                }
-            }
-        }
-        written = end;
-    }
-    let rest = &literals[literal_pos..];
-    if rest.len() > BLOCK_SIZE - written {
-        return false;
-    }
-    output[written..written + rest.len()].copy_from_slice(rest);
-    written += rest.len();
-    scratch.buffer.push(&output[..written]);
-    scratch.offset_hist = offsets;
-    true
-}
-
+/// Copies `len` literals from `literals[from..]`, which has slack after the
+/// literals, to `buf[op..]`.
 #[inline(always)]
-fn copy_history(output: &mut [u8], dest: usize, history: &[u8], source: usize, length: usize) {
-    if length <= 16 && history.len() - source >= 16 {
-        output[dest..dest + 16].copy_from_slice(&history[source..source + 16]);
-    } else {
-        output[dest..dest + length].copy_from_slice(&history[source..source + length]);
+pub(crate) fn copy_literals(buf: &mut [u8], op: usize, literals: &[u8], from: usize, len: usize) {
+    buf[op..op + CHUNK].copy_from_slice(&literals[from..from + CHUNK]);
+    let mut done = CHUNK;
+    while done < len {
+        buf[op + done..op + done + WIDE].copy_from_slice(&literals[from + done..from + done + WIDE]);
+        done += WIDE;
     }
 }
 
-/// Update the most recently used offsets to reflect the provided offset value, and return the
-/// "actual" offset needed because offsets are not stored in a raw way, some transformations are needed
-/// before you get a functional number.
-fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
-    let actual_offset = if lit_len > 0 {
-        match offset_value {
-            1..=3 => scratch[offset_value as usize - 1],
-            _ => {
-                //new offset
-                offset_value - 3
-            }
+/// Copies a match of `len` bytes from `offset` back, within the segment.
+#[inline(always)]
+pub(crate) fn copy_match(buf: &mut [u8], op: usize, offset: usize, len: usize) {
+    let from = op - offset;
+    if offset < CHUNK {
+        return copy_short_offset(buf, op, offset, len);
+    }
+    // Each chunk ends at or before the one it is copied to.
+    buf.copy_within(from..from + CHUNK, op);
+    let mut done = CHUNK;
+    if offset >= WIDE {
+        while done < len {
+            buf.copy_within(from + done..from + done + WIDE, op + done);
+            done += WIDE;
         }
     } else {
-        match offset_value {
-            1..=2 => scratch[offset_value as usize],
-            3 => scratch[0] - 1,
-            _ => {
-                //new offset
-                offset_value - 3
-            }
-        }
-    };
-
-    //update history
-    if lit_len > 0 {
-        match offset_value {
-            1 => {
-                //nothing
-            }
-            2 => {
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            _ => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-        }
-    } else {
-        match offset_value {
-            1 => {
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            2 => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            _ => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
+        while done < len {
+            buf.copy_within(from + done..from + done + CHUNK, op + done);
+            done += CHUNK;
         }
     }
+}
 
-    actual_offset
+/// A match closer than a chunk repeats its last `offset` bytes. Spread them
+/// over a chunk, then copy chunks from a whole number of periods back.
+#[inline(never)]
+fn copy_short_offset(buf: &mut [u8], op: usize, offset: usize, len: usize) {
+    // The smallest multiple of each offset that is at least a chunk.
+    const PERIOD: [u8; CHUNK] = [0, 16, 16, 18, 16, 20, 18, 21, 16, 18, 20, 22, 24, 26, 28, 30];
+    let mut pattern = [0; CHUNK];
+    pattern.copy_from_slice(&buf[op - offset..op - offset + CHUNK]);
+    for i in offset..CHUNK {
+        pattern[i] = pattern[i - offset];
+    }
+    buf[op..op + CHUNK].copy_from_slice(&pattern);
+    let period = usize::from(PERIOD[offset]);
+    let mut done = CHUNK;
+    while done < len {
+        let from = op + done - period;
+        buf.copy_within(from..from + CHUNK, op + done);
+        done += CHUNK;
+    }
+}
+
+/// The history a block's matches may reach outside its own segment.
+pub(crate) struct Far<'a> {
+    pub start: usize,
+    pub segment: usize,
+    pub old: Range<usize>,
+    pub history: usize,
+    pub dict: &'a [u8],
+    /// The output counted towards the dictionary limit before the block.
+    pub counter: u64,
+    pub window_size: usize,
+}
+
+/// Copies a match that reaches back past the segment, into the older segment
+/// or the dictionary, or rejects its offset. `uncounted` is how much of the
+/// block so far does not count towards the dictionary limit; returns how much
+/// of this match does not.
+#[cold]
+#[inline(never)]
+pub(crate) fn copy_far(
+    buf: &mut [u8],
+    op: usize,
+    offset: usize,
+    len: usize,
+    far: &Far<'_>,
+    uncounted: u64,
+) -> Result<u64, ExecuteSequencesError> {
+    if offset == 0 {
+        return Err(ExecuteSequencesError::ZeroOffset);
+    }
+    let reach = far.history + (op - far.start);
+    if offset <= reach {
+        let in_segment = op - far.segment;
+        if offset <= in_segment {
+            copy_match(buf, op, offset, len);
+            return Ok(0);
+        }
+        // The older segment's end is followed by the segment's start.
+        let back = offset - in_segment;
+        let from = far.old.end - back;
+        let n = back.min(len);
+        buf.copy_within(from..from + n, op);
+        if len > n {
+            copy_match(buf, op + n, offset, len - n);
+        }
+        return Ok(0);
+    }
+    // Only output up to a window long may refer to the dictionary.
+    let counter = far.counter + (op - far.start) as u64 - uncounted;
+    if counter > far.window_size as u64 {
+        return Err(DecodeBufferError::OffsetTooBig {
+            offset,
+            buf_len: reach,
+        }
+        .into());
+    }
+    let from_dict = offset - reach;
+    if from_dict > far.dict.len() {
+        return Err(DecodeBufferError::NotEnoughBytesInDictionary {
+            got: far.dict.len(),
+            need: from_dict,
+        }
+        .into());
+    }
+    let dict = &far.dict[far.dict.len() - from_dict..];
+    if from_dict < len {
+        buf[op..op + from_dict].copy_from_slice(dict);
+        // The rest starts at the oldest byte of the history.
+        copy_far(buf, op + from_dict, offset, len - from_dict, far, uncounted)?;
+        Ok(0)
+    } else {
+        // A match entirely within the dictionary is not counted.
+        buf[op..op + len].copy_from_slice(&dict[..len]);
+        Ok(len as u64)
+    }
+}
+
+/// Resolves an offset value to an offset, updating the most recent offsets.
+/// Values 1-3 repeat a recent offset; after no literals they shift by one,
+/// and the shifted 3 is the most recent offset minus one.
+///
+/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#repeat-offsets>
+#[inline(always)]
+pub(crate) fn resolve_offset(value: u32, no_literals: bool, recent: &mut [u32; 3]) -> u32 {
+    if value > 3 {
+        let offset = value - 3;
+        *recent = [offset, recent[0], recent[1]];
+        return offset;
+    }
+    // Values start at 1; a zero from a table left by an earlier error wraps.
+    let index = (value as usize + usize::from(no_literals)).wrapping_sub(1);
+    let offset = match index {
+        0 => return recent[0],
+        1 => recent[1],
+        2 => recent[2],
+        _ => recent[0].wrapping_sub(1),
+    };
+    if index != 1 {
+        recent[2] = recent[1];
+    }
+    recent[1] = recent[0];
+    recent[0] = offset;
+    offset
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocks::sequence_section::Sequence;
-    use alloc::{format, vec};
+    use crate::decoding::decode_buffer::SLACK;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
-    fn workspace(prefix: usize) -> DecoderScratch {
-        let mut scratch = DecoderScratch::new(128);
-        scratch.buffer.reset(128);
-        scratch.buffer.push(&vec![0; prefix]);
-        scratch.buffer.read_all(&mut vec![0; prefix]).unwrap();
-        scratch.buffer.push(
-            &(0..96)
-                .map(|n| (n * 37) as u8)
-                .collect::<alloc::vec::Vec<_>>(),
-        );
-        scratch.literals_buffer = (0..6000).map(|n| (n * 19) as u8).collect();
-        scratch
-    }
-
-    fn compare(prefix: usize, sequences: &[Sequence], dictionary: bool) {
-        let mut fast = workspace(prefix);
-        let mut general = workspace(prefix);
-        for scratch in [&mut fast, &mut general] {
-            scratch.sequences.extend_from_slice(sequences);
-            if dictionary {
-                scratch.buffer.dict_content = vec![0x63; 1024];
-            }
+    /// LZ77 semantics, one byte at a time.
+    fn reference(history: &[u8], offset: usize, len: usize) -> Vec<u8> {
+        let mut out = history.to_vec();
+        for _ in 0..len {
+            out.push(out[out.len() - offset]);
         }
-        let expected = execute_sequences_general(&mut general);
-        let actual = execute_sequences(&mut fast);
-        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
-        assert_eq!(fast.offset_hist, general.offset_hist);
-        assert_eq!(fast.buffer.drain(), general.buffer.drain());
+        out.split_off(history.len())
     }
 
     #[test]
-    fn staged_blocks_match_general_execution() {
-        for seed in 0..64usize {
-            let mut sequences = alloc::vec::Vec::new();
-            let mut available = 96;
-            for i in 0..128 {
-                let ll = (i * 17 + seed * 13) % 37;
-                let ml = 3 + (i * 31 + seed * 7) % 127;
-                available += ll;
-                let offsets = [1, 2, 3, 7, 15, 16, 17, available, available / 2];
-                let offset = offsets[(i + seed) % offsets.len()];
-                sequences.push(Sequence {
-                    ll: ll as u32,
-                    ml: ml as u32,
-                    of: if seed % 2 == 1 && i % 4 != 0 {
-                        1 + (i % 3) as u32
-                    } else {
-                        offset as u32 + 3
-                    },
-                });
-                available += ml;
-            }
-            for prefix in [0, 65, 125, 127] {
-                compare(prefix, &sequences, false);
+    fn chunked_matches_repeat_like_byte_copies() {
+        let history: Vec<u8> = (0..300u32).map(|i| (i * 73 % 251) as u8).collect();
+        for offset in 1..=70 {
+            for len in (3..=80).chain([127, 128, 129, 1000, 4099]) {
+                let mut buf = history.clone();
+                buf.resize(history.len() + len + SLACK, 0xAA);
+                copy_match(&mut buf, history.len(), offset, len);
+                assert_eq!(
+                    buf[history.len()..history.len() + len],
+                    reference(&history, offset, len),
+                    "offset {offset} len {len}"
+                );
+                assert_eq!(buf[..history.len()], history);
             }
         }
     }
 
     #[test]
-    fn staged_blocks_preserve_fallback_state_and_errors() {
-        for failing_index in [0, 1, 31, 32, 63] {
-            for failure in [
-                Sequence {
-                    ll: 6001,
-                    ml: 3,
-                    of: 4,
-                },
-                Sequence {
-                    ll: 0,
-                    ml: 3,
-                    of: 3,
-                },
-                Sequence {
-                    ll: 1,
-                    ml: 3,
-                    of: 100000,
-                },
-                Sequence {
-                    ll: 1,
-                    ml: 131073,
-                    of: 4,
-                },
-                Sequence {
-                    ll: 0,
-                    ml: 300,
-                    of: 900,
-                },
-            ] {
-                let mut sequences = vec![
-                    Sequence {
-                        ll: 1,
-                        ml: 3,
-                        of: 4
+    fn chunked_literals_copy_exactly() {
+        let literals: Vec<u8> = (0..200u8).chain([0; SLACK]).collect();
+        for from in [0, 1, 15, 16, 17, 100] {
+            for len in 0..=100.min(200 - from) {
+                let mut buf = vec![0xAA; 10 + len + SLACK];
+                copy_literals(&mut buf, 10, &literals, from, len);
+                assert_eq!(buf[10..10 + len], literals[from..from + len]);
+                assert_eq!(buf[..10], [0xAA; 10]);
+            }
+        }
+    }
+
+    #[test]
+    fn far_matches_join_the_older_segment_to_the_segment() {
+        // Logical history: the older segment's bytes, then the segment's.
+        let size = 400;
+        let old = 300..380;
+        let segment = 0;
+        for start in [0usize, 5, 40] {
+            let mut buf = vec![0u8; size];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = (i * 31 % 253) as u8;
+            }
+            let logical: Vec<u8> = buf[old.clone()]
+                .iter()
+                .chain(&buf[segment..start])
+                .copied()
+                .collect();
+            for offset in 1..=logical.len() {
+                for len in [1, 3, 16, 17, 40, 100] {
+                    let mut work = buf.clone();
+                    let far = Far {
+                        start,
+                        segment,
+                        old: old.clone(),
+                        history: logical.len(),
+                        dict: &[],
+                        counter: 0,
+                        window_size: 1000,
                     };
-                    64
-                ];
-                sequences[failing_index] = failure;
-                for dictionary in [false, true] {
-                    compare(125, &sequences, dictionary);
+                    copy_far(&mut work, start, offset, len, &far, 0).unwrap();
+                    assert_eq!(
+                        work[start..start + len],
+                        reference(&logical, offset, len),
+                        "start {start} offset {offset} len {len}"
+                    );
                 }
             }
+            let far = Far {
+                start,
+                segment,
+                old: old.clone(),
+                history: logical.len(),
+                dict: &[],
+                counter: 0,
+                window_size: 1000,
+            };
+            let mut work = buf.clone();
+            assert!(copy_far(&mut work, start, logical.len() + 1, 3, &far, 0).is_err());
+            assert!(copy_far(&mut work, start, 0, 3, &far, 0).is_err());
         }
     }
 
     #[test]
-    fn wide_kernel_boundaries_match_general() {
-        let lengths = [
-            3usize, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 66, 80, 127, 300, 2000,
+    fn far_matches_continue_from_the_dictionary() {
+        let dict: Vec<u8> = (100..140).collect();
+        let history = [1u8, 2, 3, 4, 5];
+        for offset in 6..=45 {
+            for len in [1, 3, 20, 60] {
+                let mut buf = vec![0u8; 200];
+                buf[..5].copy_from_slice(&history);
+                let far = Far {
+                    start: 5,
+                    segment: 0,
+                    old: 0..0,
+                    history: 5,
+                    dict: &dict,
+                    counter: 5,
+                    window_size: 1000,
+                };
+                let uncounted = copy_far(&mut buf, 5, offset, len, &far, 0).unwrap();
+                let logical: Vec<u8> = dict.iter().chain(&history).copied().collect();
+                assert_eq!(buf[5..5 + len], reference(&logical, offset, len));
+                let from_dict = offset - 5;
+                assert_eq!(uncounted, if from_dict >= len { len as u64 } else { 0 });
+            }
+        }
+        let far = Far {
+            start: 5,
+            segment: 0,
+            old: 0..0,
+            history: 5,
+            dict: &dict,
+            counter: 1001,
+            window_size: 1000,
+        };
+        assert!(copy_far(&mut [0; 100], 5, 6, 3, &far, 0).is_err());
+        let far = Far { counter: 5, ..far };
+        assert!(copy_far(&mut [0; 100], 5, 46, 3, &far, 0).is_err());
+    }
+
+    #[test]
+    fn repeat_offsets_follow_the_format() {
+        let start = [11, 22, 33];
+        let cases = [
+            (1, false, 11, [11, 22, 33]),
+            (2, false, 22, [22, 11, 33]),
+            (3, false, 33, [33, 11, 22]),
+            (1, true, 22, [22, 11, 33]),
+            (2, true, 33, [33, 11, 22]),
+            (3, true, 10, [10, 11, 22]),
+            (4, false, 1, [1, 11, 22]),
+            (4, true, 1, [1, 11, 22]),
+            (1000, true, 997, [997, 11, 22]),
         ];
-        for (seed, &ml) in lengths.iter().enumerate() {
-            for offset in 1..=40u32 {
-                let sequences: alloc::vec::Vec<_> = (0..32)
-                    .map(|i| Sequence {
-                        ll: (lengths[(i + seed) % lengths.len()] % 70) as u32,
-                        ml: ml as u32,
-                        of: offset + 3,
-                    })
-                    .collect();
-                for prefix in [0, 125] {
-                    compare(prefix, &sequences, false);
-                }
-            }
-        }
-        for offset in [16, 17, 31, 32, 48] {
-            for ml in [33, 64] {
-                let mut sequences = vec![
-                    Sequence {
-                        ll: 0,
-                        ml: 3,
-                        of: 4
-                    };
-                    32
-                ];
-                sequences[0] = Sequence {
-                    ll: 0,
-                    ml,
-                    of: offset + 3,
-                };
-                compare(125, &sequences, false);
-            }
-        }
-        // Literal runs ending k bytes before the literal buffer end hit both the
-        // chunked (at least eight bytes of rounding slack) and exact literal paths.
-        for k in 0..24u32 {
-            let mut sequences = vec![
-                Sequence {
-                    ll: 40,
-                    ml: 20,
-                    of: 7 + 3
-                };
-                32
-            ];
-            sequences[0].ll = 6000 - 31 * 40 - k;
-            compare(65, &sequences, false);
-        }
-    }
-
-    #[test]
-    fn staged_terminal_copies_match_general() {
-        // The last run may overcopy into padding, but only logical output commits.
-        // One byte beyond the staging limit must retain the general fallback.
-        for size in [128 * 1024, 128 * 1024 + 1] {
-            for (ll, ml, rest) in [
-                (0, 1, 0),
-                (0, 15, 0),
-                (0, 16, 0),
-                (0, 17, 0),
-                (0, 33, 0),
-                (0, 63, 0),
-                (0, 64, 0),
-                (0, 65, 0),
-                (17, 0, 0),
-                (33, 0, 15),
-                (63, 0, 16),
-                (17, 3, 1),
-            ] {
-                for offset in [1, 2, 3, 7, 15, 16, 17, 33, size - rest - ml + 10] {
-                    let mut sequences = vec![
-                        Sequence {
-                            ll: 0,
-                            ml: 3,
-                            of: 4
-                        };
-                        32
-                    ];
-                    sequences[0] = Sequence {
-                        ll: 6000 - ll - rest,
-                        ml: size - 6000 - 30 * 3 - ml,
-                        of: 4,
-                    };
-                    sequences[31] = Sequence {
-                        ll,
-                        ml,
-                        of: offset + 3,
-                    };
-                    for prefix in [0, 125] {
-                        compare(prefix, &sequences, false);
-                    }
-                }
-            }
+        for (value, no_literals, offset, recent) in cases {
+            let mut state = start;
+            assert_eq!(resolve_offset(value, no_literals, &mut state), offset);
+            assert_eq!(state, recent);
         }
     }
 }

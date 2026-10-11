@@ -1,11 +1,11 @@
 //! Structures that wrap around various decoders to make decoding easier.
 
-use super::super::blocks::sequence_section::Sequence;
 use super::decode_buffer::DecodeBuffer;
-use super::sequence_section_decoder::LengthState;
+use super::sequence_section_decoder::{derive_tables, SeqTables};
 use crate::decoding::dictionary::Dictionary;
 use crate::fse::FSETable;
 use crate::huff0::HuffmanTable;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::blocks::sequence_section::{
@@ -23,8 +23,6 @@ pub struct DecoderScratch {
     pub offset_hist: [u32; 3],
 
     pub literals_buffer: Vec<u8>,
-    pub sequences: Vec<Sequence>,
-    pub(crate) sequence_output: Vec<u8>,
     pub block_content_buffer: Vec<u8>,
 }
 
@@ -34,30 +32,18 @@ impl DecoderScratch {
             huf: HuffmanScratch {
                 table: HuffmanTable::new(),
             },
-            fse: FSEScratch {
-                offsets: FSETable::new(MAX_OFFSET_CODE),
-                of_rle: None,
-                literal_lengths: FSETable::new(MAX_LITERAL_LENGTH_CODE),
-                ll_rle: None,
-                match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
-                ml_rle: None,
-                ll_states: Vec::new(),
-                ml_states: Vec::new(),
-            },
+            fse: FSEScratch::new(),
             buffer: DecodeBuffer::new(window_size),
             offset_hist: [1, 4, 8],
 
             block_content_buffer: Vec::new(),
             literals_buffer: Vec::new(),
-            sequences: Vec::new(),
-            sequence_output: Vec::new(),
         }
     }
 
     pub fn reset(&mut self, window_size: usize) {
         self.offset_hist = [1, 4, 8];
         self.literals_buffer.clear();
-        self.sequences.clear();
         self.block_content_buffer.clear();
 
         self.buffer.reset(window_size);
@@ -108,8 +94,8 @@ pub struct FSEScratch {
     pub ll_rle: Option<u8>,
     pub match_lengths: FSETable,
     pub ml_rle: Option<u8>,
-    pub(crate) ll_states: Vec<LengthState>,
-    pub(crate) ml_states: Vec<LengthState>,
+    /// The tables above, as the sequence decoder reads them.
+    pub(crate) symbols: Box<SeqTables>,
 }
 
 impl FSEScratch {
@@ -121,8 +107,7 @@ impl FSEScratch {
             ll_rle: None,
             match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
             ml_rle: None,
-            ll_states: Vec::new(),
-            ml_states: Vec::new(),
+            symbols: Box::default(),
         }
     }
 
@@ -133,6 +118,7 @@ impl FSEScratch {
         self.of_rle = other.of_rle;
         self.ll_rle = other.ll_rle;
         self.ml_rle = other.ml_rle;
+        derive_tables(self);
     }
 }
 

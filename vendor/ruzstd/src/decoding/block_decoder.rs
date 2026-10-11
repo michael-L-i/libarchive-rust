@@ -3,6 +3,7 @@ use super::super::blocks::block::BlockType;
 use super::super::blocks::literals_section::LiteralsSection;
 use super::super::blocks::literals_section::LiteralsSectionType;
 use super::super::blocks::sequence_section::SequencesHeader;
+use super::decode_buffer::SLACK;
 use super::literals_section_decoder::decode_literals;
 use super::sequence_section_decoder::decode_sequences;
 use crate::common::MAX_BLOCK_SIZE;
@@ -12,7 +13,6 @@ use crate::decoding::errors::{
     DecompressBlockError,
 };
 use crate::decoding::scratch::DecoderScratch;
-use crate::decoding::sequence_execution::execute_sequences;
 use crate::io::Read;
 
 pub struct BlockDecoder {
@@ -60,18 +60,20 @@ impl BlockDecoder {
                         source: err,
                     }
                 })?;
+                workspace.buffer.reserve_block()?;
                 workspace
                     .buffer
-                    .extend_and_fill(buf[0], header.decompressed_size as usize);
+                    .fill_block(buf[0], header.decompressed_size as usize);
 
                 self.internal_state = DecoderState::ReadyToDecodeNextHeader;
 
                 Ok(1)
             }
             BlockType::Raw => {
+                workspace.buffer.reserve_block()?;
                 workspace
                     .buffer
-                    .extend_from_reader(&mut source, header.decompressed_size as usize)
+                    .read_block(&mut source, header.decompressed_size as usize)
                     .map_err(|err| DecodeBlockContentError::ReadError {
                         step: block_type,
                         source: err,
@@ -86,7 +88,14 @@ impl BlockDecoder {
             }
 
             BlockType::Compressed => {
-                self.decompress_block(header, workspace, source)?;
+                workspace
+                    .block_content_buffer
+                    .resize(header.content_size as usize, 0);
+                source
+                    .read_exact(workspace.block_content_buffer.as_mut_slice())
+                    .map_err(DecompressBlockError::from)?;
+                workspace.buffer.reserve_block()?;
+                self.decompress_block(header, workspace)?;
 
                 self.internal_state = DecoderState::ReadyToDecodeNextHeader;
                 Ok(u64::from(header.content_size))
@@ -94,17 +103,13 @@ impl BlockDecoder {
         }
     }
 
+    /// Decodes the compressed block in `workspace.block_content_buffer` into
+    /// the room reserved for it.
     fn decompress_block(
         &mut self,
         header: &BlockHeader,
         workspace: &mut DecoderScratch, //reuse this as often as possible. Not only if the trees are reused but also reuse the allocations when building new trees
-        mut source: impl Read,
     ) -> Result<(), DecompressBlockError> {
-        workspace
-            .block_content_buffer
-            .resize(header.content_size as usize, 0);
-
-        source.read_exact(workspace.block_content_buffer.as_mut_slice())?;
         let raw = workspace.block_content_buffer.as_slice();
 
         let mut section = LiteralsSection::new();
@@ -116,6 +121,10 @@ impl BlockDecoder {
             section.regenerated_size,
             section.compressed_size
         );
+        // Every literal is output, and a block decompresses to at most this.
+        if section.regenerated_size > MAX_BLOCK_SIZE {
+            return Err(DecompressBlockError::BlockTooLarge);
+        }
 
         let upper_limit_for_literals = match section.compressed_size {
             Some(x) => x as usize,
@@ -172,15 +181,20 @@ impl BlockDecoder {
         );
         vprintln!("Slice for sequences: {}", raw.len());
 
+        let literals_len = workspace.literals_buffer.len();
         if seq_section.num_sequences != 0 {
-            decode_sequences(
+            // Chunked literal copies read past the literals.
+            workspace.literals_buffer.resize(literals_len + SLACK, 0);
+            let (len, counted) = decode_sequences(
                 &seq_section,
                 raw,
                 &mut workspace.fse,
-                &mut workspace.sequences,
+                &workspace.literals_buffer,
+                literals_len,
+                &mut workspace.offset_hist,
+                workspace.buffer.block_target(),
             )?;
-            vprintln!("Executing sequences");
-            execute_sequences(workspace)?;
+            workspace.buffer.commit_block(len, counted);
         } else {
             if !raw.is_empty() {
                 return Err(DecompressBlockError::DecodeSequenceError(
@@ -189,8 +203,12 @@ impl BlockDecoder {
                     },
                 ));
             }
-            workspace.buffer.push(&workspace.literals_buffer);
-            workspace.sequences.clear();
+            let target = workspace.buffer.block_target();
+            target.buf[target.start..target.start + literals_len]
+                .copy_from_slice(&workspace.literals_buffer);
+            workspace
+                .buffer
+                .commit_block(literals_len, literals_len as u64);
         }
 
         Ok(())

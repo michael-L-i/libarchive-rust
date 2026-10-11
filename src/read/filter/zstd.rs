@@ -33,7 +33,9 @@
 use crate::archive::*;
 use crate::read::{Filter, FilterBidder, Read, Reader, Status, filter_code};
 use crate::util::Error;
-use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+use ruzstd::decoding::errors::{
+    DecodeBlockContentError, DecodeBufferError, FrameDecoderError, ReadFrameHeaderError,
+};
 use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 use std::ffi::{CStr, c_int};
 use std::io;
@@ -242,6 +244,9 @@ fn decode_failure(input: Input<'_, '_>, e: Option<&FrameDecoderError>) -> Error 
         Some(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(_))) => {
             "Unknown frame descriptor"
         }
+        Some(FrameDecoderError::FailedToReadBlockBody(
+            DecodeBlockContentError::DecodeBufferError(DecodeBufferError::OutOfMemory),
+        )) => "Allocation error : not enough memory",
         _ => "Data corruption detected",
     };
     failed(name)

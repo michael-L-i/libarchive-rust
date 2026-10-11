@@ -615,6 +615,17 @@ Differences:
 - The filter skips skippable frames and checks each frame's content checksum,
   since ruzstd does neither. The window limit is libzstd's default, 128 MiB.
 
+Round 12 decoder (`vendor/ruzstd/src/decoding`, see its `PATCHES.md`):
+
+- A zstd block that decompresses to more than 128 KiB fails as "Data
+  corruption detected". The format forbids such blocks and libzstd rejects
+  them; ruzstd used to decode them, growing its buffer without bound. Of 2256
+  valid and damaged archive cases, 8 changed, all bit flips: the old decoder
+  went on to deliver garbage until tar failed, and the port now stops at the
+  block, as upstream does (same status and message as upstream in 5 of them).
+- The decoder no longer has a ring buffer with unsafe code: the vendored
+  ruzstd decoder is safe Rust.
+
 Phase 5 write adapters use crabz2 and a bounded ruzstd matcher; their
 streaming behavior and encoder differences are recorded below.
 
