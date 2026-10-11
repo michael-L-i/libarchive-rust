@@ -1,6 +1,7 @@
-//! The libc calls the front-ends make that std has no wrapper for. This is
-//! the only `unsafe` code in the front-ends; every function here is safe
-//! to call.
+//! The libc calls the front-ends make that std has no wrapper for: signal
+//! dispositions, the terminal's echo, the umask and `strerror`. This is the
+//! only `unsafe` code in the front-ends; every function here is safe to
+//! call.
 
 use std::ffi::{CStr, c_int};
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -27,6 +28,20 @@ pub fn umask() -> libc::mode_t {
         let mask = libc::umask(0);
         libc::umask(mask);
         mask
+    }
+}
+
+/// Gives `sig` its default action. Rust programs start with `SIGPIPE`
+/// ignored, where C programs inherit it.
+pub fn default_signal(sig: c_int) {
+    // SAFETY: a zeroed sigaction is a valid one (no flags, and the empty
+    // mask sigemptyset makes it); `sa` outlives the calls, and a NULL old
+    // action is allowed.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(sig, &sa, std::ptr::null_mut());
     }
 }
 
