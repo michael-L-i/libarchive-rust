@@ -1,6 +1,6 @@
 [workspace]
-members = ["capi", "deflate", "tools/libarchive_fe", "tools/cat", "tools/unzip"]
-default-members = [".", "capi", "deflate", "tools/libarchive_fe", "tools/cat", "tools/unzip"]
+members = ["capi", "deflate", "tools/libarchive_fe", "tools/cat", "tools/cpio", "tools/unzip"]
+default-members = [".", "capi", "deflate", "tools/libarchive_fe", "tools/cat", "tools/cpio", "tools/unzip"]
 # The patched backends keep their own manifests and tests.
 exclude = ["vendor", "fuzz"]
 

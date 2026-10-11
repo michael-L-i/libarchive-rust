@@ -1,0 +1,15 @@
+[package]
+name = "bsdcpio"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "bsdcpio: copies files into and out of cpio and other archives (upstream's cpio/)"
+
+[[bin]]
+name = "bsdcpio"
+path = "src/cpio.rs"
+
+[dependencies]
+libarchive-fe = { path = "../libarchive_fe" }
+libarchive-rust = { path = "../.." }
+libc = "0.2"

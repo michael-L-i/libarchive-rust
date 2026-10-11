@@ -2078,3 +2078,42 @@ single-hash matcher. Levels and options keep libarchive's meaning.
   callback's own `error("Error reading password")` can't be reached.
 - `close(2)` of an extracted file goes through `sys::close`, since std's drop
   would hide the error upstream reports.
+
+## bsdcpio (`tools/cpio/`)
+
+- Not ported: `cpio_windows.c` and the `_WIN32` branches; the
+  `HAVE_UTIMES` fallback of `restore_time`; and the members of `struct cpio`
+  nothing reads (`fd`, `compress_program`, the name caches' `probes` and
+  `hits`) or nothing sets (`day_first`, so `-tv` always formats dates
+  month first). `file_to_archive` and `entry_to_archive` return nothing:
+  upstream's callers ignore the first's value, and the second's is always 0.
+- An option is a `u8`, the short option's byte or an `OPTION_*` code, so the
+  codes (1 to 14) can be match patterns. `cpio->argc` is `argv.len()`.
+- `strtol` for `-C` and `strtoul` for `-R` are one decimal parser,
+  `parse_int`. It refuses what `strtoul` would wrap from a negative number
+  (bar `-0`), where upstream accepts only the few wrapped values that land
+  in `int`'s range (-2^64+1 and the like).
+- `getpwnam` and the other lookups are the `_r` functions, in `sys`. Upstream
+  warns `getpwuid(%lld) failed` when `errno` is set and not `ENOENT`; the
+  port warns when the `_r` function returns an error other than `ENOENT`.
+- The `-tv` listing goes through a `BufWriter`, as C's standard output is
+  fully buffered, and is flushed before every exit. Other standard output
+  (`--help`, `--version`) is Rust's line-buffered `Stdout`. With both
+  streams in one file, upstream's "N blocks" comes before the listing (the
+  listing is flushed on exit) and the port's after it.
+- `SIGPIPE` stays ignored, which is Rust's start-up state and what upstream
+  sets; `SIGCHLD` is reset to its default, as upstream does.
+- `-i`, `-o` and `-p` share one match arm: their bodies are the same bar
+  `-p`'s two flag changes.
+- `list_item_verbose` writes each field into one buffer in order, so the
+  names are not copied out of the entry and the name cache; the output is
+  the same. A date `strftime` returns nothing for (as for a time
+  `localtime` rejects) prints as "invalid mtime".
+- The passphrase buffer is allocated and zeroed for each prompt, as in
+  bsdunzip.
+- `cpio_rename` reads `/dev/tty` with `read_until`, cutting the line at a NUL
+  as `getline` plus C string handling does.
+- `-p` of a FIFO hangs in the port and in the relinked C tool alike, in
+  the library's disk writer, after it creates the FIFO.
+- `Output` is `cpio->archive`, which is a `struct archive` that is a writer
+  in `-o` mode and a disk writer in `-p` mode.
