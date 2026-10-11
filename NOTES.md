@@ -1701,24 +1701,19 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 
 ## Write compression filters
 
-- gzip (miniz_oxide), bzip2 (crabz2), XZ/LZMA/lzip (lzma-rust2), LZ4
-  (lz4_flex), and Zstandard (ruzstd) use safe Rust encoders. Their output
-  decompresses to the same archive bytes but compressed bytes, ratios and
-  timing differ from the upstream C libraries. Encoder features on existing
-  dependencies are enabled; no C codec dependency is added.
-- Lzip uses upstream's dictionary and nice-length preset table. The safe
-  backend has HC4 rather than HC3 for levels 0 and 1; their compressed
-  bytes and relative compression ratios can differ on some inputs.
-- lzma-rust2 0.21.0 is vendored with a binary-tree match-extension patch:
-  the skip path uses the backend's existing safe word-at-a-time comparison.
-  Match tails use a final overlapping word in place of scalar comparisons;
-  the already-equal overlap preserves the exact first-mismatch position.
-  Presets and parsing decisions are unchanged; differential streams remain
-  byte-identical. The sans-I/O LZMA2 decoder also initializes dictionary
-  pages as chunks need them, reducing resident memory for short XZ streams.
-  Declared virtual capacity, logical history and memory limits are unchanged;
-  LZMA1 and pull readers retain full initialization. Provenance and validation
-  are in `vendor/lzma-rust2/PATCHES.md`; its unsafe `optimization` feature stays off.
+- Deflate (gzip, zip, xar, zisofs) and XZ/LZMA/lzip compress with safe
+  ports of zlib 1.2.12 and liblzma 5.8.4 and reproduce those libraries'
+  bytes (see "Deflate compressor" and "LZMA encoding"). bzip2 (crabz2), LZ4
+  (lz4_flex) and Zstandard (ruzstd) use other safe Rust encoders: their
+  output decompresses to the same archive bytes, but compressed bytes,
+  ratios and timing differ from the upstream C libraries. No C codec
+  dependency is added.
+- lzma-rust2 0.21.0 is vendored. The LZMA2 decoder initializes dictionary
+  pages as chunks need them, reducing resident memory for short XZ streams;
+  declared virtual capacity, logical history and memory limits are
+  unchanged, and LZMA1 and pull readers retain full initialization.
+  Provenance and validation are in `vendor/lzma-rust2/PATCHES.md`; its
+  unsafe `optimization` feature stays off.
   CRC32/CRC64 updates use safe slicing-by-eight tables, retaining exact checksum
   and incremental semantics while adding 21 KiB of read-only tables.
 - XZ and Zstandard accept and validate `threads` but encode on one worker.
@@ -1872,17 +1867,9 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 
 - The 7zip writer uses a seekable anonymous temporary file for encoded data
   and native solid stream headers. Copy, deflate, BZip2, LZMA1, LZMA2,
-  Zstandard and the native PPMd7 encoder are supported. Safe codec output
-  differs from C codec bytes. PPMd has checked model accesses and a bounded
+  Zstandard and the native PPMd7 encoder are supported. BZip2 and Zstandard
+  output differs from the C codecs' bytes. PPMd has checked model accesses and a bounded
   model arena; its encoded bytes follow the upstream range coder.
-- LZMA1/LZMA2 input staging uses an anonymous temporary file bounded by the
-  preset dictionary and 8 MiB, replayed through a 64 KiB buffer. Complete
-  streams below that threshold and encoded headers size encoder history to
-  their input, while retaining preset search settings and advertised dictionary
-  properties. Larger streams keep the full preset dictionary. Staging adds at
-  most 8 MiB of temporary storage and one write/read pass; using a file avoids
-  allocator-retained heap buffers increasing large-archive peak RSS. Compression
-  bytes may change with match-finder table sizing.
 - ISO9660 implements levels 1–4, Joliet and Rock Ridge, deep-directory
   relocation, hardlinks, multi-extent records, zisofs and El Torito boot
   images. File data and compressed data use anonymous temporary files;
@@ -1942,3 +1929,23 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   closure, so the callback can call back into the handle as before.
 - `ArchiveRead::data_block` copies each block (the reader's block borrows a
   `Reader` local to the call); the C export and `data_into_fd` don't.
+
+## LZMA encoding (`vendor/lzma-rust2/src/enc`, `src/lz`)
+
+- The xz, lzma, lzip, 7zip LZMA1/LZMA2 and zip LZMA writers encode with a
+  safe Rust port of liblzma 5.8.4's encoder, vendored into lzma-rust2
+  (provenance and validation in `vendor/lzma-rust2/PATCHES.md`). Given the
+  same input bytes and options, the compressed bytes equal upstream's
+  built with liblzma 5.8.4, including all presets. Other liblzma versions
+  may differ.
+- 7zip LZMA1/LZMA2 streams and encoded headers use the preset dictionary,
+  as upstream does, without staging the input to bound the dictionary by
+  its size: that changed liblzma's
+  hash table size and so the encoded bytes.
+- Ported as-is: after an LZMA2 chunk is stored uncompressed while the
+  parser had read ahead, liblzma's encoder position lags the stream by the
+  read-ahead bytes. Every position context was just reset, so the lag only
+  relabels them and decoders are unaffected; the bytes match upstream.
+- Archives of directory trees can still differ from upstream: Rust
+  `read_disk` visits a directory's entries in a different order than C, so
+  the encoder sees different input (the many-files benchmark).
