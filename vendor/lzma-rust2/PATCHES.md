@@ -231,3 +231,39 @@ Validation on Apple Silicon, 2026-10-10:
 - Differential harnesses, all timing samples (including runs affected by
   other applications), and independent review records are retained in
   sibling diagnostics/round8-lzma. Archive-level validation is separate.
+
+## Pipeline bounded BT4 hash-head lookups
+
+Within an existing bounded skip batch, update the current position's hash
+heads, calculate and load the next position's head, then walk the current
+tree. Tree insertion does not change hash tables, so even adjacent hash
+collisions consume exactly the same head. Positions advance only after the
+current walk; the final iteration retains the current hash indices. No
+persistent cache, allocation, preset, search-depth, matching, or unsafe-code
+changes. Boundary positions retain the scalar path.
+
+Validation on Apple Silicon, 2026-10-11, versus `eea9e56`:
+
+- Fresh actual Claude Opus 5.5 proposed cross-position lookup pipelining;
+  an independent fresh final review returned PASS. ARM64 assembly retains
+  the next-head load before the current tree walk.
+- Five alternating raw preset-6 LZMA2 pairs: source median improves
+  2312.329 -> 2126.544 ms (8.0%); mixed improves 1.6%. Text and records
+  are neutral; random, compiled and documents medians are respectively
+  1.1%, 1.9% and 1.3% slower. Samples vary, and a retained host snapshot
+  shows concurrent Chrome and WindowServer activity. The earlier two-pair
+  screen also improves source 7-10%. These are backend measurements;
+  archive-level validation and timing are separate.
+- All 1,656 frozen XZ/LZMA/LZIP/LZMA2 streams remain byte-identical across
+  presets, write fragmentation, flushes and custom dictionary/search options.
+  The 2,147,614,720-byte normalization stream remains exactly 401,263 bytes,
+  SHA-256 `5ea1af6a4ff04040a6177b9eff83c0615bc5821fdf637ebf7ecd587ae4049187`.
+- The expanded scalar-reference test covers 144 configurations, including
+  adjacent all-zero hash collisions, random/repetitive/mixed input,
+  interleaved match finding and skips, tails, wraps and normalization.
+  Matches and every tree/hash/cache/position field agree. All 28 available
+  vendor tests, strict all-target Clippy, rustfmt and diff checks pass;
+  eight BCJ fixture tests need omitted assets.
+- Source snapshots, raw timings, profiles, assembly, exact-stream outputs,
+  host-load evidence and authenticated review/model records are retained
+  in sibling `diagnostics/round10-lzma`.

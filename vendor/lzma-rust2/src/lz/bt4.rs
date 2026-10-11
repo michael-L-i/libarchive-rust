@@ -286,14 +286,30 @@ impl MatchFind for Bt4 {
                 .min(MAX_POS - 1 - self.lz_pos)
                 .min(self.cyclic_size - 1 - self.cyclic_pos);
             if batch > 0 {
-                for _ in 0..batch {
-                    encoder.read_pos += 1;
-                    self.lz_pos += 1;
-                    self.cyclic_pos += 1;
-                    self.hash.calc_hashes(encoder.read_buffer());
-                    let current_match = self.hash.get_hash4_pos();
+                encoder.read_pos += 1;
+                self.lz_pos += 1;
+                self.cyclic_pos += 1;
+                self.hash.calc_hashes(encoder.read_buffer());
+                let mut current_match = self.hash.get_hash4_pos();
+                for position in 0..batch {
                     self.hash.update_tables(self.lz_pos);
+                    let has_next = position + 1 < batch;
+                    let next_match = if has_next {
+                        // Tree insertion does not change hashes. Start the next
+                        // head lookup before walking the current tree.
+                        self.hash
+                            .calc_hashes(&encoder.buf[(encoder.read_pos + 1) as usize..]);
+                        self.hash.get_hash4_pos()
+                    } else {
+                        0
+                    };
                     self.skip(encoder, nice_len, current_match);
+                    if has_next {
+                        encoder.read_pos += 1;
+                        self.lz_pos += 1;
+                        self.cyclic_pos += 1;
+                        current_match = next_match;
+                    }
                 }
                 remaining -= batch;
                 continue;
@@ -343,7 +359,7 @@ mod tests {
             for nice in [8, 64, 273] {
                 for finishing in [false, true] {
                     for near_normalization in [false, true] {
-                        for repetitive in [false, true] {
+                        for pattern in 0..4 {
                             let mut actual = Bt4::new(dict, nice, 0);
                             let mut expected = Bt4::new(dict, nice, 0);
                             if near_normalization {
@@ -357,10 +373,12 @@ mod tests {
                                 seed ^= seed << 13;
                                 seed ^= seed >> 17;
                                 seed ^= seed << 5;
-                                let byte = if repetitive {
-                                    (i % 13) as u8
-                                } else {
-                                    seed as u8
+                                let byte = match pattern {
+                                    0 => seed as u8,
+                                    1 => (i % 13) as u8,
+                                    2 => 0,
+                                    _ if i % 127 < 79 => (i % 17) as u8,
+                                    _ => seed as u8,
                                 };
                                 a.buf[i] = byte;
                                 b.buf[i] = byte;
@@ -373,6 +391,16 @@ mod tests {
                             let mut turn = 0;
                             let mut cached_before_normalization = false;
                             while done < 8193 {
+                                if turn % 3 == 0 {
+                                    let mut found = Matches::new(273);
+                                    let mut reference = Matches::new(273);
+                                    MatchFind::find_matches(&mut actual, &mut a, &mut found);
+                                    MatchFind::find_matches(&mut expected, &mut b, &mut reference);
+                                    assert_eq!(found.count, reference.count);
+                                    assert_eq!(found.len, reference.len);
+                                    assert_eq!(found.dist, reference.dist);
+                                    done += 1;
+                                }
                                 let len = [1, 7, 64, 273, 2, 33][turn % 6].min(8193 - done);
                                 if near_normalization && actual.lz_pos > MAX_POS - 123 {
                                     cached_before_normalization |= actual.cached_distance != 0;
@@ -404,7 +432,7 @@ mod tests {
                                 done += len;
                                 turn += 1;
                             }
-                            if near_normalization && repetitive {
+                            if near_normalization && matches!(pattern, 1 | 2) {
                                 assert!(cached_before_normalization);
                             }
                         }
