@@ -1,6 +1,6 @@
 //! The libc calls the front-ends make that std has no wrapper for: signal
 //! dispositions, the terminal's echo, the umask, `strerror`, the locale,
-//! `fnmatch`, local time and file times. This is the only `unsafe` code in
+//! `fnmatch`, local time, file times and the user and group databases. This is the only `unsafe` code in
 //! the front-ends; every function here is safe to call.
 
 use std::ffi::{CStr, CString, c_int};
@@ -203,6 +203,144 @@ pub fn lutimens_now(path: &Path, sec: i64, nsec: i64) -> Result<(), c_int> {
     }
 }
 
+/// `geteuid()`.
+pub fn geteuid() -> libc::uid_t {
+    // SAFETY: geteuid has no memory-safety requirements.
+    unsafe { libc::geteuid() }
+}
+
+/// Calls `call` with a scratch buffer, doubled while it reports `ERANGE`.
+/// `call` returns the error number of a `get*_r` function, and what it
+/// found if anything. Not found is `Ok(None)`: a zero result, or `ENOENT`.
+fn lookup<T>(mut call: impl FnMut(&mut [u8]) -> (c_int, Option<T>)) -> Result<Option<T>, c_int> {
+    let mut buf = vec![0u8; 1024];
+    loop {
+        match call(&mut buf) {
+            (libc::ERANGE, _) if buf.len() < 1 << 20 => buf.resize(buf.len() * 2, 0),
+            (0 | libc::ENOENT, found) => return Ok(found),
+            (err, _) => return Err(err),
+        }
+    }
+}
+
+/// `getpwnam(name)`: the user's name, uid and primary gid, if there is
+/// such a user.
+pub fn getpwnam(name: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let name = CString::new(name).ok()?;
+    lookup(|buf| {
+        // SAFETY: a zeroed passwd is a valid one, for getpwnam_r to fill;
+        // `name` is a NUL-terminated string, `buf` is writable for its
+        // length and `res` is a valid place for the result. A result is
+        // valid until `buf` changes, and its name is copied out before.
+        unsafe {
+            let mut pw: libc::passwd = std::mem::zeroed();
+            let mut res = std::ptr::null_mut();
+            let err = libc::getpwnam_r(
+                name.as_ptr(),
+                &mut pw,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut res,
+            );
+            let found = (!res.is_null()).then(|| {
+                let name = CStr::from_ptr(pw.pw_name).to_bytes().to_vec();
+                (name, pw.pw_uid, pw.pw_gid)
+            });
+            (err, found)
+        }
+    })
+    .ok()
+    .flatten()
+}
+
+/// `getgrnam(name)`: the group's name and gid, if there is such a group.
+pub fn getgrnam(name: &[u8]) -> Option<(Vec<u8>, u32)> {
+    let name = CString::new(name).ok()?;
+    lookup(|buf| {
+        // SAFETY: as in `getpwnam`.
+        unsafe {
+            let mut gr: libc::group = std::mem::zeroed();
+            let mut res = std::ptr::null_mut();
+            let err = libc::getgrnam_r(
+                name.as_ptr(),
+                &mut gr,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut res,
+            );
+            let found = (!res.is_null())
+                .then(|| (CStr::from_ptr(gr.gr_name).to_bytes().to_vec(), gr.gr_gid));
+            (err, found)
+        }
+    })
+    .ok()
+    .flatten()
+}
+
+/// `getpwuid(uid)`: the user's name, `Ok(None)` if there is no such user,
+/// or the errno.
+pub fn getpwuid(uid: u32) -> Result<Option<Vec<u8>>, c_int> {
+    lookup(|buf| {
+        // SAFETY: as in `getpwnam`.
+        unsafe {
+            let mut pw: libc::passwd = std::mem::zeroed();
+            let mut res = std::ptr::null_mut();
+            let err = libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr().cast(), buf.len(), &mut res);
+            let found = (!res.is_null()).then(|| CStr::from_ptr(pw.pw_name).to_bytes().to_vec());
+            (err, found)
+        }
+    })
+}
+
+/// `getgrgid(gid)`: the group's name, `Ok(None)` if there is no such
+/// group, or the errno.
+pub fn getgrgid(gid: u32) -> Result<Option<Vec<u8>>, c_int> {
+    lookup(|buf| {
+        // SAFETY: as in `getpwnam`.
+        unsafe {
+            let mut gr: libc::group = std::mem::zeroed();
+            let mut res = std::ptr::null_mut();
+            let err = libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr().cast(), buf.len(), &mut res);
+            let found = (!res.is_null()).then(|| CStr::from_ptr(gr.gr_name).to_bytes().to_vec());
+            (err, found)
+        }
+    })
+}
+
+/// The access time and modification time, as seconds and microseconds,
+/// for `futimes` and `lutimes`.
+fn timevals(atime: (i64, i64), mtime: (i64, i64)) -> [libc::timeval; 2] {
+    let tv = |(sec, usec): (i64, i64)| libc::timeval {
+        tv_sec: sec as _,
+        tv_usec: usec as _,
+    };
+    [tv(atime), tv(mtime)]
+}
+
+/// `futimes(fd, {atime, mtime})`, with times as seconds and microseconds,
+/// or the errno.
+pub fn futimes(fd: BorrowedFd<'_>, atime: (i64, i64), mtime: (i64, i64)) -> Result<(), c_int> {
+    let times = timevals(atime, mtime);
+    // SAFETY: `times` holds the two timevals futimes reads.
+    match unsafe { libc::futimes(fd.as_raw_fd(), times.as_ptr()) } {
+        0 => Ok(()),
+        _ => Err(errno()),
+    }
+}
+
+/// `lutimes(path, {atime, mtime})`, with times as seconds and
+/// microseconds, or the errno.
+pub fn lutimes(path: &Path, atime: (i64, i64), mtime: (i64, i64)) -> Result<(), c_int> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+    let times = timevals(atime, mtime);
+    // SAFETY: `path` is a NUL-terminated string and `times` holds the two
+    // timevals lutimes reads; both outlive the call.
+    match unsafe { libc::lutimes(path.as_ptr(), times.as_ptr()) } {
+        0 => Ok(()),
+        _ => Err(errno()),
+    }
+}
+
 /// `close(fd)`, which std's drop of a descriptor does not report, or the
 /// errno.
 pub fn close(fd: OwnedFd) -> Result<(), c_int> {
@@ -248,6 +386,21 @@ mod tests {
         let t = strftime_local(c"%Y", 86400 * 365 * 30);
         assert_eq!(t.len(), 4);
         assert!(t.starts_with(b"1999") || t.starts_with(b"2000"));
+    }
+
+    #[test]
+    fn accounts_are_looked_up_by_name_and_number() {
+        assert_eq!(
+            getpwnam(b"root").map(|u| (u.0, u.1)),
+            Some((b"root".to_vec(), 0))
+        );
+        assert_eq!(getpwuid(0), Ok(Some(b"root".to_vec())));
+        assert_eq!(getpwnam(b"no such user"), None);
+        assert_eq!(getpwuid(0x7fff_fff0), Ok(None));
+        assert_eq!(getgrnam(b"no such group"), None);
+        assert_eq!(getgrgid(0x7fff_fff0), Ok(None));
+        let group = getgrgid(0).unwrap().unwrap();
+        assert_eq!(getgrnam(&group), Some((group, 0)));
     }
 
     #[test]
