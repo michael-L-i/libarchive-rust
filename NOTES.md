@@ -1921,3 +1921,24 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   other blocks match C's.
 - Unchanged here: the gzip filter writes any original-filename, where
   upstream ignores one of 32K or more with a warning.
+
+## Rust API and front-ends (`src/api/`, `tools/`)
+
+- bsdcat restores `SIGPIPE`'s default action first thing: Rust's runtime
+  starts every program with it ignored, so `bsdcat big.gz | head` would
+  otherwise report "Write error" instead of dying of the signal as C bsdcat
+  does. Unlike C, a `SIGPIPE` the parent ignored is not inherited; stable
+  Rust has no way to keep it.
+- `lafe_warnc` writes its message with one `write`, where upstream's
+  unbuffered stderr makes one per `fprintf`; the bytes are the same.
+- `lafe_explicit_bzero` zeroes and then hands the buffer to
+  `std::hint::black_box`, the barrier glibc's `explicit_bzero` uses, instead
+  of upstream's volatile-pointer loop, which needs `unsafe`.
+- `lafe_readpassphrase` is upstream's `readpassphrase` fallback (Linux's);
+  macOS builds of upstream use libc's, which is the same OpenBSD code. Only
+  `RPP_ECHO_OFF`, the flag front-ends pass, is ported.
+- `archive_read_extract2` on a NULL entry fails (`ARCHIVE_FATAL`) where
+  upstream crashes, and the progress callback is called through a shared
+  closure, so the callback can call back into the handle as before.
+- `ArchiveRead::data_block` copies each block (the reader's block borrows a
+  `Reader` local to the call); the C export and `data_into_fd` don't.

@@ -6,9 +6,10 @@ C programs (bsdtar, package managers) link it in place of `libarchive.so`.
 
 ## Rules
 
-- **Memory safe.** `unsafe` is allowed only in `src/ffi/`, the C ABI layer. The
-  crate root has `#![deny(unsafe_code)]`; only `ffi` opts out. Every `unsafe`
-  block has a `// SAFETY:` comment.
+- **Memory safe.** `unsafe` is allowed only in `src/ffi/`, the C ABI layer,
+  and in `tools/libarchive_fe/src/sys.rs` (see Front-ends). The library and
+  the tools have `#![deny(unsafe_code)]` at their roots; only those modules
+  opt out. Every `unsafe` block has a `// SAFETY:` comment.
 - **Never trust archive bytes.** Sizes, offsets and counts read from input use
   checked arithmetic and are bounded before allocating or reading ahead.
   Malformed input returns `ARCHIVE_WARN`/`ARCHIVE_FATAL` with upstream's error
@@ -45,7 +46,10 @@ include/              archive.h, archive_entry.h copied unchanged from upstream
 src/ffi/              exported archive_* functions; the only unsafe code
 src/ffi/stubs.rs      generated stubs for unported functions (scripts/gen-stubs)
 src/                  one module per upstream file (naming rule below)
+src/api/              the Rust API: typed handles over the C API's behavior
 capi/                 builds libarchive.{so,dylib,a} for C programs, + variadic.c
+tools/libarchive_fe/  the front-ends' shared helpers (libarchive_fe/)
+tools/cat/            bsdcat (cat/); tar/, cpio/, unzip/ to come
 scripts/              oracle build, port build, test runner
 tests/passing.txt     the ratchet: upstream tests that pass against our library
 tests/upstream.txt    upstream tests that pass against upstream on this machine
@@ -108,7 +112,9 @@ Upstream decides correctness, not tests we write.
 
 ```
 scripts/build-oracle            once: CMake build of upstream into build/oracle
-scripts/build-port              cargo build, relink upstream's tests against ours
+scripts/build-port              cargo build, relink upstream's tests against ours; the
+                                Rust front-ends go to build/port/bin, the relinked C
+                                ones to build/port/c-bin (and bin, until ported)
 scripts/run-tests [PATTERN...]  one process per test, parallel; checks the ratchet
 scripts/run-tests --update      add newly passing tests to tests/passing.txt
 scripts/run-tests --suite cat [PATTERN...]  front-end suite: cat, tar, cpio, unzip, or all
@@ -163,8 +169,123 @@ tests; writers, disk and match tests (338) wait for phase 5.
 **Checkpoint:** after phase 1, stop for human review of the core internal API
 (read-ahead and consume, entries, errors) before the readers fan out.
 
-Not ported: `tar/`, `cpio/`, `cat/`, `unzip/`. The upstream front-ends link our
-library unchanged and serve as integration tests. Windows-only files come last.
+The front-ends are ported to Rust one by one (see Front-ends): `cat/` is
+done; until `tar/`, `cpio/` and `unzip/` are, upstream's C ones link our
+library unchanged. Windows-only files come last.
+
+## Front-ends
+
+Upstream's command-line tools are Rust programs built on the library's Rust
+API, with upstream's options, output bytes, messages and exit codes. Their
+test programs (`bsdcat_test` and so on, from `build/oracle`) are the oracle.
+
+Layout: upstream `<dir>/<file>.c` is `tools/<dir>/src/<file>.rs`; a header's
+declarations go in the module of the `.c` that uses them (`struct bsdcat` is
+in `bsdcat.rs`). The package is named after the binary (`bsdcat`, with
+`[[bin]] path = "src/bsdcat.rs"`) and depends on `libarchive-rust` and
+`libarchive-fe`, never on `libarchive-capi`: the tools contain no C, and
+`build-port` fails if anything they build from compiles C. License headers
+and `Ported-from:` trailers work as for the library, with the upstream path
+(`// Ported from cat/bsdcat.c.`).
+
+`libarchive_fe` keeps upstream's names: `lafe_warnc(code, msg)` and
+`lafe_errc(eval, code, msg)` take the formatted message as bytes
+(`[path, b": ", err].concat()` or `format!`), `LineReader` is
+`lafe_line_reader`, and so on. `lafe_fnmatch.c` and `lafe_getline.c` are not
+ported (fallbacks for libcs without them); use `BufRead::read_until` for
+getline and add a `sys` wrapper for `fnmatch(3)`.
+
+**The unsafe exception.** The tool crates are `#![deny(unsafe_code)]`. The
+libc calls std lacks (signal dispositions, termios, umask, strerror, and to
+come setlocale) are safe wrappers in `libarchive_fe::sys`, the only module
+that opts out; add yours there, each `unsafe` block with a `// SAFETY:`
+comment. Prefer std wherever it can do the job.
+
+**Using the API.** `use libarchive_rust::{ArchiveRead, ArchiveEntry, Status};`
+The module doc of `src/api/mod.rs` has the mapping; in short:
+
+- `archive_read_X(a, ...)` is `a.X(...)` on `ArchiveRead`; likewise
+  `ArchiveWrite`, `ArchiveWriteDisk`, `ArchiveReadDisk`, `ArchiveMatch`,
+  `ArchiveEntry` and `ArchiveEntryLinkresolver`. `archive_errno`,
+  `archive_error_string`, `archive_filter_*` and friends are methods of
+  `Archive`, which every handle dereferences to. `archive_X_new` is `new`;
+  `archive_X_free` is dropping the handle.
+- `Status` mirrors the return codes and is ordered like them (`r < Status::Ok`,
+  `r <= Status::Warn`). A `ssize_t` result is `Result<usize, Status>`. The
+  error message stays on the handle: `a.error_string()` is
+  `Option<Ref<[u8]>>`, and printf prints a NULL `%s` as `(null)`, so C's
+  `"%s", archive_error_string(a)` is `.as_deref().unwrap_or(b"(null)")`.
+- Strings are `&[u8]` (truncated at a NUL as C would see them), NULL-able
+  ones `Option<&[u8]>`; file names are `&Path`; descriptors are `AsFd`
+  (`open_fd` keeps its argument open while it reads: pass a `File`, or an
+  `Rc<File>` you keep using). Callbacks are closures; one can't reach the
+  handle it is set on, so it captures what it needs.
+- `next_header` reads into the handle's own entry, `a.entry()`. A call that
+  takes an entry back (`extract2`, a writer's `header`) can't borrow the
+  handle's own one; read with `next_header2` into an `ArchiveEntry` of your
+  own instead. Entry getters take `&mut self` (text converts lazily), so copy
+  one string before asking for the next if you need both.
+- A Rust program starts with `SIGPIPE` ignored; call
+  `sys::default_signal(libc::SIGPIPE)` first in `main`, as `bsdcat` does.
+
+**Adding a function the API lacks.** Each C function's behavior after
+argument conversion (its `archive_check_magic`, with upstream's function name
+and states, and the call into the library) is one `pub(crate)` method on
+`Handle` in `src/api/<kind>.rs`, named after the C function without
+`archive_` (`read_set_format`, `match_include_date`). The export in `ffi`
+converts pointers and calls it; the typed method converts types and calls
+it. So:
+
+1. Move the export's body, minus pointer handling, into such a method. Use
+   the helpers there: `Handle::checked` (the check alone), `read_checked`,
+   `write_checked`, `match_operation`, `with_write_disk`, `with_read_disk`.
+   Return the C code.
+2. Make the export `with(a, ARCHIVE_FATAL, |h| h.read_set_format(code))`.
+3. Add the typed method, named after the C function without the kind's
+   prefix, returning `Status::from_code(...)` (or `Status::from_size` for a
+   `ssize_t`). A callback becomes a closure type stored in the library state
+   (`Box<dyn FnMut ...>`, or `Rc<dyn Fn()>` when it must run while the state
+   is not borrowed, as `Handle::read_extract_progress` does); the export
+   wraps the C function and its data into the same type.
+4. Add a unit test next to it. The oracle suites cover the C path: their
+   pass count must not move.
+
+Still to add (28 of the 140 library functions the front-ends call; the 141st
+name, `archive_names_from_file`, is bsdtar's own):
+
+- `ArchiveWrite`: `set_format`, `set_format_by_name`,
+  `set_format_pax_restricted`, the 15 `add_filter_*` (with `by_name` and
+  `program`), `set_option`, `set_passphrase`, `set_passphrase_callback`,
+  `open_fd`, `open_filename`. In `ffi/write.rs` the format setters dispatch
+  through the C exports (`write_format_large` reaches iso9660 and xar via
+  `extern "C"`): make the dispatch a `Handle` method over the safe format
+  constructors. Move `FdSink`, `FileSink` and `open_filename`'s
+  `skip_file`/`bytes_in_last_block` setup out of `ffi` with it.
+- `ArchiveReadDisk`: `entry_from_file` (the front-ends pass no `stat`: take
+  the entry and an `Option<BorrowedFd>`), `uname`, `gname`,
+  `set_metadata_filter_callback` and `set_matching`. The metadata filter and
+  the excluded callback are C function pointers in `ffi/disk.rs`
+  (`MetadataFilter`, `ExcludedCallback`); make them closures, and give the
+  metadata filter a view of the handle's `Base` so it can call
+  `can_descend`/`descend` (bsdtar's does; the traversal state is borrowed
+  then, and `descend` already records the request in `Base`). `set_matching`
+  stores a raw pointer to a C match handle (`MatchingHandle`); let the disk
+  reader own an `ArchiveMatch` instead, with an accessor for the caller.
+
+**Checklist for a tool.**
+
+1. Add `tools/<dir>` to the workspace's `members` and `default-members`, and
+   the binary to `RUST_TOOLS` in `scripts/build-port`.
+2. Port each file mechanically: same control flow, messages through
+   `lafe_*`, same exit codes; upstream's signal and locale setup in `main`
+   through `sys`. Unit-test the option parser.
+3. `scripts/build-port --release`, then `scripts/run-tests --suite <tool>`:
+   no regressions against `tests/passing.txt`. Compare with the relinked C
+   tool in `build/port/c-bin/` on cases the suite misses; it uses the same
+   library, so outputs must be byte-identical. For bsdcat,
+   `scripts/diff-cat` also compares against upstream.
+4. `otool -L` (or `ldd`) on the binary lists only the system libraries
+   (libSystem and libiconv on macOS).
 
 ## Agents and models
 
