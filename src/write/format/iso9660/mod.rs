@@ -56,6 +56,7 @@ struct Node {
     rr_child: Option<usize>,
     rr_parent: Option<usize>,
     joliet_hidden: bool,
+    mb_len: usize,
 }
 impl Node {
     fn new(mut entry: Entry, path: Vec<u8>, parent: usize, virtual_dir: bool) -> Self {
@@ -86,6 +87,7 @@ impl Node {
             rr_child: None,
             rr_parent: None,
             joliet_hidden: false,
+            mb_len: 0,
         }
     }
 }
@@ -214,6 +216,22 @@ fn normalize(path: &[u8]) -> Vec<u8> {
         out.extend_from_slice(p);
     }
     out
+}
+/// isofile_gen_utility_names()'s UTF-16BE basename: the last component of
+/// the converted pathname, without trailing slashes. Upstream converts the
+/// pathname as given, so `dir/.` is named `.` in the Joliet tree.
+fn joliet_basename(entry: &mut Entry, conv: &crate::string::StringConv) -> (Vec<u8>, bool) {
+    let (u16, converted) = entry.pathname_l(Some(conv));
+    let u16 = u16.unwrap_or_default();
+    let mut units: Vec<&[u8]> = u16.chunks_exact(2).collect();
+    while units.last() == Some(&&[0, b'/'][..]) {
+        units.pop();
+    }
+    let start = units
+        .iter()
+        .rposition(|&u| u == [0, b'/'])
+        .map_or(0, |i| i + 1);
+    (units[start..].concat(), converted)
 }
 fn both32(n: u32) -> [u8; 8] {
     let mut b = [0; 8];
@@ -428,14 +446,9 @@ impl Iso9660 {
             if self.joliet == 0 {
                 continue;
             }
-            let mut joliet = Vec::new();
-            if crate::string::strncpy_l(&mut joliet, &node.name, Some(&conv)).is_err() {
-                return Err(Error::fatal(
-                    -1,
-                    "A filename cannot be converted to UTF-16BE;You should disable making Joliet extension",
-                ));
-            }
+            let mut joliet = joliet_basename(&mut node.entry, &conv).0;
             let max = if self.joliet == 2 { 206 } else { 128 };
+            let truncated = joliet.len() > max;
             joliet.truncate(max);
             for unit in joliet.chunks_exact_mut(2) {
                 let ch = u16::from_be_bytes([unit[0], unit[1]]);
@@ -443,6 +456,17 @@ impl Iso9660 {
                     unit.copy_from_slice(&[0, b'_']);
                 }
             }
+            // The multibyte length of the name, which upstream checks
+            // against Joliet's 240-byte path limit.
+            node.mb_len = if truncated {
+                let units: Vec<u16> = joliet
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect();
+                String::from_utf16_lossy(&units).len()
+            } else {
+                node.name.len()
+            };
             node.ident[1] = joliet;
         }
         for parent in 0..self.nodes.len() {
@@ -493,23 +517,36 @@ impl Iso9660 {
             }
         }
         if self.joliet != 0 {
-            let mut queue = VecDeque::from([(0, 0usize)]);
-            while let Some((parent, parent_len)) = queue.pop_front() {
-                for child in self.children(parent, 1) {
-                    let id = &self.nodes[child].ident[1];
-                    let units: Vec<u16> = id
-                        .chunks_exact(2)
-                        .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                        .collect();
-                    let name_len = String::from_utf16_lossy(&units).len();
-                    if parent_len.checked_add(name_len).is_none_or(|n| n > 240) {
+            // isoent_traverse_tree() visits directories depth first, each
+            // one's children in order; a full pathname over 240 bytes violates
+            // the Joliet extensions.
+            let mut stack = vec![(0, 1usize)];
+            while let Some((parent, parent_len)) = stack.pop() {
+                let children = self.children(parent, 1);
+                for &child in &children {
+                    let mb_len = self.nodes[child].mb_len;
+                    if parent_len > 240 || mb_len > 240 || parent_len + mb_len > 240 {
+                        let path = self.nodes[child]
+                            .entry
+                            .pathname()
+                            .map_or(&b""[..], |p| p.to_bytes());
                         return Err(Error::fatal(
                             -1,
-                            "The regulation of Joliet extensions; A length of a full-pathname is longer than 240 bytes",
+                            [
+                                b"The regulation of Joliet extensions; A length of a full-pathname of `".as_slice(),
+                                path,
+                                format!(
+                                    "' is longer than 240 bytes, (p={parent_len}, b={mb_len})"
+                                )
+                                .as_bytes(),
+                            ]
+                            .concat(),
                         ));
                     }
+                }
+                for &child in children.iter().rev() {
                     if self.is_dir(child, 1) {
-                        queue.push_back((child, parent_len + name_len + 1));
+                        stack.push((child, parent_len + self.nodes[child].mb_len + 1));
                     }
                 }
             }
@@ -1392,13 +1429,31 @@ impl Format for Iso9660 {
             );
             return Ok(ARCHIVE_WARN);
         }
+        let mut ret = ARCHIVE_OK;
+        if self.joliet != 0 && e.pathname().is_some_and(|p| !p.is_empty()) {
+            let conv = {
+                let mut cache = a
+                    .conv
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                crate::string::conversion_to_charset(Some(&mut *cache), b"UTF-16BE", true)
+                    .map_err(|err| Error::fatal(err.errno, err.message))?
+            };
+            if !joliet_basename(e, &conv).1 {
+                a.set_error(
+                    -1,
+                    Some(b"A filename cannot be converted to UTF-16BE;You should disable making Joliet extension"),
+                );
+                ret = ARCHIVE_WARN;
+            }
+        }
         let path = normalize(
             e.pathname()
                 .ok_or_else(|| Error::new(ARCHIVE_FAILED, -1, "Missing pathname"))?
                 .to_bytes(),
         );
         if path.is_empty() {
-            return Ok(ARCHIVE_OK);
+            return Ok(ret);
         }
         let parentpath = path
             .iter()
@@ -1445,7 +1500,7 @@ impl Format for Iso9660 {
             self.current = Some(index);
             self.remaining = size;
         }
-        Ok(ARCHIVE_OK)
+        Ok(ret)
     }
     fn data(&mut self, data: &[u8], _: &mut dyn Sink) -> Result<usize, Error> {
         let n = data
@@ -1942,17 +1997,59 @@ mod tests {
     }
     #[test]
     fn joliet_rejects_path_longer_than_240_bytes() {
-        let mut iso = Iso9660::default();
-        let name = [b'a'; 64];
-        let mut path = Vec::new();
-        for _ in 0..4 {
-            if !path.is_empty() {
-                path.push(b'/');
+        let base = Base::new(crate::archive::WRITE_MAGIC);
+        let dirs = [[b'a'; 64]; 3].join(&b'/');
+        // Upstream counts a leading separator: a 239-byte path is the limit.
+        for (leaf, fails) in [(44, false), (45, true)] {
+            let mut iso = Iso9660::default();
+            let mut e = Entry::new(None);
+            e.set_pathname(&[dirs.as_slice(), b"/", &vec![b'b'; leaf]].concat());
+            e.set_mode(0o100444);
+            assert_eq!(iso.header(&base, &mut e, &mut Discard).unwrap(), ARCHIVE_OK);
+            let r = iso.identifiers();
+            assert_eq!(r.is_err(), fails);
+            if let Err(err) = r {
+                assert_eq!(
+                    err.msg,
+                    [
+                        b"The regulation of Joliet extensions; A length of a full-pathname of `".as_slice(),
+                        &dirs,
+                        b"/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' is longer than 240 bytes, (p=196, b=45)",
+                    ]
+                    .concat()
+                );
             }
-            path.extend_from_slice(&name);
         }
-        iso.directory(&path).unwrap();
-        assert!(iso.identifiers().is_err());
+    }
+    #[test]
+    fn joliet_name_comes_from_the_pathname_as_given() {
+        // isofile_gen_utility_names() warns on a failed UTF-16BE conversion,
+        // keeps the best-effort name, and takes the basename before the
+        // multibyte path is cleaned up: `d/.` is named `.`.
+        let _locale = crate::ffi::charset::lock_locale();
+        let base = Base::new(crate::archive::WRITE_MAGIC);
+        let mut iso = Iso9660::default();
+        let mut e = Entry::new(None);
+        e.set_pathname(b"bad\xff");
+        e.set_mode(0o100444);
+        assert_eq!(
+            iso.header(&base, &mut e, &mut Discard).unwrap(),
+            ARCHIVE_WARN
+        );
+        assert_eq!(
+            &*base.error.borrow(),
+            b"A filename cannot be converted to UTF-16BE;You should disable making Joliet extension\0"
+        );
+        let mut d = Entry::new(None);
+        d.set_pathname(b"d/.");
+        d.set_mode(0o40755);
+        assert_eq!(iso.header(&base, &mut d, &mut Discard).unwrap(), ARCHIVE_OK);
+        iso.identifiers().unwrap();
+        assert_eq!(
+            iso.nodes[iso.names[b"bad\xff".as_slice()]].ident[1],
+            b"\0b\0a\0d\xff\xfd"
+        );
+        assert_eq!(iso.nodes[iso.names[b"d".as_slice()]].ident[1], b"\0.");
     }
 
     #[test]
