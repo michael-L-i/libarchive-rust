@@ -1,175 +1,55 @@
 //! Compression filter exports.
-use std::ffi::CStr;
-fn string<'a>(p: *const c_char) -> Option<&'a [u8]> {
-    if p.is_null() {
-        return None;
-    }
-    // SAFETY: filter names and commands are caller-provided NUL-terminated strings.
-    Some(unsafe { CStr::from_ptr(p) }.to_bytes())
-}
-use super::write::with_writer;
-use super::{Archive, guard};
-use crate::archive::{ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN};
-use crate::read::filter_code;
-use crate::write::filter;
+use super::archive::with;
+use super::write::cbytes;
+use super::{ARCHIVE_FATAL, ARCHIVE_OK, Archive};
+use crate::api::write::AddFilter;
 use std::ffi::{c_char, c_int};
-fn add(a: *mut Archive, code: c_int) -> c_int {
-    with_writer(a, |base, w| {
-        if code == filter_code::NONE {
-            return ARCHIVE_OK;
-        }
-        match filter::by_code(code) {
-            Ok(f) => {
-                let r = w.add_filter(f);
-                if r == ARCHIVE_OK
-                    && matches!(
-                        code,
-                        filter_code::LRZIP | filter_code::LZOP | filter_code::GRZIP
-                    )
-                {
-                    let _ = base.warn(
-                        -1,
-                        format!(
-                            "Using external {} program for {} compression",
-                            match code {
-                                filter_code::LRZIP => "lrzip",
-                                filter_code::LZOP => "lzop",
-                                _ => "grzip",
-                            },
-                            match code {
-                                filter_code::LRZIP => "lrzip",
-                                filter_code::LZOP => "lzop",
-                                _ => "grzip",
-                            }
-                        ),
-                    );
-                    ARCHIVE_WARN
-                } else {
-                    r
-                }
-            }
-            Err(e) => base.raise(e),
-        }
-    })
-}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_add_filter(a: *mut Archive, code: c_int) -> c_int {
-    if code == 15 || matches!(code, filter_code::PROGRAM | filter_code::RPM) {
-        return with_writer(a, |base, _| {
-            base.raise(crate::util::Error::fatal(libc::EINVAL, "No such filter"))
-        });
-    }
-    add(a, code)
+    with(a, ARCHIVE_FATAL, |h| h.write_add_filter(code))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_add_filter_by_name(a: *mut Archive, name: *const c_char) -> c_int {
-    guard(ARCHIVE_FATAL, || {
-        with_writer(a, |base, w| {
-            let Some(name) = string(name) else {
-                return ARCHIVE_FATAL;
-            };
-            match filter::by_name(name) {
-                Ok(f) => {
-                    let code = f.code();
-                    let result = w.add_filter(f);
-                    if matches!(
-                        code,
-                        filter_code::LRZIP | filter_code::LZOP | filter_code::GRZIP
-                    ) {
-                        let name = match code {
-                            filter_code::LRZIP => "lrzip",
-                            filter_code::LZOP => "lzop",
-                            _ => "grzip",
-                        };
-                        base.set_error(
-                            -1,
-                            Some(
-                                format!("Using external {name} program for {name} compression")
-                                    .as_bytes(),
-                            ),
-                        );
-                        ARCHIVE_WARN
-                    } else {
-                        result
-                    }
-                }
-                Err(e) => {
-                    base.state.set(crate::archive::state::FATAL);
-                    base.raise(e)
-                }
-            }
-        })
+    // A NULL name crashes upstream; it fails here.
+    with(a, ARCHIVE_FATAL, |h| {
+        cbytes(name).map_or(ARCHIVE_FATAL, |name| h.write_add_filter_by_name(name))
     })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_add_filter_program(a: *mut Archive, cmd: *const c_char) -> c_int {
-    guard(ARCHIVE_FATAL, || {
-        with_writer(a, |base, w| {
-            let Some(cmd) = string(cmd) else {
-                return ARCHIVE_FATAL;
-            };
-            match filter::program(cmd) {
-                Ok(f) => w.add_filter(f),
-                Err(e) => base.raise(e),
-            }
-        })
+    with(a, ARCHIVE_FATAL, |h| {
+        h.write_add_filter_program(cbytes(cmd))
     })
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_b64encode(a: *mut Archive) -> c_int {
-    add(a, 15)
+pub extern "C" fn archive_write_add_filter_none(_: *mut Archive) -> c_int {
+    ARCHIVE_OK
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_bzip2(a: *mut Archive) -> c_int {
-    add(a, filter_code::BZIP2)
+
+/// The other `archive_write_add_filter_X` exports.
+macro_rules! add_filter {
+    ($($export:ident => $add:ident,)*) => {$(
+        #[unsafe(no_mangle)]
+        pub extern "C" fn $export(a: *mut Archive) -> c_int {
+            with(a, ARCHIVE_FATAL, |h| h.write_add_filter_x(AddFilter::$add))
+        }
+    )*};
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_compress(a: *mut Archive) -> c_int {
-    add(a, filter_code::COMPRESS)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_grzip(a: *mut Archive) -> c_int {
-    add(a, filter_code::GRZIP)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_gzip(a: *mut Archive) -> c_int {
-    add(a, filter_code::GZIP)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_lrzip(a: *mut Archive) -> c_int {
-    add(a, filter_code::LRZIP)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_lz4(a: *mut Archive) -> c_int {
-    add(a, filter_code::LZ4)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_lzip(a: *mut Archive) -> c_int {
-    add(a, filter_code::LZIP)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_lzma(a: *mut Archive) -> c_int {
-    add(a, filter_code::LZMA)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_lzop(a: *mut Archive) -> c_int {
-    add(a, filter_code::LZOP)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_none(a: *mut Archive) -> c_int {
-    add(a, filter_code::NONE)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_uuencode(a: *mut Archive) -> c_int {
-    add(a, filter_code::UU)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_xz(a: *mut Archive) -> c_int {
-    add(a, filter_code::XZ)
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_add_filter_zstd(a: *mut Archive) -> c_int {
-    add(a, filter_code::ZSTD)
+add_filter! {
+    archive_write_add_filter_b64encode => B64ENCODE,
+    archive_write_add_filter_bzip2 => BZIP2,
+    archive_write_add_filter_compress => COMPRESS,
+    archive_write_add_filter_grzip => GRZIP,
+    archive_write_add_filter_gzip => GZIP,
+    archive_write_add_filter_lrzip => LRZIP,
+    archive_write_add_filter_lz4 => LZ4,
+    archive_write_add_filter_lzip => LZIP,
+    archive_write_add_filter_lzma => LZMA,
+    archive_write_add_filter_lzop => LZOP,
+    archive_write_add_filter_uuencode => UUENCODE,
+    archive_write_add_filter_xz => XZ,
+    archive_write_add_filter_zstd => ZSTD,
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_compression_bzip2(a: *mut Archive) -> c_int {
@@ -216,6 +96,7 @@ mod tests {
     };
     use crate::ffi::read_open::archive_read_open_memory;
     use crate::ffi::{entry::*, read::*, write::*};
+    use crate::read::filter_code;
     use std::ffi::c_void;
     #[test]
     fn write_filters_round_trip_chunk_boundaries_and_chains() {
@@ -239,10 +120,10 @@ mod tests {
             assert_eq!(archive_write_set_format_raw(a), ARCHIVE_OK);
             assert_eq!(archive_write_set_bytes_per_block(a, 0), ARCHIVE_OK);
             assert_eq!(
-                if code == filter_code::PROGRAM {
-                    archive_write_add_filter_program(a, c"cat".as_ptr())
-                } else {
-                    add(a, code)
+                match code {
+                    filter_code::PROGRAM => archive_write_add_filter_program(a, c"cat".as_ptr()),
+                    15 => archive_write_add_filter_b64encode(a),
+                    _ => archive_write_add_filter(a, code),
                 },
                 ARCHIVE_OK
             );

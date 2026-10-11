@@ -4,6 +4,7 @@ use super::{
     Archive, ArchiveEntry, archive_close_callback, archive_free_callback, archive_open_callback,
     archive_write_callback, guard,
 };
+use crate::api::write::SetFormat;
 use crate::archive::*;
 use crate::util::Error;
 use crate::write::{Sink, Write};
@@ -11,33 +12,6 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::io::Write as IoWrite;
 use std::os::unix::ffi::OsStrExt;
 
-pub(crate) fn with_writer(a: *mut Archive, f: impl FnOnce(&Base, &mut Write) -> c_int) -> c_int {
-    checked!(
-        archive_write_add_filter,
-        a,
-        WRITE_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| match &h.kind {
-            Kind::Write(w) => w
-                .try_borrow_mut()
-                .map_or(ARCHIVE_FATAL, |mut w| f(&h.base, &mut w)),
-            _ => ARCHIVE_FATAL,
-        }
-    )
-}
-pub(crate) fn with_writer_named(
-    a: *mut Archive,
-    name: &str,
-    f: impl FnOnce(&Base, &mut Write) -> c_int,
-) -> c_int {
-    with(a, ARCHIVE_FATAL, |h| {
-        if h.base.check_magic(WRITE_MAGIC, state::NEW, name) == ARCHIVE_FATAL {
-            return ARCHIVE_FATAL;
-        }
-        writer(h, ARCHIVE_FATAL, |w| f(&h.base, w))
-    })
-}
 fn writer<T>(h: &Handle, fallback: T, f: impl FnOnce(&mut Write) -> T) -> T {
     match &h.kind {
         Kind::Write(w) => w.try_borrow_mut().map_or(fallback, |mut w| f(&mut w)),
@@ -93,12 +67,6 @@ pub extern "C" fn archive_write_set_skip_file(a: *mut Archive, d: i64, i: i64) -
             ARCHIVE_OK
         })
     )
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_raw(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_raw", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::raw::Raw::default()))
-    })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_header(a: *mut Archive, e: *mut ArchiveEntry) -> c_int {
@@ -344,46 +312,12 @@ pub extern "C" fn archive_write_open_file(a: *mut Archive, name: *const c_char) 
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_passphrase(a: *mut Archive, p: *const c_char) -> c_int {
-    with_writer_named(a, "archive_write_set_passphrase", |b, w| {
-        if p.is_null() {
-            return b.raise(Error::new(ARCHIVE_FAILED, -1, "Empty passphrase"));
-        }
-        // SAFETY: caller provides NUL terminated passphrase.
-        let p = unsafe { CStr::from_ptr(p) }.to_bytes();
-        if p.is_empty() {
-            return b.raise(Error::new(ARCHIVE_FAILED, -1, "Empty passphrase"));
-        }
-        w.passphrase = Some(p.to_vec());
-        ARCHIVE_OK
-    })
+    with(a, ARCHIVE_FATAL, |h| h.write_set_passphrase(cbytes(p)))
 }
 
-fn cbytes<'a>(p: *const c_char) -> Option<&'a [u8]> {
-    // SAFETY: the caller supplies NULL or a NUL terminated option string.
+pub(super) fn cbytes<'a>(p: *const c_char) -> Option<&'a [u8]> {
+    // SAFETY: the caller supplies NULL or a NUL terminated string.
     (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_bytes())
-}
-fn set_option(
-    a: *mut Archive,
-    module: *const c_char,
-    key: *const c_char,
-    value: *const c_char,
-    formats: bool,
-    filters: bool,
-) -> c_int {
-    let name = match (formats, filters) {
-        (true, false) => "archive_write_set_format_option",
-        (false, true) => "archive_write_set_filter_option",
-        _ => "archive_write_set_option",
-    };
-    with_writer_named(a, name, |b, w| {
-        crate::options::set_option(
-            b,
-            cbytes(module),
-            cbytes(key),
-            cbytes(value),
-            &mut |m, k, v| w.option(b, m, k, v, formats, filters),
-        )
-    })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_option(
@@ -392,7 +326,9 @@ pub extern "C" fn archive_write_set_format_option(
     k: *const c_char,
     v: *const c_char,
 ) -> c_int {
-    set_option(a, m, k, v, true, false)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.write_set_format_option(cbytes(m), cbytes(k), cbytes(v))
+    })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_filter_option(
@@ -401,7 +337,9 @@ pub extern "C" fn archive_write_set_filter_option(
     k: *const c_char,
     v: *const c_char,
 ) -> c_int {
-    set_option(a, m, k, v, false, true)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.write_set_filter_option(cbytes(m), cbytes(k), cbytes(v))
+    })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_option(
@@ -410,101 +348,48 @@ pub extern "C" fn archive_write_set_option(
     k: *const c_char,
     v: *const c_char,
 ) -> c_int {
-    set_option(a, m, k, v, true, true)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.write_set_option(cbytes(m), cbytes(k), cbytes(v))
+    })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_options(a: *mut Archive, opts: *const c_char) -> c_int {
-    with_writer_named(a, "archive_write_set_options", |b, w| {
-        crate::options::set_options(b, cbytes(opts).unwrap_or_default(), &mut |m, k, v| {
-            w.option(b, m, k, v, true, true)
-        })
-    })
+    let opts = cbytes(opts).unwrap_or_default();
+    with(a, ARCHIVE_FATAL, |h| h.write_set_options(opts))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_v7tar(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_v7tar", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::tar::Tar::new(0x30000)))
-    })
+/// The `archive_write_set_format_X` exports.
+macro_rules! set_format {
+    ($($export:ident => $set:ident,)*) => {$(
+        #[unsafe(no_mangle)]
+        pub extern "C" fn $export(a: *mut Archive) -> c_int {
+            with(a, ARCHIVE_FATAL, |h| h.write_set_format_x(SetFormat::$set))
+        }
+    )*};
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_ustar(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_ustar", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::tar::Tar::new(0x30001)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_pax(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_pax", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::tar::Tar::new(0x30002)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_pax_restricted(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_pax_restricted", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::tar::Tar::new(0x30003)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_gnutar(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_gnutar", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::tar::Tar::new(0x30004)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_ar_bsd(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_ar_bsd", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::ar::Ar::new(true)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_ar_svr4(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_ar_svr4", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::ar::Ar::new(false)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_cpio(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_cpio", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::cpio::Cpio::new(0x10001)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_cpio_odc(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_cpio_odc", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::cpio::Cpio::new(0x10001)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_cpio_newc(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_cpio_newc", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::cpio::Cpio::new(0x10004)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_cpio_bin(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_cpio_bin", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::cpio::Cpio::new(0x10002)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_cpio_pwb(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_cpio_pwb", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::cpio::Cpio::new(0x10006)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_xar(a: *mut Archive) -> c_int {
-    with_writer(a, |b, w| {
-        w.set_format(b, Box::new(crate::write::format::xar::Xar::default()))
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_zip(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_zip", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::zip::Zip::default()))
-    })
+set_format! {
+    archive_write_set_format_7zip => SEVENZIP,
+    archive_write_set_format_ar_bsd => AR_BSD,
+    archive_write_set_format_ar_svr4 => AR_SVR4,
+    archive_write_set_format_cpio => CPIO_ODC,
+    archive_write_set_format_cpio_bin => CPIO_BIN,
+    archive_write_set_format_cpio_newc => CPIO_NEWC,
+    archive_write_set_format_cpio_odc => CPIO_ODC,
+    archive_write_set_format_cpio_pwb => CPIO_PWB,
+    archive_write_set_format_gnutar => GNUTAR,
+    archive_write_set_format_iso9660 => ISO9660,
+    archive_write_set_format_mtree => MTREE,
+    archive_write_set_format_mtree_classic => MTREE_CLASSIC,
+    archive_write_set_format_pax => PAX,
+    archive_write_set_format_pax_restricted => PAX_RESTRICTED,
+    archive_write_set_format_raw => RAW,
+    archive_write_set_format_shar => SHAR,
+    archive_write_set_format_shar_dump => SHAR_DUMP,
+    archive_write_set_format_ustar => USTAR,
+    archive_write_set_format_v7tar => V7TAR,
+    archive_write_set_format_warc => WARC,
+    archive_write_set_format_xar => XAR,
+    archive_write_set_format_zip => ZIP,
 }
 fn zip_compression(a: *mut Archive, name: &[u8], function: &str) -> c_int {
     with(a, ARCHIVE_FATAL, |h| {
@@ -569,45 +454,15 @@ pub extern "C" fn archive_write_set_passphrase_callback(
     data: *mut c_void,
     cb: super::archive_passphrase_callback,
 ) -> c_int {
-    with_writer_named(a, "archive_write_set_passphrase_callback", |_, w| {
-        w.passphrase_callback = cb.map(|cb| {
-            Box::new(move || {
-                // SAFETY: callback registered by caller owns a live NUL terminated return value for this call.
-                let p = unsafe { cb(a, data) };
-                cbytes(p).map(<[u8]>::to_vec)
-            }) as Box<dyn FnMut() -> Option<Vec<u8>>>
-        });
-        ARCHIVE_OK
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_warc(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_warc", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::warc::Warc::default()))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_shar(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_shar", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::shar::Shar::new(false)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_shar_dump(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_shar_dump", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::shar::Shar::new(true)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_mtree(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_mtree", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::mtree::Mtree::new(false)))
-    })
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn archive_write_set_format_mtree_classic(a: *mut Archive) -> c_int {
-    with_writer_named(a, "archive_write_set_format_mtree_classic", |b, w| {
-        w.set_format(b, Box::new(crate::write::format::mtree::Mtree::new(true)))
+    let callback = cb.map(|cb| {
+        Box::new(move || {
+            // SAFETY: callback registered by caller owns a live NUL terminated return value for this call.
+            let p = unsafe { cb(a, data) };
+            cbytes(p).map(<[u8]>::to_vec)
+        }) as Box<dyn FnMut() -> Option<Vec<u8>>>
+    });
+    with(a, ARCHIVE_FATAL, |h| {
+        h.write_set_passphrase_callback(callback)
     })
 }
 
@@ -714,96 +569,14 @@ pub extern "C" fn archive_write_open_filename_w(
     })
 }
 
-unsafe extern "C" {
-    #[link_name = "archive_write_set_format_iso9660"]
-    fn set_iso(a: *mut Archive) -> c_int;
-    #[link_name = "archive_write_set_format_xar"]
-    fn set_xar(a: *mut Archive) -> c_int;
-}
-fn large_format(a: *mut Archive, iso: bool) -> c_int {
-    // SAFETY: these are the library's public setters, with the same live archive pointer contract.
-    unsafe { if iso { set_iso(a) } else { set_xar(a) } }
-}
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format(a: *mut Archive, code: c_int) -> c_int {
-    match code {
-        0xe0000 => super::write_format_large::archive_write_set_format_7zip(a),
-        0x10000 | 0x10001 => archive_write_set_format_cpio_odc(a),
-        0x10002 => archive_write_set_format_cpio_bin(a),
-        0x10004 => archive_write_set_format_cpio_newc(a),
-        0x10006 => archive_write_set_format_cpio_pwb(a),
-        0x40000 => large_format(a, true),
-        0x80000 => archive_write_set_format_mtree(a),
-        0x90000 => archive_write_set_format_raw(a),
-        0x20000 | 0x20001 => archive_write_set_format_shar(a),
-        0x20002 => archive_write_set_format_shar_dump(a),
-        0x30000 | 0x30003 => archive_write_set_format_pax_restricted(a),
-        0x30001 => archive_write_set_format_ustar(a),
-        0x30002 => archive_write_set_format_pax(a),
-        0x30004 => archive_write_set_format_gnutar(a),
-        0xf0000 => archive_write_set_format_warc(a),
-        0xa0000 => large_format(a, false),
-        0x50000 => archive_write_set_format_zip(a),
-        _ => with(a, ARCHIVE_FATAL, |h| {
-            h.base.raise(Error::fatal(libc::EINVAL, "No such format"))
-        }),
-    }
+    with(a, ARCHIVE_FATAL, |h| h.write_set_format(code))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_by_name(a: *mut Archive, name: *const c_char) -> c_int {
     let name = cbytes(name).unwrap_or_default();
-    match name {
-        b"7zip" => super::write_format_large::archive_write_set_format_7zip(a),
-        b"ar" | b"arbsd" => archive_write_set_format_ar_bsd(a),
-        b"argnu" | b"arsvr4" => archive_write_set_format_ar_svr4(a),
-        b"bin" => archive_write_set_format_cpio_bin(a),
-        b"cpio" | b"odc" => archive_write_set_format_cpio_odc(a),
-        b"newc" => archive_write_set_format_cpio_newc(a),
-        b"pwb" => archive_write_set_format_cpio_pwb(a),
-        b"cd9660" | b"iso" | b"iso9660" => large_format(a, true),
-        b"mtree" => archive_write_set_format_mtree(a),
-        b"mtree-classic" => archive_write_set_format_mtree_classic(a),
-        b"raw" => archive_write_set_format_raw(a),
-        b"shar" => archive_write_set_format_shar(a),
-        b"shardump" => archive_write_set_format_shar_dump(a),
-        b"oldtar" | b"v7tar" | b"v7" => archive_write_set_format_v7tar(a),
-        b"ustar" => archive_write_set_format_ustar(a),
-        b"gnutar" => archive_write_set_format_gnutar(a),
-        b"pax" | b"posix" => archive_write_set_format_pax(a),
-        b"paxr" | b"rpax" | b"bsdtar" => archive_write_set_format_pax_restricted(a),
-        b"warc" => archive_write_set_format_warc(a),
-        b"xar" => large_format(a, false),
-        b"zip" => archive_write_set_format_zip(a),
-        _ => with(a, ARCHIVE_FATAL, |h| {
-            h.base.state.set(state::FATAL);
-            h.base.raise(Error::fatal(
-                libc::EINVAL,
-                [b"No such format '".as_slice(), name, b"'"].concat(),
-            ))
-        }),
-    }
-}
-fn extension(name: &[u8]) -> Option<(c_int, c_int)> {
-    for (suffix, format, filter) in [
-        (b".7z".as_slice(), 0xe0000, 0),
-        (b".zip", 0x50000, 0),
-        (b".jar", 0x50000, 0),
-        (b".cpio", 0x10001, 0),
-        (b".iso", 0x40000, 0),
-        (b".a", 0x70001, 0),
-        (b".ar", 0x70001, 0),
-        (b".tar", 0x30003, 0),
-        (b".tgz", 0x30003, 1),
-        (b".tar.gz", 0x30003, 1),
-        (b".tar.bz2", 0x30003, 2),
-        (b".tar.xz", 0x30003, 6),
-        (b".tar.zst", 0x30003, 14),
-    ] {
-        if name.ends_with(suffix) {
-            return Some((format, filter));
-        }
-    }
-    None
+    with(a, ARCHIVE_FATAL, |h| h.write_set_format_by_name(name))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_format_filter_by_ext(
@@ -818,36 +591,15 @@ pub extern "C" fn archive_write_set_format_filter_by_ext_def(
     name: *const c_char,
     default: *const c_char,
 ) -> c_int {
-    let route = cbytes(name)
-        .and_then(extension)
-        .or_else(|| cbytes(default).and_then(extension));
-    let Some((format, filter)) = route else {
-        return with(a, ARCHIVE_FATAL, |h| {
-            h.base.state.set(state::FATAL);
-            h.base.raise(Error::fatal(
-                libc::EINVAL,
-                [
-                    b"No such format '".as_slice(),
-                    cbytes(name).unwrap_or_default(),
-                    b"'",
-                ]
-                .concat(),
-            ))
-        });
-    };
-    let r = if format == 0x70001 {
-        archive_write_set_format_ar_svr4(a)
-    } else {
-        archive_write_set_format(a, format)
-    };
-    if r != ARCHIVE_OK {
-        return r;
-    }
-    super::write_filter::archive_write_add_filter(a, filter)
+    let (name, default) = (cbytes(name), cbytes(default));
+    with(a, ARCHIVE_FATAL, |h| {
+        h.write_set_format_filter_by_ext(name, default)
+    })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffi::{archive::*, entry::*, read::*, read_open::*};
     unsafe extern "C" fn fail_open(_: *mut Archive, _: *mut c_void) -> c_int {
         ARCHIVE_FATAL
     }
@@ -912,5 +664,92 @@ mod tests {
         assert_eq!(used, 3);
         assert_eq!(&buf[..used], b"abc");
         assert_eq!(super::super::archive::archive_free(a), ARCHIVE_OK);
+    }
+    #[test]
+    fn sevenzip_basic_codecs_metadata_and_entry_order() {
+        // The upstream file's unregister test uses internal struct layout, so its
+        // basic tests are excluded by the public ABI oracle build.
+        for codec in [
+            c"copy", c"deflate", c"bzip2", c"lzma1", c"lzma2", c"ppmd", c"zstd",
+        ] {
+            let a = archive_write_new();
+            assert_eq!(archive_write_set_format_7zip(a), ARCHIVE_OK);
+            assert_eq!(
+                archive_write_set_format_option(
+                    a,
+                    c"7zip".as_ptr(),
+                    c"compression".as_ptr(),
+                    codec.as_ptr()
+                ),
+                ARCHIVE_OK
+            );
+            let mut output = vec![0u8; 2048];
+            let mut used = 0;
+            assert_eq!(
+                archive_write_open_memory(a, output.as_mut_ptr().cast(), output.len(), &mut used),
+                ARCHIVE_OK
+            );
+            for (name, mode, size, symlink) in [
+                (c"empty", 0o100444, 0, None),
+                (c"data", 0o100755, 8, None),
+                (c"link", 0o120755, 0, Some(c"data")),
+                (c"dir/sub", 0o40755, 512, None),
+                (c"dir", 0o40755, 512, None),
+            ] {
+                let e = archive_entry_new();
+                archive_entry_set_pathname(e, name.as_ptr());
+                archive_entry_set_mode(e, mode);
+                archive_entry_set_size(e, size);
+                archive_entry_set_mtime(e, 1, 100);
+                archive_entry_set_atime(e, 2, 0);
+                if let Some(s) = symlink {
+                    archive_entry_set_symlink(e, s.as_ptr());
+                }
+                assert_eq!(archive_write_header(a, e), ARCHIVE_OK);
+                if size == 8 {
+                    assert_eq!(archive_write_data(a, b"abc".as_ptr().cast(), 3), 3);
+                }
+                archive_entry_free(e);
+            }
+            assert_eq!(archive_write_close(a), ARCHIVE_OK);
+            assert_eq!(archive_write_free(a), ARCHIVE_OK);
+            let r = archive_read_new();
+            assert_eq!(archive_read_support_format_7zip(r), ARCHIVE_OK);
+            assert_eq!(
+                archive_read_open_memory(r, output.as_ptr().cast(), used),
+                ARCHIVE_OK
+            );
+            for (name, mode, size) in [
+                (c"data", 0o100755, 8),
+                (c"link", 0o120755, 0),
+                (c"empty", 0o100444, 0),
+                (c"dir/sub/", 0o40755, 0),
+                (c"dir/", 0o40755, 0),
+            ] {
+                let mut e = std::ptr::null_mut();
+                assert_eq!(
+                    archive_read_next_header(r, &mut e),
+                    ARCHIVE_OK,
+                    "codec {codec:?}"
+                );
+                // SAFETY: the entry getter returns a NUL-terminated pathname owned by e.
+                assert_eq!(unsafe { CStr::from_ptr(archive_entry_pathname(e)) }, name);
+                assert_eq!(archive_entry_mode(e), mode);
+                assert_eq!(archive_entry_size(e), size);
+                assert_eq!(archive_entry_mtime(e), 1);
+                assert_eq!(archive_entry_mtime_nsec(e), 100);
+                assert_eq!(archive_entry_atime(e), 2);
+                if size == 8 {
+                    let mut b = [0; 8];
+                    assert_eq!(archive_read_data(r, b.as_mut_ptr().cast(), b.len()), 8);
+                    assert_eq!(&b, b"abc\0\0\0\0\0");
+                }
+                if mode == 0o120755 {
+                    // SAFETY: symlink metadata is a NUL-terminated string owned by e.
+                    assert_eq!(unsafe { CStr::from_ptr(archive_entry_symlink(e)) }, c"data");
+                }
+            }
+            assert_eq!(archive_read_free(r), ARCHIVE_OK);
+        }
     }
 }

@@ -29,30 +29,6 @@ pub fn by_code(code: i32) -> Result<Box<dyn Filter>, Error> {
         _ => return Err(Error::fatal(libc::EINVAL, "No such filter")),
     })
 }
-pub fn by_name(name: &[u8]) -> Result<Box<dyn Filter>, Error> {
-    let code = match name {
-        b"gzip" => filter_code::GZIP,
-        b"bzip2" => filter_code::BZIP2,
-        b"xz" => filter_code::XZ,
-        b"lzma" => filter_code::LZMA,
-        b"lzip" => filter_code::LZIP,
-        b"lz4" => filter_code::LZ4,
-        b"zstd" => filter_code::ZSTD,
-        b"compress" => filter_code::COMPRESS,
-        b"uuencode" => filter_code::UU,
-        b"b64encode" => 15,
-        b"lrzip" => filter_code::LRZIP,
-        b"lzop" => filter_code::LZOP,
-        b"grzip" => filter_code::GRZIP,
-        _ => {
-            return Err(Error::fatal(
-                libc::EINVAL,
-                [b"No such filter '".as_slice(), name, b"'"].concat(),
-            ));
-        }
-    };
-    by_code(code)
-}
 pub fn program(command: &[u8]) -> Result<Box<dyn Filter>, Error> {
     Ok(Box::new(program::Program::new(command)?))
 }

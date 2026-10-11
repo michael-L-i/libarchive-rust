@@ -19,7 +19,6 @@ mod read;
 mod read_open;
 pub(crate) mod write;
 mod write_filter;
-mod write_format_large;
 #[rustfmt::skip]
 mod stubs;
 pub(crate) mod charset;
