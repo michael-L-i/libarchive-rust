@@ -40,3 +40,22 @@ compression settings and encoded bytes are unchanged. No buffers are added.
   six pre-existing style findings in unmodified upstream lines; it passes
   with only those lint categories allowed on the command line. No lint
   suppression or unrelated cleanup is added to the vendored source.
+
+## Exact short disjoint match copies
+
+The disjoint branch of `apply_match` copies lengths 4-32 with fixed-width
+head/tail slices. Overlapping head/tail writes agree byte for byte; source
+and destination are disjoint `split_at_mut` halves. Other lengths keep
+`copy_from_slice`. No speculative writes, overcopy, distance checks, refill
+points, consumed-byte counts or history semantics change. No unsafe added.
+
+Fresh actual Claude Opus 5.5 final review: PASS. All 30 vendor tests pass,
+including the expanded independent byte-reference ring/overlap test. All
+1,760 valid/truncated/mutated output/status/consumption traces match the
+published baseline, as do 39 encoder byte streams. No-default builds pass.
+Twenty-one rotating common-C-input confirmations show raw decoding gains
+of 18.5% for source gzip, 15.6% source ZIP, 10-13% mixed and 7-10%
+records/compiled data. Tiny cases vary; documents gzip is 3% slower in
+this run. These are backend measurements, not complete extraction times.
+All 16 decoded archive hashes agree with C. Raw samples and review
+records are in sibling diagnostics/round8-miniz-next.

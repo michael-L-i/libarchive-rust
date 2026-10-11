@@ -1149,6 +1149,25 @@ fn transfer(
     }
 }
 
+#[inline]
+fn copy_disjoint(dst: &mut [u8], src: &[u8]) {
+    let len = src.len();
+    // Both ranges are disjoint and exactly the match length. Repeated writes
+    // in the head/tail overlap use the same source bytes.
+    if (4..=8).contains(&len) {
+        dst[..4].copy_from_slice(&src[..4]);
+        dst[len - 4..].copy_from_slice(&src[len - 4..]);
+    } else if (9..=16).contains(&len) {
+        dst[..8].copy_from_slice(&src[..8]);
+        dst[len - 8..].copy_from_slice(&src[len - 8..]);
+    } else if (17..=32).contains(&len) {
+        dst[..16].copy_from_slice(&src[..16]);
+        dst[len - 16..].copy_from_slice(&src[len - 16..]);
+    } else {
+        dst.copy_from_slice(src);
+    }
+}
+
 /// Presumes that there is at least match_len bytes in output left.
 #[inline]
 fn apply_match(
@@ -1202,10 +1221,16 @@ fn apply_match(
         // to check that we are not wrapping here.
         if source_pos < out_pos {
             let (from_slice, to_slice) = out_slice.split_at_mut(out_pos);
-            to_slice[..match_len].copy_from_slice(&from_slice[source_pos..source_pos + match_len]);
+            copy_disjoint(
+                &mut to_slice[..match_len],
+                &from_slice[source_pos..source_pos + match_len],
+            );
         } else {
             let (to_slice, from_slice) = out_slice.split_at_mut(source_pos);
-            to_slice[out_pos..out_pos + match_len].copy_from_slice(&from_slice[..match_len]);
+            copy_disjoint(
+                &mut to_slice[out_pos..out_pos + match_len],
+                &from_slice[..match_len],
+            );
         }
     } else {
         transfer(out_slice, source_pos, out_pos, match_len, out_buf_size_mask);
@@ -2392,7 +2417,8 @@ mod test {
                         continue;
                     }
                     for length in [
-                        3usize, 4, 5, 7, 8, 15, 16, 17, 31, 32, 33, 127, 128, 129, 257, 258,
+                        3usize, 4, 5, 7, 8, 9, 10, 15, 16, 17, 18, 24, 30, 31, 32, 33, 127, 128,
+                        129, 257, 258,
                     ] {
                         if length > size - out_pos {
                             continue;
