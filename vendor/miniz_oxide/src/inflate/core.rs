@@ -635,11 +635,6 @@ impl State {
                 | InvalidDist
         )
     }
-
-    #[inline]
-    fn begin(&mut self, new_state: State) {
-        *self = new_state;
-    }
 }
 
 use self::State::*;
@@ -1254,6 +1249,60 @@ fn apply_match(
     }
 }
 
+/// Input bytes the fast loop needs at the top of an iteration: two eight-byte
+/// refills, the second at most seven bytes past the first. Callers provide
+/// eight more for the refill before the first iteration.
+const FAST_INPUT_MARGIN: usize = 24;
+/// Output bytes one fast loop iteration can write: two literals and a match.
+const FAST_OUTPUT_MARGIN: usize = 2 + 258;
+
+/// Adds the whole bytes at `window[*used..]` that fit to the bit buffer,
+/// leaving 56 to 63 bits. The low byte of `bits_left` counts them; the bits
+/// above them hold the input that follows, and the bits of `bits_left` above
+/// its low byte are ignored.
+#[inline(always)]
+fn refill(
+    bit_buf: &mut u64,
+    bits_left: &mut u32,
+    window: &[u8; FAST_INPUT_MARGIN],
+    used: &mut usize,
+) {
+    let bytes: [u8; 8] = window[*used..*used + 8].try_into().unwrap_or_default();
+    *bit_buf |= u64::from_le_bytes(bytes).wrapping_shl(*bits_left);
+    *used += 7 - ((*bits_left as usize >> 3) & 7);
+    *bits_left |= 56;
+}
+
+/// Removes the bits of `entry` from the bit buffer.
+#[inline(always)]
+fn consume(bit_buf: &mut u64, bits_left: &mut u32, entry: u32) {
+    *bit_buf = bit_buf.wrapping_shr(entry);
+    *bits_left = bits_left.wrapping_sub(entry);
+}
+
+/// The low `n % 64` bits of `bit_buf`.
+#[inline(always)]
+fn low_bits(bit_buf: u64, n: u32) -> usize {
+    (bit_buf & (1u64.wrapping_shl(n) - 1)) as usize
+}
+
+/// The extra bits of a length or distance entry, consumed from `saved`
+/// together with the codeword.
+#[inline(always)]
+fn extra_bits(saved: u64, entry: u32) -> usize {
+    low_bits(saved, entry) >> ((entry >> 8) & 15)
+}
+
+/// The state a literal/length entry that ends decoding leads to.
+#[inline]
+fn litlen_exit(entry: u32) -> (TINFLStatus, State) {
+    if entry & ENTRY_END_OF_BLOCK != 0 {
+        (TINFLStatus::Done, BlockDone)
+    } else {
+        (TINFLStatus::Failed, InvalidLitlen)
+    }
+}
+
 // Called only for disjoint, exact-length slices between three and 32 bytes.
 #[inline(always)]
 fn copy_short_disjoint(dst: &mut [u8], src: &[u8]) {
@@ -1274,15 +1323,31 @@ fn copy_short_disjoint(dst: &mut [u8], src: &[u8]) {
     }
 }
 
-/// Fast inner decompression loop which is run  while there is at least
-/// 259 bytes left in the output buffer, and at least 6 bytes left in the input buffer
-/// (The maximum one match would need + 1).
-///
-/// This was inspired by a similar optimization in zlib, which uses this info to do
-/// faster unchecked copies of multiple bytes at a time.
-/// Currently we don't do this here, but this function does avoid having to jump through the
-/// big match loop on each state change(as rust does not have fallthrough or gotos at the moment),
-/// and already improves decompression speed a fair bit.
+/// Copies a match whose source lies wholly before `pos`, overlapping the
+/// destination byte by byte as LZ77 requires.
+#[inline(always)]
+fn copy_match(out: &mut [u8], pos: usize, dist: usize, len: usize) {
+    let source = pos - dist;
+    if dist < len {
+        transfer(out, source, pos, len, usize::MAX);
+        return;
+    }
+    let (history, output) = out.split_at_mut(pos);
+    let source = &history[source..source + len];
+    if len <= 32 {
+        copy_short_disjoint(output, source);
+    } else {
+        output[..len].copy_from_slice(source);
+    }
+}
+
+/// Fast inner decompression loop, run while the input and output have room
+/// for an iteration without bounds checks: up to three literals, or two and a
+/// match. It decodes through libdeflate-style tables whose entries carry each
+/// symbol's literal or base and extra bit count, keeps 56 or more bits
+/// buffered with branchless eight-byte refills, and looks up each next
+/// literal/length entry before refilling. It stops at a symbol boundary with
+/// the bit position, output and state the state machine would reach.
 fn decompress_fast(
     r: &mut DecompressorOxide,
     in_iter: &mut InputWrapper,
@@ -1291,142 +1356,145 @@ fn decompress_fast(
     local_vars: &mut LocalVars,
     out_buf_size_mask: usize,
 ) -> (TINFLStatus, State) {
-    // Make a local copy of the most used variables, to avoid having to update and read from values
-    // in a random memory location and to encourage more register use.
-    let mut l = *local_vars;
-    let mut state;
+    let input = in_iter.as_slice();
+    let mut pos = out_buf.position();
+    let out_end = pos + out_buf.bytes_left();
+    let out = out_buf.get_mut();
+    let (Some(in_limit), Some(out_limit)) = (
+        input.len().checked_sub(FAST_INPUT_MARGIN),
+        cmp::min(out_end, out.len()).checked_sub(FAST_OUTPUT_MARGIN),
+    ) else {
+        return (TINFLStatus::Done, DecodeLitlen);
+    };
+    let litlen = &r.litlen_table;
+    let dists = &r.dist_table;
+    let litlen_mask = (1 << LITLEN_TABLE_BITS) - 1;
+    let dist_mask = (1 << DIST_TABLE_BITS) - 1;
+    // A no-op where BitBuffer is u64; other targets buffer 32 bits.
+    #[allow(clippy::useless_conversion)]
+    let mut bit_buf = u64::from(local_vars.bit_buf);
+    let mut bits_left = local_vars.num_bits;
+    let mut in_pos = 0;
+    if let Some(window) = input.first_chunk() {
+        refill(&mut bit_buf, &mut bits_left, window, &mut in_pos);
+    }
+    let mut entry = litlen[(bit_buf & litlen_mask) as usize];
 
-    let status: TINFLStatus = 'o: loop {
-        state = State::DecodeLitlen;
-        loop {
-            // This function assumes that there is at least 259 bytes left in the output buffer,
-            // and that there is at least 14 bytes left in the input buffer. 14 input bytes:
-            // 15 (prev lit) + 15 (length) + 5 (length extra) + 15 (dist)
-            // + 29 + 32 (left in bit buf, including last 13 dist extra) = 111 bits < 14 bytes
-            // We need the one extra byte as we may write one length and one full match
-            // before checking again.
-            if out_buf.bytes_left() < 259 || in_iter.bytes_left() < 14 {
-                state = State::DecodeLitlen;
-                break 'o TINFLStatus::Done;
-            }
-
-            fill_bit_buffer(&mut l, in_iter);
-
-            let (entry, code_len) = r.lookup(LITLEN_TABLE, l.bit_buf);
-            l.counter = litlen_symbol(entry);
-            l.bit_buf >>= code_len;
-            l.num_bits -= code_len;
-
-            if (l.counter & 256) != 0 {
-                // The symbol is not a literal.
-                break;
-            } else {
-                // If we have a 32-bit buffer we need to read another two bytes now
-                // to have enough bits to keep going.
-                if cfg!(not(target_pointer_width = "64")) {
-                    fill_bit_buffer(&mut l, in_iter);
-                }
-
-                let (entry, code_len) = r.lookup(LITLEN_TABLE, l.bit_buf);
-                let symbol = litlen_symbol(entry);
-                l.bit_buf >>= code_len;
-                l.num_bits -= code_len;
-                // The previous symbol was a literal, so write it directly and check
-                // the next one.
-                out_buf.write_byte(l.counter as u8);
-                if (symbol & 256) != 0 {
-                    l.counter = symbol;
-                    // The symbol is a length value.
-                    break;
-                } else {
-                    // The symbol is a literal, so write it directly and continue.
-                    out_buf.write_byte(symbol as u8);
-                }
-            }
+    // Each iteration starts with 56 or more bits buffered and `entry` looked
+    // up from them.
+    let (status, state) = loop {
+        if in_pos > in_limit || pos > out_limit {
+            break (TINFLStatus::Done, DecodeLitlen);
         }
-
-        // Mask the top bits since they may contain length info.
-        l.counter &= 511;
-        if l.counter == 256 {
-            // We hit the end of block symbol.
-            state.begin(BlockDone);
-            break 'o TINFLStatus::Done;
-        } else if l.counter > 285 {
-            // Invalid code.
-            // We already verified earlier that the code is > 256.
-            state.begin(InvalidLitlen);
-            break 'o TINFLStatus::Failed;
-        } else {
-            // The symbol was a length code.
-            // # Optimization
-            // Mask the value to avoid bounds checks
-            // While the maximum is checked, the compiler isn't able to know that the
-            // value won't wrap around here.
-            l.num_extra = LENGTH_EXTRA[(l.counter - 257) as usize & BASE_EXTRA_MASK];
-            l.counter = u32::from(LENGTH_BASE[(l.counter - 257) as usize & BASE_EXTRA_MASK]);
-            // Length and distance codes have a number of extra bits depending on
-            // the base, which together with the base gives us the exact value.
-
-            // We need to make sure we have at least 33 (so min 5 bytes) bits in the buffer at this spot.
-            fill_bit_buffer(&mut l, in_iter);
-            if l.num_extra != 0 {
-                let extra_bits = l.bit_buf & ((1 << l.num_extra) - 1);
-                l.bit_buf >>= l.num_extra;
-                l.num_bits -= u32::from(l.num_extra);
-                l.counter += extra_bits as u32;
+        let Some(window) = input[in_pos..].first_chunk() else {
+            break (TINFLStatus::Done, DecodeLitlen);
+        };
+        let mut used = 0;
+        let exit = 'iteration: {
+            let dst: &mut [u8; FAST_OUTPUT_MARGIN] = match out[pos..].first_chunk_mut() {
+                Some(dst) => dst,
+                None => break 'iteration Some((TINFLStatus::Done, DecodeLitlen)),
+            };
+            let mut saved = bit_buf;
+            consume(&mut bit_buf, &mut bits_left, entry);
+            let mut written = 0;
+            if entry & ENTRY_LITERAL != 0 {
+                // The bits buffered cover two more literals and a length.
+                dst[0] = (entry >> 16) as u8;
+                entry = litlen[(bit_buf & litlen_mask) as usize];
+                saved = bit_buf;
+                consume(&mut bit_buf, &mut bits_left, entry);
+                written = 1;
+                if entry & ENTRY_LITERAL != 0 {
+                    dst[1] = (entry >> 16) as u8;
+                    entry = litlen[(bit_buf & litlen_mask) as usize];
+                    saved = bit_buf;
+                    consume(&mut bit_buf, &mut bits_left, entry);
+                    written = 2;
+                    if entry & ENTRY_LITERAL != 0 {
+                        dst[2] = (entry >> 16) as u8;
+                        entry = litlen[(bit_buf & litlen_mask) as usize];
+                        refill(&mut bit_buf, &mut bits_left, window, &mut used);
+                        pos += 3;
+                        break 'iteration None;
+                    }
+                }
             }
-
-            // We found a length code, so a distance code should follow.
-
-            if cfg!(not(target_pointer_width = "64")) {
-                fill_bit_buffer(&mut l, in_iter);
-            }
-
-            let (entry, code_len) = r.lookup(DIST_TABLE, l.bit_buf);
-            l.bit_buf >>= code_len;
-            l.num_bits -= code_len;
+            pos += written;
             if entry & ENTRY_EXCEPTIONAL != 0 {
-                state.begin(InvalidDist);
-                break 'o TINFLStatus::Failed;
+                if entry & ENTRY_SUBTABLE == 0 {
+                    break 'iteration Some(litlen_exit(entry));
+                }
+                let index = (entry >> 16) as usize + low_bits(bit_buf, entry >> 8);
+                entry = litlen.get(index).copied().unwrap_or(INVALID_ENTRY);
+                saved = bit_buf;
+                consume(&mut bit_buf, &mut bits_left, entry);
+                if entry & ENTRY_LITERAL != 0 {
+                    dst[written] = (entry >> 16) as u8;
+                    entry = litlen[(bit_buf & litlen_mask) as usize];
+                    refill(&mut bit_buf, &mut bits_left, window, &mut used);
+                    pos += 1;
+                    break 'iteration None;
+                }
+                if entry & ENTRY_EXCEPTIONAL != 0 {
+                    break 'iteration Some(litlen_exit(entry));
+                }
             }
+            let len = ((entry >> 16) & 0x1ff) as usize + extra_bits(saved, entry);
 
-            l.num_extra = ((entry & 0xff) - ((entry >> 8) & 15)) as u8;
-            l.dist = entry >> 16;
-
-            if l.num_extra != 0 {
-                fill_bit_buffer(&mut l, in_iter);
-                let extra_bits = l.bit_buf & ((1 << l.num_extra) - 1);
-                l.bit_buf >>= l.num_extra;
-                l.num_bits -= u32::from(l.num_extra);
-                l.dist += extra_bits as u32;
+            // Up to 42 bits are gone; 14 or more remain, of which a distance
+            // needs up to 28. Refill as needed to also look up the next
+            // literal/length entry once it is consumed.
+            let mut dist_entry = dists[(bit_buf & dist_mask) as usize];
+            if dist_entry & ENTRY_EXCEPTIONAL != 0 {
+                if dist_entry & ENTRY_SUBTABLE != 0 {
+                    if (bits_left & 0xff) < 28 + LITLEN_TABLE_BITS {
+                        refill(&mut bit_buf, &mut bits_left, window, &mut used);
+                    }
+                    consume(&mut bit_buf, &mut bits_left, dist_entry);
+                    let index = (dist_entry >> 16) as usize + low_bits(bit_buf, dist_entry >> 8);
+                    dist_entry = dists.get(index).copied().unwrap_or(INVALID_ENTRY);
+                }
+                if dist_entry & ENTRY_EXCEPTIONAL != 0 {
+                    consume(&mut bit_buf, &mut bits_left, dist_entry);
+                    break 'iteration Some((TINFLStatus::Failed, InvalidDist));
+                }
+            } else if (bits_left & 0xff) < 21 + LITLEN_TABLE_BITS {
+                refill(&mut bit_buf, &mut bits_left, window, &mut used);
             }
+            saved = bit_buf;
+            consume(&mut bit_buf, &mut bits_left, dist_entry);
+            let dist = (dist_entry >> 16) as usize + extra_bits(saved, dist_entry);
+            entry = litlen[(bit_buf & litlen_mask) as usize];
+            refill(&mut bit_buf, &mut bits_left, window, &mut used);
 
-            let position = out_buf.position();
-            if (l.dist as usize > out_buf.position()
-                && (flags & TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF != 0))
-                || (l.dist as usize > out_buf.get_ref().len())
-            {
+            if dist <= pos {
+                copy_match(out, pos, dist, len);
+            } else if flags & TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF != 0 || dist > out.len() {
                 // We encountered a distance that refers a position before
                 // the start of the decoded data, so we can't continue.
-                state.begin(DistanceOutOfBounds);
-                break TINFLStatus::Failed;
-            }
-
-            let len = l.counter as usize;
-            let dist = l.dist as usize;
-            if (3..=32).contains(&len) && dist >= len && position >= dist {
-                let (history, output) = out_buf.get_mut().split_at_mut(position);
-                let source = &history[position - dist..];
-                copy_short_disjoint(&mut output[..len], &source[..len]);
+                break 'iteration Some((TINFLStatus::Failed, DistanceOutOfBounds));
             } else {
-                apply_match(out_buf.get_mut(), position, dist, len, out_buf_size_mask);
+                apply_match(out, pos, dist, len, out_buf_size_mask);
             }
-
-            out_buf.set_position(position + l.counter as usize);
+            pos += len;
+            None
+        };
+        in_pos += used;
+        if let Some(exit) = exit {
+            break exit;
         }
     };
 
-    *local_vars = l;
+    // Return the whole bytes still buffered to the input, so the bit buffer
+    // holds no more than the state machine's.
+    let bits_left = bits_left & 0xff;
+    let unused = cmp::min(bits_left as usize >> 3, in_pos);
+    let bits_left = bits_left - 8 * unused as u32;
+    in_iter.advance(in_pos - unused);
+    out_buf.set_position(pos);
+    local_vars.bit_buf = (bit_buf & ((1 << bits_left) - 1)) as BitBuffer;
+    local_vars.num_bits = bits_left;
     (status, state)
 }
 
@@ -1821,8 +1889,8 @@ pub fn decompress_with_limit(
                 } else if
                 // If there is enough space, use the fast inner decompression
                 // function.
-                    out_buf.bytes_left() >= 259 &&
-                    in_iter.bytes_left() >= 14
+                    out_buf.bytes_left() >= FAST_OUTPUT_MARGIN &&
+                    in_iter.bytes_left() >= FAST_INPUT_MARGIN + 8
                 {
                     let (status, new_state) = decompress_fast(
                         r,

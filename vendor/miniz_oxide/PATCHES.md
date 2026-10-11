@@ -175,3 +175,17 @@ of a one-codeword (or empty) code still decodes as miniz's one-bit invalid
 symbol. Serialized decoders carry the new tables; `big_array` gains their
 lengths and drops the two old ones. No unsafe code; no output, status or
 consumption change (see the round-twelve section below for evidence).
+
+## Table-driven fast loop
+
+`decompress_fast` is rewritten after libdeflate's fast loop. A 64-bit bit
+buffer is refilled branchlessly from eight-byte loads, keeping 56 to 63
+bits; one shift consumes a codeword with its extra bits; up to three
+literals are decoded per refill; and the next literal/length entry is looked
+up before each refill and match copy, so table loads overlap them. Entry
+margins (24 input bytes plus 8 for the first refill, 260 output bytes) make
+per-iteration bounds checks unnecessary. The loop stops only at symbol
+boundaries and then returns whole buffered bytes to the input, so the state
+machine resumes at the same bit position; consumed counts, statuses and
+partial output before errors are unchanged. Match copies keep the existing
+exact helpers.
