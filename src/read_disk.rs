@@ -28,7 +28,7 @@
 // Ported from libarchive/archive_read_disk_posix.c.
 
 use crate::api::read_disk::DiskMatcher;
-use crate::archive::{ARCHIVE_EOF, ARCHIVE_FAILED, ARCHIVE_OK, Base, Handle, state};
+use crate::archive::{ARCHIVE_EOF, ARCHIVE_FAILED, ARCHIVE_OK, ARCHIVE_WARN, Base, Handle, state};
 use crate::entry::Entry;
 use crate::util::Error;
 use std::collections::VecDeque;
@@ -140,7 +140,7 @@ impl ReadDisk {
                     Some(Err(e)) => {
                         let path = std::mem::take(path);
                         self.reading = None;
-                        return Err(couldnt_visit(a, &path, e));
+                        return Err(path_failure(a, &path, e, b"Couldn't visit directory"));
                     }
                     None => self.reading = None,
                 }
@@ -150,7 +150,7 @@ impl ReadDisk {
             };
             match fs::read_dir(&path) {
                 Ok(dir) => self.reading = Some((dir, path, ancestors)),
-                Err(e) => return Err(couldnt_visit(a, &path, e)),
+                Err(e) => return Err(path_failure(a, &path, e, b"Couldn't visit directory")),
             }
         }
     }
@@ -169,7 +169,15 @@ impl ReadDisk {
         self.file = None;
         self.block.clear();
         self.offset = 0;
+        // Paths below the root that vanished before they could be visited,
+        // reported with the next entry; a skipped entry drops them, as each
+        // of upstream's next_entry() calls starts afresh.
+        let mut removed = Vec::new();
+        let mut keep_removed = false;
         loop {
+            if !std::mem::take(&mut keep_removed) {
+                removed.clear();
+            }
             self.can_descend = false;
             a.disk_can_descend.set(false);
             a.disk_descend_requested.set(false);
@@ -180,6 +188,18 @@ impl ReadDisk {
                     return ARCHIVE_EOF;
                 }
                 Err(ret) => return ret,
+            };
+            let lst = match crate::ffi::disk_sys::stat(&path, -1, false) {
+                Ok(st) => st,
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) && !root => {
+                    if !removed.is_empty() {
+                        removed.push(b' ');
+                    }
+                    removed.extend_from_slice(path.as_os_str().as_bytes());
+                    keep_removed = true;
+                    continue;
+                }
+                Err(e) => return path_failure(a, &path, e, b"Cannot stat"),
             };
             if self.behavior & 4 != 0
                 && path
@@ -197,24 +217,19 @@ impl ReadDisk {
                 Ok(true) => continue,
                 Err(r) => return r,
             }
+            // Following symlinks, archive the target unless the link is
+            // broken or loops back to a parent; then the link itself.
             let follow = self.symlinks == 1 || (self.symlinks == 2 && root);
-            let mut st = match crate::ffi::disk_sys::stat(&path, -1, follow) {
-                Ok(st) => st,
-                Err(_) if follow => match crate::ffi::disk_sys::stat(&path, -1, false) {
-                    Ok(st) => st,
-                    Err(e) => return io_error(a, e, "Can't stat"),
-                },
-                Err(e) => return io_error(a, e, "Can't stat"),
+            let st = match crate::ffi::disk_sys::stat(&path, -1, true) {
+                Ok(st)
+                    if follow
+                        && !(st.st_mode & libc::S_IFMT == libc::S_IFDIR
+                            && self.ancestors.contains(&(st.st_dev as u64, st.st_ino))) =>
+                {
+                    st
+                }
+                _ => lst,
             };
-            if follow
-                && st.st_mode & libc::S_IFMT == libc::S_IFDIR
-                && self.ancestors.contains(&(st.st_dev as u64, st.st_ino))
-            {
-                st = match crate::ffi::disk_sys::stat(&path, -1, false) {
-                    Ok(st) => st,
-                    Err(e) => return io_error(a, e, "Can't stat"),
-                };
-            }
             entry.copy_stat(&st);
             #[cfg(target_vendor = "apple")]
             if self.behavior & 0x40 == 0 {
@@ -306,6 +321,10 @@ impl ReadDisk {
             }
             a.file_count.set(a.file_count.get() + 1);
             a.state.set(state::DATA);
+            if !removed.is_empty() {
+                removed.extend_from_slice(b": File removed before we read it");
+                return a.raise(Error::new(ARCHIVE_WARN, libc::ENOENT, removed));
+            }
             return ARCHIVE_OK;
         }
     }
@@ -483,8 +502,9 @@ impl ReadDisk {
     }
 }
 
-fn couldnt_visit(a: &Base, path: &Path, e: std::io::Error) -> c_int {
-    let msg = [path.as_os_str().as_bytes(), b": Couldn't visit directory"].concat();
+/// Upstream's "<path>: <what>" failure for a path the walk can't use.
+fn path_failure(a: &Base, path: &Path, e: std::io::Error, what: &[u8]) -> c_int {
+    let msg = [path.as_os_str().as_bytes(), b": ", what].concat();
     a.raise(Error::new(
         ARCHIVE_FAILED,
         e.raw_os_error().unwrap_or(libc::EIO),
@@ -531,6 +551,51 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect()
+    }
+
+    #[test]
+    fn files_removed_mid_walk_warn_with_the_next_entry() {
+        let root = std::env::temp_dir().join(format!("libarchive-gone-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            fs::write(root.join(name), b"").unwrap();
+        }
+        let a = Base::new(READ_DISK_MAGIC);
+        let mut disk = ReadDisk::new();
+        let mut entry = Entry::new(None);
+        assert_eq!(disk.open(&a, root.as_os_str().as_bytes()), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        assert_eq!(disk.descend(&a), ARCHIVE_OK);
+        // Once the directory is open and its first entry visited, remove
+        // all but the last entry readdir returns: the walk still lists them,
+        // fails to stat them, and reaches the survivor.
+        let mut order = readdir(&root);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        assert_eq!(
+            entry.pathname().unwrap().to_bytes(),
+            order[0].as_os_str().as_bytes()
+        );
+        order.remove(0);
+        let survivor = order.pop().unwrap();
+        for path in &order {
+            fs::remove_file(path).unwrap();
+        }
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_WARN);
+        assert_eq!(
+            entry.pathname().unwrap().to_bytes(),
+            survivor.as_os_str().as_bytes()
+        );
+        let gone: Vec<_> = order.iter().map(|p| p.as_os_str().as_bytes()).collect();
+        let msg = [
+            gone.join(&b' ').as_slice(),
+            b": File removed before we read it",
+        ]
+        .concat();
+        assert_eq!(a.errno.get(), libc::ENOENT);
+        assert_eq!(a.error.borrow().strip_suffix(b"\0").unwrap(), msg);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_EOF);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
