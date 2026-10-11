@@ -268,27 +268,11 @@ it. So:
 4. Add a unit test next to it. The oracle suites cover the C path: their
    pass count must not move.
 
-Still to add (28 of the 140 library functions the front-ends call; the 141st
-name, `archive_names_from_file`, is bsdtar's own):
-
-- `ArchiveWrite`: `set_format`, `set_format_by_name`,
-  `set_format_pax_restricted`, the 15 `add_filter_*` (with `by_name` and
-  `program`), `set_option`, `set_passphrase`, `set_passphrase_callback`,
-  `open_fd`, `open_filename`. In `ffi/write.rs` the format setters dispatch
-  through the C exports (`write_format_large` reaches iso9660 and xar via
-  `extern "C"`): make the dispatch a `Handle` method over the safe format
-  constructors. Move `FdSink`, `FileSink` and `open_filename`'s
-  `skip_file`/`bytes_in_last_block` setup out of `ffi` with it.
-- `ArchiveReadDisk`: `entry_from_file` (the front-ends pass no `stat`: take
-  the entry and an `Option<BorrowedFd>`), `uname`, `gname`,
-  `set_metadata_filter_callback` and `set_matching`. The metadata filter and
-  the excluded callback are C function pointers in `ffi/disk.rs`
-  (`MetadataFilter`, `ExcludedCallback`); make them closures, and give the
-  metadata filter a view of the handle's `Base` so it can call
-  `can_descend`/`descend` (bsdtar's does; the traversal state is borrowed
-  then, and `descend` already records the request in `Base`). `set_matching`
-  stores a raw pointer to a C match handle (`MatchingHandle`); let the disk
-  reader own an `ArchiveMatch` instead, with an accessor for the caller.
+The API has every library function the front-ends call. The disk
+reader's callbacks (the metadata filter and `set_matching`'s excluded
+callback) get the entry as an `ArchiveEntry` and the walk as a
+`ReadDiskView`, which has `can_descend` and `descend`. The reader owns
+the `ArchiveMatch` `set_matching` gives it; `matching()` lends it back.
 
 **Checklist for a tool.**
 
