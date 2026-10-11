@@ -629,3 +629,7 @@ Instruction counts are per compression of the benchmark tars in
   written are the same, and the compiler sees the writes in bounds. The
   extra-bits tables are padded to 64 entries for masked indexing. -1.5% to
   -3% instructions at levels 1 and 3.
+- The fast search keeps the 8 bytes it hashes at ip0 and ip1 for the
+  table match check instead of reading them again: -1.5% to -3%
+  instructions at level 1. (Reusing them for the repeat offset check too
+  cost 4-7% more cycles at levels 2 and -5, so that one is read again.)

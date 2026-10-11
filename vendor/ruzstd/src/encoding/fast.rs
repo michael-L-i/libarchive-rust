@@ -1,7 +1,9 @@
 //! The fast block compressor (levels 1-2 and negative levels), ported from
 //! libzstd 1.5.7 (`ZSTD_compressBlock_fast_noDict_generic()` in `zstd_fast.c`).
 
-use super::match_state::{count, slot, Input, MatchState, HASH_READ_SIZE, SEARCH_STRENGTH};
+use super::match_state::{
+    count, hash_value, slot, Input, MatchState, HASH_READ_SIZE, SEARCH_STRENGTH,
+};
 use super::sequences::SeqStore;
 
 /// Find the sequences of the block `src[start..]`; `src[..start]` is the
@@ -56,10 +58,10 @@ fn fast<const MLS: u32>(
         rep1 = 0;
     }
     let table = &mut ms.hash_table[..];
-    let found = |pos: usize, match_index: u32| {
-        debug_assert!(match_index < index(pos));
+    // A table match for the bytes `value` read at a position.
+    let found = |value: u64, match_index: u32| {
         match_index >= prefix_start_index
-            && input.read32((match_index - base) as usize) == input.read32(pos)
+            && input.read32((match_index - base) as usize) == value as u32
     };
 
     loop {
@@ -71,8 +73,11 @@ fn fast<const MLS: u32>(
         if ip3 >= ilimit {
             break;
         }
-        let mut hash0 = input.hash::<MLS>(ip0, hlog);
-        let mut hash1 = input.hash::<MLS>(ip1, hlog);
+        // The bytes at ip0 and ip1, read once for the hash and the match.
+        let mut value0 = input.read64(ip0);
+        let mut value1 = input.read64(ip1);
+        let mut hash0 = hash_value::<MLS>(value0, hlog);
+        let mut hash1 = hash_value::<MLS>(value1, hlog);
         let mut match_index = table[slot(table, hash0)];
         let mut current0;
 
@@ -86,19 +91,22 @@ fn fast<const MLS: u32>(
                 table[slot(table, hash1)] = index(ip1);
                 break true;
             }
-            if found(ip0, match_index) {
+            if found(value0, match_index) {
                 table[slot(table, hash1)] = index(ip1);
                 break false;
             }
             match_index = table[slot(table, hash1)];
             hash0 = hash1;
-            hash1 = input.hash::<MLS>(ip2, hlog);
+            let value2 = input.read64(ip2);
+            hash1 = hash_value::<MLS>(value2, hlog);
             ip0 = ip1;
             ip1 = ip2;
             ip2 = ip3;
+            value0 = value1;
+            value1 = value2;
             current0 = index(ip0);
             table[slot(table, hash0)] = current0;
-            if found(ip0, match_index) {
+            if found(value0, match_index) {
                 // Write the next entry only if the search resumes beyond it.
                 if step <= 4 {
                     table[slot(table, hash1)] = index(ip1);
@@ -107,9 +115,12 @@ fn fast<const MLS: u32>(
             }
             match_index = table[slot(table, hash1)];
             hash0 = hash1;
-            hash1 = input.hash::<MLS>(ip2, hlog);
+            let value2 = input.read64(ip2);
+            hash1 = hash_value::<MLS>(value2, hlog);
             ip0 = ip1;
             ip1 = ip2;
+            value0 = value1;
+            value1 = value2;
             ip2 = ip0 + step;
             ip3 = ip1 + step;
             if ip2 >= next_step {
