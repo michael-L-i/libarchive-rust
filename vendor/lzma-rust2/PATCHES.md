@@ -368,3 +368,35 @@ Validation on Apple Silicon, 2026-10-11, versus `3bd88f0`:
   validation logs and authenticated review JSON are retained in sibling
   `diagnostics/round11-lzma`. During the round the workspace was externally
   renamed from `port-rs-lib` to `port-rs-libarchive`; source was preserved.
+
+## Sixteen-byte CRC64 checksum steps
+
+`Crc64::update` folds 16 bytes with a slicing-by-sixteen table. The incoming
+state contributes only to the first eight bytes; the remaining eight
+lookups can proceed independently. Its existing eight-byte and byte tails
+remain intact. CRC32 production code, streaming state, initialization and
+finalization are unchanged. No new allocations, dependencies or unsafe
+code are added. The read-only CRC64 table grows from 16 to 32 KiB.
+
+An independent bitwise reference now covers every length through 513, all
+16 byte offsets and split points through 33. Baseline and candidate CRC
+tests pass. Five rotating checksum pairs show 44.6-44.9% lower time for
+16-byte through full 16 MiB chunks; one- and seven-byte chunks are neutral.
+
+Twenty-one rotating whole-archive in-memory ABI checks against frozen
+round-ten Rust show XZ text 9.490 -> 6.286 ms (33.8%), random
+11.521 -> 8.242 ms (28.5%), source 21.272 -> 17.966 ms (15.5%), and many
+files 7.568 -> 6.557 ms (13.4%). Other cases improve 0.8-2.4%. All eight
+decoded archive hashes match independent C and baseline Rust. These are
+in-memory archive-reader measurements, not filesystem extraction times.
+
+Three rotating writer pairs on text, documents and source produce exact
+baseline bytes; C and Rust decode all resulting streams to the expected
+SHA-256. Another 48 valid, truncated and mutated ABI records preserve
+output, error text, errno and input positions. Strict root release
+all-target Clippy and formatting pass. Fresh actual Claude Opus 5.5 design
+and independent final reviews pass after their requested whole-XZ and
+expanded split checks. All artifacts are in sibling `diagnostics/round11-crc`.
+
+Performance was measured on this Mac. The extra 16 KiB of read-only tables
+may affect smaller CPU caches; performance on other CPUs is unmeasured.

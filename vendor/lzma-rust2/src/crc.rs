@@ -77,8 +77,8 @@ impl Crc32 {
 
 const CRC64_POLY: u64 = 0xC96C5795D7870F42;
 
-const fn make_crc64_table() -> [[u64; 256]; 8] {
-    let mut table = [[0; 256]; 8];
+const fn make_crc64_table() -> [[u64; 256]; 16] {
+    let mut table = [[0; 256]; 16];
     let mut i = 0;
     while i < 256 {
         let mut crc = i as u64;
@@ -95,7 +95,7 @@ const fn make_crc64_table() -> [[u64; 256]; 8] {
         i += 1;
     }
     let mut slice = 1;
-    while slice < 8 {
+    while slice < 16 {
         let mut i = 0;
         while i < 256 {
             let crc = table[slice - 1][i];
@@ -107,7 +107,7 @@ const fn make_crc64_table() -> [[u64; 256]; 8] {
     table
 }
 
-const CRC64_TABLE: [[u64; 256]; 8] = make_crc64_table();
+const CRC64_TABLE: [[u64; 256]; 16] = make_crc64_table();
 
 /// CRC_64_XZ
 #[derive(Clone, Copy)]
@@ -124,8 +124,30 @@ impl Crc64 {
     }
 
     pub(crate) fn update(&mut self, data: &[u8]) {
-        // Each table accounts for the remaining bytes in an eight-byte group.
-        let mut chunks = data.chunks_exact(8);
+        // The last eight bytes are independent of the incoming checksum.
+        let mut wide = data.chunks_exact(16);
+        for chunk in &mut wide {
+            let word = u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]) ^ self.state;
+            self.state = CRC64_TABLE[15][(word & 0xFF) as usize]
+                ^ CRC64_TABLE[14][((word >> 8) & 0xFF) as usize]
+                ^ CRC64_TABLE[13][((word >> 16) & 0xFF) as usize]
+                ^ CRC64_TABLE[12][((word >> 24) & 0xFF) as usize]
+                ^ CRC64_TABLE[11][((word >> 32) & 0xFF) as usize]
+                ^ CRC64_TABLE[10][((word >> 40) & 0xFF) as usize]
+                ^ CRC64_TABLE[9][((word >> 48) & 0xFF) as usize]
+                ^ CRC64_TABLE[8][((word >> 56) & 0xFF) as usize]
+                ^ CRC64_TABLE[7][chunk[8] as usize]
+                ^ CRC64_TABLE[6][chunk[9] as usize]
+                ^ CRC64_TABLE[5][chunk[10] as usize]
+                ^ CRC64_TABLE[4][chunk[11] as usize]
+                ^ CRC64_TABLE[3][chunk[12] as usize]
+                ^ CRC64_TABLE[2][chunk[13] as usize]
+                ^ CRC64_TABLE[1][chunk[14] as usize]
+                ^ CRC64_TABLE[0][chunk[15] as usize];
+        }
+        let mut chunks = wide.remainder().chunks_exact(8);
         for chunk in &mut chunks {
             let word = u64::from_le_bytes([
                 chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
@@ -164,7 +186,7 @@ mod tests {
 
     #[test]
     fn slicing_matches_bitwise_crc_across_alignments_and_splits() {
-        let mut bytes = [0u8; 521];
+        let mut bytes = [0u8; 529];
         let mut seed = 0x12345678u32;
         for byte in &mut bytes {
             seed ^= seed << 13;
@@ -172,7 +194,7 @@ mod tests {
             seed ^= seed << 5;
             *byte = seed as u8;
         }
-        for offset in 0..8 {
+        for offset in 0..16 {
             for len in 0..=513 {
                 let data = &bytes[offset..offset + len];
                 let mut expected32 = !0u32;
@@ -189,7 +211,7 @@ mod tests {
                 }
                 assert_eq!(Crc32::checksum(data), !expected32);
                 assert_eq!(Crc64::checksum(data), !expected64);
-                for split in 0..=len.min(17) {
+                for split in 0..=len.min(33) {
                     let mut crc32 = Crc32::new();
                     let mut crc64 = Crc64::new();
                     for part in [&data[..split], &data[split..]] {
