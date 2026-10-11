@@ -1,7 +1,7 @@
 /*-
- * Copyright (c) 2003-2007 Tim Kientzle
- * Copyright (c) 2009 Andreas Henriksson <andreas@fatal.se>
- * Copyright (c) 2009-2012 Michihiro NAKAJIMA
+ * Copyright (c) 2003-2023 Tim Kientzle
+ * Copyright (c) 2011-2012 Michihiro NAKAJIMA
+ * Copyright (c) 2016 Martin Matuska
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
