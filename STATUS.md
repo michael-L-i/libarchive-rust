@@ -49,7 +49,7 @@ Libarchive: 764 passed / upstream baseline 829 / 934 total.
 | other | 96 | 96 | 139 |
 
 Remaining stubs (`src/ffi/stubs.rs`): 0
-`unsafe` in `src/` (excluding stubs.rs): 258
+`unsafe` in `src/` (excluding stubs.rs): 260
 
 ## Phase 5 checkpoint
 
@@ -388,6 +388,45 @@ Report: `../diagnostics/results/REPORT.md`; corrected raw matrix:
 `../diagnostics/bin/rust-round8-final-bsdtar`. The initial matrix is retained
 as `round8-final.json`; it is not the final scorecard. Rejected experiments and
 remaining leads are isolated in diagnostics, including `round8-next-work.txt`.
+Original C and pinned upstream remain clean. No work was pushed.
+
+## Optimization round 9 checkpoint
+
+Three accepted changes: exact wide DEFLATE overlap copies, complete Zstandard
+sequence bit windows, and one secure parent-path lookup on ARM macOS with a
+cached Darwin 21+ capability gate. Unknown/older kernels and lookup failures
+retain the component walker. The two new documented unsafe blocks are in the
+uname OS wrapper; codec changes remain safe Rust.
+
+The unchanged 96-case matrix now gives Rust 21 wins, 19 ties and 56 losses.
+Prior Rust in the same run gives 16 wins, 22 ties and 58 losses. A win requires
+more than 5% lower median time than C. The majority-win goal remains unmet.
+Many-file extraction improves 12–15% across all six formats; source/mixed
+Zstandard extraction improves 4–5%. All 48 Rust archive streams remain
+byte-identical. No compression settings, input datasets or weights changed.
+
+Two short-command medians regressed by 5–6% in the full matrix. A scoped
+15-rotation check did not reproduce either regression: text Zstandard
+extraction was unchanged and records tar creation improved 5.1%. The original
+matrix and score remain unchanged; raw follow-up samples are retained.
+
+Validation: 393 native tests passed, one opt-in test ignored; strict all-target
+Clippy, formatting, no-default-feature Zstandard check and all 454 public ABI
+symbols passed. The upstream/front-end suite passed 926 tests, skipped 184,
+with zero failures, crashes, timeouts or ratchet regressions (64 seconds,
+one worker). All 720 timed extractions and 288 cross-reader checks passed.
+Fresh actual Claude Opus 5.5 reviews and focused valid/damaged input,
+stream-state and filesystem-security checks are retained per accepted unit.
+
+Five trials were rejected as slower or neutral: derived DEFLATE tables,
+fused Zstandard decode/copy, contiguous writer match windows, retained writer
+hash state and forced match inlining. They remain isolated in diagnostics.
+No speculative writer change was merged.
+
+Report: `../diagnostics/results/REPORT.md`; raw results:
+`../diagnostics/results/round9-final.json`; validation and confirmation:
+`../diagnostics/round9-integration/`. Frozen binary:
+`../diagnostics/bin/rust-round9-final-bsdtar`. Code checkpoint: b421761.
 Original C and pinned upstream remain clean. No work was pushed.
 
 ## Earlier checkpoints (historical)
