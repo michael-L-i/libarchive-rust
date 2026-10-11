@@ -1175,6 +1175,14 @@ impl Iso9660 {
         let mut total = table_size;
         let mut remaining = size;
         let mut input = [0; 32768];
+        let mut zlib =
+            deflate::Deflate::new(i32::from(self.compression), 15, 8).ok_or_else(|| {
+                Error::fatal(
+                    -1,
+                    "Internal error initializing compression library: invalid setup parameter",
+                )
+            })?;
+        let mut compressed = Vec::new();
         for block in 0..count {
             let n = remaining.min(input.len() as u64) as usize;
             {
@@ -1186,8 +1194,17 @@ impl Iso9660 {
             let at = 16 + block as usize * 4;
             metadata[at..at + 4].copy_from_slice(&(total as u32).to_le_bytes());
             if n != 32768 || input[..n].iter().any(|&b| b != 0) {
-                let compressed =
-                    miniz_oxide::deflate::compress_to_vec_zlib(&input[..n], self.compression);
+                compressed.clear();
+                zlib.reset();
+                zlib.compress(&input[..n], &mut compressed).map_err(|e| {
+                    Error::fatal(
+                        -1,
+                        format!(
+                            "Compression failed: deflate() call returned status {}",
+                            e.code()
+                        ),
+                    )
+                })?;
                 temporary.write_all(&compressed).map_err(io_error)?;
                 total = total
                     .checked_add(compressed.len() as u64)
