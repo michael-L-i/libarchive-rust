@@ -35,7 +35,8 @@ use std::io::Read;
 pub struct Warc {
     omit_info: bool,
     remaining: u64,
-    active: bool,
+    /// The entry's file type; only regular files are stored.
+    regular: bool,
     now: i64,
 }
 impl Default for Warc {
@@ -43,7 +44,7 @@ impl Default for Warc {
         Self {
             omit_info: false,
             remaining: 0,
-            active: false,
+            regular: false,
             now: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -78,7 +79,9 @@ impl Warc {
         let mut out = [b"WARC/1.0\r\nWARC-Type: ".as_slice(), kind, b"\r\n"].concat();
         if let Some(uri) = uri {
             out.extend(b"WARC-Target-URI: ");
-            if !uri.windows(3).any(|s| s == b"://") {
+            // Prepend file:// unless the first ':' starts a "://".
+            let scheme = uri.iter().position(|&b| b == b':');
+            if scheme.is_none_or(|i| uri.get(i + 1..i + 3) != Some(b"//")) {
                 out.extend(b"file://");
             }
             out.extend(uri);
@@ -111,7 +114,10 @@ impl Warc {
         }
         out.extend(format!("Content-Length: {size}\r\n\r\n").as_bytes());
         if out.len() >= 512 {
-            return Err(Error::fatal(-1, "WARC resource header is too large"));
+            return Err(Error::fatal(
+                crate::read::ARCHIVE_ERRNO_FILE_FORMAT,
+                "WARC resource header is too large",
+            ));
         }
         Ok(out)
     }
@@ -134,7 +140,7 @@ impl Format for Warc {
             Ok(ARCHIVE_WARN)
         }
     }
-    fn header(&mut self, _: &Base, e: &mut Entry, sink: &mut dyn Sink) -> Result<c_int, Error> {
+    fn header(&mut self, a: &Base, e: &mut Entry, sink: &mut dyn Sink) -> Result<c_int, Error> {
         if !self.omit_info {
             let payload = b"software: libarchive/3.9.0dev\r\nformat: WARC file version 1.0\r\n";
             let h = self.header_bytes(b"warcinfo", None, self.now, payload.len() as u64)?;
@@ -143,11 +149,13 @@ impl Format for Warc {
             sink.write(b"\r\n\r\n")?;
             self.omit_info = true;
         }
-        let name = e
-            .pathname()
-            .map(|s| s.to_bytes().to_vec())
-            .ok_or_else(|| Error::new(ARCHIVE_WARN, libc::EINVAL, "Invalid filename"))?;
-        if e.filetype() != 0o100000 {
+        let Some(name) = e.pathname().map(|s| s.to_bytes().to_vec()) else {
+            a.set_error(libc::EINVAL, Some(b"Invalid filename"));
+            return Ok(ARCHIVE_WARN);
+        };
+        self.regular = e.filetype() == 0o100000;
+        self.remaining = 0;
+        if !self.regular {
             return Err(crate::write::unsupported(e, b"WARC"));
         }
         if e.size_is_set() == 0 || e.size() < 0 {
@@ -156,17 +164,20 @@ impl Format for Warc {
         self.remaining = e.size() as u64;
         let h = self.header_bytes(b"resource", Some(&name), e.mtime(), self.remaining)?;
         sink.write(&h)?;
-        self.active = true;
         Ok(ARCHIVE_OK)
     }
     fn data(&mut self, data: &[u8], sink: &mut dyn Sink) -> Result<usize, Error> {
+        if !self.regular {
+            return Ok(data.len());
+        }
+        // Never write more bytes than announced.
         let n = data.len().min(self.remaining as usize);
         sink.write(&data[..n])?;
         self.remaining -= n as u64;
         Ok(n)
     }
     fn finish_entry(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
-        if self.active {
+        if self.regular {
             if self.remaining != 0 {
                 return Err(Error::fatal(
                     -1,
@@ -174,11 +185,67 @@ impl Format for Warc {
                 ));
             }
             sink.write(b"\r\n\r\n")?;
-            self.active = false;
         }
+        self.regular = false;
         Ok(())
     }
     fn close(&mut self, _: &mut dyn Sink) -> Result<(), Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Output(Vec<u8>);
+    impl Sink for Output {
+        fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+            self.0.extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn target_uri_keeps_a_scheme_only_at_the_first_colon() {
+        let base = Base::new(WRITE_MAGIC);
+        for (path, uri) in [
+            (b"http://host/x".as_slice(), b"http://host/x".as_slice()),
+            (b"a:b://c", b"file://a:b://c"),
+            (b"dir/f", b"file://dir/f"),
+        ] {
+            let mut warc = Warc::default();
+            let mut out = Output(Vec::new());
+            let mut e = Entry::new(None);
+            e.set_pathname(path);
+            e.set_filetype(0o100000);
+            e.set_size(0);
+            assert_eq!(warc.header(&base, &mut e, &mut out), Ok(ARCHIVE_OK));
+            let line = [b"\r\nWARC-Target-URI: ".as_slice(), uri, b"\r\n"].concat();
+            assert!(out.0.windows(line.len()).any(|w| w == line));
+        }
+    }
+
+    // As upstream: no pathname is a warning, and the data that follows is
+    // accepted and dropped.
+    #[test]
+    fn missing_pathname_warns_and_drops_data() {
+        let base = Base::new(WRITE_MAGIC);
+        let mut warc = Warc {
+            omit_info: true,
+            ..Default::default()
+        };
+        let mut out = Output(Vec::new());
+        let mut e = Entry::new(None);
+        e.set_filetype(0o100000);
+        e.set_size(3);
+        assert_eq!(warc.header(&base, &mut e, &mut out), Ok(ARCHIVE_WARN));
+        assert_eq!(
+            base.error_string().as_deref(),
+            Some(b"Invalid filename".as_slice())
+        );
+        assert_eq!(warc.data(b"abc", &mut out), Ok(3));
+        warc.finish_entry(&mut out).unwrap();
+        assert!(out.0.is_empty());
     }
 }
