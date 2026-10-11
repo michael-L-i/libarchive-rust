@@ -54,11 +54,16 @@ pub fn compress(target: &Target, size: u64) -> std::io::Result<()> {
     header.extend_from_slice(&size.to_le_bytes());
     let mut buffer = vec![0; 65536];
     let mut remaining = size;
+    // Upstream's decmpfs_compression_level.
+    let mut zlib = deflate::Deflate::new(5, 15, 8).ok_or(std::io::ErrorKind::InvalidInput)?;
     for block in 0..count {
         let len = remaining.min(65536) as usize;
         file.read_exact(&mut buffer[..len])?;
         remaining -= len as u64;
-        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&buffer[..len], 5);
+        let mut compressed = Vec::new();
+        zlib.reset();
+        zlib.compress(&buffer[..len], &mut compressed)
+            .map_err(|_| std::io::Error::other("Failed to compress data"))?;
         let bytes = if compressed.len() > len {
             let mut raw = Vec::with_capacity(len + 1);
             raw.push(0xff);
