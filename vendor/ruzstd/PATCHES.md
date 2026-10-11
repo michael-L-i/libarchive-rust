@@ -624,7 +624,8 @@ Instruction counts are per compression of the benchmark tars in
   unpredictable), keeping the repeat offsets in registers, and writes the
   three code arrays. Instructions are unchanged; cycles drop 4-6% at
   level 1 and 2% at level 5.
-- The sequence and Huffman bit streams clamp their write position to
-  `end`, which it never passes, so flushes need no bounds check, and the
-  extra-bits tables are padded to 64 entries for masked indexing: -1% to
-  -2% instructions at levels 1 and 3.
+- The sequence and Huffman bit streams clamp their position to `end`
+  where they write, not when they advance it (libzstd's way): the bytes
+  written are the same, and the compiler sees the writes in bounds. The
+  extra-bits tables are padded to 64 entries for masked indexing. -1.5% to
+  -3% instructions at levels 1 and 3.

@@ -49,11 +49,12 @@ impl<'a> BitStream<'a> {
     #[inline(always)]
     pub(crate) fn flush(&mut self) {
         let bytes = (self.nbits >> 3) as usize;
-        // The position never passes `end`; clamping shows the compiler that
-        // the write is in bounds.
+        // libzstd stops the position at `end`. Clamping it where it is used
+        // instead writes the same bytes, and lets the compiler see that the
+        // write is in bounds.
         let pos = self.pos.min(self.end);
         self.out[pos..pos + 8].copy_from_slice(&self.container.to_le_bytes());
-        self.pos = (pos + bytes).min(self.end);
+        self.pos += bytes;
         self.nbits &= 7;
         self.container >>= bytes * 8;
     }
