@@ -154,6 +154,11 @@ impl<'a> Input<'a> {
     }
 
     #[inline(always)]
+    pub(crate) fn byte(self, pos: usize) -> u8 {
+        self.src[self.at(pos)]
+    }
+
+    #[inline(always)]
     pub(crate) fn read32(self, pos: usize) -> u32 {
         read32(self.src, self.at(pos))
     }

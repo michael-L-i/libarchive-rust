@@ -638,3 +638,5 @@ Instruction counts are per compression of the benchmark tars in
   gathers them to prefetch). The checks only read the input and the row
   is updated after both either way, so the result is the same: -2% to -3%
   instructions at level 5, -5% to -7% at level 9.
+- The fast and double fast catch-up loops read bytes through `Input`
+  too: -0.5% instructions at level 3.

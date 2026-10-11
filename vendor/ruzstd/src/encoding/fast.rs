@@ -135,7 +135,7 @@ fn fast<const MLS: u32>(
         let (mut match0, mut length);
         if repeat {
             match0 = ip0 - rep1 as usize;
-            length = usize::from(src[ip0 - 1] == src[match0 - 1]);
+            length = usize::from(input.byte(ip0 - 1) == input.byte(match0 - 1));
             ip0 -= length;
             match0 -= length;
             length += 4;
@@ -145,7 +145,10 @@ fn fast<const MLS: u32>(
             rep1 = (ip0 - match0) as u32;
             length = 4;
             // Count the backwards match length.
-            while ip0 > anchor && match0 > prefix_start && src[ip0 - 1] == src[match0 - 1] {
+            while ip0 > anchor
+                && match0 > prefix_start
+                && input.byte(ip0 - 1) == input.byte(match0 - 1)
+            {
                 ip0 -= 1;
                 match0 -= 1;
                 length += 1;

@@ -112,7 +112,7 @@ fn double_fast<const MLS: u32>(
             if (input.read64(m) == bytes) & valid {
                 let mut length = count(src, ip + 8, m + 8) + 8;
                 let offset = (ip - m) as u32;
-                while ip > anchor && m > prefix_lowest && src[ip - 1] == src[m - 1] {
+                while ip > anchor && m > prefix_lowest && input.byte(ip - 1) == input.byte(m - 1) {
                     ip -= 1;
                     m -= 1;
                     length += 1;
@@ -136,7 +136,7 @@ fn double_fast<const MLS: u32>(
                         m = l1;
                     }
                 }
-                while ip > anchor && m > prefix_lowest && src[ip - 1] == src[m - 1] {
+                while ip > anchor && m > prefix_lowest && input.byte(ip - 1) == input.byte(m - 1) {
                     ip -= 1;
                     m -= 1;
                     length += 1;
