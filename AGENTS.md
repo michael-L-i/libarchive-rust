@@ -30,9 +30,10 @@ C programs (bsdtar, package managers) link it in place of `libarchive.so`.
   (usually only on corrupt input) in `NOTES.md`. A machine-translated (c2rust)
   backend is allowed only when no safe option exists, and is tracked for
   replacement. A new dependency needs one line in the commit body saying why.
-  The one C file is `src/ffi/variadic.c`, which formats `archive_set_error`'s
+  The one C file is `capi/variadic.c`, which formats `archive_set_error`'s
   varargs and calls into Rust, because stable Rust can't define C variadic
-  functions.
+  functions. Only the C library (`capi/`) compiles it; the Rust crate and
+  everything built on it contain no C.
 
 ## Layout
 
@@ -44,6 +45,7 @@ include/              archive.h, archive_entry.h copied unchanged from upstream
 src/ffi/              exported archive_* functions; the only unsafe code
 src/ffi/stubs.rs      generated stubs for unported functions (scripts/gen-stubs)
 src/                  one module per upstream file (naming rule below)
+capi/                 builds libarchive.{so,dylib,a} for C programs, + variadic.c
 scripts/              oracle build, port build, test runner
 tests/passing.txt     the ratchet: upstream tests that pass against our library
 tests/upstream.txt    upstream tests that pass against upstream on this machine
@@ -62,8 +64,10 @@ Naming rule, so upstream diffs map to modules mechanically:
 | `archive_write_add_filter_X.c` | `src/write/filter/X.rs` |
 | other `archive_X.c` | `src/X.rs` |
 
-The crate builds `libarchive.{so,dylib,a}`: `[lib] name = "archive"`,
-`crate-type = ["cdylib", "staticlib", "rlib"]`.
+The workspace root is the Rust library, `libarchive-rust` (an rlib, pure
+Rust). `capi/` (`libarchive-capi`, `[lib] name = "archive"`,
+`crate-type = ["cdylib", "staticlib"]`) links its exported functions into
+`libarchive.{so,dylib,a}`.
 
 ## FFI conventions
 
@@ -211,8 +215,8 @@ Small, incremental commits in upstream libarchive's style:
 - Body only when needed, wrapped at 72, saying why rather than what.
 - Porting commits end with `Ported-from: libarchive/<file> @ 8bb3bbd`.
 - One logical change per commit. Each commit builds, passes
-  `cargo clippy -- -D warnings` and `cargo fmt --check`, and doesn't lower
-  the oracle pass count.
+  `cargo clippy --workspace --all-targets -- -D warnings` and
+  `cargo fmt --all --check`, and doesn't lower the oracle pass count.
 
 ## Upstream
 

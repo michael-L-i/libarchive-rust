@@ -160,11 +160,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "libarchive-capi"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libarchive-rust",
+]
+
+[[package]]
 name = "libarchive-rust"
 version = "0.1.0"
 dependencies = [
  "aes",
- "cc",
  "crabz2",
  "crc32fast",
  "hmac",

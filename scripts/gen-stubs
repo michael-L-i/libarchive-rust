@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 HEADERS = ROOT / "upstream/libarchive/libarchive"
 FFI = ROOT / "src/ffi"
-SKIP = {"archive_set_error"}  # variadic: src/ffi/variadic.c
+SKIP = {"archive_set_error"}  # variadic: capi/variadic.c
 
 BASE = {  # C base type -> (rust type, std::ffi import or None)
     "void": "c_void", "char": "c_char", "int": "c_int", "unsigned": "c_uint",

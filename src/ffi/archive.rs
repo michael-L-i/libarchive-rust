@@ -435,10 +435,6 @@ mod tests {
     use super::*;
     use crate::ffi::read::archive_read_new;
 
-    unsafe extern "C" {
-        fn archive_set_error(a: *mut Archive, errno: c_int, fmt: *const c_char, ...);
-    }
-
     fn string(p: *const c_char) -> Option<String> {
         // SAFETY: the tests only pass pointers the library returned.
         (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
@@ -463,12 +459,13 @@ mod tests {
         assert_eq!(archive_free(a), ARCHIVE_OK);
     }
 
+    // `archive_set_error` formats its message in C and hands it to
+    // `__archive_rs_set_error`; libarchive-capi tests the formatting.
     #[test]
-    fn set_error_formats_and_reports() {
+    fn set_error_reports_copies_and_clears() {
         let a = archive_read_new();
         assert_eq!(string(archive_error_string(a)), None);
-        // SAFETY: `a` is a live handle and the format matches its arguments.
-        unsafe { archive_set_error(a, 22, c"bad %s #%d".as_ptr(), c"entry".as_ptr(), 7 as c_int) };
+        __archive_rs_set_error(a, 22, c"bad entry #7".as_ptr());
         assert_eq!(archive_errno(a), 22);
         assert_eq!(
             string(archive_error_string(a)).as_deref(),
@@ -486,8 +483,7 @@ mod tests {
             (archive_errno(a), string(archive_error_string(a))),
             (0, None)
         );
-        // SAFETY: as above, with no message.
-        unsafe { archive_set_error(b, 5, std::ptr::null()) };
+        __archive_rs_set_error(b, 5, std::ptr::null());
         assert_eq!(
             (archive_errno(b), string(archive_error_string(b))),
             (5, None)
@@ -499,14 +495,12 @@ mod tests {
     #[test]
     fn error_string_pointer_survives_clear_and_shorter_messages() {
         let a = archive_read_new();
-        // SAFETY: `a` is a live handle and the formats take no arguments.
-        unsafe { archive_set_error(a, 1, c"a long first message".as_ptr()) };
+        __archive_rs_set_error(a, 1, c"a long first message".as_ptr());
         let p = archive_error_string(a);
         archive_clear_error(a);
         // Like upstream, the buffer is emptied in place, not freed.
         assert_eq!(string(p).as_deref(), Some(""));
-        // SAFETY: as above.
-        unsafe { archive_set_error(a, 1, c"short".as_ptr()) };
+        __archive_rs_set_error(a, 1, c"short".as_ptr());
         assert_eq!(archive_error_string(a), p);
         assert_eq!(string(p).as_deref(), Some("short"));
         assert_eq!(archive_free(a), ARCHIVE_OK);

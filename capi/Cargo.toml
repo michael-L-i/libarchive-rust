@@ -1,0 +1,16 @@
+[package]
+name = "libarchive-capi"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "libarchive's C ABI (libarchive.{so,dylib,a}) built from libarchive-rust"
+
+[lib]
+name = "archive"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+libarchive-rust = { path = ".." }
+
+[build-dependencies]
+cc = "1"

@@ -1,12 +1,14 @@
+[workspace]
+members = ["capi"]
+default-members = [".", "capi"]
+# The patched backends keep their own manifests and tests.
+exclude = ["vendor"]
+
 [package]
 name = "libarchive-rust"
 version = "0.1.0"
 edition = "2024"
 license = "BSD-2-Clause"
-
-[lib]
-name = "archive"
-crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 crc32fast = "1.5.2"
@@ -25,9 +27,6 @@ hmac = { version = "0.13", default-features = false }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 aes = { version = "0.9", default-features = false }
 xml = { version = "1.4.0", default-features = false }
-
-[build-dependencies]
-cc = "1"
 
 # The oracle runs upstream's tests against the dev build; unoptimized, the
 # fuzz tests take ~25x upstream's time. Keep debug assertions and overflow
