@@ -280,21 +280,64 @@ impl Format for Zip {
         }
         Ok(ARCHIVE_OK)
     }
-    fn header(&mut self, _: &Base, e: &mut Entry, sink: &mut dyn Sink) -> Result<c_int, Error> {
-        let (name, _) = e.pathname_l(self.conv.as_deref());
-        let mut name = name
-            .map(<[u8]>::to_vec)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    ARCHIVE_FAILED,
-                    -1,
-                    "ZIP format requires a non-empty pathname",
-                )
-            })?;
+    fn header(&mut self, a: &Base, e: &mut Entry, sink: &mut dyn Sink) -> Result<c_int, Error> {
+        let Some(original) = e.pathname().map(|p| p.to_bytes().to_vec()) else {
+            return Err(Error::new(
+                ARCHIVE_FAILED,
+                -1,
+                "Can't record entry in zip file without pathname",
+            ));
+        };
         let ty = e.filetype();
         if !matches!(ty, 0o100000 | 0o040000 | 0o120000) {
             return Err(crate::write::unsupported(e, b"zip"));
+        }
+        let mut ret = ARCHIVE_OK;
+        let conv = self.conv.as_deref();
+        let (converted, ok) = e.pathname_l(conv);
+        let converted = converted.map(<[u8]>::to_vec).unwrap_or_default();
+        if !ok {
+            // We have a wrongly-encoded MBS pathname. Warn and use it.
+            a.set_error(
+                crate::read::ARCHIVE_ERRNO_FILE_FORMAT,
+                Some(
+                    &[
+                        b"Can't translate pathname '".as_slice(),
+                        &original,
+                        b"' to ",
+                        crate::string::conversion_charset_name(conv),
+                    ]
+                    .concat(),
+                ),
+            );
+            ret = ARCHIVE_WARN;
+        }
+        let mut name = if converted.is_empty() {
+            original
+        } else {
+            converted
+        };
+        // There is no standard for symlink handling; it is converted with
+        // the filename's character set, keeping the original if that fails.
+        let sym = match e.symlink_l(conv) {
+            (Some(s), true) if !s.is_empty() => s.to_vec(),
+            _ => e
+                .symlink()
+                .map(|s| s.to_bytes().to_vec())
+                .unwrap_or_default(),
+        };
+        // If filename isn't ASCII and we can use UTF-8, set the UTF-8 flag.
+        let utf8 = !name.is_ascii()
+            && match conv {
+                Some(c) => crate::string::conversion_charset_name(Some(c)) == b"UTF-8",
+                None => crate::ffi::charset::locale_codeset() == b"UTF-8",
+            };
+        if name.is_empty() {
+            return Err(Error::new(
+                ARCHIVE_FAILED,
+                -1,
+                "ZIP format requires a non-empty pathname",
+            ));
         }
         if ty == 0o040000 {
             if !name.ends_with(b"/") {
@@ -309,10 +352,6 @@ impl Format for Zip {
                 "Pathname too long for ZIP format",
             ));
         }
-        let sym = e
-            .symlink()
-            .map(|s| s.to_bytes().to_vec())
-            .unwrap_or_default();
         let method = if ty == 0o100000 { self.method } else { 0 };
         let unknown = e.size_is_set() == 0;
         let limit = if ty == 0o100000 {
@@ -340,7 +379,7 @@ impl Format for Zip {
                 _ => 0,
             };
         }
-        if name.iter().any(|&b| b >= 128) && std::str::from_utf8(&name).is_ok() {
+        if utf8 {
             flags |= 0x800;
         }
         let mut version = match method {
@@ -528,7 +567,7 @@ impl Format for Zip {
             member.encoder = Some(f);
         }
         self.current = Some(member);
-        Ok(ARCHIVE_OK)
+        Ok(ret)
     }
     fn data(&mut self, data: &[u8], sink: &mut dyn Sink) -> Result<usize, Error> {
         let m = self
@@ -663,5 +702,57 @@ impl Drop for Zip {
         if let Some(p) = self.passphrase.as_mut() {
             p.fill(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffi::charset::{lock_locale, set_locale_all};
+
+    struct Bytes(Vec<u8>);
+    impl Sink for Bytes {
+        fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+            self.0.extend_from_slice(data);
+            Ok(())
+        }
+    }
+    /// The header's return code and its general purpose bit flags.
+    fn header(zip: &mut Zip, base: &Base, name: &[u8]) -> (c_int, u16) {
+        let mut e = Entry::new(None);
+        e.set_pathname(name);
+        e.set_mode(0o100644);
+        e.set_size(0);
+        let mut out = Bytes(Vec::new());
+        let r = zip.header(base, &mut e, &mut out).unwrap();
+        (r, u16::from_le_bytes([out.0[6], out.0[7]]))
+    }
+    #[test]
+    fn utf8_flag_follows_the_locale_codeset() {
+        // Upstream flags any non-ASCII name when nl_langinfo(CODESET) is
+        // UTF-8, even one that isn't valid UTF-8.
+        let _locale = lock_locale();
+        let base = Base::new(WRITE_MAGIC);
+        let mut zip = Zip::default();
+        assert_eq!(header(&mut zip, &base, b"bad\xff").1 & 0x800, 0);
+        if set_locale_all("en_US.UTF-8") {
+            assert_eq!(header(&mut zip, &base, b"bad\xff").1 & 0x800, 0x800);
+            assert_eq!(header(&mut zip, &base, b"ascii").1 & 0x800, 0);
+            set_locale_all("C");
+        }
+    }
+    #[test]
+    fn untranslatable_pathname_warns() {
+        let _locale = lock_locale();
+        let base = Base::new(WRITE_MAGIC);
+        let mut zip = Zip::default();
+        zip.options(&base, b"hdrcharset", Some(b"UTF-8")).unwrap();
+        let (r, flags) = header(&mut zip, &base, b"bad\xff");
+        assert_eq!(r, ARCHIVE_WARN);
+        assert_eq!(
+            &*base.error.borrow(),
+            b"Can't translate pathname 'bad\xff' to UTF-8\0"
+        );
+        assert_eq!(flags & 0x800, 0x800);
     }
 }
