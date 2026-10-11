@@ -535,3 +535,13 @@ compare the fast path with the serial decoder on valid, truncated, mutated
 and irregular streams pass, and all 2256 archive cases match the previous
 commit. On the compiled corpus (1.36 M Huffman literals) in-process decoding
 fell from 117 M to 77 M instructions.
+
+## Round 12: build FSE decoding tables without divisions
+
+`FSETable::build_decoding_table` numbered each symbol's states with a
+power-of-two slice computation that divided per table entry. It now uses
+`ZSTD_buildFSETable`'s formula: a symbol of probability p numbers its states
+p, p+1, ... in table order, and state n reads `log + 1 - highbit(n)` bits from
+`(n << bits) - size`. An exhaustive test compares both formulas for every
+accuracy log up to 9, probability and state. Predefined distributions are no
+longer copied into new vectors per block. All 2256 archive cases match.

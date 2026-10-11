@@ -132,7 +132,8 @@ impl FSETable {
         if acc_log == 0 {
             return Err(FSETableError::AccLogIsZero);
         }
-        self.symbol_probabilities = probs.to_vec();
+        self.symbol_probabilities.clear();
+        self.symbol_probabilities.extend_from_slice(probs);
         self.accuracy_log = acc_log;
         self.build_decoding_table()
     }
@@ -197,25 +198,19 @@ impl FSETable {
             }
         }
 
-        // baselines and num_bits can only be calculated when all symbols have been spread
+        // baselines and num_bits can only be calculated when all symbols have been spread.
+        // A symbol's states are numbered from its probability up, in table order: state n
+        // reads log - highbit(n) bits from (n << num_bits) - table_size (`ZSTD_buildFSETable`).
         self.symbol_counter.clear();
         self.symbol_counter
-            .resize(self.symbol_probabilities.len(), 0);
-        for idx in 0..negative_idx {
-            let entry = &mut self.decode[idx];
-            let symbol = entry.symbol;
-            let prob = self.symbol_probabilities[symbol as usize];
-
-            let symbol_count = self.symbol_counter[symbol as usize];
-            let (bl, nb) = calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
-
-            //println!("symbol: {:2}, table: {}, prob: {:3}, count: {:3}, bl: {:3}, nb: {:2}", symbol, table_size, prob, symbol_count, bl, nb);
-
-            assert!(nb <= self.accuracy_log);
-            self.symbol_counter[symbol as usize] += 1;
-
-            entry.base_line = bl;
-            entry.num_bits = nb;
+            .extend(self.symbol_probabilities.iter().map(|&p| p.max(0) as u32));
+        for entry in &mut self.decode[..negative_idx] {
+            let next = &mut self.symbol_counter[entry.symbol as usize];
+            let state = *next;
+            *next += 1;
+            let num_bits = self.accuracy_log + 1 - highest_bit_set(state) as u8;
+            entry.base_line = (state << num_bits) - table_size as u32;
+            entry.num_bits = num_bits;
         }
         Ok(())
     }
@@ -338,30 +333,55 @@ fn next_position(mut p: usize, table_size: usize) -> usize {
     p
 }
 
-fn calc_baseline_and_numbits(
-    num_states_total: u32,
-    num_states_symbol: u32,
-    state_number: u32,
-) -> (u32, u8) {
-    if num_states_symbol == 0 {
-        return (0, 0);
+#[cfg(test)]
+mod tests {
+    use super::highest_bit_set;
+
+    /// The baseline computation this module used before, from the FSE format's description.
+    fn calc_baseline_and_numbits(
+        num_states_total: u32,
+        num_states_symbol: u32,
+        state_number: u32,
+    ) -> (u32, u8) {
+        if num_states_symbol == 0 {
+            return (0, 0);
+        }
+        let num_state_slices = if 1 << (highest_bit_set(num_states_symbol) - 1) == num_states_symbol {
+            num_states_symbol
+        } else {
+            1 << (highest_bit_set(num_states_symbol))
+        }; //always power of two
+    
+        let num_double_width_state_slices = num_state_slices - num_states_symbol; //leftovers to the power of two need to be distributed
+        let num_single_width_state_slices = num_states_symbol - num_double_width_state_slices; //these will not receive a double width slice of states
+        let slice_width = num_states_total / num_state_slices; //size of a single width slice of states
+        let num_bits = highest_bit_set(slice_width) - 1; //number of bits needed to read for one slice
+    
+        if state_number < num_double_width_state_slices {
+            let baseline = num_single_width_state_slices * slice_width + state_number * slice_width * 2;
+            (baseline, num_bits as u8 + 1)
+        } else {
+            let index_shifted = state_number - num_double_width_state_slices;
+            ((index_shifted * slice_width), num_bits as u8)
+        }
     }
-    let num_state_slices = if 1 << (highest_bit_set(num_states_symbol) - 1) == num_states_symbol {
-        num_states_symbol
-    } else {
-        1 << (highest_bit_set(num_states_symbol))
-    }; //always power of two
 
-    let num_double_width_state_slices = num_state_slices - num_states_symbol; //leftovers to the power of two need to be distributed
-    let num_single_width_state_slices = num_states_symbol - num_double_width_state_slices; //these will not receive a double width slice of states
-    let slice_width = num_states_total / num_state_slices; //size of a single width slice of states
-    let num_bits = highest_bit_set(slice_width) - 1; //number of bits needed to read for one slice
-
-    if state_number < num_double_width_state_slices {
-        let baseline = num_single_width_state_slices * slice_width + state_number * slice_width * 2;
-        (baseline, num_bits as u8 + 1)
-    } else {
-        let index_shifted = state_number - num_double_width_state_slices;
-        ((index_shifted * slice_width), num_bits as u8)
+    #[test]
+    fn state_numbering_matches_slice_widths() {
+        for log in 1..=9u32 {
+            let size = 1u32 << log;
+            for prob in 1..=size {
+                for k in 0..prob {
+                    let state = prob + k;
+                    let num_bits = log + 1 - highest_bit_set(state);
+                    let base_line = (state << num_bits) - size;
+                    assert_eq!(
+                        (base_line, num_bits as u8),
+                        calc_baseline_and_numbits(size, prob, k),
+                        "log {log} prob {prob} state {k}"
+                    );
+                }
+            }
+        }
     }
 }
