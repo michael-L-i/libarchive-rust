@@ -1,6 +1,6 @@
 # libarchive-rust status
 
-Date 2026-10-10. Upstream pin `8bb3bbdc`. Run: port.
+Date 2026-10-11. Upstream pin `8bb3bbdc`. Run: port.
 
 **All suites: 926 passed, 184 skipped; zero failures, crashes or timeouts.**
 
@@ -428,6 +428,49 @@ Report: `../diagnostics/results/REPORT.md`; raw results:
 `../diagnostics/round9-integration/`. Frozen binary:
 `../diagnostics/bin/rust-round9-final-bsdtar`. Code checkpoint: b421761.
 Original C and pinned upstream remain clean. No work was pushed.
+
+## Performance round 10 checkpoint
+
+Five reviewed optimization units are integrated at `57388dd`: bounded BT4
+hash-head pipelining, a tagged next-head hint across match-finder calls,
+exact 64/32-byte DEFLATE history copies, stable DEFLATE insertion-array
+borrows, and medium-sized Zstandard literal/match copies. All codec code
+remains safe Rust; no compression settings, encoded bytes or ABI changed.
+
+Focused confirmation shows an 8% source encoder gain from BT4 pipelining.
+The additional hint improves random/mixed/compiled encoding by 24/12/5%.
+DEFLATE repetitive decoding improves 43% for gzip and 37% for ZIP;
+document data improves 3-5%. Zstandard varied-data decoding improves 3-6%.
+Stable insertion borrows improve repetitive DEFLATE encoding 5%. These
+backend results are separate from complete archive-operation timings.
+
+The unchanged 96-case, five-rotation matrix records 23 wins, 20 ties and
+53 losses against C. Prior Rust in the same run records 20 wins, 23 ties
+and 53 losses. Majority wins remain unachieved. Complete XZ/7zip creation
+improves 25% for random, 12-13% for mixed and about 6% for source data;
+repetitive gzip/ZIP extraction improves 11-14%. No full-matrix case is more
+than 5% slower than prior Rust. All 48 writer streams remain byte-identical,
+all 720 timed extractions and 288 cross-reader checks match manifests.
+
+Measurements and full C/Rust timing, size and RSS tables are in sibling
+`diagnostics/results/REPORT.md`; raw data is `round10-final.json` and
+combined logs are in `round10-integration/`. The frozen round-nine binaries
+are the before baseline. Case weights, compression presets and the common
+C-input extraction policy remain unchanged.
+
+Combined verification: 393 native tests pass, one opt-in test ignored;
+strict all-target Clippy, formatting, no-default Zstandard and all 454 ABI
+symbols pass. All upstream/front-end suites: 926 pass, 184 skip, zero
+failures, crashes, timeouts or ratchet regressions, 65 seconds with one worker.
+Unit checks include exact damaged-stream traces, level-switch/reset traces,
+1,656 frozen LZMA streams in release and assertion-enabled builds, and a real
+2.147 GB normalization stream. Fresh actual Claude Opus 5.5 design and final
+reviews are retained alongside specialist results.
+
+Mirrored and scaled-interleaved DEFLATE chain tables were rejected for
+regressions. Extra Zstandard periodic-copy/repcode branches were removed
+because the smaller accepted copy change performed better. Original C and
+pinned upstream remain clean. No work was pushed.
 
 ## Earlier checkpoints (historical)
 
