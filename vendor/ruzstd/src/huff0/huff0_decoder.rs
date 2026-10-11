@@ -38,6 +38,7 @@ impl<'t> HuffmanDecoder<'t> {
 
     /// Advance the internal cursor to the next symbol. After this, you can call `decode_symbol`
     /// to read from the new position.
+    #[inline(always)]
     pub fn next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         // self.state stores a small section, or a window of the bit stream. The table can be indexed via this state,
         // telling you how many bits identify the current symbol.
@@ -74,6 +75,12 @@ pub struct HuffmanTable {
 }
 
 impl HuffmanTable {
+    // max_num_bits is public and may differ from the privately built table.
+    pub(crate) fn fast_decode_ok(&self) -> bool {
+        let m = self.max_num_bits;
+        (1..=MAX_MAX_NUM_BITS).contains(&m) && self.decode.len() == 1usize << m
+    }
+
     /// Create a new, empty table.
     pub fn new() -> HuffmanTable {
         HuffmanTable {

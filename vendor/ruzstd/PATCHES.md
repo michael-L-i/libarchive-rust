@@ -418,3 +418,32 @@ cases range from 1.6% slower to 0.9% faster. All eight decoded hashes match C.
 These timings exclude filesystem extraction. Prompts, actual model usage,
 rejected variants, raw samples and validation logs: sibling
 diagnostics/round10-zstd.
+
+## Interleaved Huffman literal streams
+
+Decode canonical four-stream Huffman literals in parallel lanes, with inlined
+state transitions so independent table lookups can overlap. The guarded path
+uses initialized, disjoint output slices and validates each lane's terminal
+bit count. Empty initial output, bounded stream/output sizes and a consistent
+Huffman table are required. Any mismatch clears the speculative output and
+runs the original serial decoder, preserving malformed-input error precedence,
+partial output and public scratch state. Noncanonical accepted streams retain
+the serial behavior, at the cost of bounded speculative work. No new unsafe
+code, dependencies or public API changes.
+
+Actual Claude Opus 5.5 supplied the lane design and independently reviewed the
+final implementation: PASS with minor nits. The suggested div_ceil cleanup is
+applied. All 51 self-contained vendor tests pass with debug assertions and
+overflow checks, including serial comparisons of valid, truncated, mutated,
+noncanonical and prepopulated literal targets, exact errors, bytes and capacity.
+All 175 valid/damaged ABI records match. Strict root release all-target Clippy,
+standalone vendor Clippy and formatting checks pass.
+
+Twenty-one rotating before/after/C runs on the same eight C archives show raw
+in-memory decoding gains of 24.2% compiled, 15.5% records and 7.5% source;
+remaining cases range from 0.4% slower to 2.3% faster. All decoded hashes match C.
+These timings exclude filesystem extraction. The frozen unit binary predates
+only the equivalent bounded div_ceil syntax cleanup; final-source vendor tests
+and Clippy passed afterward. The combined integration rebuild and matrix use
+the final source. Evidence, actual model usage, initial timeout, profiles,
+attribution runs and raw validation logs: sibling diagnostics/round11-zstd.
