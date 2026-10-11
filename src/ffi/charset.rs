@@ -59,6 +59,19 @@ pub fn locale_codeset() -> Vec<u8> {
     }
 }
 
+/// The locale is process-wide and cargo runs tests on parallel threads, so
+/// every test that sets the locale or depends on it holds this lock. Each
+/// starts in the "C" locale, whatever the previous holder left.
+#[cfg(test)]
+pub fn lock_locale() -> std::sync::MutexGuard<'static, ()> {
+    static LOCALE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCALE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_locale_all("C");
+    guard
+}
+
 /// `setlocale(LC_ALL, name)`; false if the locale is unavailable.
 #[cfg(test)]
 pub fn set_locale_all(name: &str) -> bool {

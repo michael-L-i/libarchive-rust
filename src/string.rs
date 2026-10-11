@@ -1763,18 +1763,10 @@ impl MString {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi::charset::set_locale_all;
+    use crate::ffi::charset::{lock_locale, set_locale_all};
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
-
-    // The locale is process-wide and cargo runs tests on parallel threads.
-    // Every test that touches it holds this lock.
-    static LOCALE: Mutex<()> = Mutex::new(());
-
-    fn lock_locale() -> MutexGuard<'static, ()> {
-        LOCALE.lock().unwrap_or_else(PoisonError::into_inner)
-    }
 
     fn skipping(msg: &str) {
         eprintln!("SKIPPED: {msg}");

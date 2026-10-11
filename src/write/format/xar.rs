@@ -999,6 +999,8 @@ mod tests {
     }
     #[test]
     fn invalid_utf8_path_returns_warning_without_panicking() {
+        // Converting names to UTF-8 depends on the locale.
+        let _locale = crate::ffi::charset::lock_locale();
         let base = Base::new(WRITE_MAGIC);
         let mut xar = Xar::default();
         let mut entry = Entry::new(None);
@@ -1012,6 +1014,8 @@ mod tests {
     }
     #[test]
     fn invalid_utf8_symlink_returns_warning_at_header() {
+        // Converting names to UTF-8 depends on the locale.
+        let _locale = crate::ffi::charset::lock_locale();
         let base = Base::new(WRITE_MAGIC);
         let mut xar = Xar::default();
         let mut entry = Entry::new(None);
@@ -1026,6 +1030,8 @@ mod tests {
     }
     #[test]
     fn invalid_owner_charset_aborts_toc_without_emitting_archive() {
+        // Converting names to UTF-8 depends on the locale.
+        let _locale = crate::ffi::charset::lock_locale();
         for group in [false, true] {
             let base = Base::new(WRITE_MAGIC);
             let mut xar = Xar::default();
