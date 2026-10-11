@@ -290,6 +290,21 @@ impl Deflate {
         let status = self.0.deflate(&mut strm, flush)?;
         Ok((status, strm.next_in, strm.next_out))
     }
+
+    /// Compress all of `input` and finish the stream, appending its output
+    /// to `out`: deflate() with Z_FINISH until Z_STREAM_END.
+    pub fn compress(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+        loop {
+            let start = out.len();
+            out.resize(start + 65536, 0);
+            let (status, used, n) = self.deflate(input, &mut out[start..], Flush::Finish)?;
+            out.truncate(start + n);
+            input = &input[used..];
+            if status == Status::StreamEnd {
+                return Ok(());
+            }
+        }
+    }
 }
 
 struct State {

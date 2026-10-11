@@ -251,6 +251,21 @@ fn reset_starts_a_new_stream() {
 }
 
 #[test]
+fn compresses_whole_buffers() {
+    let data = sample(150_000, 11);
+    let mut d = Deflate::new(9, 15, 8).unwrap();
+    let mut out = b"prefix".to_vec();
+    d.compress(&data, &mut out).unwrap();
+    assert_eq!(out[6..], compress(9, 15, &data));
+    // A finished stream takes no more input until it is reset.
+    assert_eq!(d.compress(b"more", &mut out), Err(Error::Buf));
+    d.reset();
+    out.clear();
+    d.compress(b"", &mut out).unwrap();
+    assert_eq!(decompress_to_vec_zlib(&out).unwrap(), b"");
+}
+
+#[test]
 fn reports_zlib_errors() {
     for (level, wbits, mem) in [
         (10, -15, 8),
