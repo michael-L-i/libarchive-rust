@@ -559,10 +559,10 @@ mod tests {
     struct Directory(std::path::PathBuf);
     impl Directory {
         fn new() -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            // Tests run in parallel and the clock has microsecond
+            // resolution, so a counter keeps the names apart.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let root = std::env::temp_dir()
                 .join(format!("libarchive-parent-{}-{unique}", std::process::id()));
             std::fs::create_dir(&root).unwrap();
