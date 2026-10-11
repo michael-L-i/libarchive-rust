@@ -11,30 +11,68 @@ examples, benchmarks, development dependencies and documentation metadata.
 Tests and fixture assets are not vendored. The root disables default features,
 including `optimization`; the enabled implementation remains safe Rust.
 
-`Bt4::skip` previously extended binary-tree matches one byte at a time. It now
-calls the existing `extend_match` helper, already used by `find_matches`, which
-compares native words in safe Rust. The first byte was already tested equal,
-so extension starts at `len + 1` and retains exactly the previous limit and
-binary-tree updates. No preset, match depth, dictionary, or parsing policy
-changes. Keep this patch until the equivalent change is available upstream.
+## Encoder ported from liblzma 5.8.4
 
-Validation on Apple Silicon, 2026-10-09:
+The xz-for-Java encoder (`src/enc/encoder*.rs`, `src/enc/range_enc.rs`,
+`src/lz/lz_encoder.rs`, `src/lz/bt4.rs`, `src/lz/hc4.rs`,
+`src/lz/hash234.rs`) is replaced by a safe Rust port of liblzma 5.8.4's
+encoder (0BSD; Igor Pavlov, Lasse Collin): the LZ window and HC3/HC4/BT4
+match finders (`lz/lz_encoder.c`, `lz_encoder_mf.c`, `lz_encoder_hash.h`,
+`common/memcmplen.h`), the LZMA encoder with its normal and fast optimum
+parsers and price tables (`lzma/lzma_encoder*.c`), the range encoder and
+prices (`rangecoder/`), LZMA2 chunking (`lzma/lzma2_encoder.c`) and the
+presets (`lzma/lzma_encoder_presets.c`, so preset 0 uses HC3 and `MfType`
+gains `Hc3`). BT2 and BT3, which no preset uses, are not ported. The
+public writers and options keep their API and container framing, except
+that the unused `get_extra_size_before()` helper is gone.
 
-- 1,440 compressed streams are byte-identical to the unmodified crate: XZ,
-  LZMA and LZIP; presets 0 through 9; random, repetitive and mixed data;
-  sizes 0, 1, 7, 8, 9, 63, 64, 65, 273, 274, 4095, 4096, 65535, 65536,
-  65537, 131100; write chunks 1, 63 or 65536 selected by preset. These
-  cases cap the dictionary at 64 KiB to exercise match-finder wraparound.
-  Length-prefixed concatenated output is 11,308,770 bytes, SHA-256
-  `230abc013cf9f0d83bd9c063b7078deaa357df7e723bfe3c3a93be345a922059`.
-- At unchanged default preset 6, all three diagnostic tar corpora produce
-  byte-identical XZ output. Six in-process compression runs (opt-level 3)
-  give median text 66.303 -> 23.134 ms, random 178.678 -> 172.281 ms,
-  small-files 28.076 -> 17.666 ms. Random timings are noisy; do not infer
-  a random-data improvement. End-to-end archive measurements are separate.
-- The experiment source, outputs and raw timings are retained under the
-  sibling `diagnostics/lzma-micro` directory. Project oracle validation is
-  performed on the combined integration branch.
+liblzma updates the dictionary and alignment price tables in batches
+(`match_price_count`, `align_price_count`), length prices every
+`nice_len - 1` encodings per position state, and splits LZMA2 chunks at
+61,439 compressed bytes. xz for Java did each of these slightly
+differently, so its output differed from liblzma's by a few hundred bytes
+per archive even though both did the same match-finder and parser work.
+
+Differences from liblzma, none visible in the output:
+
+- liblzma queues the bits of a symbol and encodes them once output space
+  is available; here they are encoded at once into a `Vec`. Normalization
+  still precedes each bit, so LZMA2's chunk-size checks see the same
+  range-coder state. Because the queued bits update probabilities only
+  after the symbol, a length price table is recomputed before, not after,
+  the length's own bits are encoded.
+- Out-of-range options are clamped instead of rejected (dictionary to
+  4 KiB-1.5 GiB, `nice_len` to the match finder's minimum-273, `lc` <= 8,
+  `lp` and `pb` <= 4); `lc + lp` above liblzma's limit of 4 remains
+  available to LZMA1. LZMA2's `chunk_size` independent chunks re-create
+  the encoder after a sync flush.
+- liblzma's quirk is kept: after an LZMA2 chunk stored uncompressed with
+  read-ahead bytes, the encoder's position lags by those bytes. All
+  position contexts were just reset, so the shift relabels them
+  consistently and decoders are unaffected.
+
+The earlier xz-for-Java encoder patches (BT4 skip match extension,
+overlapping-word tails, proved skip prefixes, masked literal updates,
+bounded skips and distance prices, hash-head pipelining and the find
+hint) went away with that code; their evidence remains in sibling
+`diagnostics/lzma-micro` and `diagnostics/round{4..10}-lzma*`.
+
+Validation on Apple Silicon, 2026-10-11, against liblzma 5.8.4 (Homebrew
+`xz`, `diagnostics/round12-lzma-enc/harness/cenc`):
+
+- All eight benchmark tar inputs produce byte-identical `.xz` at preset 6
+  (these equal the C bsdtar archives in `diagnostics/round8-suite`), and
+  records and compiled at presets 0-9.
+- 1,200 streams are byte-identical: `.xz`, raw LZMA2, raw LZMA1 with end
+  marker and `.lzma`, at presets 0-9 and their extreme variants, over 15
+  inputs: empty, 1-5 bytes, 273/274, 4 KiB and 64 KiB + 1 random, 1 MiB of
+  zeros, a period-3 pattern, 300 KiB random (beyond preset 0's
+  dictionary), 3 MiB of text with long-range repeats and 2.4 MiB of mixed
+  random and text that produces uncompressed LZMA2 chunks.
+- Sync flushes every 1,000, 65,536 and 100,000 bytes (xz and LZMA2, six
+  presets) and preset dictionaries of 1 byte, 100 KB and 2 MB (raw LZMA1
+  and LZMA2) are byte-identical, as is a flush with a preset dictionary.
+- Every `.xz` and `.lzma` output decodes with `xz -d`.
 
 ## LZMA2 decoder resident dictionary pages
 
@@ -98,227 +136,6 @@ Validation on Apple Silicon, 2026-10-09:
   changed Rust file passes rustfmt.
 - Raw samples, differential records, and timings are retained in sibling
   `diagnostics/round4-lzma-micro`. Integration oracle remains the root task.
-
-## Encoder match comparison tails
-
-The safe `extend_match_safe` in `src/lz/mod.rs` compares a remaining short
-suffix with a final overlapping native word when the complete match region
-is at least one word long. The overlap contains only bytes already proved
-equal; leading/trailing zeros locate the same first differing byte on either
-endianness. Regions shorter than a word retain scalar comparisons. This
-applies to BT4 and HC4 without changing match limits or parse decisions.
-
-Validation on Apple Silicon, 2026-10-09:
-
-- Default-preset-6 raw LZMA2 profiling shows BT4 skip in 531 of 547 active
-  text samples, and 487 skip plus 189 find-matches samples on source data.
-  The original word matcher still compared short tails byte by byte.
-- A scalar-reference test checks every mismatch position at lengths 0 through
-  300, eight alignments, equal inputs and unequal slice lengths. It passes;
-  all 1,440 encoder differential streams remain byte-identical, and vendor
-  clippy with warnings denied and changed-file rustfmt pass.
-- Raw LZMA2 16 MiB text compression: 130.940 -> 111.891 ms (seven-run
-  medians). Source: 2131.094 -> 2051.142 ms (two runs; limited sample).
-  Five alternating random pairs have medians 2580.359 -> 2555.104 ms,
-  with overlapping ranges 2533.298–2584.172 and 2525.717–2583.543 ms.
-  No random-data speed improvement is claimed. Encoded lengths are unchanged.
-- Profiles, reference harness and raw timings are retained under sibling
-  `diagnostics/round4-lzma-micro`. Integration/held-out archive validation
-  remains the root task. No decoder code changes in this patch.
-
-## Reuse proved BT4 skip prefixes
-
-`src/lz/bt4.rs` retains the distance, position and length of the last complete
-skip match in three `i32` fields. When a later tree candidate has the same
-distance, the overlapping suffix is already known equal. After the existing
-first-byte check, extension can start at that proved prefix, clamped to the
-current nice limit. Tree traversal, ordering, depth and match limits are
-unchanged. Buffer slides preserve the relative equality; position normalization
-invalidates the cache before old coordinates can be reused. No absolute end
-position is added, avoiding overflow near the normalization boundary.
-
-Validation on Apple Silicon, 2026-10-09, versus accepted baseline `a0fbedb`:
-
-- Raw preset-6 LZMA2 16 MiB text compression improves 114.115 -> 88.631 ms
-  and 111.378 -> 89.038 ms in separate five-run comparisons (about 20-22%).
-  Source comparisons overlap: 2224.732/2173.242 ms before versus
-  2192.956/2214.983 ms after; a further pair is 2055.496/2053.107 ms.
-  Random is also effectively unchanged; no source/random gain is claimed.
-- Auxiliary counters find 16.77 million useful cached prefixes on text,
-  avoiding 1.04 billion byte comparisons. Source has 12.09 million useful
-  prefixes among 168.08 million tree visits. Keeping the cache lookup behind
-  the existing first-byte test avoids adding work to immediately rejected
-  candidates. A version that looked up the cache first regressed source and
-  was rejected; seeding from longer find-matches proofs added no benefit.
-- All 1,440 XZ/LZMA/LZIP differential streams remain byte-identical across
-  presets 0 through 9, boundary sizes, three data patterns and chunk sizes.
-- A streaming 2,147,614,720-byte case uses only a 64 KiB input block and
-  dictionary, changing one byte per block. It crosses match-finder position
-  normalization after many dictionary and buffer wraps. Both encoders emit
-  exactly 401,263 bytes, SHA-256
-  `5ea1af6a4ff04040a6177b9eff83c0615bc5821fdf637ebf7ecd587ae4049187`.
-- All 27 self-contained vendor tests and vendor Clippy with warnings denied
-  pass; eight BCJ fixture tests require assets omitted from the vendor tree.
-  The changed Rust file passes rustfmt. Integration checks remain separate.
-- Harnesses, raw timings, counters, differential output and rejected variants
-  are retained in sibling `diagnostics/round6-lzma-micro`.
-
-## Normal literal range updates
-
-`src/enc/range_enc.rs` adds masked probability, range and low-word updates
-used only for normal literals in `src/enc/encoder.rs`. Matched literals retain
-the original branch because their predicted prefix is more predictable.
-The mask preserves zero versus any nonzero bit semantics, and all state
-updates finish before the unchanged normalization and writer-error path.
-No preset, probability model, parser, match policy or format changes.
-
-Validation on Apple Silicon, 2026-10-09, versus baseline `fafa7a5`:
-
-- Actual Claude Opus 5.5 proposed selective literal arithmetic; independent
-  implementation and fresh reviews checked arithmetic and writer-error
-  equivalence. A select-expression version was rejected after assembly
-  showed LLVM restoring the bit-dependent branches. Mask arithmetic removes
-  those branches; applying it to matched literals too regressed source and
-  was rejected.
-- Five alternating raw LZMA2 pairs, preset 6: 16 MiB random medians
-  2576.818 -> 2409.469 ms (6.5% faster). Source 2007.898 -> 2010.431 ms
-  and compiled data 624.632 -> 625.474 ms are effectively unchanged.
-  Preset 1 random medians improve 1061.875 -> 823.200 ms (22.5%).
-  Two-pair text and records screens show no material change; no general
-  archive speedup is inferred from these backend measurements.
-- All 1,440 XZ/LZMA/LZIP streams remain byte-identical across presets 0-9,
-  boundary sizes, three data patterns and write chunk sizes. Another 216
-  raw LZMA2 cases match across dictionary sizes, nice lengths, depth limits,
-  preset dictionaries and explicit flushes. Output SHA-256 values are
-  `230abc013cf9f0d83bd9c063b7078deaa357df7e723bfe3c3a93be345a922059`
-  and `fca8a1077de84220920bfda36a3c4017f3e3619e1337de3e989206d4a1b29550`.
-- An independent diagnostic checks 381,504 exact state transitions against
-  unchanged `encode_bit`: every reachable probability, bits 0/1/2/u32::MAX,
-  normalization/carry cases and injected writer failures. Probabilities,
-  range, low, cache, output bytes and error kinds agree in debug builds.
-- All 27 self-contained vendor tests pass; eight BCJ fixture tests require
-  omitted assets. Vendor Clippy with warnings denied and changed-file
-  rustfmt checks pass.
-- Raw samples, source snapshots, assembly, Opus prompts/results and validation
-  harnesses are retained in sibling `diagnostics/round7-lzma-micro`.
-  Integration and held-out archive validation remain separate.
-
-## Bounded BT4 skips and match distance prices
-
-BT4 skips now batch positions only while a full nice-length window remains
-and neither cyclic wrap nor position normalization can occur. Boundary
-positions retain the scalar path. The inner skip is inlined; hash updates,
-tree traversal, cached matches and search limits remain unchanged. The
-normal parser computes the distance price once per fixed-distance interval
-after the length-dependent states converge at length five. Addition order,
-candidate ordering, strict price ties and endpoint work are preserved.
-
-Validation on Apple Silicon, 2026-10-10:
-
-- Fresh actual Claude Opus 5.5 review approved both changes, conditional on
-  exact-stream tests. Its cached-state test concern was addressed by
-  asserting nonzero cached distance before synthetic normalization.
-- All 1,656 differential streams match the frozen encoder byte for byte,
-  including presets 0-9, flushes, dictionaries and write fragmentation.
-  A real stream crossing the 2.147 GB position normalization boundary also
-  matches the frozen output exactly.
-- A scalar-reference test compares every tree/hash/cache/position state
-  through 72 configurations of dictionary wraps, pending tails, nice
-  lengths and normalization, using random and repetitive input.
-- All 28 self-contained vendor tests pass; eight BCJ tests require fixtures
-  omitted from the vendor tree. Strict vendor Clippy and changed-file
-  rustfmt pass.
-- Differential harnesses, all timing samples (including runs affected by
-  other applications), and independent review records are retained in
-  sibling diagnostics/round8-lzma. Archive-level validation is separate.
-
-## Pipeline bounded BT4 hash-head lookups
-
-Within an existing bounded skip batch, update the current position's hash
-heads, calculate and load the next position's head, then walk the current
-tree. Tree insertion does not change hash tables, so even adjacent hash
-collisions consume exactly the same head. Positions advance only after the
-current walk; the final iteration retains the current hash indices. No
-persistent cache, allocation, preset, search-depth, matching, or unsafe-code
-changes. Boundary positions retain the scalar path.
-
-Validation on Apple Silicon, 2026-10-11, versus `eea9e56`:
-
-- Fresh actual Claude Opus 5.5 proposed cross-position lookup pipelining;
-  an independent fresh final review returned PASS. ARM64 assembly retains
-  the next-head load before the current tree walk.
-- Five alternating raw preset-6 LZMA2 pairs: source median improves
-  2312.329 -> 2126.544 ms (8.0%); mixed improves 1.6%. Text and records
-  are neutral; random, compiled and documents medians are respectively
-  1.1%, 1.9% and 1.3% slower. Samples vary, and a retained host snapshot
-  shows concurrent Chrome and WindowServer activity. The earlier two-pair
-  screen also improves source 7-10%. These are backend measurements;
-  archive-level validation and timing are separate.
-- All 1,656 frozen XZ/LZMA/LZIP/LZMA2 streams remain byte-identical across
-  presets, write fragmentation, flushes and custom dictionary/search options.
-  The 2,147,614,720-byte normalization stream remains exactly 401,263 bytes,
-  SHA-256 `5ea1af6a4ff04040a6177b9eff83c0615bc5821fdf637ebf7ecd587ae4049187`.
-- The expanded scalar-reference test covers 144 configurations, including
-  adjacent all-zero hash collisions, random/repetitive/mixed input,
-  interleaved match finding and skips, tails, wraps and normalization.
-  Matches and every tree/hash/cache/position field agree. All 28 available
-  vendor tests, strict all-target Clippy, rustfmt and diff checks pass;
-  eight BCJ fixture tests need omitted assets.
-- Source snapshots, raw timings, profiles, assembly, exact-stream outputs,
-  host-load evidence and authenticated review/model records are retained
-  in sibling `diagnostics/round10-lzma`.
-
-## Carry the next BT4 hash head across match-finder calls
-
-After `find_matches` updates the current hash tables, load the next
-position's hash4 head before walking the current tree. Cache only the head
-and its absolute position; the next find or skip still calculates all hash
-indices normally. Reading after the current update preserves adjacent
-same-slot collisions. Five available bytes keep the hinted hash below the
-write boundary, so refills, window moves and pending-byte rewinds preserve
-its input. Consumption and position normalization invalidate the hint.
-Search effort, match ordering, presets, allocations and encoded bytes are
-unchanged; two `i32` fields replace a delayed hash-table load. No unsafe code
-is added. Debug builds compare every consumed hint with the live table.
-
-Validation on Apple Silicon, 2026-10-11, versus the accepted skip pipeline
-`9893d1c` (integrated as `e3fc144`):
-
-- Fresh actual Claude Opus 5.5 design and independent final implementation
-  review returned PASS. The reviewer requested refill coverage with live
-  assertions; all 1,656 frozen streams also pass an optimized build with
-  debug assertions enabled (7.7 seconds including compilation).
-- Five alternating raw preset-6 LZMA2 pairs: random median improves
-  2627.907 -> 2001.992 ms (23.8%), mixed 2350.098 -> 2059.524 ms (12.4%),
-  and compiled 644.279 -> 613.182 ms (4.8%). Source, records and documents
-  medians improve 0.4%, 1.8% and 1.3%; text is 0.7% slower. These smaller
-  changes are within observed timing variance. The earlier two-pair screen
-  also improves random, mixed and compiled by 26.4%, 11.6% and 6.1%.
-  All samples are retained; archive-level measurements are separate.
-- All 1,656 frozen XZ/LZMA/LZIP/LZMA2 streams remain byte-identical in
-  release and assertion-enabled builds, covering presets, fragmentation,
-  flushes, preset dictionaries and custom dictionary/search options.
-  The real 2,147,614,720-byte normalization input still produces exactly
-  401,263 bytes, SHA-256
-  `5ea1af6a4ff04040a6177b9eff83c0615bc5821fdf637ebf7ecd587ae4049187`.
-- The 144-configuration debug state test now includes consecutive finds
-  alongside scalar-reference skips, hash collisions, tails, dictionary
-  wraps and normalization. Live-head assertions provide an independent
-  check of the cached value. All 28 available vendor tests, strict
-  all-target Clippy, changed-file rustfmt and diff checks pass; eight BCJ
-  tests require omitted fixture assets.
-- Raw timing pairs, exact-stream outputs, assertion-enabled validation,
-  source snapshots and authenticated final review/model records are in
-  sibling `diagnostics/round10-lzma-hints`. The fresh design review is in
-  `diagnostics/round10-lzma/opus-find-hint-design.json`.
-
-The confirmation records 70 timings (seven corpora, five pairs); the screen
-records another 28. Both fresh reviews resolved to `claude-opus-5-5` via
-`firstParty`. Recorded `modelUsage`: design 18,772 cache-creation input
-tokens, 2 uncached input tokens and 5,345 output tokens (3,268 thinking);
-final review 21,316 cache-creation input tokens, 2 uncached input tokens
-and 3,668 output tokens (2,157 thinking). Neither used cached reads or
-web searches. Full JSON records retain the provider metadata.
 
 ## Expose the fixed eight-bit literal decode count
 

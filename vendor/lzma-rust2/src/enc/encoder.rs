@@ -1,23 +1,16 @@
+//! LZMA encoder, ported from liblzma 5.8.4 (`lzma/lzma_encoder.c`,
+//! `lzma/lzma_encoder_private.h`, `lzma/lzma_common.h`; Igor Pavlov,
+//! Lasse Collin; 0BSD).
+
 use alloc::{vec, vec::Vec};
 
-use super::{
-    encoder_fast::FastEncoderMode,
-    encoder_normal::NormalEncoderMode,
-    lz::{LzEncoder, MfType},
-    range_enc::{RangeEncoder, RangeEncoderBuffer},
-};
+use super::{LzmaOptions, range_enc::RangeEncoder};
 use crate::{
-    ALIGN_BITS, ALIGN_MASK, ALIGN_SIZE, DIST_MODEL_END, DIST_MODEL_START, DIST_STATES,
-    FULL_DISTANCES, LOW_SYMBOLS, LengthCoder, LiteralCoder, LiteralSubCoder, LzmaCoder,
-    MATCH_LEN_MAX, MATCH_LEN_MIN, MID_SYMBOLS, REPS, Write, get_dist_state, state::State,
+    ALIGN_BITS, ALIGN_MASK, ALIGN_SIZE, DIST_MODEL_END, DIST_MODEL_START, DIST_SLOTS, DIST_STATES,
+    FULL_DISTANCES, POS_STATES_MAX, PROB_INIT, REPS,
+    lz::{Action, LzOptions, Match, Mf, MfType, is_enc_dict_size_valid},
+    state::{STATES, State},
 };
-
-const LZMA2_UNCOMPRESSED_LIMIT: u32 = (2 << 20) - MATCH_LEN_MAX as u32;
-const LZMA2_COMPRESSED_LIMIT: u32 = (64 << 10) - 26;
-
-const DIST_PRICE_UPDATE_INTERVAL: u32 = FULL_DISTANCES as u32;
-const ALIGN_PRICE_UPDATE_INTERVAL: u32 = ALIGN_SIZE as u32;
-const PRICE_UPDATE_INTERVAL: usize = 32;
 
 /// The mode to use when encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,841 +21,614 @@ pub enum EncodeMode {
     Normal,
 }
 
-pub(crate) trait LzmaEncoderTrait {
-    fn get_next_symbol(&mut self, encoder: &mut LzmaEncoder) -> u32;
-    fn reset(&mut self) {}
-}
+/// Number of entries in the optimum array.
+pub(crate) const OPTS: usize = 1 << 12;
 
-pub(crate) enum LzmaEncoderModes {
-    Fast(FastEncoderMode),
-    Normal(NormalEncoderMode),
-}
+/// Number of bytes that a single encoding loop in `encode()` can consume
+/// from the dictionary. This limit comes from the optimum functions.
+pub(crate) const LOOP_INPUT_MAX: u32 = OPTS as u32 + 1;
 
-impl LzmaEncoderTrait for LzmaEncoderModes {
-    fn get_next_symbol(&mut self, encoder: &mut LzmaEncoder) -> u32 {
-        match self {
-            LzmaEncoderModes::Fast(a) => a.get_next_symbol(encoder),
-            LzmaEncoderModes::Normal(a) => a.get_next_symbol(encoder),
-        }
-    }
+/// Maximum number of bytes of actual data per LZMA2 chunk (no headers).
+pub(crate) const LZMA2_CHUNK_MAX: u32 = 1 << 16;
 
-    fn reset(&mut self) {
-        match self {
-            LzmaEncoderModes::Fast(a) => a.reset(),
-            LzmaEncoderModes::Normal(a) => a.reset(),
-        }
-    }
-}
+pub(crate) const MATCH_LEN_MIN: u32 = 2;
+pub(crate) const LEN_LOW_BITS: u32 = 3;
+pub(crate) const LEN_LOW_SYMBOLS: u32 = 1 << LEN_LOW_BITS;
+pub(crate) const LEN_MID_BITS: u32 = 3;
+pub(crate) const LEN_MID_SYMBOLS: u32 = 1 << LEN_MID_BITS;
+pub(crate) const LEN_HIGH_BITS: u32 = 8;
+pub(crate) const LEN_HIGH_SYMBOLS: u32 = 1 << LEN_HIGH_BITS;
+pub(crate) const LEN_SYMBOLS: usize =
+    (LEN_LOW_SYMBOLS + LEN_MID_SYMBOLS + LEN_HIGH_SYMBOLS) as usize;
+pub(crate) const MATCH_LEN_MAX: u32 = MATCH_LEN_MIN + LEN_SYMBOLS as u32 - 1;
+pub(crate) const DIST_SLOT_BITS: u32 = 6;
+const LITERAL_CODER_SIZE: usize = 0x300;
 
-pub(crate) struct LzmaEncoder {
-    pub(crate) coder: LzmaCoder,
-    pub(crate) lz: LzEncoder,
-    pub(crate) literal_encoder: LiteralEncoder,
-    pub(crate) match_len_encoder: LengthEncoder,
-    pub(crate) rep_len_encoder: LengthEncoder,
-    pub(crate) data: LzmaEncData,
-}
-
-pub(crate) struct LzmaEncData {
-    pub(crate) nice_len: usize,
-    dist_price_count: i32,
-    align_price_count: i32,
-    dist_slot_prices_size: u32,
-    dist_slot_prices: Vec<Vec<u32>>,
-    full_dist_prices: [[u32; FULL_DISTANCES]; DIST_STATES],
-    align_prices: [u32; ALIGN_SIZE],
-    pub(crate) back: i32,
-    pub(crate) read_ahead: i32,
-    pub(crate) uncompressed_size: u32,
-}
-
-impl LzmaEncoder {
-    pub(crate) fn get_dist_slot(dist: u32) -> u32 {
-        if dist <= DIST_MODEL_START as u32 {
-            return dist;
-        }
-        let mut n = dist;
-        let mut i = 31;
-
-        if (n & 0xFFFF0000) == 0 {
-            n <<= 16;
-            i = 15;
-        }
-
-        if (n & 0xFF000000) == 0 {
-            n <<= 8;
-            i -= 8;
-        }
-
-        if (n & 0xF0000000) == 0 {
-            n <<= 4;
-            i -= 4;
-        }
-
-        if (n & 0xC0000000) == 0 {
-            n <<= 2;
-            i -= 2;
-        }
-
-        if (n & 0x80000000) == 0 {
-            i -= 1;
-        }
-
-        (i << 1) + ((dist >> (i - 1)) & 1)
-    }
-
-    pub(crate) fn get_mem_usage(
-        mode: EncodeMode,
-        dict_size: u32,
-        extra_size_before: u32,
-        mf: MfType,
-    ) -> u32 {
-        let mut m = 80;
-        match mode {
-            EncodeMode::Fast => {
-                m += FastEncoderMode::get_memory_usage(dict_size, extra_size_before, mf);
-            }
-            EncodeMode::Normal => {
-                m += NormalEncoderMode::get_memory_usage(dict_size, extra_size_before, mf);
-            }
-        }
-        m
+/// Index of the probability array for match distances of length `len`.
+#[inline(always)]
+pub(crate) fn get_dist_state(len: u32) -> usize {
+    if len < DIST_STATES as u32 + MATCH_LEN_MIN {
+        (len - MATCH_LEN_MIN) as usize
+    } else {
+        DIST_STATES - 1
     }
 }
 
-impl LzmaEncoder {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        mode: EncodeMode,
-        lc: u32,
-        lp: u32,
-        pb: u32,
-        mf: MfType,
-        depth_limit: i32,
-        dict_size: u32,
-        nice_len: usize,
-    ) -> (Self, LzmaEncoderModes) {
-        let fast_mode = mode == EncodeMode::Fast;
-        let mut mode: LzmaEncoderModes = if fast_mode {
-            LzmaEncoderModes::Fast(FastEncoderMode::default())
-        } else {
-            LzmaEncoderModes::Normal(NormalEncoderMode::new())
-        };
-        let (extra_size_before, extra_size_after) = if fast_mode {
-            (
-                FastEncoderMode::EXTRA_SIZE_BEFORE,
-                FastEncoderMode::EXTRA_SIZE_AFTER,
-            )
-        } else {
-            (
-                NormalEncoderMode::EXTRA_SIZE_BEFORE,
-                NormalEncoderMode::EXTRA_SIZE_AFTER,
-            )
-        };
-        let lz = match mf {
-            MfType::Hc4 => LzEncoder::new_hc4(
-                dict_size,
-                extra_size_before,
-                extra_size_after,
-                nice_len as _,
-                MATCH_LEN_MAX as _,
-                depth_limit,
-            ),
-            MfType::Bt4 => LzEncoder::new_bt4(
-                dict_size,
-                extra_size_before,
-                extra_size_after,
-                nice_len as _,
-                MATCH_LEN_MAX as _,
-                depth_limit,
-            ),
-        };
-
-        let literal_encoder = LiteralEncoder::new(lc, lp);
-        let match_len_encoder = LengthEncoder::new(pb, nice_len);
-        let rep_len_encoder = LengthEncoder::new(pb, nice_len);
-        let dist_slot_price_size = LzmaEncoder::get_dist_slot(dict_size - 1) + 1;
-        let mut e = Self {
-            coder: LzmaCoder::new(pb as usize),
-            lz,
-            literal_encoder,
-            match_len_encoder,
-            rep_len_encoder,
-            data: LzmaEncData {
-                nice_len,
-                dist_price_count: 0,
-                align_price_count: 0,
-                dist_slot_prices_size: dist_slot_price_size,
-                dist_slot_prices: vec![vec![0; dist_slot_price_size as usize]; DIST_STATES],
-                full_dist_prices: [[0; FULL_DISTANCES]; DIST_STATES],
-                align_prices: Default::default(),
-                back: 0,
-                read_ahead: -1,
-                uncompressed_size: 0,
-            },
-        };
-        e.reset(&mut mode);
-
-        (e, mode)
-    }
-
-    pub(crate) fn reset(&mut self, mode: &mut dyn LzmaEncoderTrait) {
-        self.coder.reset();
-        self.literal_encoder.reset();
-        self.match_len_encoder.reset();
-        self.rep_len_encoder.reset();
-        self.data.dist_price_count = 0;
-        self.data.align_price_count = 0;
-        self.data.uncompressed_size += (self.data.read_ahead + 1) as u32;
-        self.data.read_ahead = -1;
-        mode.reset();
-    }
-
-    #[inline(always)]
-    pub(crate) fn reset_uncompressed_size(&mut self) {
-        self.data.uncompressed_size = 0;
-    }
-
-    #[allow(unused)]
-    pub(crate) fn encode_for_lzma1<W: Write>(
-        &mut self,
-        rc: &mut RangeEncoder<W>,
-        mode: &mut dyn LzmaEncoderTrait,
-    ) -> crate::Result<()> {
-        if !self.lz.is_started() && !self.encode_init(rc)? {
-            return Ok(());
-        }
-        while self.encode_symbol(rc, mode)? {}
-        Ok(())
-    }
-
-    #[allow(unused)]
-    pub(crate) fn encode_lzma1_end_marker<W: Write>(
-        &mut self,
-        rc: &mut RangeEncoder<W>,
-    ) -> crate::Result<()> {
-        let pos_state = (self.lz.get_pos() - self.data.read_ahead) as u32 & self.coder.pos_mask;
-        rc.encode_bit(
-            &mut self.coder.is_match[self.coder.state.get() as usize],
-            pos_state as usize,
-            1,
-        )?;
-        rc.encode_bit(&mut self.coder.is_rep, self.coder.state.get() as usize, 0)?;
-        self.encode_match(u32::MAX, MATCH_LEN_MIN as u32, pos_state, rc)?;
-        Ok(())
-    }
-
-    fn encode_init<W: Write>(&mut self, rc: &mut RangeEncoder<W>) -> crate::Result<bool> {
-        debug_assert_eq!(self.data.read_ahead, -1);
-        if !self.lz.has_enough_data(0) {
-            return Ok(false);
-        }
-        self.skip(1);
-        let state = self.coder.state.get() as usize;
-        rc.encode_bit(&mut self.coder.is_match[state], 0, 0)?;
-        self.literal_encoder
-            .encode_init(&self.lz, &self.data, &mut self.coder, rc)?;
-        self.data.read_ahead -= 1;
-        debug_assert_eq!(self.data.read_ahead, -1);
-        self.data.uncompressed_size += 1;
-        debug_assert_eq!(self.data.uncompressed_size, 1);
-        Ok(true)
-    }
-
-    fn encode_symbol<W: Write>(
-        &mut self,
-        rc: &mut RangeEncoder<W>,
-        mode: &mut dyn LzmaEncoderTrait,
-    ) -> crate::Result<bool> {
-        if !self.lz.has_enough_data(self.data.read_ahead + 1) {
-            return Ok(false);
-        }
-        let len = mode.get_next_symbol(self);
-
-        debug_assert!(self.data.read_ahead >= 0);
-        let pos_state = (self.lz.get_pos() - self.data.read_ahead) as u32 & self.coder.pos_mask;
-
-        if self.data.back == -1 {
-            debug_assert_eq!(len, 1);
-            let state = self.coder.state.get() as usize;
-            rc.encode_bit(&mut self.coder.is_match[state], pos_state as _, 0)?;
-            self.literal_encoder
-                .encode(&self.lz, &self.data, &mut self.coder, rc)?;
-        } else {
-            let state = self.coder.state.get() as usize;
-            rc.encode_bit(&mut self.coder.is_match[state], pos_state as usize, 1)?;
-            if self.data.back < REPS as i32 {
-                let state = self.coder.state.get() as usize;
-                rc.encode_bit(&mut self.coder.is_rep, state, 1)?;
-                self.encode_rep_match(self.data.back as u32, len, pos_state, rc)?;
-            } else {
-                let state = self.coder.state.get() as usize;
-                rc.encode_bit(&mut self.coder.is_rep, state, 0)?;
-                self.encode_match((self.data.back - REPS as i32) as u32, len, pos_state, rc)?;
-            }
-        }
-        self.data.read_ahead -= len as i32;
-        self.data.uncompressed_size += len;
-        Ok(true)
-    }
-
-    fn encode_match<W: Write>(
-        &mut self,
-        dist: u32,
-        len: u32,
-        pos_state: u32,
-        rc: &mut RangeEncoder<W>,
-    ) -> crate::Result<()> {
-        self.coder.state.update_match();
-        self.match_len_encoder.encode(len, pos_state, rc)?;
-        let dist_slot = LzmaEncoder::get_dist_slot(dist);
-        rc.encode_bit_tree(
-            &mut self.coder.dist_slots[get_dist_state(len) as usize],
-            dist_slot,
-        )?;
-
-        if dist_slot as usize >= DIST_MODEL_START {
-            let footer_bits = (dist_slot >> 1).wrapping_sub(1);
-            let base = (2 | (dist_slot & 1)) << footer_bits;
-            let dist_reduced = dist - base;
-
-            if dist_slot < DIST_MODEL_END as u32 {
-                rc.encode_reverse_bit_tree(
-                    self.coder
-                        .get_dist_special(dist_slot as usize - DIST_MODEL_START),
-                    dist_reduced,
-                )?;
-            } else {
-                rc.encode_direct_bits(dist_reduced >> ALIGN_BITS, footer_bits - ALIGN_BITS as u32)?;
-                rc.encode_reverse_bit_tree(
-                    &mut self.coder.dist_align,
-                    dist_reduced & ALIGN_MASK as u32,
-                )?;
-                self.data.align_price_count -= 1;
-            }
-        }
-
-        self.coder.reps[3] = self.coder.reps[2];
-        self.coder.reps[2] = self.coder.reps[1];
-        self.coder.reps[1] = self.coder.reps[0];
-        self.coder.reps[0] = dist as i32;
-
-        self.data.dist_price_count -= 1;
-        Ok(())
-    }
-
-    fn encode_rep_match<W: Write>(
-        &mut self,
-        rep: u32,
-        len: u32,
-        pos_state: u32,
-        rc: &mut RangeEncoder<W>,
-    ) -> crate::Result<()> {
-        if rep == 0 {
-            let state = self.coder.state.get() as usize;
-            rc.encode_bit(&mut self.coder.is_rep0, state, 0)?;
-            let state = self.coder.state.get() as usize;
-            rc.encode_bit(
-                &mut self.coder.is_rep0_long[state],
-                pos_state as usize,
-                if len == 1 { 0 } else { 1 },
-            )?;
-        } else {
-            let dist = self.coder.reps[rep as usize];
-            let state = self.coder.state.get() as usize;
-
-            rc.encode_bit(&mut self.coder.is_rep0, state, 1)?;
-
-            if rep == 1 {
-                let state = self.coder.state.get() as usize;
-                rc.encode_bit(&mut self.coder.is_rep1, state, 0)?;
-            } else {
-                let state = self.coder.state.get() as usize;
-                rc.encode_bit(&mut self.coder.is_rep1, state, 1)?;
-                let state = self.coder.state.get() as usize;
-                rc.encode_bit(&mut self.coder.is_rep2, state, rep - 2)?;
-
-                if rep == 3 {
-                    self.coder.reps[3] = self.coder.reps[2];
-                }
-                self.coder.reps[2] = self.coder.reps[1];
-            }
-
-            self.coder.reps[1] = self.coder.reps[0];
-            self.coder.reps[0] = dist;
-        }
-
-        if len == 1 {
-            self.coder.state.update_short_rep();
-        } else {
-            self.rep_len_encoder.encode(len, pos_state, rc)?;
-            self.coder.state.update_long_rep();
-        }
-        Ok(())
-    }
-
-    pub(crate) fn find_matches(&mut self) {
-        self.data.read_ahead += 1;
-        self.lz.find_matches();
-        debug_assert!(self.lz.verify_matches());
-    }
-
-    pub(crate) fn skip(&mut self, len: usize) {
-        self.data.read_ahead += len as i32;
-        self.lz.skip(len)
-    }
-
-    pub(crate) fn get_any_match_price(&self, state: &State, pos_state: u32) -> u32 {
-        RangeEncoder::get_bit_price(
-            self.coder.is_match[state.get() as usize][pos_state as usize] as _,
-            1,
-        )
-    }
-
-    pub(crate) fn get_normal_match_price(&self, any_match_price: u32, state: &State) -> u32 {
-        any_match_price
-            + RangeEncoder::get_bit_price(self.coder.is_rep[state.get() as usize] as _, 0)
-    }
-
-    pub(crate) fn get_any_rep_price(&self, any_match_price: u32, state: &State) -> u32 {
-        any_match_price
-            + RangeEncoder::get_bit_price(self.coder.is_rep[state.get() as usize] as _, 1)
-    }
-
-    pub(crate) fn get_short_rep_price(
-        &self,
-        any_rep_price: u32,
-        state: &State,
-        pos_state: u32,
-    ) -> u32 {
-        any_rep_price
-            + RangeEncoder::get_bit_price(self.coder.is_rep0[state.get() as usize] as _, 0)
-            + RangeEncoder::get_bit_price(
-                self.coder.is_rep0_long[state.get() as usize][pos_state as usize] as _,
-                0,
-            )
-    }
-
-    pub(crate) fn get_long_rep_price(
-        &self,
-        any_rep_price: u32,
-        rep: u32,
-        state: &State,
-        pos_state: u32,
-    ) -> u32 {
-        let mut price = any_rep_price;
-
-        if rep == 0 {
-            price += RangeEncoder::get_bit_price(self.coder.is_rep0[state.get() as usize] as _, 0)
-                + RangeEncoder::get_bit_price(
-                    self.coder.is_rep0_long[state.get() as usize][pos_state as usize] as _,
-                    1,
-                );
-        } else {
-            price += RangeEncoder::get_bit_price(self.coder.is_rep0[state.get() as usize] as _, 1);
-
-            if rep == 1 {
-                price +=
-                    RangeEncoder::get_bit_price(self.coder.is_rep1[state.get() as usize] as _, 0)
-            } else {
-                price +=
-                    RangeEncoder::get_bit_price(self.coder.is_rep1[state.get() as usize] as _, 1)
-                        + RangeEncoder::get_bit_price(
-                            self.coder.is_rep2[state.get() as usize] as _,
-                            rep as i32 - 2,
-                        );
-            }
-        }
-
-        price
-    }
-
-    pub(crate) fn get_long_rep_and_len_price(
-        &self,
-        rep: u32,
-        len: u32,
-        state: &State,
-        pos_state: u32,
-    ) -> u32 {
-        let any_match_price = self.get_any_match_price(state, pos_state);
-        let any_rep_price = self.get_any_rep_price(any_match_price, state);
-        let long_rep_price = self.get_long_rep_price(any_rep_price, rep, state, pos_state);
-        long_rep_price + self.rep_len_encoder.get_price(len as _, pos_state as _)
-    }
-
-    pub(crate) fn get_match_distance_price(&self, dist: u32, len: u32) -> u32 {
-        let dist_state = get_dist_state(len);
-        if dist < FULL_DISTANCES as u32 {
-            self.data.full_dist_prices[dist_state as usize][dist as usize]
-        } else {
-            // dist_slot_prices includes the price of direct bits.
-            let dist_slot = LzmaEncoder::get_dist_slot(dist);
-            self.data.dist_slot_prices[dist_state as usize][dist_slot as usize]
-                + self.data.align_prices[(dist & ALIGN_MASK as u32) as usize]
-        }
-    }
-
-    pub(crate) fn update_dist_prices(&mut self) {
-        self.data.dist_price_count = DIST_PRICE_UPDATE_INTERVAL as _;
-
-        for dist_state in 0..DIST_STATES {
-            for dist_slot in 0..self.data.dist_slot_prices_size as usize {
-                self.data.dist_slot_prices[dist_state][dist_slot] =
-                    RangeEncoder::get_bit_tree_price(
-                        &mut self.coder.dist_slots[dist_state],
-                        dist_slot as u32,
-                    );
-            }
-
-            for dist_slot in DIST_MODEL_END as u32..self.data.dist_slot_prices_size {
-                let count = (dist_slot >> 1) - 1 - ALIGN_BITS as u32;
-                self.data.dist_slot_prices[dist_state][dist_slot as usize] +=
-                    RangeEncoder::get_direct_bits_price(count);
-            }
-
-            for dist in 0..DIST_MODEL_START {
-                self.data.full_dist_prices[dist_state][dist] =
-                    self.data.dist_slot_prices[dist_state][dist];
-            }
-        }
-
-        let mut dist = DIST_MODEL_START;
-        for dist_slot in DIST_MODEL_START..DIST_MODEL_END {
-            let footer_bits = (dist_slot >> 1) - 1;
-            let base = (2 | (dist_slot & 1)) << footer_bits;
-
-            let limit = self
-                .coder
-                .get_dist_special(dist_slot - DIST_MODEL_START)
-                .len();
-            for _i in 0..limit {
-                let dist_reduced = dist - base;
-                let price = RangeEncoder::get_reverse_bit_tree_price(
-                    self.coder.get_dist_special(dist_slot - DIST_MODEL_START),
-                    dist_reduced as u32,
-                );
-
-                for dist_state in 0..DIST_STATES {
-                    self.data.full_dist_prices[dist_state][dist] =
-                        self.data.dist_slot_prices[dist_state][dist_slot] + price;
-                }
-                dist += 1;
-            }
-        }
-
-        debug_assert_eq!(dist, FULL_DISTANCES);
-    }
-
-    fn update_align_prices(&mut self) {
-        self.data.align_price_count = ALIGN_PRICE_UPDATE_INTERVAL as i32;
-
-        for i in 0..ALIGN_SIZE {
-            self.data.align_prices[i] =
-                RangeEncoder::get_reverse_bit_tree_price(&mut self.coder.dist_align, i as u32);
-        }
-    }
-
-    pub(crate) fn update_prices(&mut self) {
-        if self.data.dist_price_count <= 0 {
-            self.update_dist_prices();
-        }
-
-        if self.data.align_price_count <= 0 {
-            self.update_align_prices();
-        }
-        self.match_len_encoder.update_prices();
-        self.rep_len_encoder.update_prices();
-    }
-}
-
-impl LzmaEncoder {
-    pub fn encode_for_lzma2(
-        &mut self,
-        rc: &mut RangeEncoder<RangeEncoderBuffer>,
-        mode: &mut dyn LzmaEncoderTrait,
-    ) -> crate::Result<bool> {
-        if !self.lz.is_started() && !self.encode_init(rc)? {
-            return Ok(false);
-        }
-        while self.data.uncompressed_size <= LZMA2_UNCOMPRESSED_LIMIT
-            && rc.get_pending_size() <= LZMA2_COMPRESSED_LIMIT
-        {
-            if !self.encode_symbol(rc, mode)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-}
-
-pub(crate) struct LiteralEncoder {
-    coder: LiteralCoder,
-    sub_encoders: Vec<LiteralSubEncoder>,
-}
-
-#[derive(Clone)]
-struct LiteralSubEncoder {
-    coder: LiteralSubCoder,
-}
-
-impl LiteralEncoder {
-    pub(crate) fn new(lc: u32, lp: u32) -> Self {
-        Self {
-            coder: LiteralCoder::new(lc, lp),
-            sub_encoders: vec![LiteralSubEncoder::new(); 1 << (lc + lp)],
-        }
-    }
-
-    pub(crate) fn reset(&mut self) {
-        for ele in self.sub_encoders.iter_mut() {
-            ele.reset();
-        }
-    }
-
-    pub(crate) fn encode_init<W: Write>(
-        &mut self,
-        lz: &LzEncoder,
-        data: &LzmaEncData,
-        coder: &mut LzmaCoder,
-        rc: &mut RangeEncoder<W>,
-    ) -> crate::Result<()> {
-        debug_assert!(data.read_ahead >= 0);
-        self.sub_encoders[0].encode(lz, data, coder, rc)
-    }
-
-    pub(crate) fn encode<W: Write>(
-        &mut self,
-        lz: &LzEncoder,
-        data: &LzmaEncData,
-        coder: &mut LzmaCoder,
-        rc: &mut RangeEncoder<W>,
-    ) -> crate::Result<()> {
-        debug_assert!(data.read_ahead >= 0);
-        let i = self.coder.get_sub_coder_index(
-            lz.get_byte_backward(1 + data.read_ahead) as _,
-            (lz.get_pos() - data.read_ahead) as u32,
-        );
-        self.sub_encoders[i as usize].encode(lz, data, coder, rc)
-    }
-
-    pub(crate) fn get_price(
-        &self,
-        encoder: &LzmaEncoder,
-        cur_byte: u32,
-        match_byte: u32,
-        prev_byte: u32,
-        pos: u32,
-        state: &State,
-    ) -> u32 {
-        let mut price = RangeEncoder::get_bit_price(
-            encoder.coder.is_match[state.get() as usize][(pos & encoder.coder.pos_mask) as usize]
-                as _,
-            0,
-        );
-        let i = self.coder.get_sub_coder_index(prev_byte, pos) as usize;
-        price += if state.is_literal() {
-            self.sub_encoders[i].get_normal_price(cur_byte)
-        } else {
-            self.sub_encoders[i].get_matched_price(cur_byte, match_byte)
-        };
-        price
-    }
-}
-
-impl LiteralSubEncoder {
-    fn new() -> Self {
-        Self {
-            coder: LiteralSubCoder::new(),
-        }
-    }
-
-    fn reset(&mut self) {
-        self.coder.reset()
-    }
-
-    fn encode<W: Write>(
-        &mut self,
-        lz: &LzEncoder,
-        data: &LzmaEncData,
-        coder: &mut LzmaCoder,
-        rc: &mut RangeEncoder<W>,
-    ) -> crate::Result<()> {
-        let mut symbol = lz.get_byte_backward(data.read_ahead) as u32 | 0x100;
-
-        if coder.state.is_literal() {
-            let mut subencoder_index;
-            let mut bit;
-
-            loop {
-                subencoder_index = symbol >> 8;
-                bit = (symbol >> 7) & 1;
-                rc.encode_bit_unpredictable(
-                    &mut self.coder.probs,
-                    subencoder_index as _,
-                    bit as _,
-                )?;
-                symbol <<= 1;
-                if symbol >= 0x10000 {
-                    break;
-                }
-            }
-        } else {
-            let mut match_byte = lz.get_byte_backward(coder.reps[0] + 1 + data.read_ahead) as u32;
-            let mut offset = 0x100;
-            let mut subencoder_index;
-            let mut match_bit;
-            let mut bit;
-
-            loop {
-                match_byte <<= 1;
-                match_bit = match_byte & offset;
-                subencoder_index = offset + match_bit + (symbol >> 8);
-                bit = (symbol >> 7) & 1;
-                rc.encode_bit(&mut self.coder.probs, subencoder_index as _, bit)?;
-                symbol <<= 1;
-                offset &= !(match_byte ^ symbol);
-                if symbol >= 0x10000 {
-                    break;
-                }
-            }
-        }
-
-        coder.state.update_literal();
-        Ok(())
-    }
-
-    fn get_normal_price(&self, symbol: u32) -> u32 {
-        let mut price: u32 = 0;
-        let mut subencoder_index;
-        let mut bit;
-        let mut symbol = symbol | 0x100;
-        loop {
-            subencoder_index = symbol >> 8;
-            bit = (symbol >> 7) & 1;
-            price += RangeEncoder::get_bit_price(
-                self.coder.probs[subencoder_index as usize] as _,
-                bit as _,
-            );
-            symbol <<= 1;
-            if symbol >= (0x100 << 8) {
-                break;
-            }
-        }
-        price
-    }
-
-    fn get_matched_price(&self, symbol: u32, mut match_byte: u32) -> u32 {
-        let mut price = 0;
-        let mut offset = 0x100;
-        let mut subencoder_index;
-        let mut match_bit;
-        let mut bit;
-        let mut symbol = symbol | 0x100;
-        loop {
-            match_byte <<= 1;
-            match_bit = match_byte & offset;
-            subencoder_index = offset + match_bit + (symbol >> 8);
-            bit = (symbol >> 7) & 1;
-            price += RangeEncoder::get_bit_price(
-                self.coder.probs[subencoder_index as usize] as _,
-                bit as _,
-            );
-            symbol <<= 1;
-            offset &= !(match_byte ^ symbol);
-            if symbol >= (0x100 << 8) {
-                break;
-            }
-        }
-        price
+/// The highest two bits of a match distance (distance slot), as in
+/// `fastpos.h`.
+#[inline(always)]
+pub(crate) fn get_dist_slot(dist: u32) -> u32 {
+    if dist <= 4 {
+        dist
+    } else {
+        let i = 31 - dist.leading_zeros();
+        (i + i) + ((dist >> (i - 1)) & 1)
     }
 }
 
 pub(crate) struct LengthEncoder {
-    coder: LengthCoder,
-    counters: Vec<i32>,
-    prices: Vec<Vec<u32>>,
+    pub(crate) choice: u16,
+    pub(crate) choice2: u16,
+    pub(crate) low: [[u16; LEN_LOW_SYMBOLS as usize]; POS_STATES_MAX],
+    pub(crate) mid: [[u16; LEN_MID_SYMBOLS as usize]; POS_STATES_MAX],
+    pub(crate) high: [u16; LEN_HIGH_SYMBOLS as usize],
+    pub(crate) prices: [[u32; LEN_SYMBOLS]; POS_STATES_MAX],
+    pub(crate) table_size: u32,
+    counters: [u32; POS_STATES_MAX],
 }
 
 impl LengthEncoder {
-    pub(crate) fn new(pb: u32, nice_len: usize) -> Self {
-        let pos_states = 1usize << pb;
-        let counters = vec![0; pos_states];
-        let len_symbols = (nice_len - MATCH_LEN_MIN + 1).max(LOW_SYMBOLS + MID_SYMBOLS);
-        let prices = vec![vec![0; len_symbols]; pos_states];
+    fn new(table_size: u32) -> Self {
         Self {
-            coder: LengthCoder::new(),
-            counters,
-            prices,
+            choice: PROB_INIT,
+            choice2: PROB_INIT,
+            low: [[PROB_INIT; LEN_LOW_SYMBOLS as usize]; POS_STATES_MAX],
+            mid: [[PROB_INIT; LEN_MID_SYMBOLS as usize]; POS_STATES_MAX],
+            high: [PROB_INIT; LEN_HIGH_SYMBOLS as usize],
+            prices: [[0; LEN_SYMBOLS]; POS_STATES_MAX],
+            table_size,
+            counters: [0; POS_STATES_MAX],
         }
     }
 
-    fn reset(&mut self) {
-        self.coder.reset();
-        self.counters.fill(0);
-    }
+    fn update_prices(&mut self, pos_state: usize) {
+        use super::range_enc::{bit_0_price, bit_1_price, bittree_price};
+        let table_size = self.table_size;
+        self.counters[pos_state] = table_size;
 
-    fn encode<W: Write>(
-        &mut self,
-        len: u32,
-        pos_state: u32,
-        rc: &mut RangeEncoder<W>,
-    ) -> crate::Result<()> {
-        let mut len = len as usize - MATCH_LEN_MIN;
-        if len < LOW_SYMBOLS {
-            rc.encode_bit(&mut self.coder.choice, 0, 0)?;
-            rc.encode_bit_tree(&mut self.coder.low[pos_state as usize], len as _)?;
-        } else {
-            rc.encode_bit(&mut self.coder.choice, 0, 1)?;
-            len -= LOW_SYMBOLS;
-            if len < MID_SYMBOLS {
-                rc.encode_bit(&mut self.coder.choice, 1, 0)?;
-                rc.encode_bit_tree(&mut self.coder.mid[pos_state as usize], len as _)?;
-            } else {
-                rc.encode_bit(&mut self.coder.choice, 1, 1)?;
-                rc.encode_bit_tree(&mut self.coder.high, (len - MID_SYMBOLS) as _)?;
-            }
+        let a0 = bit_0_price(self.choice);
+        let a1 = bit_1_price(self.choice);
+        let b0 = a1 + bit_0_price(self.choice2);
+        let b1 = a1 + bit_1_price(self.choice2);
+        let prices = &mut self.prices[pos_state];
+
+        let mut i = 0;
+        while i < table_size && i < LEN_LOW_SYMBOLS {
+            prices[i as usize] = a0 + bittree_price(&self.low[pos_state], LEN_LOW_BITS, i);
+            i += 1;
         }
-        self.counters[pos_state as usize] = self.counters[pos_state as usize].wrapping_sub(1);
-        Ok(())
-    }
-
-    pub(crate) fn get_price(&self, len: usize, pos_state: usize) -> u32 {
-        self.prices[pos_state][len - MATCH_LEN_MIN]
-    }
-
-    fn update_prices(&mut self) {
-        for pos_state in 0..self.counters.len() {
-            if self.counters[pos_state] <= 0 {
-                self.counters[pos_state] = PRICE_UPDATE_INTERVAL as _;
-                self.update_prices_with_state(pos_state);
-            }
+        while i < table_size && i < LEN_LOW_SYMBOLS + LEN_MID_SYMBOLS {
+            prices[i as usize] =
+                b0 + bittree_price(&self.mid[pos_state], LEN_MID_BITS, i - LEN_LOW_SYMBOLS);
+            i += 1;
         }
-    }
-
-    fn update_prices_with_state(&mut self, pos_state: usize) {
-        let mut choice0_price = RangeEncoder::get_bit_price(self.coder.choice[0] as _, 0);
-        let mut start = 0;
-        for i in start..LOW_SYMBOLS {
-            self.prices[pos_state][i] = choice0_price
-                + RangeEncoder::get_bit_tree_price(&mut self.coder.low[pos_state], i as _);
-        }
-        start = LOW_SYMBOLS;
-        choice0_price = RangeEncoder::get_bit_price(self.coder.choice[0] as _, 1);
-        let mut choice1_price = RangeEncoder::get_bit_price(self.coder.choice[1] as _, 0);
-        for i in start..(LOW_SYMBOLS + MID_SYMBOLS) {
-            self.prices[pos_state][i] = choice0_price
-                + choice1_price
-                + RangeEncoder::get_bit_tree_price(
-                    &mut self.coder.mid[pos_state],
-                    (i - start) as u32,
+        while i < table_size {
+            prices[i as usize] = b1
+                + bittree_price(
+                    &self.high,
+                    LEN_HIGH_BITS,
+                    i - LEN_LOW_SYMBOLS - LEN_MID_SYMBOLS,
                 );
+            i += 1;
         }
-        start = LOW_SYMBOLS + MID_SYMBOLS;
-        choice1_price = RangeEncoder::get_bit_price(self.coder.choice[1] as _, 1);
-        for i in start..self.prices[pos_state].len() {
-            self.prices[pos_state][i] = choice0_price
-                + choice1_price
-                + RangeEncoder::get_bit_tree_price(&mut self.coder.high, (i - start) as u32)
+    }
+
+    fn reset(&mut self, num_pos_states: usize, fast_mode: bool) {
+        let table_size = self.table_size;
+        *self = Self::new(table_size);
+        if !fast_mode {
+            for pos_state in 0..num_pos_states {
+                self.update_prices(pos_state);
+            }
         }
+    }
+
+    #[inline(always)]
+    fn encode(&mut self, rc: &mut RangeEncoder, pos_state: usize, len: u32, fast_mode: bool) {
+        // Only getoptimum uses the prices so don't update the table when
+        // in fast mode. liblzma queues the bits of a symbol and updates
+        // the probabilities only after the symbol, so the prices are those
+        // from before encoding this length.
+        if !fast_mode {
+            self.counters[pos_state] -= 1;
+            if self.counters[pos_state] == 0 {
+                self.update_prices(pos_state);
+            }
+        }
+
+        debug_assert!(len <= MATCH_LEN_MAX);
+        let mut len = len - MATCH_LEN_MIN;
+        if len < LEN_LOW_SYMBOLS {
+            rc.bit(&mut self.choice, 0);
+            rc.bittree(&mut self.low[pos_state], LEN_LOW_BITS, len);
+        } else {
+            rc.bit(&mut self.choice, 1);
+            len -= LEN_LOW_SYMBOLS;
+            if len < LEN_MID_SYMBOLS {
+                rc.bit(&mut self.choice2, 0);
+                rc.bittree(&mut self.mid[pos_state], LEN_MID_BITS, len);
+            } else {
+                rc.bit(&mut self.choice2, 1);
+                len -= LEN_MID_SYMBOLS;
+                rc.bittree(&mut self.high, LEN_HIGH_BITS, len);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Optimal {
+    pub(crate) state: State,
+    pub(crate) prev_1_is_literal: bool,
+    pub(crate) prev_2: bool,
+    pub(crate) pos_prev_2: u32,
+    pub(crate) back_prev_2: u32,
+    pub(crate) price: u32,
+    pub(crate) pos_prev: u32,
+    pub(crate) back_prev: u32,
+    pub(crate) backs: [u32; REPS],
+}
+
+/// `lzma_lzma1_encoder`
+pub(crate) struct LzmaEncoder {
+    pub(crate) rc: RangeEncoder,
+    /// Uncompressed size (doesn't include possible preset dictionary)
+    pub(crate) uncomp_size: u64,
+    pub(crate) state: State,
+    /// The four most recent match distances
+    pub(crate) reps: [u32; REPS],
+    pub(crate) matches: [Match; MATCH_LEN_MAX as usize + 1],
+    pub(crate) matches_count: u32,
+    /// The length of the longest match between calls to the optimum
+    /// functions.
+    pub(crate) longest_match_length: u32,
+    pub(crate) fast_mode: bool,
+    /// True if the encoder has been initialized by encoding the first
+    /// byte as a literal.
+    is_initialized: bool,
+    use_eopm: bool,
+    pub(crate) pos_mask: u32,
+    pub(crate) literal_context_bits: u32,
+    pub(crate) literal_mask: u32,
+    lc: u32,
+    lp: u32,
+    pb: u32,
+    pub(crate) literal: Vec<u16>,
+    pub(crate) is_match: [[u16; POS_STATES_MAX]; STATES],
+    pub(crate) is_rep: [u16; STATES],
+    pub(crate) is_rep0: [u16; STATES],
+    pub(crate) is_rep1: [u16; STATES],
+    pub(crate) is_rep2: [u16; STATES],
+    pub(crate) is_rep0_long: [[u16; POS_STATES_MAX]; STATES],
+    pub(crate) dist_slot: [[u16; DIST_SLOTS]; DIST_STATES],
+    pub(crate) dist_special: [u16; FULL_DISTANCES - DIST_MODEL_END],
+    pub(crate) dist_align: [u16; ALIGN_SIZE],
+    pub(crate) match_len_encoder: LengthEncoder,
+    pub(crate) rep_len_encoder: LengthEncoder,
+    pub(crate) dist_slot_prices: [[u32; DIST_SLOTS]; DIST_STATES],
+    pub(crate) dist_prices: [[u32; FULL_DISTANCES]; DIST_STATES],
+    pub(crate) dist_table_size: u32,
+    pub(crate) match_price_count: u32,
+    pub(crate) align_prices: [u32; ALIGN_SIZE],
+    pub(crate) align_price_count: u32,
+    pub(crate) opts_end_index: u32,
+    pub(crate) opts_current_index: u32,
+    pub(crate) opts: Vec<Optimal>,
+}
+
+/// Options adjusted as liblzma's encoder sees them, with out-of-range
+/// values clamped.
+pub(crate) struct Settings {
+    pub(crate) dict_size: u32,
+    pub(crate) nice_len: u32,
+    pub(crate) lc: u32,
+    pub(crate) lp: u32,
+    pub(crate) pb: u32,
+}
+
+impl Settings {
+    pub(crate) fn new(options: &LzmaOptions) -> Self {
+        let dict_size = options
+            .dict_size
+            .clamp(crate::DICT_SIZE_MIN, (1 << 30) + (1 << 29));
+        debug_assert!(is_enc_dict_size_valid(dict_size));
+        Self {
+            dict_size,
+            // The encoder ensures that nice_len is big enough for the
+            // selected match finder.
+            nice_len: options
+                .nice_len
+                .clamp(MATCH_LEN_MIN, MATCH_LEN_MAX)
+                .max(options.mf.hash_bytes()),
+            lc: options.lc.min(8),
+            lp: options.lp.min(4),
+            pb: options.pb.min(4),
+        }
+    }
+
+    /// The LZ encoder options for LZMA (`set_lz_options()`), with
+    /// `before_size` raised to keep LZMA2's uncompressed chunks available.
+    pub(crate) fn lz_options<'a>(&self, options: &'a LzmaOptions, lzma2: bool) -> LzOptions<'a> {
+        let mut before_size = OPTS as u32;
+        if lzma2 && before_size + self.dict_size < LZMA2_CHUNK_MAX {
+            before_size = LZMA2_CHUNK_MAX - self.dict_size;
+        }
+        LzOptions {
+            before_size,
+            dict_size: self.dict_size,
+            after_size: LOOP_INPUT_MAX,
+            match_len_max: MATCH_LEN_MAX,
+            nice_len: self.nice_len,
+            match_finder: options.mf,
+            depth: options.depth_limit.max(0) as u32,
+            preset_dict: options.preset_dict.as_deref(),
+        }
+    }
+}
+
+impl LzmaEncoder {
+    /// `lzma_lzma_encoder_create()`: LZMA1 streams end with an end of
+    /// payload marker if `use_eopm`; LZMA2 never uses one.
+    pub(crate) fn new(options: &LzmaOptions, settings: &Settings, use_eopm: bool) -> Self {
+        let fast_mode = options.mode == EncodeMode::Fast;
+        // Round the dictionary size up to next 2^n.
+        let log_size = 32 - (settings.dict_size - 1).leading_zeros();
+        // Length encoders' price table size
+        let table_size = settings.nice_len + 1 - MATCH_LEN_MIN;
+        let mut e = Self {
+            rc: RangeEncoder::new(Vec::new()),
+            uncomp_size: 0,
+            state: State::new(),
+            reps: [0; REPS],
+            matches: [Match::default(); MATCH_LEN_MAX as usize + 1],
+            matches_count: 0,
+            longest_match_length: 0,
+            fast_mode,
+            // We don't need to write the first byte as literal if there is
+            // a non-empty preset dictionary.
+            is_initialized: options.preset_dict.as_ref().is_some_and(|d| !d.is_empty()),
+            use_eopm,
+            pos_mask: 0,
+            literal_context_bits: 0,
+            literal_mask: 0,
+            lc: settings.lc,
+            lp: settings.lp,
+            pb: settings.pb,
+            literal: vec![PROB_INIT; LITERAL_CODER_SIZE << (settings.lc + settings.lp)],
+            is_match: [[PROB_INIT; POS_STATES_MAX]; STATES],
+            is_rep: [PROB_INIT; STATES],
+            is_rep0: [PROB_INIT; STATES],
+            is_rep1: [PROB_INIT; STATES],
+            is_rep2: [PROB_INIT; STATES],
+            is_rep0_long: [[PROB_INIT; POS_STATES_MAX]; STATES],
+            dist_slot: [[PROB_INIT; DIST_SLOTS]; DIST_STATES],
+            dist_special: [PROB_INIT; FULL_DISTANCES - DIST_MODEL_END],
+            dist_align: [PROB_INIT; ALIGN_SIZE],
+            match_len_encoder: LengthEncoder::new(table_size),
+            rep_len_encoder: LengthEncoder::new(table_size),
+            dist_slot_prices: [[0; DIST_SLOTS]; DIST_STATES],
+            dist_prices: [[0; FULL_DISTANCES]; DIST_STATES],
+            dist_table_size: log_size * 2,
+            match_price_count: 0,
+            align_prices: [0; ALIGN_SIZE],
+            align_price_count: 0,
+            opts_end_index: 0,
+            opts_current_index: 0,
+            opts: if fast_mode {
+                Vec::new()
+            } else {
+                vec![Optimal::default(); OPTS]
+            },
+        };
+        e.reset();
+        e
+    }
+
+    /// `lzma_lzma_encoder_reset()`
+    pub(crate) fn reset(&mut self) {
+        self.pos_mask = (1 << self.pb) - 1;
+        self.literal_context_bits = self.lc;
+        self.literal_mask = (0x100 << self.lp) - (0x100 >> self.lc);
+
+        self.rc.reset();
+        self.state = State::new();
+        self.reps = [0; REPS];
+        self.literal.fill(PROB_INIT);
+        self.is_match = [[PROB_INIT; POS_STATES_MAX]; STATES];
+        self.is_rep0_long = [[PROB_INIT; POS_STATES_MAX]; STATES];
+        self.is_rep = [PROB_INIT; STATES];
+        self.is_rep0 = [PROB_INIT; STATES];
+        self.is_rep1 = [PROB_INIT; STATES];
+        self.is_rep2 = [PROB_INIT; STATES];
+        self.dist_special = [PROB_INIT; FULL_DISTANCES - DIST_MODEL_END];
+        self.dist_slot = [[PROB_INIT; DIST_SLOTS]; DIST_STATES];
+        self.dist_align = [PROB_INIT; ALIGN_SIZE];
+
+        let num_pos_states = 1 << self.pb;
+        self.match_len_encoder.reset(num_pos_states, self.fast_mode);
+        self.rep_len_encoder.reset(num_pos_states, self.fast_mode);
+
+        // Price counts are incremented every time appropriate probabilities
+        // are changed. price counts are set to zero when the price tables
+        // are updated, which is done when the appropriate price counts have
+        // big enough value, and read_ahead == 0 which happens at least
+        // every OPTS (a few thousand) possible price count increments.
+        //
+        // By resetting price counts to u32::MAX / 2, we make sure that the
+        // price tables will be initialized before they will be used.
+        self.match_price_count = u32::MAX / 2;
+        self.align_price_count = u32::MAX / 2;
+
+        self.opts_end_index = 0;
+        self.opts_current_index = 0;
+    }
+
+    /// The properties byte (`lzma_lzma_lclppb_encode()`).
+    pub(crate) fn lclppb(&self) -> u8 {
+        ((self.pb * 5 + self.lp) * 9 + self.lc) as u8
+    }
+
+    /// Index of the literal coder for the next literal byte. The choice
+    /// depends on the lowest literal_pos_bits bits of the position of the
+    /// current byte and the highest literal_context_bits bits of the
+    /// previous byte.
+    #[inline(always)]
+    pub(crate) fn literal_subcoder(&self, pos: u32, prev_byte: u8) -> usize {
+        3 * ((((pos << 8) + u32::from(prev_byte)) & self.literal_mask) << self.literal_context_bits)
+            as usize
+    }
+
+    fn literal(&mut self, mf: &Mf, position: u32) {
+        // Locate the literal byte to be encoded and the subcoder.
+        let at = (mf.read_pos - mf.read_ahead) as usize;
+        let cur_byte = mf.buffer[at];
+        let base = self.literal_subcoder(position, mf.buffer[at - 1]);
+        let subcoder = &mut self.literal[base..base + LITERAL_CODER_SIZE];
+
+        if self.state.is_literal() {
+            // Previous LZMA-symbol was a literal. Encode a normal
+            // literal without a match byte.
+            self.state.update_literal();
+            self.rc.bittree(subcoder, 8, u32::from(cur_byte));
+        } else {
+            // Previous LZMA-symbol was a match. Use the last byte of
+            // the match as a "match byte". That is, compare the bits
+            // of the current literal and the match byte.
+            self.state.update_literal();
+            let mut match_byte = u32::from(mf.buffer[at - self.reps[0] as usize - 1]);
+            let mut offset = 0x100;
+            let mut symbol = u32::from(cur_byte) + (1 << 8);
+            loop {
+                match_byte <<= 1;
+                let match_bit = match_byte & offset;
+                let subcoder_index = offset + match_bit + (symbol >> 8);
+                let bit = (symbol >> 7) & 1;
+                self.rc.bit(&mut subcoder[subcoder_index as usize], bit);
+                symbol <<= 1;
+                offset &= !(match_byte ^ symbol);
+                if symbol >= 1 << 16 {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn match_(&mut self, pos_state: usize, distance: u32, len: u32) {
+        self.state.update_match();
+        self.match_len_encoder
+            .encode(&mut self.rc, pos_state, len, self.fast_mode);
+
+        let dist_slot = get_dist_slot(distance);
+        let dist_state = get_dist_state(len);
+        self.rc
+            .bittree(&mut self.dist_slot[dist_state], DIST_SLOT_BITS, dist_slot);
+
+        if dist_slot >= DIST_MODEL_START as u32 {
+            let footer_bits = (dist_slot >> 1) - 1;
+            let base = (2 | (dist_slot & 1)) << footer_bits;
+            let dist_reduced = distance - base;
+
+            if dist_slot < DIST_MODEL_END as u32 {
+                // Careful here: base - dist_slot - 1 can be -1, but
+                // the reverse bittree starts at probs[1], not probs[0].
+                self.rc.bittree_reverse(
+                    &mut self.dist_special,
+                    (base - dist_slot) as usize,
+                    footer_bits,
+                    dist_reduced,
+                );
+            } else {
+                self.rc
+                    .direct(dist_reduced >> ALIGN_BITS, footer_bits - ALIGN_BITS as u32);
+                self.rc.bittree_reverse(
+                    &mut self.dist_align,
+                    1,
+                    ALIGN_BITS as u32,
+                    dist_reduced & ALIGN_MASK as u32,
+                );
+                self.align_price_count = self.align_price_count.wrapping_add(1);
+            }
+        }
+
+        self.reps[3] = self.reps[2];
+        self.reps[2] = self.reps[1];
+        self.reps[1] = self.reps[0];
+        self.reps[0] = distance;
+        self.match_price_count = self.match_price_count.wrapping_add(1);
+    }
+
+    fn rep_match(&mut self, pos_state: usize, rep: u32, len: u32) {
+        let state = self.state.get() as usize;
+        if rep == 0 {
+            self.rc.bit(&mut self.is_rep0[state], 0);
+            self.rc.bit(
+                &mut self.is_rep0_long[state][pos_state],
+                u32::from(len != 1),
+            );
+        } else {
+            let distance = self.reps[rep as usize];
+            self.rc.bit(&mut self.is_rep0[state], 1);
+            if rep == 1 {
+                self.rc.bit(&mut self.is_rep1[state], 0);
+            } else {
+                self.rc.bit(&mut self.is_rep1[state], 1);
+                self.rc.bit(&mut self.is_rep2[state], rep - 2);
+                if rep == 3 {
+                    self.reps[3] = self.reps[2];
+                }
+                self.reps[2] = self.reps[1];
+            }
+            self.reps[1] = self.reps[0];
+            self.reps[0] = distance;
+        }
+
+        if len == 1 {
+            self.state.update_short_rep();
+        } else {
+            self.rep_len_encoder
+                .encode(&mut self.rc, pos_state, len, self.fast_mode);
+            self.state.update_long_rep();
+        }
+    }
+
+    fn encode_symbol(&mut self, mf: &mut Mf, back: u32, len: u32, position: u32) {
+        let pos_state = (position & self.pos_mask) as usize;
+        let state = self.state.get() as usize;
+
+        if back == u32::MAX {
+            // Literal i.e. eight-bit byte
+            debug_assert_eq!(len, 1);
+            self.rc.bit(&mut self.is_match[state][pos_state], 0);
+            self.literal(mf, position);
+        } else {
+            // Some type of match
+            self.rc.bit(&mut self.is_match[state][pos_state], 1);
+            if back < REPS as u32 {
+                // It's a repeated match i.e. the same distance
+                // has been used earlier.
+                self.rc.bit(&mut self.is_rep[state], 1);
+                self.rep_match(pos_state, back, len);
+            } else {
+                // Normal match
+                self.rc.bit(&mut self.is_rep[state], 0);
+                self.match_(pos_state, back - REPS as u32, len);
+            }
+        }
+
+        debug_assert!(mf.read_ahead >= len);
+        mf.read_ahead -= len;
+    }
+
+    fn encode_init(&mut self, mf: &mut Mf) -> bool {
+        debug_assert_eq!(self.uncomp_size, 0);
+        if mf.read_pos == mf.read_limit {
+            if mf.action == Action::Run {
+                return false; // We cannot do anything.
+            }
+            // We are finishing (we cannot get here when flushing).
+            debug_assert_eq!(mf.write_pos, mf.read_pos);
+            debug_assert_eq!(mf.action, Action::Finish);
+        } else {
+            // Do the actual initialization. The first LZMA symbol must
+            // always be a literal.
+            mf.skip(1);
+            mf.read_ahead = 0;
+            self.rc.bit(&mut self.is_match[0][0], 0);
+            let byte = u32::from(mf.buffer[0]);
+            self.rc
+                .bittree(&mut self.literal[..LITERAL_CODER_SIZE], 8, byte);
+            self.uncomp_size += 1;
+        }
+
+        // Initialization is done (except if empty file).
+        self.is_initialized = true;
+        true
+    }
+
+    fn encode_eopm(&mut self, position: u32) {
+        let pos_state = (position & self.pos_mask) as usize;
+        let state = self.state.get() as usize;
+        self.rc.bit(&mut self.is_match[state][pos_state], 1);
+        self.rc.bit(&mut self.is_rep[state], 0);
+        self.match_(pos_state, u32::MAX, MATCH_LEN_MIN);
+    }
+
+    /// Encodes until more input is needed, returning false, or until the
+    /// LZMA1 stream or LZMA2 chunk is finished and flushed, returning true
+    /// (`lzma_lzma_encode()`). An LZMA2 chunk ends before `read_pos -
+    /// read_ahead` reaches `limit`, or before the compressed data could get
+    /// too big.
+    pub(crate) fn encode(&mut self, mf: &mut Mf, limit: Option<u32>) -> bool {
+        // Initialize the stream if no data has been encoded yet.
+        if !self.is_initialized && !self.encode_init(mf) {
+            return false;
+        }
+
+        loop {
+            // With LZMA2 we need to take care that compressed size of
+            // a chunk doesn't get too big.
+            if limit.is_some_and(|limit| {
+                mf.read_pos - mf.read_ahead >= limit
+                    || self.rc.out.len() as u64 + self.rc.pending()
+                        >= u64::from(LZMA2_CHUNK_MAX - LOOP_INPUT_MAX)
+            }) {
+                break;
+            }
+
+            // Check that there is some input to process.
+            if mf.read_pos >= mf.read_limit {
+                if mf.action == Action::Run {
+                    return false;
+                }
+                if mf.read_ahead == 0 {
+                    break;
+                }
+            }
+
+            // Get optimal match (repeat position and length).
+            // Value ranges for back:
+            //   - [0, REPS): repeated match
+            //   - [REPS, u32::MAX): match at (back - REPS)
+            //   - u32::MAX: not a match but a literal
+            // Value ranges for len: [MATCH_LEN_MIN, MATCH_LEN_MAX]
+            let position = self.uncomp_size as u32;
+            let (back, len) = if self.fast_mode {
+                self.optimum_fast(mf)
+            } else {
+                self.optimum_normal(mf, position)
+            };
+            self.encode_symbol(mf, back, len, position);
+            self.uncomp_size += u64::from(len);
+        }
+
+        // LZMA2 doesn't use EOPM at LZMA level.
+        if self.use_eopm {
+            self.encode_eopm(self.uncomp_size as u32);
+        }
+
+        // Flush the remaining bytes from the range encoder.
+        self.rc.flush();
+        true
+    }
+}
+
+/// Builds the window and match finder for `options`.
+pub(crate) fn new_mf(options: &LzmaOptions, settings: &Settings, lzma2: bool) -> Mf {
+    Mf::new(&settings.lz_options(options, lzma2))
+}
+
+impl MfType {
+    pub(crate) fn mem_usage(self, options: &LzmaOptions) -> u64 {
+        crate::lz::memusage(&Settings::new(options).lz_options(options, true))
     }
 }

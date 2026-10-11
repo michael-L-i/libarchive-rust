@@ -1,83 +1,140 @@
-use alloc::{vec, vec::Vec};
+//! Range encoder and probability prices, ported from liblzma 5.8.4
+//! (`rangecoder/range_encoder.h`, `rangecoder/price.h`; Igor Pavlov,
+//! Lasse Collin; 0BSD).
+//!
+//! liblzma queues the bits of a symbol and encodes them when output space
+//! is available. Output goes to a `Vec` here, so bits are encoded at once;
+//! normalization still happens before each bit, as in `rc_encode()`, so
+//! `pending()` sees the same state between symbols.
 
-use crate::{BIT_MODEL_TOTAL, BIT_MODEL_TOTAL_BITS, MOVE_BITS, SHIFT_BITS, TOP_MASK, Write};
+use alloc::vec::Vec;
 
-const MOVE_REDUCING_BITS: usize = 4;
-const BIT_PRICE_SHIFT_BITS: usize = 4;
+use crate::{BIT_MODEL_TOTAL, BIT_MODEL_TOTAL_BITS, MOVE_BITS, SHIFT_BITS, TOP_VALUE};
 
-/// Pre-calculated price table for which 7zip has a function. We could use const to also calculate
-/// it at compile time without much benefit.
-static PRICES: &[u8; 128] = &[
-    0x80, 0x67, 0x5B, 0x54, 0x4E, 0x49, 0x45, 0x42, 0x3F, 0x3D, 0x3A, 0x38, 0x36, 0x34, 0x33, 0x31,
-    0x30, 0x2E, 0x2D, 0x2C, 0x2B, 0x2A, 0x29, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x22, 0x21,
-    0x20, 0x1F, 0x1F, 0x1E, 0x1D, 0x1D, 0x1C, 0x1C, 0x1B, 0x1A, 0x1A, 0x19, 0x19, 0x18, 0x18, 0x17,
-    0x17, 0x16, 0x16, 0x16, 0x15, 0x15, 0x14, 0x14, 0x13, 0x13, 0x13, 0x12, 0x12, 0x11, 0x11, 0x11,
-    0x10, 0x10, 0x10, 0xF, 0xF, 0xF, 0xE, 0xE, 0xE, 0xD, 0xD, 0xD, 0xC, 0xC, 0xC, 0xB, 0xB, 0xB,
-    0xB, 0xA, 0xA, 0xA, 0xA, 0x9, 0x9, 0x9, 0x9, 0x8, 0x8, 0x8, 0x8, 0x7, 0x7, 0x7, 0x7, 0x6, 0x6,
-    0x6, 0x6, 0x5, 0x5, 0x5, 0x5, 0x5, 0x4, 0x4, 0x4, 0x4, 0x3, 0x3, 0x3, 0x3, 0x3, 0x2, 0x2, 0x2,
-    0x2, 0x2, 0x2, 0x1, 0x1, 0x1, 0x1, 0x1,
-];
+const MOVE_REDUCING_BITS: u32 = 4;
+const BIT_PRICE_SHIFT_BITS: u32 = 4;
 
-pub(crate) struct RangeEncoder<W> {
-    low: u64,
-    range: u32,
-    cache_size: u32,
-    cache: u8,
-    inner: W,
+pub(crate) const INFINITY_PRICE: u32 = 1 << 30;
+
+/// Lookup table for the price functions (`price_tablegen.c`).
+static PRICES: [u8; (BIT_MODEL_TOTAL >> MOVE_REDUCING_BITS) as usize] = {
+    let mut prices = [0; (BIT_MODEL_TOTAL >> MOVE_REDUCING_BITS) as usize];
+    let mut i = (1 << MOVE_REDUCING_BITS) / 2;
+    while i < BIT_MODEL_TOTAL {
+        let mut w = i;
+        let mut bit_count = 0;
+        let mut j = 0;
+        while j < BIT_PRICE_SHIFT_BITS {
+            w *= w;
+            bit_count <<= 1;
+            while w >= 1 << 16 {
+                w >>= 1;
+                bit_count += 1;
+            }
+            j += 1;
+        }
+        prices[(i >> MOVE_REDUCING_BITS) as usize] =
+            ((BIT_MODEL_TOTAL_BITS << BIT_PRICE_SHIFT_BITS) - 15 - bit_count) as u8;
+        i += 1 << MOVE_REDUCING_BITS;
+    }
+    prices
+};
+
+#[inline(always)]
+pub(crate) fn bit_price(prob: u16, bit: u32) -> u32 {
+    let i =
+        (u32::from(prob) ^ (0u32.wrapping_sub(bit) & (BIT_MODEL_TOTAL - 1))) >> MOVE_REDUCING_BITS;
+    u32::from(PRICES[i as usize])
 }
 
-impl<W: Write> RangeEncoder<W> {
-    pub(crate) fn new(inner: W) -> Self {
-        let mut e = Self {
+#[inline(always)]
+pub(crate) fn bit_0_price(prob: u16) -> u32 {
+    u32::from(PRICES[(prob >> MOVE_REDUCING_BITS) as usize])
+}
+
+#[inline(always)]
+pub(crate) fn bit_1_price(prob: u16) -> u32 {
+    u32::from(PRICES[((u32::from(prob) ^ (BIT_MODEL_TOTAL - 1)) >> MOVE_REDUCING_BITS) as usize])
+}
+
+#[inline(always)]
+pub(crate) fn bittree_price(probs: &[u16], bit_levels: u32, symbol: u32) -> u32 {
+    let mut price = 0;
+    let mut symbol = symbol + (1 << bit_levels);
+    loop {
+        let bit = symbol & 1;
+        symbol >>= 1;
+        price += bit_price(probs[symbol as usize], bit);
+        if symbol == 1 {
+            return price;
+        }
+    }
+}
+
+/// `rc_bittree_reverse_price()` with the tree at `probs[base - 1 + 1..]`.
+#[inline(always)]
+pub(crate) fn bittree_reverse_price(
+    probs: &[u16],
+    base: usize,
+    bit_levels: u32,
+    mut symbol: u32,
+) -> u32 {
+    let mut price = 0;
+    let mut model_index = 1;
+    for _ in 0..bit_levels {
+        let bit = symbol & 1;
+        symbol >>= 1;
+        price += bit_price(probs[base + model_index - 1], bit);
+        model_index = (model_index << 1) + bit as usize;
+    }
+    price
+}
+
+#[inline(always)]
+pub(crate) fn direct_price(bits: u32) -> u32 {
+    bits << BIT_PRICE_SHIFT_BITS
+}
+
+pub(crate) struct RangeEncoder {
+    low: u64,
+    cache_size: u64,
+    range: u32,
+    cache: u8,
+    /// Encoded bytes.
+    pub(crate) out: Vec<u8>,
+}
+
+impl RangeEncoder {
+    pub(crate) fn new(out: Vec<u8>) -> Self {
+        Self {
             low: 0,
-            range: 0,
-            cache_size: 0,
+            cache_size: 1,
+            range: u32::MAX,
             cache: 0,
-            inner,
-        };
-        e.reset();
-        e
-    }
-
-    #[inline]
-    pub(crate) fn inner(&self) -> &W {
-        &self.inner
-    }
-
-    #[inline]
-    pub(crate) fn inner_mut(&mut self) -> &mut W {
-        &mut self.inner
-    }
-
-    pub(crate) fn into_inner(self) -> W {
-        self.inner
+            out,
+        }
     }
 
     pub(crate) fn reset(&mut self) {
         self.low = 0;
-        self.range = 0xFFFFFFFFu32;
-        self.cache = 0;
         self.cache_size = 1;
+        self.range = u32::MAX;
+        self.cache = 0;
     }
 
-    pub(crate) fn finish(&mut self) -> crate::Result<Option<usize>> {
-        for _i in 0..5 {
-            self.shift_low()?;
-        }
-        Ok(None)
+    /// Bytes that may still be output for the symbols encoded so far.
+    #[inline(always)]
+    pub(crate) fn pending(&self) -> u64 {
+        self.cache_size + 5 - 1
     }
 
-    fn write_byte(&mut self, b: u8) -> crate::Result<()> {
-        self.inner.write_all(&[b])
-    }
-
-    fn shift_low(&mut self) -> crate::Result<()> {
-        let low_hi = (self.low >> 32) as i32;
-        if low_hi != 0 || self.low < 0xFF000000u64 {
-            let mut temp = self.cache;
+    fn shift_low(&mut self) {
+        if (self.low as u32) < 0xFF00_0000 || (self.low >> 32) != 0 {
+            let carry = (self.low >> 32) as u8;
+            let mut byte = self.cache;
             loop {
-                self.write_byte((temp as i32 + low_hi) as u8)?;
-                temp = 0xFF;
+                self.out.push(byte.wrapping_add(carry));
+                byte = 0xFF;
                 self.cache_size -= 1;
                 if self.cache_size == 0 {
                     break;
@@ -86,222 +143,84 @@ impl<W: Write> RangeEncoder<W> {
             self.cache = (self.low >> 24) as u8;
         }
         self.cache_size += 1;
-        self.low = (self.low & 0x00FFFFFF) << 8;
-
-        Ok(())
+        self.low = (self.low & 0x00FF_FFFF) << SHIFT_BITS;
     }
 
-    pub(crate) fn encode_bit(
-        &mut self,
-        probs: &mut [u16],
-        index: usize,
-        bit: u32,
-    ) -> crate::Result<()> {
-        let prob = &mut probs[index];
-        let bound = (self.range >> BIT_MODEL_TOTAL_BITS) * (*prob as u32);
+    #[inline(always)]
+    fn normalize(&mut self) {
+        if self.range < TOP_VALUE {
+            self.shift_low();
+            self.range <<= SHIFT_BITS;
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn bit(&mut self, prob: &mut u16, bit: u32) {
+        self.normalize();
+        let p = u32::from(*prob);
+        let bound = (self.range >> BIT_MODEL_TOTAL_BITS) * p;
         if bit == 0 {
             self.range = bound;
-            *prob += ((BIT_MODEL_TOTAL.wrapping_sub(*prob as u32)) >> MOVE_BITS) as u16;
+            *prob = (p + ((BIT_MODEL_TOTAL - p) >> MOVE_BITS)) as u16;
         } else {
-            self.low += bound as u64;
-            self.range = self.range.wrapping_sub(bound);
-            *prob -= (*prob) >> (MOVE_BITS as u16);
+            self.low += u64::from(bound);
+            self.range -= bound;
+            *prob = (p - (p >> MOVE_BITS)) as u16;
         }
-        if self.range & TOP_MASK == 0 {
-            self.range <<= SHIFT_BITS;
-            self.shift_low()?;
-        }
-        Ok(())
     }
 
-    // Mask literal-bit updates to avoid unpredictable branches.
     #[inline(always)]
-    pub(crate) fn encode_bit_unpredictable(
-        &mut self,
-        probs: &mut [u16],
-        index: usize,
-        bit: u32,
-    ) -> crate::Result<()> {
-        let prob = &mut probs[index];
-        let p = *prob;
-        let range = self.range;
-        let bound = (range >> BIT_MODEL_TOTAL_BITS) * (p as u32);
-        let mask = 0u32.wrapping_sub(u32::from(bit != 0));
-        let p0 = p + ((BIT_MODEL_TOTAL.wrapping_sub(p as u32)) >> MOVE_BITS) as u16;
-        let p1 = p - (p >> (MOVE_BITS as u16));
-        *prob = p0 ^ ((p0 ^ p1) & mask as u16);
-        self.low += (bound & mask) as u64;
-        self.range = bound ^ ((bound ^ range.wrapping_sub(bound)) & mask);
-        if self.range & TOP_MASK == 0 {
-            self.range <<= SHIFT_BITS;
-            self.shift_low()?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn encode_bit_tree(&mut self, probs: &mut [u16], symbol: u32) -> crate::Result<()> {
-        let mut index = 1;
-        let mut mask = probs.len() as u32;
-
+    pub(crate) fn bittree(&mut self, probs: &mut [u16], mut bit_count: u32, symbol: u32) {
+        let mut model_index = 1;
         loop {
-            mask >>= 1;
-            let bit = symbol & mask;
-            self.encode_bit(probs, index, bit)?;
-            index <<= 1;
-            if bit != 0 {
-                index |= 1;
-            }
-            if mask == 1 {
-                break;
+            bit_count -= 1;
+            let bit = (symbol >> bit_count) & 1;
+            self.bit(&mut probs[model_index], bit);
+            model_index = (model_index << 1) + bit as usize;
+            if bit_count == 0 {
+                return;
             }
         }
-
-        Ok(())
     }
 
-    pub(crate) fn encode_reverse_bit_tree(
+    /// `rc_bittree_reverse()` with the tree at `probs[base - 1 + 1..]`.
+    #[inline(always)]
+    pub(crate) fn bittree_reverse(
         &mut self,
         probs: &mut [u16],
-        symbol: u32,
-    ) -> crate::Result<()> {
-        let mut index = 1u32;
-        let mut symbol = symbol | probs.len() as u32;
-        loop {
+        base: usize,
+        bit_count: u32,
+        mut symbol: u32,
+    ) {
+        let mut model_index = 1;
+        for _ in 0..bit_count {
             let bit = symbol & 1;
             symbol >>= 1;
-            self.encode_bit(probs, index as usize, bit)?;
-            index = (index << 1) | bit;
-            if symbol == 1 {
-                break;
-            }
+            self.bit(&mut probs[base + model_index - 1], bit);
+            model_index = (model_index << 1) + bit as usize;
         }
-        Ok(())
     }
 
-    pub(crate) fn encode_direct_bits(&mut self, value: u32, mut count: u32) -> crate::Result<()> {
+    pub(crate) fn direct(&mut self, value: u32, mut bit_count: u32) {
         loop {
+            self.normalize();
+            bit_count -= 1;
             self.range >>= 1;
-            count -= 1;
-            let m = 0u32.wrapping_sub((value >> count) & 1);
-            self.low += (self.range & m) as u64;
-
-            if self.range & TOP_MASK == 0 {
-                self.range <<= SHIFT_BITS;
-                self.shift_low()?;
+            if (value >> bit_count) & 1 != 0 {
+                self.low += u64::from(self.range);
             }
-            if count == 0 {
-                break;
+            if bit_count == 0 {
+                return;
             }
         }
-        Ok(())
-    }
-}
-
-impl RangeEncoder<()> {
-    #[inline(always)]
-    pub(crate) fn get_bit_price(prob: u32, bit: i32) -> u32 {
-        debug_assert!(bit == 0 || bit == 1);
-        let i = (prob ^ ((-bit) as u32 & (BIT_MODEL_TOTAL - 1))) >> MOVE_REDUCING_BITS;
-        PRICES[i as usize] as u32
     }
 
-    pub(crate) fn get_bit_tree_price(probs: &mut [u16], symbol: u32) -> u32 {
-        let mut price = 0;
-        let mut symbol = symbol | probs.len() as u32;
-
-        loop {
-            let bit = symbol & 1;
-            symbol >>= 1;
-            price += Self::get_bit_price(probs[symbol as usize] as u32, bit as i32);
-            if symbol == 1 {
-                break;
-            }
+    /// Flushes the last five bytes and resets the encoder.
+    pub(crate) fn flush(&mut self) {
+        self.normalize();
+        for _ in 0..5 {
+            self.shift_low();
         }
-
-        price
-    }
-
-    pub(crate) fn get_reverse_bit_tree_price(probs: &mut [u16], symbol: u32) -> u32 {
-        let mut price = 0;
-        let mut index = 1u32;
-        let mut symbol = symbol | probs.len() as u32;
-
-        loop {
-            let bit = symbol & 1;
-            symbol >>= 1;
-            price += Self::get_bit_price(probs[index as usize] as u32, bit as i32);
-            index = (index << 1) | bit;
-            if symbol == 1 {
-                break;
-            }
-        }
-
-        price
-    }
-
-    #[inline]
-    pub(crate) fn get_direct_bits_price(count: u32) -> u32 {
-        count << BIT_PRICE_SHIFT_BITS
-    }
-}
-
-impl RangeEncoder<RangeEncoderBuffer> {
-    pub(crate) fn write_to<W: Write>(&self, out: &mut W) -> crate::Result<()> {
-        self.inner.write_to(out)
-    }
-
-    pub(crate) fn finish_buffer(&mut self) -> crate::Result<Option<usize>> {
-        self.finish()?;
-        Ok(Some(self.inner.pos))
-    }
-
-    pub(crate) fn new_buffer(buf_size: usize) -> Self {
-        Self::new(RangeEncoderBuffer::new(buf_size))
-    }
-
-    pub(crate) fn reset_buffer(&mut self) {
         self.reset();
-        self.inner.pos = 0;
-    }
-
-    #[inline]
-    pub(crate) fn get_pending_size(&self) -> u32 {
-        self.inner.pos as u32 + self.cache_size + 5 - 1
-    }
-}
-
-pub(crate) struct RangeEncoderBuffer {
-    buf: Vec<u8>,
-    pos: usize,
-}
-
-impl RangeEncoderBuffer {
-    pub(crate) fn new(size: usize) -> Self {
-        Self {
-            buf: vec![0; size],
-            pos: 0,
-        }
-    }
-
-    pub(crate) fn write_to<W: Write>(&self, out: &mut W) -> crate::Result<()> {
-        out.write_all(&self.buf[..self.pos])
-    }
-}
-
-impl Write for RangeEncoderBuffer {
-    fn write(&mut self, buf: &[u8]) -> crate::Result<usize> {
-        let size = buf.len().min(self.buf.len() - self.pos);
-
-        if size == 0 {
-            return Ok(0);
-        }
-
-        self.buf[self.pos..(self.pos + size)].copy_from_slice(&buf[..size]);
-        self.pos += size;
-        Ok(size)
-    }
-
-    fn flush(&mut self) -> crate::Result<()> {
-        Ok(())
     }
 }

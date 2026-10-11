@@ -1,19 +1,18 @@
 use super::{
     LzmaOptions,
-    encoder::{LzmaEncoder, LzmaEncoderModes},
-    range_enc::RangeEncoder,
+    encoder::{LzmaEncoder, Settings, new_mf},
+    lz::{Action, Mf},
 };
 use crate::{AutoFinish, AutoFinisher, Write, error_invalid_input, error_unsupported};
 
 /// A single-threaded LZMA compressor.
 pub struct LzmaWriter<W: Write> {
-    rc: RangeEncoder<W>,
+    inner: W,
+    mf: Mf,
     lzma: LzmaEncoder,
-    use_end_marker: bool,
     current_uncompressed_size: u64,
     expected_uncompressed_size: Option<u64>,
     props: u8,
-    mode: LzmaEncoderModes,
 }
 
 impl<W: Write> LzmaWriter<W> {
@@ -25,43 +24,40 @@ impl<W: Write> LzmaWriter<W> {
         use_end_marker: bool,
         expected_uncompressed_size: Option<u64>,
     ) -> crate::Result<LzmaWriter<W>> {
-        let (mut lzma, mode) = LzmaEncoder::new(
-            options.mode,
-            options.lc,
-            options.lp,
-            options.pb,
-            options.mf,
-            options.depth_limit,
-            options.dict_size,
-            options.nice_len as usize,
-        );
-        if let Some(preset_dict) = &options.preset_dict {
-            if use_header {
-                return Err(error_unsupported(
-                    "header is not supported with preset dict",
-                ));
-            }
-            lzma.lz.set_preset_dict(options.dict_size, preset_dict);
+        if use_header && options.preset_dict.is_some() {
+            return Err(error_unsupported(
+                "header is not supported with preset dict",
+            ));
         }
+        let settings = Settings::new(options);
+        let mf = new_mf(options, &settings, false);
+        let lzma = LzmaEncoder::new(options, &settings, use_end_marker);
+        let props = lzma.lclppb();
 
-        let props = options.get_props();
         if use_header {
+            // Round up to the next 2^n or 2^n + 2^(n - 1) depending on which
+            // one is the next unless it is u32::MAX, as liblzma's
+            // `lzma_alone_encoder()` does to keep its decoder accepting the
+            // resulting files.
+            let mut d = settings.dict_size - 1;
+            d |= d >> 2;
+            d |= d >> 3;
+            d |= d >> 4;
+            d |= d >> 8;
+            d |= d >> 16;
+            d = d.saturating_add(1);
             out.write_all(&[props])?;
-            let dict_size = options.dict_size;
-            out.write_all(&dict_size.to_le_bytes())?;
-            let expected_compressed_size = expected_uncompressed_size.unwrap_or(u64::MAX);
-            out.write_all(&expected_compressed_size.to_le_bytes())?;
+            out.write_all(&d.to_le_bytes())?;
+            out.write_all(&expected_uncompressed_size.unwrap_or(u64::MAX).to_le_bytes())?;
         }
 
-        let rc = RangeEncoder::new(out);
         Ok(LzmaWriter {
-            rc,
+            inner: out,
+            mf,
             lzma,
-            use_end_marker,
             current_uncompressed_size: 0,
             expected_uncompressed_size,
             props,
-            mode,
         })
     }
 
@@ -104,17 +100,26 @@ impl<W: Write> LzmaWriter<W> {
 
     /// Unwraps the writer, returning the underlying writer.
     pub fn into_inner(self) -> W {
-        self.rc.into_inner()
+        self.inner
     }
 
     /// Returns a reference to the inner writer.
     pub fn inner(&self) -> &W {
-        self.rc.inner()
+        &self.inner
     }
 
     /// Returns a mutable reference to the inner writer.
     pub fn inner_mut(&mut self) -> &mut W {
-        self.rc.inner_mut()
+        &mut self.inner
+    }
+
+    /// Runs the encoder and moves its output to the inner writer. Returns
+    /// true once the stream is finished.
+    fn encode(&mut self) -> crate::Result<bool> {
+        let finished = self.lzma.encode(&mut self.mf, None);
+        self.inner.write_all(&self.lzma.rc.out)?;
+        self.lzma.rc.out.clear();
+        Ok(finished)
     }
 
     /// Finishes the compression and returns the underlying writer.
@@ -126,16 +131,14 @@ impl<W: Write> LzmaWriter<W> {
                 ));
             }
         }
-        self.lzma.lz.set_finishing();
-        self.lzma.encode_for_lzma1(&mut self.rc, &mut self.mode)?;
-        if self.use_end_marker {
-            self.lzma.encode_lzma1_end_marker(&mut self.rc)?;
+        loop {
+            if self.mf.action == Action::Run && self.mf.read_pos >= self.mf.read_limit {
+                self.mf.fill_window(&[], Action::Finish);
+            }
+            if self.encode()? {
+                return Ok(self.inner);
+            }
         }
-        self.rc.finish()?;
-
-        let Self { rc, .. } = self;
-
-        Ok(rc.into_inner())
     }
 }
 
@@ -149,16 +152,15 @@ impl<W: Write> Write for LzmaWriter<W> {
             }
         }
         self.current_uncompressed_size += buf.len() as u64;
-        let mut len = buf.len();
-        let mut off = 0;
-        while len > 0 {
-            let used = self.lzma.lz.fill_window(&buf[off..]);
-            off += used;
-            len -= used;
-            self.lzma.encode_for_lzma1(&mut self.rc, &mut self.mode)?;
+        let mut pos = 0;
+        while pos < buf.len() {
+            // Read more data to the history buffer if needed.
+            if self.mf.action == Action::Run && self.mf.read_pos >= self.mf.read_limit {
+                pos += self.mf.fill_window(&buf[pos..], Action::Run);
+            }
+            self.encode()?;
         }
-
-        Ok(off)
+        Ok(pos)
     }
 
     fn flush(&mut self) -> crate::Result<()> {
