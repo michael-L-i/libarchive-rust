@@ -1106,6 +1106,15 @@ fn transfer(
     // can do slightly better than the naive case by copying everything at once
     } else if not_wrapping && out_pos > source_pos && (out_pos - source_pos >= 4) {
         let end_pos = cmp::min(end_pos, out_slice.len().saturating_sub(3));
+        if source_diff >= 16 {
+            // Each chunk reads completed history: its width does not exceed
+            // the match distance. Leave the existing four-byte/tail handling.
+            while end_pos.saturating_sub(out_pos) >= 16 {
+                out_slice.copy_within(source_pos..source_pos + 16, out_pos);
+                source_pos += 16;
+                out_pos += 16;
+            }
+        }
         while out_pos < end_pos {
             out_slice.copy_within(source_pos..=source_pos + 3, out_pos);
             source_pos += 4;
@@ -2412,13 +2421,15 @@ mod test {
     fn bulk_matches_preserve_wrapping_and_overlap_bytes() {
         for size in [8usize, 16, 32, 64, 128, 32768] {
             for out_pos in [0, 1, 3, 7, size / 2, size.saturating_sub(258), size - 1] {
-                for dist in [1usize, 2, 3, 4, 7, 15, 16, 31, 32, 255, 256, size] {
+                for dist in [
+                    1usize, 2, 3, 4, 7, 15, 16, 17, 31, 32, 33, 63, 64, 255, 256, size,
+                ] {
                     if dist > size {
                         continue;
                     }
                     for length in [
-                        3usize, 4, 5, 7, 8, 9, 10, 15, 16, 17, 18, 24, 30, 31, 32, 33, 127, 128,
-                        129, 257, 258,
+                        0usize, 1, 2, 3, 4, 5, 7, 8, 9, 10, 15, 16, 17, 18, 24, 30, 31, 32, 33,
+                        127, 128, 129, 47, 48, 49, 63, 64, 65, 255, 256, 257, 258,
                     ] {
                         if length > size - out_pos {
                             continue;

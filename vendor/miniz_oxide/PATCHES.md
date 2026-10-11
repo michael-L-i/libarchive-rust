@@ -59,3 +59,29 @@ records/compiled data. Tiny cases vary; documents gzip is 3% slower in
 this run. These are backend measurements, not complete extraction times.
 All 16 decoded archive hashes agree with C. Raw samples and review
 records are in sibling diagnostics/round8-miniz-next.
+
+## Exact wide overlapping match copies
+
+For contiguous backward matches whose distance is at least 16 bytes,
+`transfer` copies complete 16-byte chunks before its existing four-byte and
+byte-tail loops. Each chunk reads only completed history because its width
+never exceeds the distance. Every write stays within the requested match;
+wrapping, forward-source, distance-one and short-distance paths retain their
+original behavior. The saturated loop bound also handles partial matches of
+zero to two bytes at the buffer end. No state, refill, checksum, encoder,
+allocation, or unsafe-code changes are introduced.
+
+The expanded byte-reference test exercises distance and chunk boundaries,
+partial matches, wrapping and invalid initial history. All 30 vendor tests,
+1,760 exact valid/truncated/mutated stream/core output/status/consumption
+comparisons and 39 identical encoded streams pass. Root release all-target
+Clippy with warnings denied and vendor no-default-features checks pass.
+All 16 decoded archive hashes match baseline and independent C.
+
+Twenty-one rotating in-memory runs against the frozen round-eight final
+binary show text gzip 2.215 -> 1.499 ms (32.3%) and text ZIP 2.598 -> 1.852 ms
+(28.7%). Documents gain 3.4-3.9%; the other twelve cases range from 0.5% slower
+to 1.4% faster. These are backend measurements, not full extraction times.
+Both attempted macOS sampling profiles were denied by the OS; their logs,
+raw measurements, frozen baseline hash, and actual Claude Opus 5.5 design
+and fresh final reviews are retained in sibling `diagnostics/round9-deflate`.
