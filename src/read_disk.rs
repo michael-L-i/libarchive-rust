@@ -48,7 +48,10 @@ pub struct ReadDisk {
     pub metadata_filter: crate::ffi::disk::MetadataFilter,
     pub matching: Option<crate::ffi::matching::MatchingHandle>,
     pub excluded: crate::ffi::disk::ExcludedCallback,
-    entry: *mut Entry,
+    /// The entry `archive_read_next_header` hands to C, which
+    /// `archive_read_disk_new` makes and `archive_free` frees; NULL for a
+    /// handle that is not C's.
+    pub(crate) entry: *mut Entry,
     pending: Vec<Pending>,
     current: Option<PathBuf>,
     ancestors: Vec<(u64, u64)>,
@@ -68,7 +71,6 @@ pub struct ReadDisk {
 impl ReadDisk {
     pub fn new() -> Self {
         Self {
-            entry: Box::into_raw(Box::new(Entry::new(None))),
             behavior: 4,
             ..Self::default()
         }

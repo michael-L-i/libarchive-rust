@@ -1218,7 +1218,7 @@ pub struct Read {
     /// The device and inode extraction must not overwrite, as the client or
     /// `archive_read_extract_set_skip_file` set it.
     pub(crate) skip_file: Option<(i64, i64)>,
-    pub(crate) extract: Option<crate::ffi::disk::Extract>,
+    pub(crate) extract: Option<crate::read_extract2::Extract>,
     /// The client callbacks `archive_read_set_*_callback` have collected,
     /// until the archive is opened.
     pub(crate) callbacks: crate::ffi::client::Callbacks,

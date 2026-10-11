@@ -7,7 +7,6 @@ use super::{
 use crate::archive::*;
 use crate::util::Error;
 use crate::write::{Sink, Write};
-use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::io::Write as IoWrite;
 use std::os::unix::ffi::OsStrExt;
@@ -48,28 +47,12 @@ fn writer<T>(h: &Handle, fallback: T, f: impl FnOnce(&mut Write) -> T) -> T {
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_new() -> *mut Archive {
     guard(std::ptr::null_mut(), || {
-        Box::into_raw(Box::new(Handle {
-            base: Base::new(WRITE_MAGIC),
-            kind: Kind::Write(RefCell::new(Write::default())),
-        }))
-        .cast()
+        Box::into_raw(Box::new(crate::api::write::new())).cast()
     })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_bytes_per_block(a: *mut Archive, n: c_int) -> c_int {
-    checked!(
-        archive_write_set_bytes_per_block,
-        a,
-        WRITE_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| writer(h, ARCHIVE_FATAL, |w| {
-            if n >= 0 {
-                w.bytes_per_block = n;
-            }
-            ARCHIVE_OK
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| h.write_set_bytes_per_block(n))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_get_bytes_per_block(a: *mut Archive) -> c_int {
@@ -84,17 +67,7 @@ pub extern "C" fn archive_write_get_bytes_per_block(a: *mut Archive) -> c_int {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_set_bytes_in_last_block(a: *mut Archive, n: c_int) -> c_int {
-    checked!(
-        archive_write_set_bytes_in_last_block,
-        a,
-        WRITE_MAGIC,
-        state::ANY,
-        ARCHIVE_FATAL,
-        |h| writer(h, ARCHIVE_FATAL, |w| {
-            w.bytes_in_last_block = n;
-            ARCHIVE_OK
-        })
-    )
+    with(a, ARCHIVE_FATAL, |h| h.write_set_bytes_in_last_block(n))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_get_bytes_in_last_block(a: *mut Archive) -> c_int {
@@ -134,10 +107,7 @@ pub extern "C" fn archive_write_header(a: *mut Archive, e: *mut ArchiveEntry) ->
         let Some(e) = (unsafe { e.cast::<crate::entry::Entry>().as_mut() }) else {
             return ARCHIVE_FATAL;
         };
-        match &h.kind {
-            Kind::WriteDisk(w) => w.borrow_mut().header(&h.base, e),
-            _ => writer(h, ARCHIVE_FATAL, |w| w.header(&h.base, e)),
-        }
+        h.write_header(e)
     })
 }
 

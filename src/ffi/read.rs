@@ -30,7 +30,7 @@ use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 /// before `Handle::with_read`, which holds the read state.
 // The entry is a separate allocation the handle only points to.
 #[allow(clippy::mut_from_ref)]
-fn own_entry(h: &Handle) -> Option<&mut Entry> {
+pub(super) fn own_entry(h: &Handle) -> Option<&mut Entry> {
     // SAFETY: the handle's entry is a live `Box` leak, only used through
     // this pointer and the ones handed to the caller, and nothing else
     // holds a reference to it during the call.
@@ -686,9 +686,10 @@ pub extern "C" fn archive_read_data_block(
     offset: *mut i64,
 ) -> c_int {
     if let Some(ret) = with(a, None, |h| match &h.kind {
-        Kind::ReadDisk(d) => Some(d.borrow_mut().data_block(&h.base).map_or_else(
-            |e| e,
-            |(data, o)| {
+        Kind::ReadDisk(d) => Some({
+            let mut d = d.borrow_mut();
+            let block = d.data_block(&h.base);
+            if let Ok((data, o)) = &block {
                 put(
                     buff,
                     if data.is_empty() {
@@ -698,14 +699,10 @@ pub extern "C" fn archive_read_data_block(
                     },
                 );
                 put(size, data.len());
-                put(offset, o);
-                if data.is_empty() {
-                    ARCHIVE_EOF
-                } else {
-                    ARCHIVE_OK
-                }
-            },
-        )),
+                put(offset, *o);
+            }
+            crate::api::read_disk::block_code(&block)
+        }),
         _ => None,
     }) {
         return ret;

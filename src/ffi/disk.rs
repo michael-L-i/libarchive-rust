@@ -5,10 +5,10 @@ use super::{Archive, ArchiveEntry, guard};
 use crate::archive::{self, ARCHIVE_FATAL, ARCHIVE_OK, Base, Handle, Kind};
 use crate::entry::Entry;
 use crate::{read_disk, write_disk};
-use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 pub type Cleanup = Option<unsafe extern "C" fn(*mut c_void)>;
 pub type ReadLookup = Option<unsafe extern "C" fn(*mut c_void, i64) -> *const c_char>;
@@ -32,6 +32,12 @@ pub struct NameLookup {
     cache: Vec<Option<CachedName>>,
 }
 impl NameLookup {
+    /// The lookup in the system's user and group databases.
+    pub fn standard() -> Self {
+        let mut lookup = NameLookup::default();
+        lookup.standard = true;
+        lookup
+    }
     pub fn lookup(&mut self, id: i64, group: bool) -> Option<&CStr> {
         if self.standard {
             // Match the uid_t/gid_t conversion in the system lookup and upstream cache.
@@ -82,6 +88,13 @@ pub struct IdLookup {
     pub standard: bool,
 }
 impl IdLookup {
+    /// The lookup in the system's user and group databases.
+    pub fn standard() -> Self {
+        IdLookup {
+            standard: true,
+            ..IdLookup::default()
+        }
+    }
     pub fn lookup(&mut self, name: Option<&CStr>, fallback: i64, group: bool) -> i64 {
         let Some(name) = name else {
             return fallback;
@@ -113,24 +126,14 @@ fn read<T: Copy>(
     fallback: T,
     f: impl FnOnce(&Base, &mut read_disk::ReadDisk) -> T,
 ) -> T {
-    with(a, fallback, |h| match &h.kind {
-        Kind::ReadDisk(d) => d
-            .try_borrow_mut()
-            .map_or(fallback, |mut d| f(&h.base, &mut d)),
-        _ => fallback,
-    })
+    with(a, fallback, |h| h.with_read_disk(fallback, f))
 }
 fn write<T: Copy>(
     a: *mut Archive,
     fallback: T,
     f: impl FnOnce(&Base, &mut write_disk::WriteDisk) -> T,
 ) -> T {
-    with(a, fallback, |h| match &h.kind {
-        Kind::WriteDisk(d) => d
-            .try_borrow_mut()
-            .map_or(fallback, |mut d| f(&h.base, &mut d)),
-        _ => fallback,
-    })
+    with(a, fallback, |h| h.with_write_disk(fallback, f))
 }
 fn cstr<'a>(p: *const c_char) -> Option<&'a CStr> {
     // SAFETY: API caller supplies NULL or a NUL-terminated string.
@@ -140,50 +143,29 @@ fn cstr<'a>(p: *const c_char) -> Option<&'a CStr> {
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_disk_new() -> *mut Archive {
     guard(std::ptr::null_mut(), || {
-        Box::into_raw(Box::new(Handle {
-            base: Base::new(archive::WRITE_DISK_MAGIC),
-            kind: Kind::WriteDisk(RefCell::new(write_disk::WriteDisk::default())),
-        }))
-        .cast()
+        Box::into_raw(Box::new(crate::api::write_disk::new())).cast()
     })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_new() -> *mut Archive {
     guard(std::ptr::null_mut(), || {
-        Box::into_raw(Box::new(Handle {
-            base: Base::new(archive::READ_DISK_MAGIC),
-            kind: Kind::ReadDisk(RefCell::new(read_disk::ReadDisk::new())),
-        }))
-        .cast()
+        let h = crate::api::read_disk::new();
+        let entry = Box::into_raw(Box::new(Entry::new(None)));
+        h.with_read_disk((), |_, d| d.entry = entry);
+        Box::into_raw(Box::new(h)).cast()
     })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_disk_set_options(a: *mut Archive, flags: c_int) -> c_int {
-    write(a, ARCHIVE_FATAL, |_, d| {
-        d.options = flags;
-        ARCHIVE_OK
-    })
+    with(a, ARCHIVE_FATAL, |h| h.write_disk_set_options(flags))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_disk_set_skip_file(a: *mut Archive, dev: i64, ino: i64) -> c_int {
-    write(a, ARCHIVE_FATAL, |_, d| {
-        d.skip_file = Some((dev, ino));
-        ARCHIVE_OK
-    })
+    with(a, ARCHIVE_FATAL, |h| h.write_disk_set_skip_file(dev, ino))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_disk_set_standard_lookup(a: *mut Archive) -> c_int {
-    write(a, ARCHIVE_FATAL, |_, d| {
-        d.user = IdLookup {
-            standard: true,
-            ..IdLookup::default()
-        };
-        d.group = IdLookup {
-            standard: true,
-            ..IdLookup::default()
-        };
-        ARCHIVE_OK
-    })
+    with(a, ARCHIVE_FATAL, Handle::write_disk_set_standard_lookup)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_disk_set_group_lookup(
@@ -230,29 +212,20 @@ pub extern "C" fn archive_write_disk_uid(a: *mut Archive, name: *const c_char, i
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_set_symlink_logical(a: *mut Archive) -> c_int {
-    read(a, ARCHIVE_FATAL, |_, d| {
-        d.symlinks = 1;
-        ARCHIVE_OK
-    })
+    with(a, ARCHIVE_FATAL, |h| h.read_disk_set_symlinks(1))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_set_symlink_physical(a: *mut Archive) -> c_int {
-    read(a, ARCHIVE_FATAL, |_, d| {
-        d.symlinks = 0;
-        ARCHIVE_OK
-    })
+    with(a, ARCHIVE_FATAL, |h| h.read_disk_set_symlinks(0))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_set_symlink_hybrid(a: *mut Archive) -> c_int {
-    read(a, ARCHIVE_FATAL, |_, d| {
-        d.symlinks = 2;
-        ARCHIVE_OK
-    })
+    with(a, ARCHIVE_FATAL, |h| h.read_disk_set_symlinks(2))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_open(a: *mut Archive, path: *const c_char) -> c_int {
-    read(a, ARCHIVE_FATAL, |base, d| {
-        cstr(path).map_or(ARCHIVE_FATAL, |p| d.open(base, p.to_bytes()))
+    with(a, ARCHIVE_FATAL, |h| {
+        cstr(path).map_or(ARCHIVE_FATAL, |p| h.read_disk_open(p.to_bytes()))
     })
 }
 #[unsafe(no_mangle)]
@@ -273,23 +246,12 @@ pub extern "C" fn archive_read_disk_open_w(a: *mut Archive, path: *const libc::w
             let mut b = [0; 4];
             bytes.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
         }
-        read(a, ARCHIVE_FATAL, |base, d| d.open(base, &bytes))
+        with(a, ARCHIVE_FATAL, |h| h.read_disk_open(&bytes))
     })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_descend(a: *mut Archive) -> c_int {
-    with(a, ARCHIVE_FATAL, |h| {
-        if let Kind::ReadDisk(d) = &h.kind {
-            if let Ok(mut d) = d.try_borrow_mut() {
-                d.descend(&h.base)
-            } else {
-                h.base.disk_descend_requested.set(true);
-                ARCHIVE_OK
-            }
-        } else {
-            ARCHIVE_FATAL
-        }
-    })
+    with(a, ARCHIVE_FATAL, Handle::read_disk_descend)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_can_descend(a: *mut Archive) -> c_int {
@@ -309,10 +271,7 @@ pub extern "C" fn archive_read_disk_current_filesystem_is_remote(a: *mut Archive
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_set_behavior(a: *mut Archive, flags: c_int) -> c_int {
-    read(a, ARCHIVE_FATAL, |_, d| {
-        d.behavior = flags;
-        ARCHIVE_OK
-    })
+    with(a, ARCHIVE_FATAL, |h| h.read_disk_set_behavior(flags))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_set_atime_restored(a: *mut Archive) -> c_int {
@@ -323,25 +282,7 @@ pub extern "C" fn archive_read_disk_set_atime_restored(a: *mut Archive) -> c_int
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_set_standard_lookup(a: *mut Archive) -> c_int {
-    read(a, ARCHIVE_FATAL, |_, d| {
-        d.user = NameLookup {
-            standard: true,
-            data: std::ptr::null_mut(),
-            callback: None,
-            cleanup: None,
-            value: None,
-            cache: Vec::new(),
-        };
-        d.group = NameLookup {
-            standard: true,
-            data: std::ptr::null_mut(),
-            callback: None,
-            cleanup: None,
-            value: None,
-            cache: Vec::new(),
-        };
-        ARCHIVE_OK
-    })
+    with(a, ARCHIVE_FATAL, Handle::read_disk_set_standard_lookup)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_disk_set_gname_lookup(
@@ -502,27 +443,6 @@ impl ExcludedCallback {
 }
 
 pub type Progress = Option<unsafe extern "C" fn(*mut c_void)>;
-pub struct Extract {
-    pub disk: write_disk::WriteDisk,
-    pub base: Base,
-    progress: Progress,
-    data: *mut c_void,
-}
-impl Default for Extract {
-    fn default() -> Self {
-        Self {
-            disk: write_disk::WriteDisk::default(),
-            base: Base::new(archive::WRITE_DISK_MAGIC),
-            progress: None,
-            data: std::ptr::null_mut(),
-        }
-    }
-}
-impl Extract {
-    pub fn close(&mut self) -> c_int {
-        self.disk.close(&self.base)
-    }
-}
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_extract_set_progress_callback(
     a: *mut Archive,
@@ -530,26 +450,12 @@ pub extern "C" fn archive_read_extract_set_progress_callback(
     data: *mut c_void,
 ) {
     with(a, (), |h| {
-        if let Kind::Read(r) = &h.kind {
-            let mut r = r.borrow_mut();
-            let extract = r.extract.get_or_insert_with(Extract::default);
-            extract.progress = progress;
-            extract.data = data;
-        }
+        h.read_extract_set_progress_callback(progress.map(|progress| -> Rc<dyn Fn()> {
+            // SAFETY: the caller registered the callback to be called with
+            // `data`.
+            Rc::new(move || unsafe { progress(data) })
+        }));
     });
-}
-fn progress(a: *mut Archive) {
-    let cb = with(a, None, |h| {
-        if let Kind::Read(r) = &h.kind {
-            r.borrow().extract.as_ref().map(|e| (e.progress, e.data))
-        } else {
-            None
-        }
-    });
-    if let Some((Some(cb), data)) = cb {
-        // SAFETY: callback/data registered by caller; no read state is borrowed during callback.
-        unsafe { cb(data) };
-    }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_extract(
@@ -568,7 +474,7 @@ pub extern "C" fn archive_read_extract(
             };
             let mut r = r.borrow_mut();
             let skip = r.skip_file();
-            let e = r.extract.get_or_insert_with(Extract::default);
+            let e = r.extract.get_or_insert_with(Default::default);
             e.disk.options = flags;
             e.disk.skip_file = skip;
             let code = e.disk.header(&e.base, entry);
@@ -615,7 +521,7 @@ pub extern "C" fn archive_read_extract(
                     result = code;
                     break;
                 }
-                progress(a);
+                with(a, (), Handle::read_extract_progress);
             }
         }
         let finish = with(a, ARCHIVE_FATAL, |h| {
@@ -635,63 +541,24 @@ pub extern "C" fn archive_read_extract(
         result.min(finish)
     })
 }
-fn copy_extract_error(a: *mut Archive, dest: *mut Archive) {
-    with(a, (), |h| with(dest, (), |d| h.base.copy_error(&d.base)));
-}
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_read_extract2(
     a: *mut Archive,
     entry: *mut ArchiveEntry,
     dest: *mut Archive,
 ) -> c_int {
-    guard(ARCHIVE_FATAL, || {
-        let skip = with(a, None, |h| {
-            if let Kind::Read(r) = &h.kind {
-                r.borrow().skip_file()
-            } else {
-                None
-            }
-        });
-        if let Some((dev, ino)) = skip {
-            archive_write_disk_set_skip_file(dest, dev, ino);
-        }
-        let mut result = super::write::archive_write_header(dest, entry).max(archive::ARCHIVE_WARN);
-        if result < 0 {
-            copy_extract_error(a, dest);
-        }
-        // SAFETY: caller's entry remains live for extraction.
-        let copy = unsafe { entry.cast::<Entry>().as_ref() }
-            .is_some_and(|e| e.size_is_set() == 0 || e.size() > 0);
-        if result == ARCHIVE_OK && copy {
-            loop {
-                let mut data = std::ptr::null();
-                let mut size = 0;
-                let mut offset = 0;
-                let code =
-                    super::read::archive_read_data_block(a, &mut data, &mut size, &mut offset);
-                if code == archive::ARCHIVE_EOF {
-                    break;
-                }
-                if code != ARCHIVE_OK {
-                    result = code;
-                    break;
-                }
-                let code = (super::archive::archive_write_data_block(dest, data, size, offset)
-                    as c_int)
-                    .max(archive::ARCHIVE_WARN);
-                if code < 0 {
-                    copy_extract_error(a, dest);
-                    result = code;
-                    break;
-                }
-                progress(a);
-            }
-        }
-        let finish = super::archive::archive_write_finish_entry(dest).max(archive::ARCHIVE_WARN);
-        if finish < 0 && result == ARCHIVE_OK {
-            copy_extract_error(a, dest);
-        }
-        result.min(finish)
+    with(a, ARCHIVE_FATAL, |h| {
+        with(dest, ARCHIVE_FATAL, |d| {
+            // SAFETY: `entry` is NULL or a live entry the caller owns. It may
+            // be the handle's own entry, so this reference ends before
+            // `own_entry` makes another.
+            let (r, copy) = match unsafe { entry.cast::<Entry>().as_mut() } {
+                Some(e) => h.read_extract2_header(e, d),
+                // A NULL entry crashes upstream; it fails here.
+                None => (ARCHIVE_FATAL, false),
+            };
+            h.read_extract2_data(super::read::own_entry(h), d, r, copy)
+        })
     })
 }
 

@@ -5,7 +5,7 @@
 //! its messages) and the call into the reader. `ffi` exports it and
 //! `ArchiveRead` wraps it.
 
-use super::{Archive, ArchiveEntry, Status};
+use super::{Archive, ArchiveEntry, ArchiveWriteDisk, Status};
 use crate::archive::{ARCHIVE_EOF, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN, Base, Handle, Kind};
 use crate::archive::{READ_MAGIC, state};
 use crate::entry::Entry;
@@ -32,6 +32,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::rc::Rc;
 
 /// A registration's code: its status, or its failure, recorded.
 fn code(a: &Base, result: Result<read::Status, Error>) -> c_int {
@@ -625,6 +626,24 @@ impl ArchiveRead {
     pub fn data_into_fd(&mut self, fd: impl AsFd) -> Status {
         let fd = Fd(fd.as_fd().as_raw_fd());
         Status::from_code(self.a.h.read_data_into_fd(Some(&mut self.entry.0), fd))
+    }
+
+    /// `archive_read_extract2`: writes `entry` and the rest of its data to
+    /// `dest`. To extract what `next_header` read, read it with
+    /// `next_header2` into an entry of your own: the handle's own entry
+    /// can't be lent to a call on the handle.
+    pub fn extract2(&mut self, entry: &mut ArchiveEntry, dest: &mut ArchiveWriteDisk) -> Status {
+        let (r, copy) = self.a.h.read_extract2_header(&mut entry.0, &dest.h);
+        let own = Some(&mut *self.entry.0);
+        Status::from_code(self.a.h.read_extract2_data(own, &dest.h, r, copy))
+    }
+
+    /// `archive_read_extract_set_progress_callback`: `progress` runs after
+    /// each block `extract2` writes.
+    pub fn extract_set_progress_callback(&mut self, progress: impl Fn() + 'static) {
+        self.a
+            .h
+            .read_extract_set_progress_callback(Some(Rc::new(progress)));
     }
 
     /// `archive_read_header_position`: the offset of the last header in

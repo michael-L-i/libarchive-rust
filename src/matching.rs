@@ -32,7 +32,7 @@ use crate::pathmatch;
 use crate::string::MString;
 use crate::util::Error;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CStr, c_char};
+use std::ffi::CStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -230,19 +230,21 @@ impl Matching {
             .count()
             .min(i32::MAX as usize) as i32
     }
-    pub fn unmatched_next(&mut self, wide: bool) -> (i32, *const c_char, *const libc::wchar_t) {
+    /// The next unmatched inclusion pattern: `ARCHIVE_OK` and the pattern,
+    /// or `ARCHIVE_EOF` once, after the last one.
+    pub fn unmatched_next(&mut self) -> (i32, Option<&mut MString>) {
         if self.eof {
             self.eof = false;
-            return (ARCHIVE_EOF, std::ptr::null(), std::ptr::null());
+            return (ARCHIVE_EOF, None);
         }
         if self.next.is_none() && self.unmatched() == 0 {
-            return (ARCHIVE_EOF, std::ptr::null(), std::ptr::null());
+            return (ARCHIVE_EOF, None);
         }
         let start = self.next.unwrap_or(0);
         let Some(index) = (start..self.inclusions.len()).find(|&i| !self.inclusions[i].matched)
         else {
             self.next = None;
-            return (ARCHIVE_EOF, std::ptr::null(), std::ptr::null());
+            return (ARCHIVE_EOF, None);
         };
         self.next = if index + 1 < self.inclusions.len() {
             Some(index + 1)
@@ -250,23 +252,7 @@ impl Matching {
             self.eof = true;
             None
         };
-        let p = &mut self.inclusions[index].text;
-        if wide {
-            (
-                ARCHIVE_OK,
-                std::ptr::null(),
-                p.get_wcs_z(None)
-                    .ok()
-                    .flatten()
-                    .map_or([0 as libc::wchar_t].as_ptr(), |w| w.as_ptr()),
-            )
-        } else {
-            (
-                ARCHIVE_OK,
-                p.get_mbs_c(None).ok().flatten().unwrap_or(c"").as_ptr(),
-                std::ptr::null(),
-            )
-        }
+        (ARCHIVE_OK, Some(&mut self.inclusions[index].text))
     }
     pub fn include_time(
         &mut self,

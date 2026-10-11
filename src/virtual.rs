@@ -152,6 +152,16 @@ impl Handle {
         state::FATAL as c_int
     }
 
+    pub fn write_header(&self, entry: &mut Entry) -> c_int {
+        match &self.kind {
+            Kind::Read(_) | Kind::ReadDisk(_) | Kind::Match(_) => ARCHIVE_FATAL,
+            Kind::Write(w) => w
+                .try_borrow_mut()
+                .map_or(ARCHIVE_FATAL, |mut w| w.header(&self.base, entry)),
+            Kind::WriteDisk(w) => w.borrow_mut().header(&self.base, entry),
+        }
+    }
+
     pub fn write_finish_entry(&self) -> c_int {
         match &self.kind {
             Kind::Read(_) | Kind::ReadDisk(_) | Kind::Match(_) => ARCHIVE_FATAL,

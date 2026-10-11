@@ -4,10 +4,9 @@ use super::entry::put;
 use super::{Archive, ArchiveEntry, guard};
 use crate::archive::*;
 use crate::entry::Entry;
-use crate::matching::{Matching, invalid};
+use crate::matching::Matching;
 use crate::string::MString;
 use crate::util::Error;
-use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_long};
 
 fn text(p: *const c_char) -> MString {
@@ -33,33 +32,13 @@ fn operation(
     name: &str,
     f: impl FnOnce(&Base, &mut Matching) -> Result<c_int, Error>,
 ) -> c_int {
-    with(a, ARCHIVE_FATAL, |h| {
-        if h.base.check_magic(MATCH_MAGIC, state::NEW, name) == ARCHIVE_FATAL {
-            return ARCHIVE_FATAL;
-        }
-        let Kind::Match(m) = &h.kind else {
-            return ARCHIVE_FATAL;
-        };
-        let mut m = m.borrow_mut();
-        f(&h.base, &mut m).unwrap_or_else(|e| {
-            if e.code == ARCHIVE_FATAL {
-                h.base.state.set(state::FATAL);
-            }
-            h.base.raise(e)
-        })
-    })
+    with(a, ARCHIVE_FATAL, |h| h.match_operation(name, f))
 }
-fn entry(
-    a: *mut Archive,
-    p: *mut ArchiveEntry,
-    name: &str,
-    f: impl FnOnce(&Base, &mut Matching, &mut Entry) -> Result<c_int, Error>,
-) -> c_int {
-    operation(a, name, |b, m| {
-        // SAFETY: the caller supplies NULL or a live archive_entry allocation.
-        let e = unsafe { p.cast::<Entry>().as_mut() }.ok_or_else(|| invalid("entry is NULL"))?;
-        f(b, m, e)
-    })
+/// An entry argument, as the reference the call uses.
+fn entry<'a>(e: *mut ArchiveEntry) -> Option<&'a mut Entry> {
+    // SAFETY: the caller passes NULL or a live entry it owns, which nothing
+    // else uses during the call.
+    unsafe { e.cast::<Entry>().as_mut() }
 }
 #[derive(Clone, Copy)]
 pub(crate) struct MatchingHandle(*mut Archive);
@@ -74,9 +53,7 @@ impl MatchingHandle {
         with(self.0, (), |h| dest.copy_error(&h.base));
     }
     pub(crate) fn path_excluded(self, e: &mut Entry) -> c_int {
-        operation(self.0, "archive_match_path_excluded", |b, m| {
-            Ok(m.path_excluded(b, e))
-        })
+        with(self.0, ARCHIVE_FATAL, |h| h.match_path_excluded(Some(e)))
     }
     pub(crate) fn time_excluded(self, e: &mut Entry) -> c_int {
         operation(self.0, "archive_match_time_excluded_ae", |_, m| {
@@ -92,11 +69,7 @@ impl MatchingHandle {
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_match_new() -> *mut Archive {
     guard(std::ptr::null_mut(), || {
-        Box::into_raw(Box::new(Handle {
-            base: Base::new(MATCH_MAGIC),
-            kind: Kind::Match(RefCell::new(Matching::default())),
-        }))
-        .cast()
+        Box::into_raw(Box::new(crate::api::matching::new())).cast()
     })
 }
 #[unsafe(no_mangle)]
@@ -120,26 +93,24 @@ pub extern "C" fn archive_match_free(a: *mut Archive) -> c_int {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_match_set_inclusion_recursion(a: *mut Archive, enabled: c_int) -> c_int {
-    operation(a, "archive_match_set_inclusion_recursion", |_, m| {
-        m.recursive = enabled != 0;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_set_inclusion_recursion(enabled != 0)
     })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_match_path_unmatched_inclusions(a: *mut Archive) -> c_int {
-    operation(a, "archive_match_unmatched_inclusions", |_, m| {
-        Ok(m.unmatched())
-    })
+    with(a, ARCHIVE_FATAL, Handle::match_path_unmatched_inclusions)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_match_path_unmatched_inclusions_next(
     a: *mut Archive,
     p: *mut *const c_char,
 ) -> c_int {
-    operation(a, "archive_match_unmatched_inclusions_next", |_, m| {
-        let (r, s, _) = m.unmatched_next(false);
-        put(p, s);
-        Ok(r)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_path_unmatched_inclusions_next("archive_match_unmatched_inclusions_next", |s| {
+            let s = s.map(|s| s.get_mbs_c(None).ok().flatten().unwrap_or(c""));
+            put(p, s.map_or(std::ptr::null(), CStr::as_ptr));
+        })
     })
 }
 #[unsafe(no_mangle)]
@@ -147,10 +118,12 @@ pub extern "C" fn archive_match_path_unmatched_inclusions_next_w(
     a: *mut Archive,
     p: *mut *const libc::wchar_t,
 ) -> c_int {
-    operation(a, "archive_match_unmatched_inclusions_next_w", |_, m| {
-        let (r, _, s) = m.unmatched_next(true);
-        put(p, s);
-        Ok(r)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_path_unmatched_inclusions_next("archive_match_unmatched_inclusions_next_w", |s| {
+            static EMPTY: [libc::wchar_t; 1] = [0];
+            let s = s.map(|s| s.get_wcs_z(None).ok().flatten().unwrap_or(&EMPTY));
+            put(p, s.map_or(std::ptr::null(), <[libc::wchar_t]>::as_ptr));
+        })
     })
 }
 #[unsafe(no_mangle)]
@@ -171,10 +144,7 @@ pub extern "C" fn archive_match_exclude_entry(
     flag: c_int,
     e: *mut ArchiveEntry,
 ) -> c_int {
-    entry(a, e, "archive_match_time_include_entry", |_, m, e| {
-        m.exclude_entry(flag, e)?;
-        Ok(ARCHIVE_OK)
-    })
+    with(a, ARCHIVE_FATAL, |h| h.match_exclude_entry(flag, entry(e)))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_parse_date(now: libc::time_t, p: *const c_char) -> libc::time_t {
@@ -189,41 +159,28 @@ pub extern "C" fn archive_parse_date(now: libc::time_t, p: *const c_char) -> lib
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_match_excluded(a: *mut Archive, e: *mut ArchiveEntry) -> c_int {
-    entry(a, e, "archive_match_excluded", |b, m, e| {
-        let _ = b;
-        Ok(m.excluded(b, e))
-    })
+    with(a, ARCHIVE_FATAL, |h| h.match_excluded(entry(e)))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_match_path_excluded(a: *mut Archive, e: *mut ArchiveEntry) -> c_int {
-    entry(a, e, "archive_match_path_excluded", |b, m, e| {
-        let _ = b;
-        Ok(m.path_excluded(b, e))
-    })
+    with(a, ARCHIVE_FATAL, |h| h.match_path_excluded(entry(e)))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_match_time_excluded(a: *mut Archive, e: *mut ArchiveEntry) -> c_int {
-    entry(a, e, "archive_match_time_excluded", |b, m, e| {
-        let _ = b;
-        Ok(m.time_excluded(e))
-    })
+    with(a, ARCHIVE_FATAL, |h| h.match_time_excluded(entry(e)))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_match_owner_excluded(a: *mut Archive, e: *mut ArchiveEntry) -> c_int {
-    entry(a, e, "archive_match_owner_excluded", |b, m, e| {
-        let _ = b;
-        Ok(m.owner_excluded(e))
-    })
+    with(a, ARCHIVE_FATAL, |h| h.match_owner_excluded(entry(e)))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_match_include_pattern(a: *mut Archive, p: *const c_char) -> c_int {
-    operation(a, "archive_match_include_pattern", |_, m| {
-        m.pattern(true, text(p))?;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_pattern("archive_match_include_pattern", true, text(p))
     })
 }
 
@@ -233,18 +190,13 @@ pub extern "C" fn archive_match_include_pattern_from_file(
     p: *const c_char,
     null: c_int,
 ) -> c_int {
-    operation(a, "archive_match_include_pattern_from_file", |_, m| {
-        let mut t = text(p);
-        let path = t
-            .get_mbs_c(None)
-            .ok()
-            .flatten()
-            .ok_or_else(|| invalid("pathname is empty"))?;
-        if path.to_bytes().is_empty() {
-            return Err(invalid("pathname is empty"));
-        }
-        m.patterns_file(true, path.to_bytes(), null != 0)?;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_pattern_from_file(
+            "archive_match_include_pattern_from_file",
+            true,
+            text(p),
+            null != 0,
+        )
     })
 }
 
@@ -253,9 +205,8 @@ pub extern "C" fn archive_match_include_pattern_w(
     a: *mut Archive,
     p: *const libc::wchar_t,
 ) -> c_int {
-    operation(a, "archive_match_include_pattern_w", |_, m| {
-        m.pattern(true, wide(p))?;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_pattern("archive_match_include_pattern_w", true, wide(p))
     })
 }
 
@@ -265,26 +216,20 @@ pub extern "C" fn archive_match_include_pattern_from_file_w(
     p: *const libc::wchar_t,
     null: c_int,
 ) -> c_int {
-    operation(a, "archive_match_include_pattern_from_file_w", |_, m| {
-        let mut t = wide(p);
-        let path = t
-            .get_mbs_c(None)
-            .ok()
-            .flatten()
-            .ok_or_else(|| invalid("pathname is empty"))?;
-        if path.to_bytes().is_empty() {
-            return Err(invalid("pathname is empty"));
-        }
-        m.patterns_file(true, path.to_bytes(), null != 0)?;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_pattern_from_file(
+            "archive_match_include_pattern_from_file_w",
+            true,
+            wide(p),
+            null != 0,
+        )
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_match_exclude_pattern(a: *mut Archive, p: *const c_char) -> c_int {
-    operation(a, "archive_match_exclude_pattern", |_, m| {
-        m.pattern(false, text(p))?;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_pattern("archive_match_exclude_pattern", false, text(p))
     })
 }
 
@@ -294,18 +239,13 @@ pub extern "C" fn archive_match_exclude_pattern_from_file(
     p: *const c_char,
     null: c_int,
 ) -> c_int {
-    operation(a, "archive_match_exclude_pattern_from_file", |_, m| {
-        let mut t = text(p);
-        let path = t
-            .get_mbs_c(None)
-            .ok()
-            .flatten()
-            .ok_or_else(|| invalid("pathname is empty"))?;
-        if path.to_bytes().is_empty() {
-            return Err(invalid("pathname is empty"));
-        }
-        m.patterns_file(false, path.to_bytes(), null != 0)?;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_pattern_from_file(
+            "archive_match_exclude_pattern_from_file",
+            false,
+            text(p),
+            null != 0,
+        )
     })
 }
 
@@ -314,9 +254,8 @@ pub extern "C" fn archive_match_exclude_pattern_w(
     a: *mut Archive,
     p: *const libc::wchar_t,
 ) -> c_int {
-    operation(a, "archive_match_exclude_pattern_w", |_, m| {
-        m.pattern(false, wide(p))?;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_pattern("archive_match_exclude_pattern_w", false, wide(p))
     })
 }
 
@@ -326,18 +265,13 @@ pub extern "C" fn archive_match_exclude_pattern_from_file_w(
     p: *const libc::wchar_t,
     null: c_int,
 ) -> c_int {
-    operation(a, "archive_match_exclude_pattern_from_file_w", |_, m| {
-        let mut t = wide(p);
-        let path = t
-            .get_mbs_c(None)
-            .ok()
-            .flatten()
-            .ok_or_else(|| invalid("pathname is empty"))?;
-        if path.to_bytes().is_empty() {
-            return Err(invalid("pathname is empty"));
-        }
-        m.patterns_file(false, path.to_bytes(), null != 0)?;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_pattern_from_file(
+            "archive_match_exclude_pattern_from_file_w",
+            false,
+            wide(p),
+            null != 0,
+        )
     })
 }
 
@@ -363,16 +297,8 @@ pub extern "C" fn archive_match_include_file_time(
     flag: c_int,
     p: *const c_char,
 ) -> c_int {
-    operation(a, "archive_match_include_file_time", |_, m| {
-        crate::matching::validate_time(flag)?;
-        let mut t = text(p);
-        let path = t
-            .get_mbs_c(None)
-            .ok()
-            .flatten()
-            .ok_or_else(|| invalid("pathname is empty"))?;
-        m.include_file_time(flag, path.to_bytes())?;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_include_file_time("archive_match_include_file_time", flag, text(p))
     })
 }
 
@@ -382,22 +308,8 @@ pub extern "C" fn archive_match_include_date(
     flag: c_int,
     p: *const c_char,
 ) -> c_int {
-    operation(a, "archive_match_include_date", |_, m| {
-        crate::matching::validate_time(flag)?;
-        let mut t = text(p);
-        let date = t
-            .get_mbs_c(None)
-            .ok()
-            .flatten()
-            .ok_or_else(|| invalid("date is empty"))?
-            .to_bytes();
-        if date.is_empty() {
-            return Err(invalid("date is empty"));
-        }
-        let sec =
-            crate::parse_date::parse(m.now, date).ok_or_else(|| invalid("invalid date string"))?;
-        m.include_time(flag, (sec, 0), (sec, 0))?;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_include_date("archive_match_include_date", flag, text(p))
     })
 }
 
@@ -423,16 +335,8 @@ pub extern "C" fn archive_match_include_file_time_w(
     flag: c_int,
     p: *const libc::wchar_t,
 ) -> c_int {
-    operation(a, "archive_match_include_file_time_w", |_, m| {
-        crate::matching::validate_time(flag)?;
-        let mut t = wide(p);
-        let path = t
-            .get_mbs_c(None)
-            .ok()
-            .flatten()
-            .ok_or_else(|| invalid("pathname is empty"))?;
-        m.include_file_time(flag, path.to_bytes())?;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_include_file_time("archive_match_include_file_time_w", flag, wide(p))
     })
 }
 
@@ -442,22 +346,8 @@ pub extern "C" fn archive_match_include_date_w(
     flag: c_int,
     p: *const libc::wchar_t,
 ) -> c_int {
-    operation(a, "archive_match_include_date_w", |_, m| {
-        crate::matching::validate_time(flag)?;
-        let mut t = wide(p);
-        let date = t
-            .get_mbs_c(None)
-            .ok()
-            .flatten()
-            .ok_or_else(|| invalid("date is empty"))?
-            .to_bytes();
-        if date.is_empty() {
-            return Err(invalid("date is empty"));
-        }
-        let sec =
-            crate::parse_date::parse(m.now, date).ok_or_else(|| invalid("invalid date string"))?;
-        m.include_time(flag, (sec, 0), (sec, 0))?;
-        Ok(ARCHIVE_OK)
+    with(a, ARCHIVE_FATAL, |h| {
+        h.match_include_date("archive_match_include_date_w", flag, wide(p))
     })
 }
 

@@ -55,4 +55,5 @@ mod r#virtual;
 mod write;
 
 mod read_disk;
+mod read_extract2;
 mod write_disk;
