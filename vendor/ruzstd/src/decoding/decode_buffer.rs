@@ -205,6 +205,34 @@ impl DecodeBuffer {
         self.len()
     }
 
+    /// Collects the next `len` bytes without copying them, if they are
+    /// collectable (all of them, once `finished`) and contiguous. They stay
+    /// readable through [DecodeBuffer::collected] until the next block is
+    /// decoded.
+    pub fn collect_in_place(&mut self, len: usize, finished: bool) -> Option<Range<usize>> {
+        let collectable = if finished {
+            self.len()
+        } else {
+            self.can_drain_to_window_size().unwrap_or(0)
+        };
+        let first = if self.old.is_empty() {
+            &self.new
+        } else {
+            &self.old
+        };
+        if collectable < len || first.len() < len {
+            return None;
+        }
+        let range = first.start..first.start + len;
+        self.drop_first_n(len);
+        Some(range)
+    }
+
+    /// The bytes [DecodeBuffer::collect_in_place] collected.
+    pub fn collected(&self, range: Range<usize>) -> &[u8] {
+        self.buf.get(range).unwrap_or_default()
+    }
+
     /// Drain as much as possible while retaining enough so that decoding si still possible with the required window_size
     /// At best call only if can_drain_to_window_size reports a 'high' number of bytes to reduce allocations
     pub fn drain_to_window_size(&mut self) -> Option<Vec<u8>> {
@@ -348,6 +376,11 @@ mod tests {
             push(&mut buffer, &data);
             expected.extend_from_slice(&data);
             assert_eq!(buffer.size, super::ring_size(window).unwrap());
+            if i % 3 == 0 {
+                while let Some(range) = buffer.collect_in_place(4096, false) {
+                    collected.extend_from_slice(buffer.collected(range));
+                }
+            }
             let mut out = vec![0; buffer.can_drain_to_window_size().unwrap_or(0)];
             std::io::Read::read_exact(&mut buffer, &mut out).unwrap();
             collected.extend_from_slice(&out);

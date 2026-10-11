@@ -13,6 +13,7 @@ use crate::io::{Error, Read, Write};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::convert::TryInto;
+use core::ops::Range;
 
 /// The default maximum window size, in bytes, that a [FrameDecoder] accepts.
 ///
@@ -417,6 +418,23 @@ impl FrameDecoder {
                 .buffer
                 .can_drain_to_window_size()
                 .unwrap_or(0)
+        }
+    }
+
+    /// Collects the next `len` bytes without copying them, if [FrameDecoder::can_collect] reports
+    /// at least that many and they are contiguous in the decode buffer. They stay readable through
+    /// [FrameDecoder::collected] until the next block is decoded.
+    pub fn collect_in_place(&mut self, len: usize) -> Option<Range<usize>> {
+        let finished = self.is_finished();
+        let state = self.state.as_mut()?;
+        state.decoder_scratch.buffer.collect_in_place(len, finished)
+    }
+
+    /// The bytes [FrameDecoder::collect_in_place] collected.
+    pub fn collected(&self, range: Range<usize>) -> &[u8] {
+        match &self.state {
+            None => &[],
+            Some(s) => s.decoder_scratch.buffer.collected(range),
         }
     }
 

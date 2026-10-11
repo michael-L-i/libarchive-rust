@@ -39,6 +39,7 @@ use ruzstd::decoding::errors::{
 use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 use std::ffi::{CStr, c_int};
 use std::io;
+use std::ops::Range;
 
 /// `ZSTD_DStreamOutSize()`: the largest block, as upstream's output block.
 const BLOCK: usize = 128 * 1024;
@@ -104,7 +105,6 @@ impl FilterBidder for Bidder {
         out.try_reserve_exact(BLOCK).map_err(|_| {
             Error::fatal(libc::ENOMEM, "Can't allocate data for zstd decompression")
         })?;
-        out.resize(BLOCK, 0);
         let mut decoder = FrameDecoder::new();
         decoder.set_max_window_size(MAX_WINDOW);
         Ok(Box::new(Zstd {
@@ -113,6 +113,7 @@ impl FilterBidder for Bidder {
             eof: false,
             out,
             len: 0,
+            in_place: None,
         }))
     }
 }
@@ -257,9 +258,12 @@ struct Zstd {
     /// In the middle of a frame.
     in_frame: bool,
     eof: bool,
-    /// The output block; its first `len` bytes are the current block.
+    /// The output block, initialized when first needed; its first `len`
+    /// bytes are the current block, unless that is `in_place`.
     out: Vec<u8>,
     len: usize,
+    /// A whole block left in the decoder's buffer, uncopied.
+    in_place: Option<Range<usize>>,
 }
 
 impl Filter for Zstd {
@@ -272,10 +276,12 @@ impl Filter for Zstd {
     }
 
     /// Fills the output block, or ends at the end of the input. A frame's
-    /// checksum is checked once all its output has been read.
+    /// checksum is checked once all its output has been read. A full block
+    /// that lies contiguously in the decoder's buffer is used in place.
     fn read(&mut self, up: &mut Reader<'_>) -> Result<(), Error> {
         self.len = 0;
-        while self.len < self.out.len() && !self.eof {
+        self.in_place = None;
+        while self.len < BLOCK && !self.eof {
             if !self.in_frame {
                 if !skip_skippable(up)? {
                     self.eof = true;
@@ -289,18 +295,27 @@ impl Filter for Zstd {
                 self.in_frame = true;
             }
             let mut input = Input::new(up);
-            while self.decoder.can_collect() == 0 && !self.decoder.is_finished() {
+            let want = BLOCK - self.len;
+            while self.decoder.can_collect() < want && !self.decoder.is_finished() {
                 let strategy = BlockDecodingStrategy::UptoBytes(1);
                 if let Err(e) = self.decoder.decode_blocks(&mut input, strategy) {
                     return Err(decode_failure(input, Some(&e)));
                 }
             }
-            let room = self.out.get_mut(self.len..).unwrap_or_default();
-            let n = match io::Read::read(&mut self.decoder, room) {
-                Ok(n) => n,
-                Err(_) => return Err(decode_failure(input, None)),
-            };
-            self.len += n;
+            if want == BLOCK
+                && let Some(range) = self.decoder.collect_in_place(BLOCK)
+            {
+                self.in_place = Some(range);
+                self.len = BLOCK;
+            } else {
+                self.out.resize(BLOCK, 0);
+                let room = self.out.get_mut(self.len..).unwrap_or_default();
+                let n = match io::Read::read(&mut self.decoder, room) {
+                    Ok(n) => n,
+                    Err(_) => return Err(decode_failure(input, None)),
+                };
+                self.len += n;
+            }
             if self.decoder.is_finished() && self.decoder.can_collect() == 0 {
                 if let Some(stored) = self.decoder.get_checksum_from_data()
                     && self.decoder.get_calculated_checksum() != Some(stored)
@@ -314,7 +329,10 @@ impl Filter for Zstd {
     }
 
     fn block(&self) -> &[u8] {
-        self.out.get(..self.len).unwrap_or_default()
+        match &self.in_place {
+            Some(range) => self.decoder.collected(range.clone()),
+            None => self.out.get(..self.len).unwrap_or_default(),
+        }
     }
 }
 

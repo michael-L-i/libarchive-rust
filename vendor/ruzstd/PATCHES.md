@@ -505,3 +505,16 @@ pass with debug assertions and overflow checks, including chunked copies
 against byte-at-a-time LZ77, joins of the older segment and the dictionary,
 repeat offsets, and ring wrapping without growth. Upstream zstd, zip and 7zip
 tests and `diff-cat` agree. Evidence: sibling `diagnostics/round12-zstd-dec`.
+
+## Round 12: collect whole blocks in place
+
+`FrameDecoder::collect_in_place` drains collectable bytes without copying
+when they are contiguous in the window and returns where they lie;
+`FrameDecoder::collected` reads them until the next block is decoded. The
+archive filter decodes until a whole 128 KiB output block is collectable and
+hands out that slice of the window, copying only a frame's last partial block
+or one that straddles the ring's wrap. Output blocks, their boundaries, input
+consumption, error precedence and partial output are unchanged: all 2256
+archive cases match the previous commit, including a digest of every block's
+offset and size. Because the window caps match history, decoding up to a
+block ahead of collection accepts exactly the same offsets.
