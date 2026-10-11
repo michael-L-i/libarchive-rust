@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    # The port is developed and validated on macOS; Linux builds and lints
+    # cleanly, but its tests have not been validated there yet.
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --release
+
+  oracle:
+    name: Upstream test suite (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install upstream's build dependencies
+        run: brew install cmake xz zstd lz4 libb2 libiconv
+      - name: Build upstream libarchive (the oracle)
+        run: scripts/build-oracle
+      - name: Build the port and relink upstream's tests
+        run: scripts/build-port --release
+      - name: Run upstream's tests against the port
+        run: scripts/run-tests --suite all --timeout 60
