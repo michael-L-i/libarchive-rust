@@ -518,3 +518,20 @@ consumption, error precedence and partial output are unchanged: all 2256
 archive cases match the previous commit, including a digest of every block's
 offset and size. Because the window caps match history, decoding up to a
 block ahead of collection accepts exactly the same offsets.
+
+## Round 12: decode Huffman literals a word at a time
+
+The four-stream fast path now starts with libzstd's
+`HUF_decompress4X1_usingDTable_internal_fast_c_loop`: each lane keeps its
+next bits on top of a word with a sentinel bit below them, looks up the top
+11 bits in a table expanded to 2048 entries, and reloads a whole word after
+five symbols (at most 55 bits; a reloaded word holds 56). Lanes run while
+every word starts at least 7 bytes into its stream, then hand their exact
+reader position to the existing per-symbol lanes, which decode the rest and
+make the serial decoder's terminal checks. A lane whose stream is shorter
+than 8 bytes or whose padding takes more than a byte skips the word loop.
+Output, errors and the serial fallback are unchanged: the vendor tests that
+compare the fast path with the serial decoder on valid, truncated, mutated
+and irregular streams pass, and all 2256 archive cases match the previous
+commit. On the compiled corpus (1.36 M Huffman literals) in-process decoding
+fell from 117 M to 77 M instructions.

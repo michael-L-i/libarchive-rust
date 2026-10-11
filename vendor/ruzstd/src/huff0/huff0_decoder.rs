@@ -81,6 +81,19 @@ impl HuffmanTable {
         (1..=MAX_MAX_NUM_BITS).contains(&m) && self.decode.len() == 1usize << m
     }
 
+    /// The table indexed by the next 11 bits, as libzstd's fast decoder
+    /// reads it: each entry is the symbol above the code length. Requires
+    /// [HuffmanTable::fast_decode_ok].
+    pub(crate) fn word_table(&self) -> [u16; 1 << MAX_MAX_NUM_BITS] {
+        let shift = MAX_MAX_NUM_BITS - self.max_num_bits;
+        let mut table = [0; 1 << MAX_MAX_NUM_BITS];
+        for (i, entry) in table.iter_mut().enumerate() {
+            let e = self.decode[i >> shift];
+            *entry = u16::from(e.symbol) << 8 | u16::from(e.num_bits);
+        }
+        table
+    }
+
     /// Create a new, empty table.
     pub fn new() -> HuffmanTable {
         HuffmanTable {

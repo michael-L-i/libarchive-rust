@@ -87,6 +87,32 @@ impl<'s> BitReaderReversed<'s> {
         debug_assert!(self.bits_consumed < 8);
     }
 
+    /// The reader as a whole-word decoder holds it (libzstd's Huffman fast
+    /// loop): the index of the 8-byte word holding the next bits, and that
+    /// word shifted so they are on top, with a sentinel 1 in place of its
+    /// lowest bit. The sentinel's trailing zeros count the bits consumed from
+    /// the word. None unless a word is loaded with at most a byte consumed.
+    pub(crate) fn to_word(&self) -> Option<(usize, u64)> {
+        if self.extra_bits != 0 || self.bits_consumed > 8 || self.source.len() < 8 {
+            return None;
+        }
+        Some((self.index, (self.bit_container | 1) << self.bits_consumed))
+    }
+
+    /// The reader where a whole-word decoder left `word`, loaded from `index`.
+    pub(crate) fn from_word(source: &'s [u8], index: usize, word: u64) -> Self {
+        let mut br = BitReaderReversed {
+            index,
+            bits_consumed: 0,
+            extra_bits: 0,
+            source,
+            bit_container: 0,
+        };
+        br.bit_container = u64::from_le_bytes(source[index..index + 8].try_into().unwrap());
+        br.bits_consumed = word.trailing_zeros() as u8;
+        br
+    }
+
     // A sequence uses at most three refills, each moving at most eight bytes.
     // Keeping 32 source bytes guarantees that these refills cannot enter the tail.
     #[inline(always)]

@@ -8,6 +8,7 @@ use crate::decoding::errors::DecompressLiteralsError;
 use crate::huff0::{HuffmanDecoder, HuffmanTable};
 
 use alloc::vec::Vec;
+use core::convert::TryInto;
 
 const FAST_MAX_REGEN: usize = 128 * 1024;
 
@@ -170,29 +171,31 @@ fn decompress_literals<const FORCE_SERIAL: bool>(
     Ok(bytes_read)
 }
 
+/// Skips a stream's padding exactly as in the serial path; None on bad padding.
+fn skip_padding(stream: &[u8]) -> Option<BitReaderReversed<'_>> {
+    let mut br = BitReaderReversed::new(stream);
+    let mut skipped = 0u32;
+    loop {
+        let v = br.get_bits(1);
+        skipped += 1;
+        if v == 1 || skipped > 8 {
+            break;
+        }
+    }
+    (skipped <= 8).then_some(br)
+}
+
 struct Lane<'t, 's> {
     dec: HuffmanDecoder<'t>,
     br: BitReaderReversed<'s>,
 }
 
 impl<'t, 's> Lane<'t, 's> {
-    /// Padding skip and init exactly as in the serial path; None on bad padding.
-    fn new(table: &'t HuffmanTable, stream: &'s [u8]) -> Option<Self> {
-        let mut br = BitReaderReversed::new(stream);
-        let mut skipped = 0u32;
-        loop {
-            let v = br.get_bits(1);
-            skipped += 1;
-            if v == 1 || skipped > 8 {
-                break;
-            }
-        }
-        if skipped > 8 {
-            return None;
-        }
+    /// The initial state, read after the padding.
+    fn new(table: &'t HuffmanTable, mut br: BitReaderReversed<'s>) -> Self {
         let mut dec = HuffmanDecoder::new(table);
         dec.init_state(&mut br);
-        Some(Lane { dec, br })
+        Lane { dec, br }
     }
 
     #[inline(always)]
@@ -234,28 +237,36 @@ fn decode_4_fast(
         Some(n) if n > 0 => n,
         _ => return false, // irregular/tiny: let serial handle it
     };
-    let (mut l0, mut l1, mut l2, mut l3) = match (
-        Lane::new(table, streams[0]),
-        Lane::new(table, streams[1]),
-        Lane::new(table, streams[2]),
-        Lane::new(table, streams[3]),
-    ) {
-        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-        _ => return false, // target untouched
+    let (Some(r0), Some(r1), Some(r2), Some(r3)) = (
+        skip_padding(streams[0]),
+        skip_padding(streams[1]),
+        skip_padding(streams[2]),
+        skip_padding(streams[3]),
+    ) else {
+        return false; // target untouched
     };
+    let mut readers = [r0, r1, r2, r3];
 
     target.resize(regen, 0); // within the earlier reserve(regen)
     let (o0, rest) = target.split_at_mut(chunk);
     let (o1, rest) = rest.split_at_mut(chunk);
     let (o2, o3) = rest.split_at_mut(chunk);
     let (n4, n3) = (last - 1, chunk - 1);
+    let done = decode_words(table, streams, &mut readers, [o0, o1, o2, o3], n4);
+    let [r0, r1, r2, r3] = readers;
+    let (mut l0, mut l1, mut l2, mut l3) = (
+        Lane::new(table, r0),
+        Lane::new(table, r1),
+        Lane::new(table, r2),
+        Lane::new(table, r3),
+    );
 
     // Four independent dependency chains per iteration.
-    for (((a, b), c), d) in o0[..n4]
+    for (((a, b), c), d) in o0[done..n4]
         .iter_mut()
-        .zip(o1[..n4].iter_mut())
-        .zip(o2[..n4].iter_mut())
-        .zip(o3[..n4].iter_mut())
+        .zip(o1[done..n4].iter_mut())
+        .zip(o2[done..n4].iter_mut())
+        .zip(o3[done..n4].iter_mut())
     {
         l0.step(a);
         l1.step(b);
@@ -281,6 +292,70 @@ fn decode_4_fast(
         target.clear();
     }
     ok
+}
+
+/// Decodes the start of the four lanes a word at a time, after libzstd's
+/// `HUF_decompress4X1_usingDTable_internal_fast_c_loop`: the next 11 bits
+/// index a table, and each lane reloads a whole word after five symbols, at
+/// most 55 bits. A word loaded after consuming at most 7 bits of its first
+/// byte holds 56, so every lane runs while its word starts at least 7 bytes
+/// into its stream. Decodes the same number of symbols, a multiple of five
+/// and at most `limit`, into each output, returns it and leaves the readers
+/// after them; the symbols are those the serial decoder would produce.
+fn decode_words<'s>(
+    table: &HuffmanTable,
+    streams: &[&'s [u8]; 4],
+    readers: &mut [BitReaderReversed<'s>; 4],
+    [o0, o1, o2, o3]: [&mut [u8]; 4],
+    limit: usize,
+) -> usize {
+    const SYMBOLS: usize = 5;
+    let (Some(w0), Some(w1), Some(w2), Some(w3)) = (
+        readers[0].to_word(),
+        readers[1].to_word(),
+        readers[2].to_word(),
+        readers[3].to_word(),
+    ) else {
+        return 0;
+    };
+    let mut words = [w0, w1, w2, w3];
+    let lookup = table.word_table();
+    let mut done = 0;
+    for (((a, b), c), d) in o0[..limit]
+        .chunks_exact_mut(SYMBOLS)
+        .zip(o1[..limit].chunks_exact_mut(SYMBOLS))
+        .zip(o2[..limit].chunks_exact_mut(SYMBOLS))
+        .zip(o3[..limit].chunks_exact_mut(SYMBOLS))
+    {
+        if words.iter().any(|&(index, _)| index < 7) {
+            break;
+        }
+        for i in 0..SYMBOLS {
+            a[i] = word_symbol(&lookup, &mut words[0].1);
+            b[i] = word_symbol(&lookup, &mut words[1].1);
+            c[i] = word_symbol(&lookup, &mut words[2].1);
+            d[i] = word_symbol(&lookup, &mut words[3].1);
+        }
+        for ((index, word), stream) in words.iter_mut().zip(streams) {
+            let consumed = word.trailing_zeros();
+            *index -= (consumed >> 3) as usize;
+            let next = u64::from_le_bytes(stream[*index..*index + 8].try_into().unwrap());
+            *word = (next | 1) << (consumed & 7);
+        }
+        done += SYMBOLS;
+    }
+    for ((reader, (index, word)), stream) in readers.iter_mut().zip(words).zip(streams) {
+        *reader = BitReaderReversed::from_word(stream, index, word);
+    }
+    done
+}
+
+/// Decodes the symbol at the top of `word` and shifts its code out.
+#[inline(always)]
+fn word_symbol(lookup: &[u16; 1 << 11], word: &mut u64) -> u8 {
+    let entry = lookup[(*word >> 53) as usize];
+    *word <<= entry & 63;
+    (entry >> 8) as u8
 }
 
 #[cfg(test)]
