@@ -2,11 +2,11 @@
 
 use super::{Archive, ArchiveEntry, ArchiveMatch, Status};
 use crate::archive::READ_DISK_MAGIC;
-use crate::archive::{ARCHIVE_EOF, ARCHIVE_FATAL, ARCHIVE_OK, Base, Handle, Kind};
+use crate::archive::{ARCHIVE_EOF, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, Base, Handle, Kind};
 use crate::entry::Entry;
 use crate::ffi::disk::NameLookup;
 use crate::ffi::matching::MatchingHandle;
-use crate::read_disk::{self, ExcludedCallback, MetadataFilter, ReadDisk};
+use crate::read_disk::{ExcludedCallback, MetadataFilter, ReadDisk};
 use crate::string::until_nul;
 use std::cell::RefCell;
 use std::ffi::{CStr, OsStr, c_int};
@@ -126,13 +126,23 @@ impl Handle {
             if let Some(st) = st {
                 entry.copy_stat(st);
             } else {
-                let stat = match crate::ffi::disk_sys::stat(&path, fd, d.symlinks != 0) {
+                let follow = d.symlinks != 0;
+                let stat = match crate::ffi::disk_sys::stat(&path, fd, follow) {
                     Ok(s) => s,
-                    Err(e) => return read_disk::io_error(a, e, "Can't stat"),
+                    Err(e) => {
+                        let name = path.as_os_str().as_bytes();
+                        let msg = match (fd >= 0, follow) {
+                            (true, _) => b"Can't fstat".to_vec(),
+                            (false, false) => [b"Can't lstat ", name].concat(),
+                            (false, true) => [b"Can't stat ", name].concat(),
+                        };
+                        let errno = e.raw_os_error().unwrap_or(libc::EIO);
+                        return a.raise(crate::util::Error::new(ARCHIVE_FAILED, errno, msg));
+                    }
                 };
                 entry.copy_stat(&stat);
             }
-            d.fill_metadata(a, entry, &path)
+            d.fill_metadata(a, entry, &path, d.symlinks != 0)
         })
     }
 

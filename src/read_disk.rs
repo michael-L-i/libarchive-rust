@@ -100,6 +100,13 @@ impl ReadDisk {
         std::mem::replace(&mut self.entry, std::ptr::null_mut())
     }
     pub fn open(&mut self, a: &Base, path: &[u8]) -> c_int {
+        // Upstream's tree_append strips trailing '/', unless the name is "/".
+        let mut path = path;
+        while let [rest @ .., b'/'] = path
+            && !rest.is_empty()
+        {
+            path = rest;
+        }
         self.root = Some(PathBuf::from(std::ffi::OsStr::from_bytes(path)));
         self.descents.clear();
         self.reading = None;
@@ -220,15 +227,15 @@ impl ReadDisk {
             // Following symlinks, archive the target unless the link is
             // broken or loops back to a parent; then the link itself.
             let follow = self.symlinks == 1 || (self.symlinks == 2 && root);
-            let st = match crate::ffi::disk_sys::stat(&path, -1, true) {
+            let (st, followed) = match crate::ffi::disk_sys::stat(&path, -1, true) {
                 Ok(st)
                     if follow
                         && !(st.st_mode & libc::S_IFMT == libc::S_IFDIR
                             && self.ancestors.contains(&(st.st_dev as u64, st.st_ino))) =>
                 {
-                    st
+                    (st, true)
                 }
-                _ => lst,
+                _ => (lst, false),
             };
             entry.copy_stat(&st);
             #[cfg(target_vendor = "apple")]
@@ -299,7 +306,7 @@ impl ReadDisk {
                 continue;
             }
             entry.set_sourcepath(path.as_os_str().as_bytes());
-            let ret = self.fill_metadata(a, entry, &path);
+            let ret = self.fill_metadata(a, entry, &path, followed);
             if ret < 0 {
                 return ret;
             }
@@ -369,7 +376,17 @@ impl ReadDisk {
         }
         let _ = a;
     }
-    pub fn fill_metadata(&mut self, a: &Base, entry: &mut Entry, path: &Path) -> c_int {
+    /// Upstream's `archive_read_disk_entry_from_file` after the stat: names,
+    /// the link target, then ACLs, extended attributes, Mac metadata and
+    /// sparse extents; a failure among those last four warns or fails but
+    /// the rest are still read, and the worst result is returned.
+    pub fn fill_metadata(
+        &mut self,
+        a: &Base,
+        entry: &mut Entry,
+        path: &Path,
+        follow: bool,
+    ) -> c_int {
         if let Some(name) = self.user.lookup(entry.uid(), false) {
             entry.set_uname(name.to_bytes());
         }
@@ -379,19 +396,29 @@ impl ReadDisk {
         if entry.filetype() == libc::S_IFLNK {
             match fs::read_link(path) {
                 Ok(p) => entry.set_symlink(p.as_os_str().as_bytes()),
-                Err(e) => return io_error(a, e, "Can't read link"),
+                Err(e) => return io_error(a, e, "Couldn't read link data"),
             }
         }
-        if self.behavior & 0x10 == 0
-            && let Err(e) = crate::ffi::disk_sys::read_xattrs(path, entry)
-        {
-            return io_error(a, e, "Can't read extended attributes");
-        }
+        let mut ret = ARCHIVE_OK;
+        let mut worse = |code: c_int, e: std::io::Error, msg: &str| {
+            let errno = e.raw_os_error().unwrap_or(libc::EIO);
+            ret = ret.min(a.raise(Error::new(code, errno, msg)));
+        };
         #[cfg(target_vendor = "apple")]
         if self.behavior & 0x20 == 0
             && let Err(e) = crate::ffi::disk_acl::read(path, entry, &mut self.user, &mut self.group)
         {
-            return io_error(a, e, "Can't read ACL");
+            worse(ARCHIVE_WARN, e, "Couldn't translate NFSv4 ACLs");
+        }
+        if self.behavior & 0x10 == 0
+            && let Err((e, msg)) = crate::ffi::disk_sys::read_xattrs(path, entry, follow)
+        {
+            worse(ARCHIVE_WARN, e, msg);
+        }
+        if self.behavior & 4 != 0
+            && let Err(e) = crate::ffi::disk_sys::pack_mac_metadata(path, entry)
+        {
+            worse(ARCHIVE_FAILED, e, "Can't read Mac metadata");
         }
         if self.behavior & 0x80 == 0 && entry.filetype() == libc::S_IFREG {
             match crate::ffi::disk_sys::sparse(path, self.symlinks != 0, entry.size()) {
@@ -400,15 +427,10 @@ impl ReadDisk {
                         entry.sparse_add(offset, len);
                     }
                 }
-                Err(e) => return io_error(a, e, "Can't read sparse data"),
+                Err(e) => worse(ARCHIVE_FAILED, e, "Can't read sparse data"),
             }
         }
-        if self.behavior & 4 != 0
-            && let Err(e) = crate::ffi::disk_sys::pack_mac_metadata(path, entry)
-        {
-            return io_error(a, e, "Can't read Mac metadata");
-        }
-        ARCHIVE_OK
+        ret
     }
     pub fn data(&mut self, a: &Base, dest: &mut [u8]) -> isize {
         if a.check_magic(

@@ -158,39 +158,43 @@ pub fn id(name: &CStr, fallback: i64, group: bool) -> i64 {
     }
 }
 
+/// Upstream's Darwin `setup_xattrs`: adds `path`'s extended attributes
+/// (its target's when `follow`), skipping any it can't read. A failure to
+/// list them comes back with upstream's message for it.
 #[cfg(target_vendor = "apple")]
-pub fn read_xattrs(path: &Path, entry: &mut Entry) -> std::io::Result<()> {
-    let path = path_c(path)?;
+pub fn read_xattrs(
+    path: &Path,
+    entry: &mut Entry,
+    follow: bool,
+) -> Result<(), (std::io::Error, &'static str)> {
+    let path = path_c(path).map_err(|e| (e, "Couldn't list extended attributes"))?;
+    let flags = if follow { 0 } else { libc::XATTR_NOFOLLOW };
     // SAFETY: querying length does not write through the NULL buffer.
-    let count =
-        unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, libc::XATTR_NOFOLLOW) };
+    let count = unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, flags) };
     if count < 0 {
         let e = std::io::Error::last_os_error();
-        if [libc::ENOTSUP, libc::EPERM].contains(&e.raw_os_error().unwrap_or(0)) {
+        if [libc::ENOTSUP, libc::ENOSYS].contains(&e.raw_os_error().unwrap_or(0)) {
             return Ok(());
         }
-        return Err(e);
+        return Err((e, "Couldn't list extended attributes"));
     }
     if count > 1024 * 1024 {
-        return Err(std::io::Error::from_raw_os_error(libc::ENOMEM));
+        let e = std::io::Error::from_raw_os_error(libc::ENOMEM);
+        return Err((e, "Couldn't list extended attributes"));
     }
     let mut names = vec![0u8; count as usize];
     // SAFETY: buffer is writable for its full size.
-    let count = unsafe {
-        libc::listxattr(
-            path.as_ptr(),
-            names.as_mut_ptr().cast(),
-            names.len(),
-            libc::XATTR_NOFOLLOW,
-        )
-    };
+    let count =
+        unsafe { libc::listxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len(), flags) };
     if count < 0 {
-        return Err(std::io::Error::last_os_error());
+        let e = std::io::Error::last_os_error();
+        return Err((e, "Couldn't retrieve extended attributes"));
     }
     names.truncate(count as usize);
     for name in names.split(|&b| b == 0).filter(|n| !n.is_empty()) {
-        let name =
-            CString::new(name).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let Ok(name) = CString::new(name) else {
+            continue;
+        };
         // SAFETY: query with no destination only reports value length.
         let len = unsafe {
             libc::getxattr(
@@ -199,14 +203,13 @@ pub fn read_xattrs(path: &Path, entry: &mut Entry) -> std::io::Result<()> {
                 std::ptr::null_mut(),
                 0,
                 0,
-                libc::XATTR_NOFOLLOW,
+                flags,
             )
         };
-        if len < 0 {
+        // Upstream skips an attribute it can't read; a value too large to
+        // trust is skipped too.
+        if !(0..=16 * 1024 * 1024).contains(&len) {
             continue;
-        }
-        if len > 16 * 1024 * 1024 {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOMEM));
         }
         let mut value = vec![0; len as usize];
         // SAFETY: both C strings and writable value remain live.
@@ -217,7 +220,7 @@ pub fn read_xattrs(path: &Path, entry: &mut Entry) -> std::io::Result<()> {
                 value.as_mut_ptr().cast(),
                 value.len(),
                 0,
-                libc::XATTR_NOFOLLOW,
+                flags,
             )
         };
         if len >= 0 {
@@ -228,7 +231,11 @@ pub fn read_xattrs(path: &Path, entry: &mut Entry) -> std::io::Result<()> {
     Ok(())
 }
 #[cfg(not(target_vendor = "apple"))]
-pub fn read_xattrs(_path: &Path, _entry: &mut Entry) -> std::io::Result<()> {
+pub fn read_xattrs(
+    _path: &Path,
+    _entry: &mut Entry,
+    _follow: bool,
+) -> Result<(), (std::io::Error, &'static str)> {
     Ok(())
 }
 
