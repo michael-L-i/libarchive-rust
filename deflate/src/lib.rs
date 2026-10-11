@@ -52,6 +52,8 @@ const MAX_MATCH: usize = 258;
 const MIN_LOOKAHEAD: usize = MAX_MATCH + MIN_MATCH + 1;
 /// Matches of length 3 are discarded if their distance exceeds TOO_FAR.
 const TOO_FAR: usize = 4096;
+/// Size of the window array: the largest window, 2 * 32K, plus a match.
+const WINDOW_LEN: usize = (1 << 16) + MAX_MATCH;
 /// Maximum stored block length in deflate format (not including header).
 const MAX_STORED: usize = 65535;
 
@@ -233,9 +235,9 @@ impl Deflate {
             w_size,
             w_bits: w_bits as usize,
             w_mask: w_size - 1,
-            window: vec![0; 2 * w_size],
+            window: Box::new([0; WINDOW_LEN]),
             window_size: 2 * w_size,
-            prev: vec![0; w_size],
+            prev: Box::new([0; 1 << 15]),
             head: vec![0; 1 << hash_bits],
             ins_h: 0,
             hash_mask: (1 << hash_bits) - 1,
@@ -315,15 +317,17 @@ struct State {
     /// window, and move to the first half later to keep a dictionary of at
     /// least wSize bytes. With this organization, matches are limited to a
     /// distance of wSize-MAX_MATCH bytes, but this ensures that IO is always
-    /// performed with a length multiple of the block size.
-    window: Vec<u8>,
+    /// performed with a length multiple of the block size. It is allocated
+    /// for the largest window plus a match, so that a match at any u16
+    /// position is in bounds.
+    window: Box<[u8; WINDOW_LEN]>,
     /// Actual size of window: 2*wSize, except when the user input buffer is
     /// directly used as sliding window.
     window_size: usize,
     /// Link to older string with same hash index. To limit the size of this
     /// array to 64K, this link is maintained only for the last 32K strings.
     /// An index in this array is thus a window index modulo 32K.
-    prev: Vec<u16>,
+    prev: Box<[u16; 1 << 15]>,
     /// Heads of the hash chains or NIL.
     head: Vec<u16>,
 
@@ -432,12 +436,12 @@ impl State {
     /// IN  assertion: all calls to INSERT_STRING are made with consecutive
     ///    input characters and the first MIN_MATCH bytes of str are valid
     ///    (except for the last MIN_MATCH-1 bytes of the input file).
-    fn insert_string(&mut self, str: usize) -> usize {
+    fn insert_string(&mut self, str: usize) -> u16 {
         self.update_hash(self.window[str + (MIN_MATCH - 1)]);
         let head = self.head[self.ins_h];
         self.prev[str & self.w_mask] = head;
         self.head[self.ins_h] = str as u16;
-        usize::from(head)
+        head
     }
 
     /// Slide the hash table when sliding the window down (could be avoided
@@ -626,18 +630,23 @@ impl State {
     ///   string (strstart) and its distance is <= MAX_DIST, and prev_length >=
     ///   1
     /// OUT assertion: the match length is not greater than s->lookahead.
-    fn longest_match(&mut self, mut cur_match: usize) -> usize {
+    fn longest_match(&mut self, cur_match: u16) -> usize {
         let mut chain_length = self.max_chain_length; // max hash chain length
-        let window = &self.window[..];
-        let scan = self.strstart; // current string
-        let mut best_len = self.prev_length; // best match length so far
+        let window = &*self.window;
+        // best match length so far; prev_length is always within these
+        // bounds, which spares the bounds checks below
+        let mut best_len = self.prev_length.clamp(MIN_MATCH - 1, MAX_MATCH);
         let mut nice_match = self.nice_match; // stop if match long enough
         // Stop when cur_match becomes <= limit. To simplify the code, we
         // prevent matches with the string of window index 0.
         let limit = self.strstart.saturating_sub(self.max_dist());
-        let strend = scan + MAX_MATCH;
-        let mut scan_end1 = window[scan + best_len - 1];
-        let mut scan_end = window[scan + best_len];
+        // Within the 32K prev array, as w_mask is.
+        let wmask = self.w_mask & 0x7fff;
+
+        let scan = &window[self.strstart..self.strstart + MAX_MATCH + 1]; // current string
+        let mut scan_end1 = scan[best_len - 1];
+        let mut scan_end = scan[best_len];
+        let (scan_rest, _) = scan[3..].as_chunks::<8>();
 
         // Do not waste too much time if we already have a good match:
         if self.prev_length >= self.good_match {
@@ -649,51 +658,48 @@ impl State {
             nice_match = self.lookahead;
         }
 
+        let mut cur_match = usize::from(cur_match);
         loop {
-            let m = cur_match;
+            // A u16 position plus MAX_MATCH is always within the window.
+            let m = &window[cur_match..cur_match + MAX_MATCH + 1]; // matched string
             // Skip to next match if the match length cannot increase or if the
             // match length is less than 2. Note that the checks below for
             // insufficient lookahead only occur occasionally for performance
             // reasons. Therefore bytes past the input will be compared.
             // However the length of the match is limited to the lookahead, so
             // the output of deflate is not affected by those values.
-            if window[m + best_len] == scan_end
-                && window[m + best_len - 1] == scan_end1
-                && window[m] == window[scan]
-                && window[m + 1] == window[scan + 1]
+            if m[best_len] == scan_end
+                && m[best_len - 1] == scan_end1
+                && m[0] == scan[0]
+                && m[1] == scan[1]
             {
                 // The check at best_len-1 can be removed because it will be
                 // made again later. (This heuristic is not always a win.) It
                 // is not necessary to compare scan[2] and match[2] since they
                 // are always equal when the other bytes match, given that the
-                // hash keys are equal and that HASH_BITS >= 8.
-                let (mut s, mut mm) = (scan + 2, m + 2);
-                // We check for insufficient lookahead only every 8th
-                // comparison; the 256th check will be made at strstart+258.
-                'scan: loop {
-                    for _ in 0..8 {
-                        s += 1;
-                        mm += 1;
-                        if window[s] != window[mm] {
-                            break 'scan;
-                        }
-                    }
-                    if s >= strend {
+                // hash keys are equal and that HASH_BITS >= 8. Like zlib,
+                // compare strstart+3 up to strstart+258 and stop at the first
+                // difference, here eight bytes at a time.
+                let (match_rest, _) = m[3..].as_chunks::<8>();
+                let mut len = MAX_MATCH;
+                for (i, (x, y)) in scan_rest.iter().zip(match_rest).enumerate() {
+                    let diff = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
+                    if diff != 0 {
+                        len = 3 + 8 * i + diff.trailing_zeros() as usize / 8;
                         break;
                     }
                 }
-                let len = MAX_MATCH - (strend - s);
                 if len > best_len {
                     self.match_start = cur_match;
                     best_len = len;
                     if len >= nice_match {
                         break;
                     }
-                    scan_end1 = window[scan + best_len - 1];
-                    scan_end = window[scan + best_len];
+                    scan_end1 = scan[best_len - 1];
+                    scan_end = scan[best_len];
                 }
             }
-            cur_match = usize::from(self.prev[cur_match & self.w_mask]);
+            cur_match = usize::from(self.prev[cur_match & wmask]);
             if cur_match <= limit {
                 break;
             }
@@ -994,7 +1000,7 @@ impl State {
 
             // Find the longest match, discarding those <= prev_length. At this
             // point we have always match_length < MIN_MATCH
-            if hash_head != 0 && self.strstart - hash_head <= self.max_dist() {
+            if hash_head != 0 && self.strstart - usize::from(hash_head) <= self.max_dist() {
                 // To simplify the code, we prevent matches with the string of
                 // window index 0 (in particular we have to avoid a match of
                 // the string with itself at the start of the input file).
@@ -1084,7 +1090,7 @@ impl State {
 
             if hash_head != 0
                 && self.prev_length < self.max_lazy_match
-                && self.strstart - hash_head <= self.max_dist()
+                && self.strstart - usize::from(hash_head) <= self.max_dist()
             {
                 // To simplify the code, we prevent matches with the string of
                 // window index 0 (in particular we have to avoid a match of
