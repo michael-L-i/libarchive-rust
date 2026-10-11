@@ -70,10 +70,10 @@ impl Encoder {
         } else {
             EncodeMode::Normal
         };
-        options.lzma_options.mf = if self.level <= 2 {
-            MfType::Hc4
-        } else {
-            MfType::Bt4
+        options.lzma_options.mf = match self.level {
+            0 | 1 => MfType::Hc3,
+            2 => MfType::Hc4,
+            _ => MfType::Bt4,
         };
         options.lzma_options.depth_limit = 0;
         options
