@@ -479,10 +479,18 @@ impl Format for SevenZip {
             crate::string::conversion_to_charset(Some(&mut *cache), b"UTF-16LE", true)
                 .map_err(|err| Error::fatal(err.errno, err.message))?
         };
-        let (name, ok) = e.pathname_l(Some(&conv));
+        let (name, converted) = e.pathname_l(Some(&conv));
         let name = name
             .ok_or_else(|| Error::new(ARCHIVE_FAILED, -1, "Missing pathname"))?
             .to_vec();
+        let mut ret = ARCHIVE_OK;
+        if !converted {
+            a.set_error(
+                -1,
+                Some(b"A filename cannot be converted to UTF-16LE;You should disable making Joliet extension"),
+            );
+            ret = ARCHIVE_WARN;
+        }
         let mode = u32::from(e.mode());
         let kind = e.filetype();
         let sym = if kind == 0o120000 {
@@ -524,6 +532,12 @@ impl Format for SevenZip {
             }
         });
         if size > 0 {
+            // Upstream overwrites file_new()'s result with the encoder
+            // initialization's on the first non-empty file, dropping its
+            // pathname warning (the error message stays set).
+            if self.spool.is_none() {
+                ret = ARCHIVE_OK;
+            }
             self.initialize()?;
         }
         self.files
@@ -542,12 +556,7 @@ impl Format for SevenZip {
             self.append(&sym)?;
             self.remaining = 0;
         }
-        if !ok {
-            a.set_error(-1,Some(b"A filename cannot be converted to UTF-16LE;You should disable making Joliet extension"));
-            Ok(ARCHIVE_WARN)
-        } else {
-            Ok(ARCHIVE_OK)
-        }
+        Ok(ret)
     }
     fn data(&mut self, data: &[u8], _: &mut dyn Sink) -> Result<usize, Error> {
         let n = data
@@ -676,6 +685,33 @@ mod tests {
         let mut decoded = Vec::new();
         reader.read_to_end(&mut decoded).unwrap();
         decoded
+    }
+
+    #[test]
+    fn first_non_empty_file_drops_pathname_warning() {
+        // Upstream's _7z_write_header() overwrites file_new()'s WARN with
+        // the encoder initialization's result on the first non-empty file.
+        let _locale = crate::ffi::charset::lock_locale();
+        let base = Base::new(WRITE_MAGIC);
+        let mut archive = SevenZip::default();
+        let mut sink = Bytes(Vec::new());
+        for (size, expected) in [(0, ARCHIVE_WARN), (1, ARCHIVE_OK), (1, ARCHIVE_WARN)] {
+            let mut entry = Entry::new(None);
+            entry.set_pathname(b"bad-\xff");
+            entry.set_mode(libc::S_IFREG | 0o644);
+            entry.set_size(size);
+            assert_eq!(
+                archive.header(&base, &mut entry, &mut sink).unwrap(),
+                expected
+            );
+            assert_eq!(
+                &*base.error.borrow(),
+                b"A filename cannot be converted to UTF-16LE;You should disable making Joliet extension\0"
+            );
+            archive.data(&[0][..size as usize], &mut sink).unwrap();
+            archive.finish_entry(&mut sink).unwrap();
+            base.error.borrow_mut().clear();
+        }
     }
 
     #[test]
