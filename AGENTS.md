@@ -49,7 +49,7 @@ src/                  one module per upstream file (naming rule below)
 src/api/              the Rust API: typed handles over the C API's behavior
 capi/                 builds libarchive.{so,dylib,a} for C programs, + variadic.c
 tools/libarchive_fe/  the front-ends' shared helpers (libarchive_fe/)
-tools/cat/            bsdcat (cat/); tar/, cpio/, unzip/ to come
+tools/<dir>/          bsdtar, bsdcpio, bsdcat, bsdunzip (tar/, cpio/, cat/, unzip/)
 scripts/              oracle build, port build, test runner
 tests/passing.txt     the ratchet: upstream tests that pass against our library
 tests/upstream.txt    upstream tests that pass against upstream on this machine
@@ -187,9 +187,9 @@ tests; writers, disk and match tests (338) wait for phase 5.
 **Checkpoint:** after phase 1, stop for human review of the core internal API
 (read-ahead and consume, entries, errors) before the readers fan out.
 
-The front-ends are ported to Rust one by one (see Front-ends): `cat/` is
-done; until `tar/`, `cpio/` and `unzip/` are, upstream's C ones link our
-library unchanged. Windows-only files come last.
+The front-ends are ported too (see Front-ends): `tar/`, `cpio/`, `cat/` and
+`unzip/` are Rust programs; upstream's C ones, relinked against our library,
+remain as references in `build/port/c-bin`. Windows-only files come last.
 
 ## Front-ends
 
@@ -214,10 +214,11 @@ ported (fallbacks for libcs without them); use `BufRead::read_until` for
 getline and add a `sys` wrapper for `fnmatch(3)`.
 
 **The unsafe exception.** The tool crates are `#![deny(unsafe_code)]`. The
-libc calls std lacks (signal dispositions, termios, umask, strerror, and to
-come setlocale) are safe wrappers in `libarchive_fe::sys`, the only module
-that opts out; add yours there, each `unsafe` block with a `// SAFETY:`
-comment. Prefer std wherever it can do the job.
+libc calls std lacks (signal dispositions, termios, umask, strerror, the
+locale, regex, the user and group databases and so on) are safe wrappers in
+`libarchive_fe::sys`, the only module that opts out; add yours there, each
+`unsafe` block with a `// SAFETY:` comment. Prefer std wherever it can do
+the job.
 
 **Using the API.** `use libarchive_rust::{ArchiveRead, ArchiveEntry, Status};`
 The module doc of `src/api/mod.rs` has the mapping; in short:
