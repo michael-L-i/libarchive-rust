@@ -650,12 +650,14 @@ impl Target {
         if let Some(file) = &self.live {
             return file.try_clone();
         }
+        // O_NONBLOCK: opening a FIFO for reading would otherwise wait for a
+        // writer; it changes nothing for other file types.
         // SAFETY: valid descriptor/name; O_SYMLINK opens link itself, never its target.
         let fd = unsafe {
             libc::openat(
                 self.parent.as_raw_fd(),
                 self.name.as_ptr(),
-                libc::O_RDONLY | libc::O_SYMLINK | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
         };
         if fd < 0 {
