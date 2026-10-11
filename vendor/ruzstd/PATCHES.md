@@ -368,3 +368,26 @@ Two seven-pair archive screens agree on improvements. Confirmation medians
 (before -> after, ms): source 60.37 -> 55.67, mixed 41.54 -> 39.18, compiled
 20.87 -> 19.78, records 18.69 -> 18.08, text 9.36 -> 8.99. Random is 21.42 ->
 21.63 and documents 9.22 -> 9.02. Full integration results belong in STATUS.md.
+
+## Complete sequence bit windows
+
+For a guarded sequence whose six extra/state fields total at most 56 bits,
+read a single window and split it into independent fields before the three
+FSE transitions. Wider sequences retain the prior refill path; final
+sequences and input tails retain the general reader. The existing 32-byte
+guard bounds every refill, and bit order, final-state rules and error
+precedence are unchanged. No new allocation, unsafe code or format changes.
+
+Fresh actual Claude Opus 5.5 final review: PASS, with pending checks now
+complete. All 47 self-contained vendor tests pass with debug assertions
+and overflow checks. New field tests compare six values, remaining bits
+and subsequent tail reads against the scalar reader; existing generated
+state/error comparisons exercise both wide branches. All 175 damaged/valid
+ABI records retain exact status, errno, messages and decoded hashes. Strict
+release all-target Clippy passes.
+
+Twenty-one rotating same-C-input confirmations show raw decoding gains of
+7.5% source, 7.1% mixed, 5.5% records and 4.2% compiled data; remaining
+cases range from 0.7% slower to 2% faster. All eight decoded hashes agree
+with C. These are backend timings, not complete archive extraction.
+Evidence, prompts and raw samples: sibling diagnostics/round9-zstd.

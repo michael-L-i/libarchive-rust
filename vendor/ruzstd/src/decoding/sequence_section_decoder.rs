@@ -227,39 +227,55 @@ fn decode_sequences_without_rle(
                 offset_code: of_code,
             });
         }
+        let extra_bits = of_code + ml_state.extra_bits + ll_state.extra_bits;
+        let state_bits = ll_state.state_bits + ml_state.state_bits + of_dec.state.num_bits;
         br.refill_sequence();
-        let (obits, ml_add, ll_add) = if of_code + ml_state.extra_bits + ll_state.extra_bits <= 56 {
-            let values = br.peek_bits_triple(
-                of_code + ml_state.extra_bits + ll_state.extra_bits,
+        let [obits, ml_add, ll_add, ll_next, ml_next, of_next] = if extra_bits + state_bits <= 56 {
+            br.read_sequence_fields([
                 of_code,
                 ml_state.extra_bits,
                 ll_state.extra_bits,
-            );
-            br.consume(of_code + ml_state.extra_bits + ll_state.extra_bits);
-            values
+                ll_state.state_bits,
+                ml_state.state_bits,
+                of_dec.state.num_bits,
+            ])
         } else {
-            let offset = br.read_sequence_bits(of_code);
+            let (obits, ml_add, ll_add) = if extra_bits <= 56 {
+                let values = br.peek_bits_triple(
+                    extra_bits,
+                    of_code,
+                    ml_state.extra_bits,
+                    ll_state.extra_bits,
+                );
+                br.consume(extra_bits);
+                values
+            } else {
+                let offset = br.read_sequence_bits(of_code);
+                br.refill_sequence();
+                (
+                    offset,
+                    br.read_sequence_bits(ml_state.extra_bits),
+                    br.read_sequence_bits(ll_state.extra_bits),
+                )
+            };
             br.refill_sequence();
-            (
-                offset,
-                br.read_sequence_bits(ml_state.extra_bits),
-                br.read_sequence_bits(ll_state.extra_bits),
-            )
+            [
+                obits,
+                ml_add,
+                ll_add,
+                br.read_sequence_bits(ll_state.state_bits),
+                br.read_sequence_bits(ml_state.state_bits),
+                br.read_sequence_bits(of_dec.state.num_bits),
+            ]
         };
         target.push(Sequence {
             ll: ll_state.base + ll_add as u32,
             ml: ml_state.base + ml_add as u32,
             of: (1u32 << of_code) + obits as u32,
         });
-
-        // LL/ML/OF transitions use at most 9 + 9 + 8 bits together.
-        br.refill_sequence();
-        let ll_add = br.read_sequence_bits(ll_state.state_bits);
-        ll_state = scratch.ll_states[usize::from(ll_state.next_base) + ll_add as usize];
-        let ml_add = br.read_sequence_bits(ml_state.state_bits);
-        ml_state = scratch.ml_states[usize::from(ml_state.next_base) + ml_add as usize];
-        let of_add = br.read_sequence_bits(of_dec.state.num_bits);
-        of_dec.state = scratch.offsets.decode[of_dec.state.base_line as usize + of_add as usize];
+        ll_state = scratch.ll_states[usize::from(ll_state.next_base) + ll_next as usize];
+        ml_state = scratch.ml_states[usize::from(ml_state.next_base) + ml_next as usize];
+        of_dec.state = scratch.offsets.decode[of_dec.state.base_line as usize + of_next as usize];
     }
 
     for _seq_idx in target.len()..section.num_sequences as usize {

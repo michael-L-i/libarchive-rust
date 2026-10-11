@@ -112,6 +112,27 @@ impl<'s> BitReaderReversed<'s> {
         value
     }
 
+    // Read a complete sequence window immediately after refill_sequence.
+    // The caller bounds the total to 56 bits.
+    #[inline(always)]
+    pub(crate) fn read_sequence_fields(&mut self, widths: [u8; 6]) -> [u64; 6] {
+        let [a, b, c, d, e, f] = widths;
+        let ef = e + f;
+        let def = d + ef;
+        let cdef = c + def;
+        let bcdef = b + cdef;
+        debug_assert!(a + bcdef <= 56);
+        let bits = self.read_sequence_bits(a + bcdef);
+        [
+            (bits >> bcdef) & ((1u64 << a) - 1),
+            (bits >> cdef) & ((1u64 << b) - 1),
+            (bits >> def) & ((1u64 << c) - 1),
+            (bits >> ef) & ((1u64 << d) - 1),
+            (bits >> f) & ((1u64 << e) - 1),
+            bits & ((1u64 << f) - 1),
+        ]
+    }
+
     /// Read `n` number of bits from the source. Will read at most 56 bits.
     /// If there are no more bits to be read from the source zero bits will be returned instead.
     #[inline(always)]
@@ -190,6 +211,47 @@ impl<'s> BitReaderReversed<'s> {
 
 #[cfg(test)]
 mod test {
+
+    #[test]
+    fn complete_sequence_windows_match_scalar_reads() {
+        for len in 32..=128 {
+            let data: alloc::vec::Vec<u8> = (0..len).map(|i| (i * 73 + len * 17) as u8).collect();
+            for prefix in 0..8 {
+                let mut fast = super::BitReaderReversed::new(&data);
+                let mut scalar = super::BitReaderReversed::new(&data);
+                assert_eq!(fast.get_bits(prefix), scalar.get_bits(prefix));
+                let mut seed = (len as u32 + 1) * 123457 + u32::from(prefix);
+                for turn in 0..64 {
+                    if !fast.has_fast_sequence() {
+                        break;
+                    }
+                    let mut widths = [0; 6];
+                    let mut left = 56;
+                    for (width, max) in widths.iter_mut().zip([31, 16, 16, 9, 9, 8]) {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        *width = if turn % 7 == 0 {
+                            0
+                        } else {
+                            (seed % (u32::from(max.min(left)) + 1)) as u8
+                        };
+                        left -= *width;
+                    }
+                    fast.refill_sequence();
+                    let actual = fast.read_sequence_fields(widths);
+                    for (got, width) in actual.iter().copied().zip(widths) {
+                        assert_eq!(got, scalar.get_bits(width));
+                    }
+                    assert_eq!(fast.bits_remaining(), scalar.bits_remaining());
+                }
+                for _ in 0..64 {
+                    assert_eq!(fast.get_bits(7), scalar.get_bits(7));
+                    assert_eq!(fast.bits_remaining(), scalar.bits_remaining());
+                }
+            }
+        }
+    }
 
     #[test]
     fn guarded_sequences_match_general_reader_through_tail() {
