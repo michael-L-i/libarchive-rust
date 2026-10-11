@@ -18,6 +18,9 @@ exceptions, mirroring upstream's COPYING:
 * Triple-licensed under CC0 1.0 Universal, OpenSSL or Apache 2.0:
     src/blake2s_ref.rs, src/blake2sp_ref.rs
 
+* deflate/ is a port of zlib 1.2.12's compressor and is under the zlib
+  license (deflate/LICENSE), marked as an altered version.
+
 * Patched copies of third-party crates under vendor/ keep their own
   licenses; see the LICENSE files there:
     vendor/miniz_oxide   MIT, Zlib or Apache-2.0
