@@ -1,11 +1,14 @@
 pub mod ar;
 pub mod cpio;
+pub mod gnutar;
 pub mod iso9660;
 pub mod mtree;
+pub mod pax;
 pub mod raw;
 pub mod sevenzip;
 pub mod shar;
-pub mod tar;
+pub mod ustar;
+pub mod v7tar;
 pub mod warc;
 pub mod xar;
 pub mod zip;

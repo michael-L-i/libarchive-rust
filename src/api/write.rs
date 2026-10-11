@@ -11,8 +11,8 @@ use crate::read::filter_code;
 use crate::string::until_nul;
 use crate::util::Error;
 use crate::write::format::{
-    ar::Ar, cpio::Cpio, iso9660::Iso9660, mtree::Mtree, raw::Raw, sevenzip::SevenZip, shar::Shar,
-    tar::Tar, warc::Warc, xar::Xar, zip::Zip,
+    ar::Ar, cpio::Cpio, gnutar::Gnutar, iso9660::Iso9660, mtree::Mtree, pax::Pax, raw::Raw,
+    sevenzip::SevenZip, shar::Shar, ustar::Ustar, v7tar::V7tar, warc::Warc, xar::Xar, zip::Zip,
 };
 use crate::write::{Format, Sink, Write, filter};
 use std::cell::RefCell;
@@ -46,17 +46,17 @@ set_formats! {
     // archive_write_set_format_cpio is this one.
     CPIO_ODC: "archive_write_set_format_cpio_odc" => Cpio::new(0x10001);
     CPIO_PWB: "archive_write_set_format_cpio_binary" => Cpio::new(0x10007);
-    GNUTAR: "archive_write_set_format_gnutar" => Tar::new(0x30004);
+    GNUTAR: "archive_write_set_format_gnutar" => Gnutar::default();
     ISO9660: "archive_write_set_format_iso9660" => Iso9660::default();
     MTREE: "archive_write_set_format_mtree" => Mtree::new(false);
     MTREE_CLASSIC: "archive_write_set_format_mtree_classic" => Mtree::new(true);
-    PAX: "archive_write_set_format_pax" => Tar::new(0x30002);
-    PAX_RESTRICTED: "archive_write_set_format_pax_restricted" => Tar::new(0x30003);
+    PAX: "archive_write_set_format_pax" => Pax::new(false);
+    PAX_RESTRICTED: "archive_write_set_format_pax_restricted" => Pax::new(true);
     RAW: "archive_write_set_format_raw" => Raw::default();
     SHAR: "archive_write_set_format_shar" => Shar::new(false);
     SHAR_DUMP: "archive_write_set_format_shar" => Shar::new(true);
-    USTAR: "archive_write_set_format_ustar" => Tar::new(0x30001);
-    V7TAR: "archive_write_set_format_v7tar" => Tar::new(0x30000);
+    USTAR: "archive_write_set_format_ustar" => Ustar::default();
+    V7TAR: "archive_write_set_format_v7tar" => V7tar::default();
     WARC: "archive_write_set_format_warc" => Warc::default();
     XAR: "archive_write_set_format_xar" => Xar::default();
     ZIP: "archive_write_set_format_zip" => Zip::default();
