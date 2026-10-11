@@ -1,6 +1,6 @@
 # libarchive-rust status
 
-Date 2026-10-09. Upstream pin `8bb3bbdc`. Run: port.
+Date 2026-10-10. Upstream pin `8bb3bbdc`. Run: port.
 
 **All suites: 926 passed, 184 skipped; zero failures, crashes or timeouts.**
 
@@ -345,6 +345,50 @@ Current report: `../diagnostics/results/REPORT.md`; previous report:
 `../diagnostics/bin/rust-round7-final-bsdtar`, identical to `rust-bsdtar`.
 Original C/upstream remain clean. Work is committed locally; no test, build
 or benchmark remains running.
+
+## Optimization round 8 checkpoint
+
+Eight reviewed performance changes are committed through `deefb72`: standard
+name/filesystem caches, runtime bulk CRC32 dispatch, Zstandard sequence decoding,
+AArch64 DEFLATE bulk copies, bounded Zstandard sequence bit output, fresh-file
+metadata work, bounded LZMA skips/distance prices, and exact short DEFLATE copies.
+No compression preset was relaxed; all 48 Rust archive byte streams remain
+identical to round 7. No local unsafe code was added. Existing `crc32fast` was
+promoted from a development dependency to runtime; its CPU-dispatched backend
+has a portable fallback and a little-endian gate. The exact published
+`miniz_oxide` 0.9.1 source is vendored with two small local changes.
+
+The fixed six-format, eight-dataset creation/common-C-input extraction matrix
+has 96 equally weighted cases, five rotating repetitions, 1,440 timed commands,
+720 verified timed extractions, 288 cross-reader checks and 48 byte identities.
+Current Rust wins 17, ties 20 and loses 59 against C; prior Rust wins 15, ties 13
+and loses 68 in the same run. Wins require over 5% lower median time. The majority
+win goal is not met. ZIP extraction improves 13-39%, many-file extraction 13-14%
+(rounded), text 7zip creation 17%, and source Zstandard creation 10% versus prior
+Rust. No corrected-matrix case has a median regression above 5%; smaller
+regressions and compression-size differences from C remain in the report.
+
+An initial matrix exposed output-path allocation/cache timing bias in creation.
+A shared-path diagnostic removed the apparent tar/Zstandard regressions. The
+same full matrix was rerun using one timed output path for every executable,
+with verification copies outside timing. Both complete raw matrices and the
+confirmation are retained. No cases were removed or reweighted.
+
+Validation: 390 native tests passed, one opt-in test ignored; strict all-target
+Clippy, formatting, no-default-feature Zstandard checks and all 454 ABI symbols
+passed. The full upstream/front-end suite passed 926 tests, skipped 184, with
+zero failures, crashes, timeouts or ratchet regressions (61 seconds, one worker).
+Additional exact-stream/error-state tests and fresh actual Claude Opus 5.5
+reviews are retained with each unit. LZMA includes 1,656 exact streams and a
+real 2.147 GB normalization crossing. DEFLATE includes 1,760 exact
+output/status/consumption traces and 39 unchanged encoder streams.
+
+Report: `../diagnostics/results/REPORT.md`; corrected raw matrix:
+`../diagnostics/results/round8-shared-output.json`. Frozen release:
+`../diagnostics/bin/rust-round8-final-bsdtar`. The initial matrix is retained
+as `round8-final.json`; it is not the final scorecard. Rejected experiments and
+remaining leads are isolated in diagnostics, including `round8-next-work.txt`.
+Original C and pinned upstream remain clean. No work was pushed.
 
 ## Earlier checkpoints (historical)
 
