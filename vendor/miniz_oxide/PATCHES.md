@@ -141,3 +141,37 @@ These are raw level-six encoder timings, not end-to-end archive results.
 Frozen binaries, assembly, exact-stream harness, raw timing samples, actual
 Opus design/final review records, and rejected chain-table experiments remain
 in sibling `diagnostics/round10-deflate`.
+
+## Inline exact short disjoint decoding matches
+
+The fast decoder handles backward, contiguous, disjoint matches of 3-32
+bytes with a small inline head/tail copy. The existing distance validation
+runs first. Splitting output at its current position makes the history tail
+length equal to the distance, exposing the bounds relationship to LLVM.
+The helper reads and writes only the requested bytes; overlapping head/tail
+writes agree. Forward-source ring matches, overlapping matches and longer
+matches retain `apply_match`. Refills, state updates, error handling, public
+serialized fields, allocation and compression settings are unchanged.
+
+Fresh actual Claude Opus 5.5 design and independent final reviews cover the
+copy bounds, ring equivalence, output limits and malformed-stream behavior;
+the final review returned PASS. All 1,760 exact valid/truncated/mutated
+stream/core comparisons preserve output, statuses and consumption; 39
+encoder streams remain byte-identical. All 31 vendor tests pass, including
+900 byte-reference cases covering every short length, alignments, adjacent
+and separated sources, and preservation of surrounding bytes. No-default
+features, formatting and diff checks pass. Standalone all-target Clippy
+passes with warnings denied and only pre-existing upstream lint categories
+allowed on the command line: the five previously documented library
+categories plus `unnecessary_cast` and `useless_vec` in unchanged stream
+tests. No source lint suppression or unsafe code is added.
+
+Seventeen rotating native confirmation pairs use the same C-produced gzip
+payloads and a frozen round-ten decoder. Source improves 19.283 -> 18.597 ms
+(3.6%), mixed 3.7%, compiled 4.2% and records 5.8%. Text and documents are
+unchanged; random is 0.7% slower and many-files 1.0% faster. These are raw
+streaming decoder timings, not end-to-end archive results. Profiles, frozen
+baseline, assembly, exact-trace harness, raw samples and actual Opus records
+are retained in sibling `diagnostics/round11-inflate`. The marginal leaf-only
+inlining trial and the earlier, slower long-match guard are preserved there
+as separate experiments.

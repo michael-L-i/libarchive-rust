@@ -1260,6 +1260,26 @@ fn apply_match(
     }
 }
 
+// Called only for disjoint, exact-length slices between three and 32 bytes.
+#[inline(always)]
+fn copy_short_disjoint(dst: &mut [u8], src: &[u8]) {
+    let len = src.len();
+    let dst = &mut dst[..len];
+    if len <= 4 {
+        dst[..2].copy_from_slice(&src[..2]);
+        dst[len - 2..].copy_from_slice(&src[len - 2..]);
+    } else if len <= 8 {
+        dst[..4].copy_from_slice(&src[..4]);
+        dst[len - 4..].copy_from_slice(&src[len - 4..]);
+    } else if len <= 16 {
+        dst[..8].copy_from_slice(&src[..8]);
+        dst[len - 8..].copy_from_slice(&src[len - 8..]);
+    } else {
+        dst[..16].copy_from_slice(&src[..16]);
+        dst[len - 16..].copy_from_slice(&src[len - 16..]);
+    }
+}
+
 /// Fast inner decompression loop which is run  while there is at least
 /// 259 bytes left in the output buffer, and at least 6 bytes left in the input buffer
 /// (The maximum one match would need + 1).
@@ -1398,13 +1418,15 @@ fn decompress_fast(
                 break TINFLStatus::Failed;
             }
 
-            apply_match(
-                out_buf.get_mut(),
-                position,
-                l.dist as usize,
-                l.counter as usize,
-                out_buf_size_mask,
-            );
+            let len = l.counter as usize;
+            let dist = l.dist as usize;
+            if (3..=32).contains(&len) && dist >= len && position >= dist {
+                let (history, output) = out_buf.get_mut().split_at_mut(position);
+                let source = &history[position - dist..];
+                copy_short_disjoint(&mut output[..len], &source[..len]);
+            } else {
+                apply_match(out_buf.get_mut(), position, dist, len, out_buf_size_mask);
+            }
 
             out_buf.set_position(position + l.counter as usize);
         }
@@ -2145,6 +2167,28 @@ pub fn decompress_with_limit(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn short_disjoint_copies_preserve_surrounding_bytes() {
+        for len in 3..=32 {
+            for source in 0..10 {
+                for dist in [len, len + 1, 64] {
+                    let position = source + dist;
+                    let mut actual = [0u8; 160];
+                    for (i, byte) in actual.iter_mut().enumerate() {
+                        *byte = (i as u8).wrapping_mul(37).wrapping_add(11);
+                    }
+                    let mut expected = actual;
+                    for i in 0..len {
+                        expected[position + i] = expected[source + i];
+                    }
+                    let (history, output) = actual.split_at_mut(position);
+                    copy_short_disjoint(&mut output[..len], &history[source..source + len]);
+                    assert_eq!(actual, expected, "len={len} source={source} dist={dist}");
+                }
+            }
+        }
+    }
 
     //TODO: Fix these.
 
