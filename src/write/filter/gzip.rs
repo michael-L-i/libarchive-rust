@@ -46,6 +46,8 @@ enum Wrap {
     Gzip,
     /// None: 7-Zip's and ZIP's deflate coders.
     Raw,
+    /// A zlib header and trailer: XAR's gzip encoding.
+    Zlib,
 }
 
 pub struct Gzip {
@@ -84,6 +86,14 @@ impl Gzip {
             ..Self::default()
         }
     }
+    /// A zlib stream, buffered like XAR's.
+    pub(crate) fn zlib(level: u8) -> Self {
+        Self {
+            level,
+            wrap: Wrap::Zlib,
+            ..Self::default()
+        }
+    }
     fn start(&mut self, sink: &dyn Sink) -> Result<(), Error> {
         if self.state.is_some() {
             return Ok(());
@@ -101,8 +111,9 @@ impl Gzip {
                     bs
                 }
             }
-            // 7-Zip's write buffer, 512 * 20 * 6.
+            // The callers' write buffers: 7-Zip's 512 * 20 * 6, XAR's 64K.
             Wrap::Raw => 61440,
+            Wrap::Zlib => 65536,
         };
         if self.compressed.try_reserve_exact(size).is_err() {
             return Err(Error::fatal(
@@ -136,12 +147,15 @@ impl Gzip {
         }
         self.used = self.compressed.len();
         self.compressed.resize(size.max(self.used), 0);
-        self.state = Some(Deflate::new(i32::from(self.level), -15, 8).ok_or_else(|| {
-            Error::fatal(
-                -1,
-                "Internal error initializing compression library: invalid setup parameter",
-            )
-        })?);
+        let window_bits = if self.wrap == Wrap::Zlib { 15 } else { -15 };
+        self.state = Some(
+            Deflate::new(i32::from(self.level), window_bits, 8).ok_or_else(|| {
+                Error::fatal(
+                    -1,
+                    "Internal error initializing compression library: invalid setup parameter",
+                )
+            })?,
+        );
         Ok(())
     }
     /// Push input data through the compressor, writing full output blocks as

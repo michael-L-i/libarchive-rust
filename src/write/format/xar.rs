@@ -32,9 +32,6 @@ use crate::ffi::sys;
 use crate::read::{filter_code, format_code};
 use crate::util::Error;
 use crate::write::{Filter, Format, Sink};
-use miniz_oxide::deflate::core::{
-    CompressorOxide, TDEFLFlush, TDEFLStatus, compress, create_comp_flags_from_zip_params,
-};
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::fs::File;
@@ -141,11 +138,8 @@ struct Node {
     link: Option<usize>,
     script: Vec<u8>,
 }
-enum Encoder {
-    None,
-    Zlib(Box<CompressorOxide>),
-    Filter(Box<dyn Filter>),
-}
+/// The encoder of a file's data or extended attribute, None if it is stored.
+type Encoder = Option<Box<dyn Filter>>;
 struct Active {
     index: usize,
     encoder: Encoder,
@@ -213,55 +207,26 @@ impl Sink for HeapSink<'_> {
 }
 fn encode(
     encoder: &mut Encoder,
-    mut input: &[u8],
+    input: &[u8],
     finish: bool,
     sink: &mut dyn Sink,
 ) -> Result<(), Error> {
     match encoder {
-        Encoder::None => sink.write(input),
-        Encoder::Filter(f) => {
+        None => sink.write(input),
+        Some(f) => {
             f.write(input, sink)?;
             if finish {
                 f.close(sink)?;
             }
             Ok(())
         }
-        Encoder::Zlib(state) => {
-            let mut output = [0; 65536];
-            loop {
-                let (status, used, produced) = compress(
-                    state,
-                    input,
-                    &mut output,
-                    if finish {
-                        TDEFLFlush::Finish
-                    } else {
-                        TDEFLFlush::None
-                    },
-                );
-                sink.write(&output[..produced])?;
-                input = &input[used..];
-                if status == TDEFLStatus::Done
-                    || (!finish && input.is_empty() && produced < output.len())
-                {
-                    return Ok(());
-                }
-                if (used == 0 && produced == 0)
-                    || !matches!(status, TDEFLStatus::Okay | TDEFLStatus::Done)
-                {
-                    return Err(Error::fatal(-1, "Gzip compression failed"));
-                }
-            }
-        }
     }
 }
 impl Xar {
     fn encoder(&self, kind: Compression) -> Result<Encoder, Error> {
         Ok(match kind {
-            Compression::None => Encoder::None,
-            Compression::Gzip => Encoder::Zlib(Box::new(CompressorOxide::new(
-                create_comp_flags_from_zip_params(i32::from(self.level), 15, 0),
-            ))),
+            Compression::None => None,
+            Compression::Gzip => Some(Box::new(crate::write::filter::gzip::Gzip::zlib(self.level))),
             c => {
                 let code = match c {
                     Compression::Bzip2 => filter_code::BZIP2,
@@ -271,7 +236,7 @@ impl Xar {
                 let mut filter = crate::write::filter::by_code(code)?;
                 let level = [b'0' + self.level];
                 let _ = filter.options(b"compression-level", Some(&level))?;
-                Encoder::Filter(filter)
+                Some(filter)
             }
         })
     }
@@ -856,7 +821,12 @@ impl Format for Xar {
             }
         }
         let toc = self.toc();
-        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(toc.as_bytes(), self.level);
+        // Upstream compresses the TOC at level 6, whatever the files' level.
+        let mut compressed = Vec::new();
+        deflate::Deflate::new(6, 15, 8)
+            .ok_or_else(|| Error::fatal(-1, "Internal error initializing compression library"))?
+            .compress(toc.as_bytes(), &mut compressed)
+            .map_err(crate::write::filter::gzip::failed)?;
         let mut sum = self.toc_sum.digest();
         if let Some(d) = sum.as_mut() {
             d.update(&compressed);
