@@ -201,7 +201,7 @@ impl SevenZip {
                 return Err(Error::fatal(
                     -1,
                     format!(
-                        "compression-level option value `{}` out of range 0-9",
+                        "compression-level option value `{}' out of range 0-9",
                         self.level
                     ),
                 ));
