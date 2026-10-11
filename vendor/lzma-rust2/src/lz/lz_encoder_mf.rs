@@ -484,14 +484,9 @@ impl Mf {
     fn hash4_find(&mut self, len_limit: u32, matches: &mut [Match]) -> (usize, u32, u32) {
         let pos = self.read_pos.wrapping_add(self.offset);
         let cur = self.read_pos as usize;
-        let (h2, h3, hv) = hash_4(&self.buffer[cur..cur + 4], self.hash_mask);
-
-        let mut delta2 = pos.wrapping_sub(self.hash2[h2]);
-        let delta3 = pos.wrapping_sub(self.hash3[h3]);
-        let cur_match = self.hash[hv];
-        self.hash2[h2] = pos;
-        self.hash3[h3] = pos;
-        self.hash[hv] = pos;
+        let (hash2, hash3, cur_match) = self.hash4_update(pos, cur);
+        let mut delta2 = pos.wrapping_sub(hash2);
+        let delta3 = pos.wrapping_sub(hash3);
 
         let mut len_best = 1;
         let mut count = 0;
@@ -528,13 +523,40 @@ impl Mf {
     #[inline(always)]
     fn hash4_skip(&mut self) -> u32 {
         let pos = self.read_pos.wrapping_add(self.offset);
-        let cur = self.read_pos as usize;
-        let (h2, h3, hv) = hash_4(&self.buffer[cur..cur + 4], self.hash_mask);
-        let cur_match = self.hash[hv];
+        self.hash4_update(pos, self.read_pos as usize).2
+    }
+
+    /// Stores the current position in the hash tables, returning their
+    /// previous values (`hash_4_calc()` and the table updates).
+    ///
+    /// Searching the chain or tree doesn't change the hash tables, so the
+    /// next position's chain head is loaded right after the update, and its
+    /// cache miss overlaps the search. With five bytes available, its hash
+    /// input is final: refills, window moves and rewinds after a sync flush
+    /// keep it. Normalization rewrites the tables, so no hint is kept
+    /// across it.
+    #[inline(always)]
+    fn hash4_update(&mut self, pos: u32, cur: usize) -> (u32, u32, u32) {
+        let (h2, h3, hv, head) = match self.hash4_hint.take() {
+            Some((hint_pos, h2, h3, hv, head)) if hint_pos == pos => {
+                debug_assert_eq!(head, self.hash[hv]);
+                (h2, h3, hv, head)
+            }
+            _ => {
+                let (h2, h3, hv) = hash_4(&self.buffer[cur..cur + 4], self.hash_mask);
+                (h2, h3, hv, self.hash[hv])
+            }
+        };
+        let old = (self.hash2[h2], self.hash3[h3], head);
         self.hash2[h2] = pos;
         self.hash3[h3] = pos;
         self.hash[hv] = pos;
-        cur_match
+
+        if self.avail() >= 5 && pos + 1 != MUST_NORMALIZE_POS {
+            let (h2, h3, hv) = hash_4(&self.buffer[cur + 1..cur + 5], self.hash_mask);
+            self.hash4_hint = Some((pos + 1, h2, h3, hv, self.hash[hv]));
+        }
+        old
     }
 
     fn hc4_find(&mut self, matches: &mut [Match]) -> usize {

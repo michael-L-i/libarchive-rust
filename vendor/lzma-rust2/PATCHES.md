@@ -86,6 +86,22 @@ instructions retired, not time, judge these).
   per-load bounds checks: 6.635 -> 6.394 G instructions on the source
   slice, 11.14 -> 11.01 G on records.
 
+- After the HC4 and BT4 finders store a position in the hash tables,
+  they load the next position's chain head, which the chain or tree
+  search cannot change, so its cache miss overlaps the search; the next
+  find or skip uses it if it is at that position. Five available bytes
+  make its hash input final across refills, window moves and sync-flush
+  rewinds, and none is kept across normalization; debug builds compare
+  each use with the table. This is the round-10 xz-for-Java "find hint",
+  re-applied. Median cycles of three interleaved runs relative to
+  liblzma, source slice and records: before 1.076 and 1.082; with the
+  memcmplen change and pipelining limited to skips 1.041 and 1.076; with
+  this hint 0.968 and 1.011, for 1.1% and 1.2% more instructions than
+  the skip-only variant. Cycles are noisy on the shared machine. With
+  debug assertions, 504 streams over nine edge inputs, four formats and
+  14 presets, the sync-flush runs and the preset-dictionary runs are
+  byte-identical to liblzma.
+
 ## LZMA2 decoder resident dictionary pages
 
 `src/lz/lz_decoder.rs` and `src/lzma2_reader.rs` defer initialization of

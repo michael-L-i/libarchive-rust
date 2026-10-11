@@ -92,6 +92,9 @@ pub(crate) struct Mf {
     pub(crate) hash3: Vec<u32>,
     pub(crate) hash: Vec<u32>,
     pub(crate) son: Vec<u32>,
+    /// Hash indices and chain head loaded ahead for a position:
+    /// (position, hash_2_value, hash_3_value, hash_value, head).
+    pub(crate) hash4_hint: Option<(u32, usize, usize, usize, u32)>,
     pub(crate) cyclic_pos: u32,
     /// Must be dictionary size + 1.
     pub(crate) cyclic_size: u32,
@@ -148,6 +151,7 @@ impl Mf {
             hash3: vec![0; if hash_bytes > 3 { HASH_3_SIZE } else { 0 }],
             hash: vec![0; hs as usize + 1],
             son: vec![0; cyclic_size as usize * if is_bt { 2 } else { 1 }],
+            hash4_hint: None,
             cyclic_pos: 0,
             cyclic_size,
             hash_mask: hs,
