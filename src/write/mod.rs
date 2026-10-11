@@ -85,6 +85,17 @@ pub trait Format {
     }
 }
 
+/// Records a format's error and returns its code. A format call without
+/// the handle reports upstream's "set error, return `ARCHIVE_WARN`" as an
+/// `Error` carrying `ARCHIVE_WARN`.
+fn report(a: &Base, e: Error) -> c_int {
+    if e.code == ARCHIVE_WARN {
+        a.set_error(e.errno, Some(&e.msg));
+        return ARCHIVE_WARN;
+    }
+    a.raise(e)
+}
+
 pub struct Write {
     pub bytes_per_block: c_int,
     pub bytes_in_last_block: c_int,
@@ -351,7 +362,7 @@ impl Write {
                 }
                 ret.min(r)
             }
-            Err(e) => a.raise(e),
+            Err(e) => report(a, e),
         }
     }
     pub fn data(&mut self, a: &Base, data: &[u8]) -> isize {
@@ -362,7 +373,7 @@ impl Write {
         let data = &data[..data.len().min(c_int::MAX as usize)];
         match self.run(a, |f, s| f.data(data, s)) {
             Ok(n) => n as isize,
-            Err(e) => a.raise(e) as isize,
+            Err(e) => report(a, e) as isize,
         }
     }
     pub fn finish_entry(&mut self, a: &Base) -> c_int {
@@ -406,7 +417,7 @@ impl Write {
                 } else {
                     state::HEADER
                 });
-                a.raise(e)
+                report(a, e)
             }
         }
     }
@@ -425,7 +436,7 @@ impl Write {
         if self.format.is_some()
             && let Err(e) = self.run(a, |f, s| f.close(s))
         {
-            r = r.min(a.raise(e));
+            r = r.min(report(a, e));
         }
         if let Some(output) = self.output.as_mut() {
             for i in 0..self.filters.len() {
@@ -467,7 +478,7 @@ impl Write {
             matched = true;
             result = match f.options(a, key, value) {
                 Ok(r) => r,
-                Err(e) => a.raise(e),
+                Err(e) => report(a, e),
             };
         }
         if filters {
@@ -658,6 +669,38 @@ mod tests {
             c"test"
         }
     }
+    struct Collect(Rc<RefCell<Vec<u8>>>);
+    impl Sink for Collect {
+        fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+            self.0.borrow_mut().extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    fn file(size: i64) -> Entry {
+        let mut e = Entry::new(None);
+        e.set_pathname(b"f");
+        e.set_mode(0o100644);
+        e.set_size(size);
+        e
+    }
+
+    #[test]
+    fn format_warnings_without_the_handle_are_recorded() {
+        let base = Base::new(WRITE_MAGIC);
+        let mut writer = Write::default();
+        writer.set_format(&base, Box::new(format::ar::Ar::new(false)));
+        let out = Rc::new(RefCell::new(Vec::new()));
+        assert_eq!(writer.open(&base, Box::new(Collect(out))), ARCHIVE_OK);
+        assert_eq!(writer.header(&base, &mut file(2)), ARCHIVE_OK);
+        assert_eq!(writer.data(&base, b"x"), 1);
+        assert_eq!(writer.finish_entry(&base), ARCHIVE_WARN);
+        assert_eq!(
+            base.error_string().as_deref(),
+            Some(b"Entry remaining bytes larger than 0".as_slice())
+        );
+    }
+
     #[test]
     fn failed_filter_open_closes_only_opened_tail_and_frees_client_once() {
         let events = Rc::new(RefCell::new(Vec::new()));
