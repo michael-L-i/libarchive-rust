@@ -529,6 +529,24 @@ repaired. An interrupted CRC screen was repeated with full raw samples;
 source and benchmark artifacts were preserved. Original C and pinned
 upstream remain clean. No work was pushed.
 
+### Workspace cleanup (October 11, 2026)
+
+Retired all 45 experimental worktrees after the round-eleven validation
+checkpoint `1e72899`. Only the main Rust checkout remains. All branches
+are retained, with a verified all-ref Git bundle, staged/unstaged patches
+and local file backups in sibling
+`diagnostics/archive/worktrees-2026-10-11/`. Six uncommitted experiments
+and seven local lockfiles are recoverable; all six patches apply to their
+recorded HEADs. Fifty standalone native harness binaries are archived.
+
+Removed retired worktree caches, standalone Cargo targets, Python bytecode
+and the main debug target, reclaiming about 14 GiB. Current release binaries,
+the C oracle, benchmark inputs, profiles, independent reviews and reports
+remain. All 181 retained evidence fingerprints match; repository connectivity
+checks pass. Original C and pinned upstream remain clean. The workspace and
+diagnostics guides now identify the current checkpoint and reproduction paths.
+No compiler, compatibility test or benchmark was rerun for this cleanup.
+
 ## Earlier checkpoints (historical)
 
 ### Phase 2 checkpoint
