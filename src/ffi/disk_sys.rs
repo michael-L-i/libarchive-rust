@@ -236,6 +236,31 @@ use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Component;
 
+// Darwin 21 (macOS 12) and later have the verified O_NOFOLLOW_ANY behavior.
+// Unknown versions stay on the component walker; old kernels may ignore new flags.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn supports_nofollow_any() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        // SAFETY: utsname consists entirely of fixed-size character arrays; zero is valid.
+        let mut info: libc::utsname = unsafe { std::mem::zeroed() };
+        // SAFETY: info is a live, correctly sized writable utsname; uname retains no pointer.
+        if unsafe { libc::uname(&mut info) } != 0 {
+            return false;
+        }
+        let release = info.release.map(|c| c as u8);
+        let Some(end) = release.iter().position(|&c| c == b'.') else {
+            return false;
+        };
+        let digits = &release[..end];
+        digits.iter().all(u8::is_ascii_digit)
+            && std::str::from_utf8(digits)
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_some_and(|major| major >= 21)
+    })
+}
+
 /// Holds the destination directory open so renames cannot redirect extraction.
 pub struct Target {
     parent: File,
@@ -267,9 +292,9 @@ impl Target {
         unlink: bool,
         autodir: bool,
     ) -> std::io::Result<Self> {
-        let mut components: Vec<_> = path.components().collect();
+        let mut components = path.components();
         let last = components
-            .pop()
+            .next_back()
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
         let name = if last == Component::RootDir {
             c".".to_owned()
@@ -278,6 +303,27 @@ impl Target {
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
         };
         let start = if path.is_absolute() { c"/" } else { c"." };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if supports_nofollow_any() {
+            use std::os::unix::fs::OpenOptionsExt;
+            let path = components.as_path();
+            let path = if path.as_os_str().is_empty() {
+                Path::new(if last == Component::RootDir { "/" } else { "." })
+            } else {
+                path
+            };
+            if let Ok(parent) = File::options()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | if secure { libc::O_NOFOLLOW_ANY } else { 0 })
+                .open(path)
+            {
+                return Ok(Self {
+                    parent,
+                    name,
+                    live: None,
+                });
+            }
+        }
         // SAFETY: start is a terminated path, and open returns a new owned fd.
         let fd = unsafe {
             libc::open(
@@ -510,6 +556,129 @@ pub fn umask() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Directory(std::path::PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir()
+                .join(format!("libarchive-parent-{}-{unique}", std::process::id()));
+            std::fs::create_dir(&root).unwrap();
+            Self(std::fs::canonicalize(root).unwrap())
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn target_parent_preserves_path_components() {
+        use std::os::unix::fs::MetadataExt;
+        let root = Directory::new();
+        std::fs::create_dir(root.0.join("dir")).unwrap();
+        for (path, parent, name) in [
+            (
+                std::path::PathBuf::from("/"),
+                std::path::PathBuf::from("/"),
+                ".",
+            ),
+            (
+                std::path::PathBuf::from("."),
+                std::path::PathBuf::from("."),
+                ".",
+            ),
+            (
+                std::path::PathBuf::from("file"),
+                std::path::PathBuf::from("."),
+                "file",
+            ),
+            (root.0.join("dir//file"), root.0.join("dir"), "file"),
+            (root.0.join("dir/./file"), root.0.join("dir"), "file"),
+            (root.0.join("dir/../file"), root.0.join("dir/.."), "file"),
+            (root.0.join("dir/.."), root.0.join("dir"), ".."),
+            (root.0.join("dir/"), root.0.clone(), "dir"),
+        ] {
+            let target = Target::prepare(&path, true, false, false).unwrap();
+            let actual = target.parent.metadata().unwrap();
+            let expected = std::fs::metadata(parent).unwrap();
+            assert_eq!(
+                (actual.dev(), actual.ino()),
+                (expected.dev(), expected.ino()),
+                "{path:?}"
+            );
+            assert_eq!(target.name.to_bytes(), name.as_bytes(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn target_parent_keeps_symlink_unlink_and_autodir_rules() {
+        use std::io::Write;
+        let root = Directory::new();
+        let outside = root.0.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let link = root.0.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let path = link.join("file");
+        assert!(Target::prepare(&path, true, false, true).is_err());
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        Target::prepare(&path, false, false, false)
+            .unwrap()
+            .open(0o600, true)
+            .unwrap()
+            .write_all(b"followed")
+            .unwrap();
+        assert_eq!(std::fs::read(outside.join("file")).unwrap(), b"followed");
+        assert!(Target::prepare(&path, true, true, false).is_err());
+        assert!(!link.exists());
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        Target::prepare(&path, true, true, true)
+            .unwrap()
+            .open(0o600, true)
+            .unwrap()
+            .write_all(b"inside")
+            .unwrap();
+        assert!(!std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&path).unwrap(), b"inside");
+        assert_eq!(std::fs::read(outside.join("file")).unwrap(), b"followed");
+        let missing = root.0.join("missing/nested/file");
+        assert!(Target::prepare(&missing, true, false, false).is_err());
+        assert!(!root.0.join("missing").exists());
+        assert!(Target::prepare(&missing, true, false, true).is_ok());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn target_parent_accepts_searchable_ancestors_without_read_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        if !supports_nofollow_any() {
+            return;
+        }
+        struct Restore(File);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = self
+                    .0
+                    .set_permissions(std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let root = Directory::new();
+        let ancestor = root.0.join("ancestor");
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::create_dir(ancestor.join("parent")).unwrap();
+        let restore = Restore(File::open(&ancestor).unwrap());
+        restore
+            .0
+            .set_permissions(std::fs::Permissions::from_mode(0o111))
+            .unwrap();
+        let target = Target::prepare(&ancestor.join("parent/file"), true, false, false).unwrap();
+        target.open(0o600, true).unwrap();
+        assert!(ancestor.join("parent/file").exists());
+    }
+
     #[test]
     fn exclusive_open_preserves_existing_file_and_symlink() {
         struct Cleanup(std::path::PathBuf);

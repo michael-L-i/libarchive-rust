@@ -1781,6 +1781,22 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   Numeric filesystem IDs, symlink handling and write-side owner lookup fallback
   behavior are unchanged. Real Opus 5.5 design/review and byte-identical
   six-format many-file measurements are retained in `../diagnostics/round8-system`.
+- On ARM macOS with Darwin kernel major 21 or later, parent directories are
+  opened in one lookup with O_NOFOLLOW_ANY when secure symlink handling is
+  requested. The resulting descriptor remains pinned for child operations.
+  Any failed lookup uses the original component walker, including its symlink
+  unlinking and automatic-directory behavior. A cached uname query gates this
+  path conservatively; old/unknown kernels and other targets keep the walker.
+  The query adds two documented unsafe blocks in the OS FFI layer; directory
+  opening uses safe std APIs. Searchable but unreadable intermediate ancestors
+  are now accepted, matching C; the final parent still requires read permission.
+  Actual Opus 5.5 design/final review, primary kernel sources, filesystem
+  differential checks and rotating six-format measurements are retained in
+  `../diagnostics/round9-system`.
+- The parent-path checks retain two pre-existing errno differences: rejection
+  of a symlink ancestor reports ENOTDIR here versus ELOOP in C; unlinking that
+  symlink with NO_AUTODIR reports ENOTDIR here versus ENOENT in C. Return status
+  and filesystem effects agree, and the optimized path preserves Rust's errno.
 - Ordinary non-atomic regular files first attempt exclusive creation after all
   path/security checks, like upstream. Success proves the destination was absent
   and avoids its pre-create stat; any error follows the original existing-file
