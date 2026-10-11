@@ -231,6 +231,6 @@ file together in one `upstream: Bump to <sha>` commit.
 BSD-2-Clause, like upstream. Each ported module starts with the upstream file's
 copyright header unchanged (upstream requires it "in this position and
 unchanged"), then `// Ported from libarchive/<file>.` Per upstream `COPYING`,
-`archive_read_support_filter_compress.c` also carries a UC Regents 3-clause
-notice, `archive_parse_date.c` is public domain, and the BLAKE2 files are
+`archive_read_support_filter_compress.c` and
+`archive_write_add_filter_compress.c` also carry a UC Regents notice, `archive_parse_date.c` is public domain, and the BLAKE2 files are
 CC0/OpenSSL/Apache-2.0. Keep those notices on the modules ported from them.
