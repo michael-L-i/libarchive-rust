@@ -1,0 +1,12 @@
+[package]
+name = "deflate"
+version = "0.1.0"
+edition = "2024"
+license = "Zlib"
+description = "zlib 1.2.12's deflate compressor, ported to safe Rust"
+
+[dependencies]
+adler2 = { version = "2.0.1", default-features = false }
+
+[dev-dependencies]
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }

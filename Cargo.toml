@@ -1,6 +1,6 @@
 [workspace]
-members = ["capi"]
-default-members = [".", "capi"]
+members = ["capi", "deflate"]
+default-members = [".", "capi", "deflate"]
 # The patched backends keep their own manifests and tests.
 exclude = ["vendor"]
 
