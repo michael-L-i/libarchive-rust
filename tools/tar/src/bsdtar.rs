@@ -291,12 +291,6 @@ fn number(arg: &[u8]) -> Option<i64> {
     (!arg.is_empty() && end == arg.len()).then_some(l)
 }
 
-/// The argument of the option just parsed. getopt gives one to every
-/// option that requires it.
-fn argument(bsdtar: &Bsdtar) -> Vec<u8> {
-    bsdtar.argument.clone().unwrap_or_default()
-}
-
 /// Checks the match calls of the options that select by time.
 fn match_time(bsdtar: &Bsdtar, r: Status) {
     if r != Status::Ok {
@@ -320,7 +314,8 @@ fn main() {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
 
-    // Set up signal handling.
+    // Set up signal handling. sigaction can't fail for these, which
+    // upstream checks.
     #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
     sys::catch(libc::SIGINFO, siginfo_handler);
     // ... and treat SIGUSR1 the same way as SIGINFO.
@@ -397,6 +392,9 @@ fn main() {
     // originated: SUSv2, POSIX, GNU tar, star, etc. If there's no such
     // comment, then I don't know of anyone else who implements that option.
     while let Some(opt) = bsdtar.getopt() {
+        // The option's argument: getopt gives one to every option that
+        // requires it.
+        let arg = bsdtar.argument.take().unwrap_or_default();
         match opt {
             // GNU tar
             'a' => bsdtar.flags |= OPTFLAG_AUTO_COMPRESS,
@@ -410,7 +408,7 @@ fn main() {
             'B' => {}
             // SUSv2
             'b' => {
-                let l = number(&argument(&bsdtar)).filter(|l| (1..=8192).contains(l));
+                let l = number(&arg).filter(|l| (1..=8192).contains(l));
                 let Some(l) = l else {
                     lafe_errc(1, 0, "Invalid or out of range (1..8192) argument to -b");
                 };
@@ -427,7 +425,7 @@ fn main() {
             }
             // GNU tar
             'C' => {
-                let dir = argument(&bsdtar);
+                let dir = arg;
                 if dir.is_empty() {
                     lafe_errc(1, 0, "Meaningless option: -C ''");
                 }
@@ -444,7 +442,7 @@ fn main() {
             }
             // GNU tar
             OPTION_EXCLUDE => {
-                let pattern = argument(&bsdtar);
+                let pattern = arg;
                 if bsdtar.matching.exclude_pattern(&pattern) != Status::Ok {
                     lafe_errc(1, 0, [b"Couldn't exclude ".as_slice(), &pattern].concat());
                 }
@@ -463,22 +461,22 @@ fn main() {
                 bsdtar.flags |= OPTFLAG_FFLAGS;
             }
             // GNU tar, others
-            OPTION_FORMAT => bsdtar.cset.set_format(&argument(&bsdtar)),
+            OPTION_FORMAT => bsdtar.cset.set_format(&arg),
             // SUSv2
-            'f' => bsdtar.filename = bsdtar.argument.clone(),
+            'f' => bsdtar.filename = Some(arg),
             // cpio
             OPTION_GID => {
-                let l = number(&argument(&bsdtar)).filter(|l| (0..c_int::MAX.into()).contains(l));
+                let l = number(&arg).filter(|l| (0..c_int::MAX.into()).contains(l));
                 let Some(l) = l else {
                     lafe_errc(1, 0, "Invalid argument to --gid");
                 };
                 bsdtar.gid = l as c_int;
             }
             // cpio
-            OPTION_GNAME => bsdtar.gname = bsdtar.argument.clone(),
+            OPTION_GNAME => bsdtar.gname = Some(arg),
             // GNU tar
             OPTION_GROUP => {
-                let (name, id) = owner(&argument(&bsdtar), b"--group");
+                let (name, id) = owner(&arg, b"--group");
                 bsdtar.gname = Some(name);
                 if let Some(id) = id {
                     bsdtar.gid = id;
@@ -508,12 +506,12 @@ fn main() {
                 // coming from disk. This can be used to "refresh" an
                 // archive or to design archives with special permissions
                 // without having to create those permissions on disk.
-                bsdtar.names_from_file = bsdtar.argument.clone();
+                bsdtar.names_from_file = Some(arg);
             }
             OPTION_INCLUDE => {
                 // No one else has the @archive extension, so no one else
                 // needs this to filter entries when transforming archives.
-                let pattern = argument(&bsdtar);
+                let pattern = arg;
                 if bsdtar.matching.include_pattern(&pattern) != Status::Ok {
                     let msg = [b"Failed to add ".as_slice(), &pattern, b" to inclusion list"];
                     lafe_errc(1, 0, msg.concat());
@@ -562,7 +560,7 @@ fn main() {
             }
             // GNU tar
             OPTION_MODE => {
-                let mode = argument(&bsdtar);
+                let mode = arg;
                 bsdtar.file_mode = lafe_setmode(&mode);
                 if bsdtar.file_mode.is_none() {
                     lafe_errc(1, 0, [b"Invalid file mode: ".as_slice(), &mode].concat());
@@ -577,23 +575,23 @@ fn main() {
             // GNU tar
             OPTION_NEWER_CTIME => {
                 let flag = ARCHIVE_MATCH_CTIME | ARCHIVE_MATCH_NEWER;
-                let r = bsdtar.matching.include_date(flag, &argument(&bsdtar));
+                let r = bsdtar.matching.include_date(flag, &arg);
                 match_time(&bsdtar, r);
             }
             OPTION_NEWER_CTIME_THAN => {
                 let flag = ARCHIVE_MATCH_CTIME | ARCHIVE_MATCH_NEWER;
-                let r = include_file_time(&mut bsdtar, flag);
+                let r = bsdtar.matching.include_file_time(flag, util::path(&arg));
                 match_time(&bsdtar, r);
             }
             // GNU tar
             OPTION_NEWER_MTIME => {
                 let flag = ARCHIVE_MATCH_MTIME | ARCHIVE_MATCH_NEWER;
-                let r = bsdtar.matching.include_date(flag, &argument(&bsdtar));
+                let r = bsdtar.matching.include_date(flag, &arg);
                 match_time(&bsdtar, r);
             }
             OPTION_NEWER_MTIME_THAN => {
                 let flag = ARCHIVE_MATCH_MTIME | ARCHIVE_MATCH_NEWER;
-                let r = include_file_time(&mut bsdtar, flag);
+                let r = bsdtar.matching.include_file_time(flag, util::path(&arg));
                 match_time(&bsdtar, r);
             }
             // star
@@ -658,22 +656,22 @@ fn main() {
             //         on specified file
             OPTION_OLDER_CTIME => {
                 let flag = ARCHIVE_MATCH_CTIME | ARCHIVE_MATCH_OLDER;
-                let r = bsdtar.matching.include_date(flag, &argument(&bsdtar));
+                let r = bsdtar.matching.include_date(flag, &arg);
                 match_time(&bsdtar, r);
             }
             OPTION_OLDER_CTIME_THAN => {
                 let flag = ARCHIVE_MATCH_CTIME | ARCHIVE_MATCH_OLDER;
-                let r = include_file_time(&mut bsdtar, flag);
+                let r = bsdtar.matching.include_file_time(flag, util::path(&arg));
                 match_time(&bsdtar, r);
             }
             OPTION_OLDER_MTIME => {
                 let flag = ARCHIVE_MATCH_MTIME | ARCHIVE_MATCH_OLDER;
-                let r = bsdtar.matching.include_date(flag, &argument(&bsdtar));
+                let r = bsdtar.matching.include_date(flag, &arg);
                 match_time(&bsdtar, r);
             }
             OPTION_OLDER_MTIME_THAN => {
                 let flag = ARCHIVE_MATCH_MTIME | ARCHIVE_MATCH_OLDER;
-                let r = include_file_time(&mut bsdtar, flag);
+                let r = bsdtar.matching.include_file_time(flag, util::path(&arg));
                 match_time(&bsdtar, r);
             }
             // GNU tar
@@ -689,11 +687,11 @@ fn main() {
                     ];
                     lafe_warnc(0, msg.concat());
                 }
-                bsdtar.option_options = bsdtar.argument.clone();
+                bsdtar.option_options = Some(arg);
             }
             // GNU tar
             OPTION_OWNER => {
-                let (name, id) = owner(&argument(&bsdtar), b"--owner");
+                let (name, id) = owner(&arg, b"--owner");
                 bsdtar.uname = Some(name);
                 if let Some(id) = id {
                     bsdtar.uid = id;
@@ -702,7 +700,7 @@ fn main() {
             // GNU tar
             OPTION_MTIME => {
                 bsdtar.has_mtime = true;
-                bsdtar.mtime = parse_date(now, &argument(&bsdtar));
+                bsdtar.mtime = parse_date(now, &arg);
                 if bsdtar.mtime == -1 {
                     lafe_errc(1, 0, "Invalid argument to --mtime (bad date string)");
                 }
@@ -722,7 +720,7 @@ fn main() {
                 bsdtar.extract_flags |= ARCHIVE_EXTRACT_FFLAGS;
                 bsdtar.extract_flags |= ARCHIVE_EXTRACT_MAC_METADATA;
             }
-            OPTION_PASSPHRASE => bsdtar.passphrase = bsdtar.argument.clone(),
+            OPTION_PASSPHRASE => bsdtar.passphrase = Some(arg),
             // GNU tar
             OPTION_POSIX => bsdtar.cset.set_format(b"pax"),
             // FreeBSD GNU tar --fast-read, NetBSD -q
@@ -737,7 +735,7 @@ fn main() {
             'S' => bsdtar.extract_flags |= ARCHIVE_EXTRACT_SPARSE,
             // NetBSD pax-as-tar
             's' => {
-                let rule = argument(&bsdtar);
+                let rule = arg;
                 add_substitution(&mut bsdtar, &rule);
             }
             OPTION_SAFE_WRITES => bsdtar.extract_flags |= ARCHIVE_EXTRACT_SAFE_WRITES,
@@ -745,7 +743,7 @@ fn main() {
             OPTION_SAME_OWNER => bsdtar.extract_flags |= ARCHIVE_EXTRACT_OWNER,
             // GNU tar 1.15
             OPTION_STRIP_COMPONENTS => {
-                let l = number(&argument(&bsdtar)).filter(|l| (0..=100000).contains(l));
+                let l = number(&arg).filter(|l| (0..=100000).contains(l));
                 let Some(l) = l else {
                     lafe_errc(1, 0, "Invalid argument to --strip-components");
                 };
@@ -756,7 +754,7 @@ fn main() {
                 if bsdtar.names_from_file.is_some() {
                     lafe_errc(1, 0, "Multiple --files-from/-T options are not supported");
                 }
-                bsdtar.names_from_file = bsdtar.argument.clone();
+                bsdtar.names_from_file = Some(arg);
             }
             // SUSv2
             't' => {
@@ -774,14 +772,14 @@ fn main() {
             'u' => set_mode(&mut bsdtar, opt),
             // cpio
             OPTION_UID => {
-                let l = number(&argument(&bsdtar)).filter(|l| (0..c_int::MAX.into()).contains(l));
+                let l = number(&arg).filter(|l| (0..c_int::MAX.into()).contains(l));
                 let Some(l) = l else {
                     lafe_errc(1, 0, "Invalid argument to --uid");
                 };
                 bsdtar.uid = l as c_int;
             }
             // cpio
-            OPTION_UNAME => bsdtar.uname = bsdtar.argument.clone(),
+            OPTION_UNAME => bsdtar.uname = Some(arg),
             OPTION_UUENCODE => {
                 if compression2 != '\0' {
                     lafe_errc(1, 0, "Can't specify both --uuencode and --b64encode");
@@ -797,7 +795,7 @@ fn main() {
             'w' => bsdtar.flags |= OPTFLAG_INTERACTIVE,
             // GNU tar
             'X' => {
-                let file = argument(&bsdtar);
+                let file = arg;
                 let r = bsdtar.matching.exclude_pattern_from_file(util::path(&file), false);
                 if r != Status::Ok {
                     lafe_errc(1, 0, util::error_string(&bsdtar.matching));
@@ -817,7 +815,7 @@ fn main() {
             'Z' => set_compression(&mut compression, opt, &mut compression_name, b"compress"),
             // GNU tar, star, many others
             'z' => set_compression(&mut compression, opt, &mut compression_name, b"gzip"),
-            OPTION_USE_COMPRESS_PROGRAM => compress_program = bsdtar.argument.clone(),
+            OPTION_USE_COMPRESS_PROGRAM => compress_program = Some(arg),
             _ => usage(),
         }
     }
@@ -1009,12 +1007,6 @@ fn owner(arg: &[u8], option: &[u8]) -> (Vec<u8>, Option<c_int>) {
             None => (arg.to_vec(), None),
         }
     }
-}
-
-/// `archive_match_include_file_time` with the option's argument.
-fn include_file_time(bsdtar: &mut Bsdtar, flag: c_int) -> Status {
-    let file = argument(bsdtar);
-    bsdtar.matching.include_file_time(flag, util::path(&file))
 }
 
 fn set_mode(bsdtar: &mut Bsdtar, opt: char) {

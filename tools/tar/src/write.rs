@@ -141,8 +141,7 @@ pub fn tar_mode_c(bsdtar: &mut Bsdtar) {
 }
 
 /// The archive file of -r and -u, opened with `options`.
-fn open_archive(bsdtar: &Bsdtar, options: &OpenOptions) -> Rc<File> {
-    let filename = bsdtar.filename.as_deref().unwrap_or_default();
+fn open_archive(filename: &[u8], options: &OpenOptions) -> Rc<File> {
     match options.open(path(filename)) {
         Ok(f) => Rc::new(f),
         Err(e) => {
@@ -165,15 +164,14 @@ fn seek_to_end(fd: &File, end_offset: i64) {
 /// uncompressed files on disk.
 pub fn tar_mode_r(bsdtar: &mut Bsdtar) {
     // Sanity-test some arguments and the file.
-    test_for_append(bsdtar);
+    let filename = test_for_append(bsdtar);
 
     let mut format = ARCHIVE_FORMAT_TAR_PAX_RESTRICTED;
 
     let fd = open_archive(
-        bsdtar,
+        &filename,
         OpenOptions::new().read(true).write(true).create(true),
     );
-    let filename = bsdtar.filename.clone().unwrap_or_default();
 
     let mut a = ArchiveRead::new();
     a.support_filter_all();
@@ -242,10 +240,9 @@ pub fn tar_mode_u(bsdtar: &mut Bsdtar) {
     let mut format = ARCHIVE_FORMAT_TAR_PAX_RESTRICTED;
 
     // Sanity-test some arguments and the file.
-    test_for_append(bsdtar);
+    let filename = test_for_append(bsdtar);
 
-    let fd = open_archive(bsdtar, OpenOptions::new().read(true).write(true));
-    let filename = bsdtar.filename.clone().unwrap_or_default();
+    let fd = open_archive(&filename, OpenOptions::new().read(true).write(true));
 
     let mut a = ArchiveRead::new();
     a.support_filter_all();
@@ -384,17 +381,17 @@ fn write_archive(mut a: ArchiveWrite, bsdtar: &mut Bsdtar) {
             // entry to read the contents.
             // TODO: Work with -C option as well.
             let sourcepath = e.sourcepath().unwrap_or_default().to_vec();
-            let disk_r = &mut disk.diskreader;
-            if disk_r.open(path(&sourcepath)) != Status::Ok {
-                lafe_warnc(disk_r.errno(), error_string(disk_r));
+            let diskreader = &mut disk.diskreader;
+            if diskreader.open(path(&sourcepath)) != Status::Ok {
+                lafe_warnc(diskreader.errno(), error_string(diskreader));
                 bsdtar.return_value = 1;
             } else {
                 // Invoke archive_read_next_header2() to work
                 // archive_read_data_block(), which is called via
-                // write_file(), without failure.
-                let r = disk_r.next_header2(&mut ArchiveEntry::new());
+                // write_entry(), without failure.
+                let r = diskreader.next_header2(&mut ArchiveEntry::new());
                 if r != Status::Ok {
-                    lafe_warnc(disk_r.errno(), error_string(disk_r));
+                    lafe_warnc(diskreader.errno(), error_string(diskreader));
                     if r == Status::Fatal {
                         bsdtar.return_value = 1;
                     }
@@ -541,11 +538,13 @@ fn append_archive(
         if e != Status::Ok {
             break e;
         }
-        let matching = disk.diskreader.matching();
-        match matching.map_or(Ok(false), |m| m.excluded(&mut in_entry)) {
-            Err(_) => {
-                let matching = disk.diskreader.matching();
-                let msg = matching.map(|m| error_string(m)).unwrap_or_default();
+        // The match handle is the disk reader's while bsdtar writes.
+        let excluded = match disk.diskreader.matching() {
+            Some(m) => m.excluded(&mut in_entry).map_err(|_| error_string(m)),
+            None => Ok(false),
+        };
+        match excluded {
+            Err(msg) => {
                 if bsdtar.verbose == 0 {
                     lafe_errc(1, 0, msg);
                 } else {
@@ -846,19 +845,20 @@ fn report_write(bsdtar: &Bsdtar, a: &ArchiveWrite, entry: &mut ArchiveEntry, pro
     let _ = writeln!(stderr, " ({progress}/{} bytes)", entry.size());
 }
 
-fn test_for_append(bsdtar: &Bsdtar) {
+/// Checks the arguments and the archive file of -r and -u: the file's
+/// name.
+fn test_for_append(bsdtar: &Bsdtar) -> Vec<u8> {
     if bsdtar.argv.is_empty() && bsdtar.names_from_file.is_none() {
         lafe_errc(1, 0, "no files or directories specified");
     }
-    let Some(filename) = &bsdtar.filename else {
+    let Some(filename) = bsdtar.filename.clone() else {
         lafe_errc(1, 0, "Cannot append to stdout");
     };
 
-    let Ok(s) = std::fs::metadata(path(filename)) else {
-        return;
-    };
-
-    if !s.is_file() && !s.file_type().is_block_device() {
+    if let Ok(s) = std::fs::metadata(path(&filename))
+        && !s.is_file()
+        && !s.file_type().is_block_device()
+    {
         let msg = [
             b"Cannot append to ",
             filename.as_slice(),
@@ -866,4 +866,5 @@ fn test_for_append(bsdtar: &Bsdtar) {
         ];
         lafe_errc(1, 0, msg.concat());
     }
+    filename
 }

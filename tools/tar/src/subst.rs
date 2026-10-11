@@ -13,7 +13,7 @@
 use crate::Bsdtar;
 use libarchive_fe::lafe_err::lafe_errc;
 use libarchive_fe::sys::Regex;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::io::Write;
 
 /// The compile flags: basic regular expressions, macOS's `REG_BASIC`.
@@ -153,11 +153,11 @@ pub fn apply_substitution(
     let Some(subst) = &bsdtar.substitution else {
         return Ok(None);
     };
-    let path = name;
     let mut result: Option<Vec<u8>> = None;
-    // The text the rules match, as a C string, and where the next match
-    // starts in it.
-    let mut buffer = CString::new(name).unwrap_or_default().into_bytes_with_nul();
+    // The name as C has it, ending at a NUL: the text the rules match, and
+    // where the next match starts in it.
+    let path = name.split(|&c| c == 0).next().unwrap_or_default();
+    let mut buffer = [path, b"\0"].concat();
     let mut name = 0;
     let mut got_match = false;
     let mut print_match = false;

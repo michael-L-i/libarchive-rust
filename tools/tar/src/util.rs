@@ -97,6 +97,8 @@ pub fn safe_fputs(s: Option<&[u8]>, f: &mut dyn Write) {
         let _ = f.write_all(b"(null)");
         return;
     };
+    // A C string ends at its NUL.
+    let s = s.split(|&c| c == 0).next().unwrap_or_default();
 
     // Reset the shift state, and see if the encoding has one.
     let stateful = sys::mbtowc_reset();
@@ -560,6 +562,8 @@ mod tests {
         assert_eq!(safe(b"a\\b"), b"a\\\\b");
         assert_eq!(safe(b"tab\there\n"), b"tab\\there\\n");
         assert_eq!(safe(b"\x01\x7f"), b"\\001\\177");
+        // A C string ends at its NUL.
+        assert_eq!(safe(b"a\0\x01"), b"a");
         let mut out = Vec::new();
         safe_fputs(None, &mut out);
         assert_eq!(out, b"(null)");
