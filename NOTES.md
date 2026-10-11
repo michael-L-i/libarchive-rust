@@ -1998,3 +1998,30 @@ single-hash matcher. Levels and options keep libarchive's meaning.
   each of the (up to 25) nested filter layers multiplies the output; upstream
   `bsdcat` writes gigabytes from it too. The harness stops reading entry data
   after 1 MiB per input instead of the library imposing a limit.
+
+## bsdunzip (`tools/unzip/`)
+
+- Not ported: `bsdunzip_windows.c` and the `_WIN32` branches of
+  `bsdunzip.c`; the `lutimes`/`futimes` fallbacks for libcs without
+  `utimensat`/`futimens`; the glibc-only `setenv("POSIXLY_CORRECT")`, which
+  only matters to GNU `getopt(3)` and the port has its own parser; and
+  `OPTION_NONE`, which the parser never returns.
+- A zip file named `-` (reachable as `bsdunzip -- -`; `-` alone is an empty
+  option group) is standard input in intent, but upstream calls
+  `strlen(NULL)` on it and crashes (SIGSEGV). The port reads standard input
+  and prints the name as `(null)`, which is what upstream's printf would
+  print.
+- Standard output is Rust's line-buffered `Stdout`, where C's is fully
+  buffered unless it is a terminal. The bytes are the same, and every
+  message to standard error flushes it first, as upstream's do, so only the
+  interleaving of the "replace ...?" prompt (which does not flush) with
+  earlier output differs when both streams go to one file.
+- `error()` after a short or failed `write(2)` reports the failure's errno;
+  after a short write with no error, upstream reports a stale `errno` and
+  the port reports 0.
+- The passphrase buffer is allocated and zeroed for each prompt, not once
+  and zeroed at the end; the bytes handed to the library are a copy either
+  way. `lafe_readpassphrase` exits on every error but `EINTR`, so the
+  callback's own `error("Error reading password")` can't be reached.
+- `close(2)` of an extracted file goes through `sys::close`, since std's drop
+  would hide the error upstream reports.

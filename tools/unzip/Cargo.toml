@@ -1,0 +1,15 @@
+[package]
+name = "bsdunzip"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "bsdunzip: lists, tests and extracts zip archives (upstream's unzip/)"
+
+[[bin]]
+name = "bsdunzip"
+path = "src/bsdunzip.rs"
+
+[dependencies]
+libarchive-fe = { path = "../libarchive_fe" }
+libarchive-rust = { path = "../.." }
+libc = "0.2"
