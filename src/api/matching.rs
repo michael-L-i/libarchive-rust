@@ -55,7 +55,8 @@ impl Handle {
     }
 
     pub(crate) fn match_excluded(&self, e: Option<&mut Entry>) -> c_int {
-        self.match_entry("archive_match_excluded", e, |a, m, e| Ok(m.excluded(a, e)))
+        let func = "archive_match_excluded_ae";
+        self.match_entry(func, e, |a, m, e| Ok(m.excluded(a, e)))
     }
 
     pub(crate) fn match_path_excluded(&self, e: Option<&mut Entry>) -> c_int {
@@ -64,12 +65,12 @@ impl Handle {
     }
 
     pub(crate) fn match_time_excluded(&self, e: Option<&mut Entry>) -> c_int {
-        let func = "archive_match_time_excluded";
+        let func = "archive_match_time_excluded_ae";
         self.match_entry(func, e, |_, m, e| Ok(m.time_excluded(e)))
     }
 
     pub(crate) fn match_owner_excluded(&self, e: Option<&mut Entry>) -> c_int {
-        let func = "archive_match_owner_excluded";
+        let func = "archive_match_id_excluded_ae";
         self.match_entry(func, e, |_, m, e| Ok(m.owner_excluded(e)))
     }
 
