@@ -26,13 +26,14 @@
 
 // Ported from libarchive/archive_match.c.
 
+use crate::api::{ArchiveRead, Status};
 use crate::archive::*;
 use crate::entry::Entry;
 use crate::pathmatch;
 use crate::string::MString;
 use crate::util::Error;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::CStr;
+use std::ffi::{CStr, c_int};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -148,21 +149,76 @@ impl Matching {
         });
         Ok(())
     }
-    pub fn patterns_file(&mut self, include: bool, path: &[u8], null: bool) -> Result<(), Error> {
-        let bytes = std::fs::read(Path::new(std::ffi::OsStr::from_bytes(path))).map_err(|e| {
-            Error::fatal(
-                e.raw_os_error().unwrap_or(libc::EIO),
-                format!("Failed to open '{}'", String::from_utf8_lossy(path)),
-            )
-        })?;
-        for b in bytes.split(|&b| if null { b == 0 } else { b == 13 || b == 10 }) {
-            if !b.is_empty() {
-                let mut text = MString::default();
-                text.copy_mbs(b);
-                self.pattern(include, text)?;
+    /// `add_pattern_from_file`: the patterns in the file `path` (standard
+    /// input for `None` or an empty name), one a line or, with `null`,
+    /// separated by NULs. A failure to read it is copied to `a`, and its
+    /// status returned.
+    pub fn patterns_file(
+        &mut self,
+        a: &Base,
+        include: bool,
+        path: Option<&[u8]>,
+        null: bool,
+    ) -> Result<c_int, Error> {
+        let mut ar = ArchiveRead::new();
+        let mut r = ar.support_format_raw();
+        if r == Status::Ok {
+            r = ar.support_format_empty();
+        }
+        if r == Status::Ok {
+            let path = path.map(|p| Path::new(std::ffi::OsStr::from_bytes(p)));
+            r = ar.open_filename(path, 512 * 20);
+        }
+        if r == Status::Ok {
+            r = ar.next_header();
+            if r == Status::Eof {
+                return Ok(ARCHIVE_OK);
             }
         }
-        Ok(())
+        if r != Status::Ok {
+            a.copy_error(&ar.h.base);
+            return Ok(r.code());
+        }
+
+        let separator = |&c: &u8| if null { c == 0 } else { c == 0x0d || c == 0x0a };
+        // A line ends at a NUL too, as a C string does.
+        let text = |s: &[u8]| s.split(|&c| c == 0).next().unwrap_or_default().to_vec();
+        let mut line = Vec::new();
+        let r = loop {
+            let (r, block, _) = ar.data_block();
+            if r != Status::Ok {
+                break r;
+            }
+            let mut lines = block.split(separator);
+            // What follows the last separator continues in the next block.
+            let rest = lines.next_back().unwrap_or_default();
+            for s in lines {
+                line.extend(text(s));
+                // If the line is not empty, add the pattern.
+                if !line.is_empty() {
+                    self.pattern_mbs(include, &line)?;
+                    line.clear();
+                }
+            }
+            line.extend(text(rest));
+        };
+
+        // If an error occurred, report it immediately.
+        if r < Status::Ok {
+            a.copy_error(&ar.h.base);
+            return Ok(r.code());
+        }
+        // If the line is not empty, add the pattern.
+        if !line.is_empty() {
+            self.pattern_mbs(include, &line)?;
+        }
+        Ok(ARCHIVE_OK)
+    }
+    /// `add_pattern_mbs`.
+    fn pattern_mbs(&mut self, include: bool, pattern: &[u8]) -> Result<(), Error> {
+        let mut text = MString::default();
+        text.copy_mbs(pattern);
+        self.pattern(include, text)
     }
     pub fn path_excluded(&mut self, a: &Base, e: &mut Entry) -> i32 {
         let pathname = e.pathname();

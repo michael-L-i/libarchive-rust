@@ -118,8 +118,8 @@ impl Handle {
     }
 
     /// The `archive_match_*_pattern_from_file*` functions (`func`): the
-    /// patterns in the file `path`, one a line or, with `null`, separated
-    /// by NULs.
+    /// patterns in the file `path` (standard input for NULL or an empty
+    /// name), one a line or, with `null`, separated by NULs.
     pub(crate) fn match_pattern_from_file(
         &self,
         func: &str,
@@ -127,14 +127,8 @@ impl Handle {
         mut path: MString,
         null: bool,
     ) -> c_int {
-        self.match_operation(func, |_, m| {
-            let path = c_text(&mut path).filter(|p| !p.is_empty());
-            m.patterns_file(
-                include,
-                path.ok_or_else(|| invalid("pathname is empty"))?,
-                null,
-            )?;
-            Ok(ARCHIVE_OK)
+        self.match_operation(func, |a, m| {
+            m.patterns_file(a, include, c_text(&mut path), null)
         })
     }
 
@@ -160,6 +154,7 @@ impl Handle {
             let date = c_text(&mut date).filter(|d| !d.is_empty());
             let date = date.ok_or_else(|| invalid("date is empty"))?;
             let sec = crate::parse_date::parse(m.now, date)
+                .filter(|&sec| sec != -1)
                 .ok_or_else(|| invalid("invalid date string"))?;
             m.include_time(flag, (sec, 0), (sec, 0))?;
             Ok(ARCHIVE_OK)
@@ -383,17 +378,25 @@ mod tests {
     #[test]
     fn patterns_from_a_file() {
         let path = std::env::temp_dir().join(format!("api-match-{}", std::process::id()));
-        std::fs::write(&path, b"*.tmp\n*.bak\n").unwrap();
+        // The first pattern straddles two of the reader's blocks.
+        let long = [vec![b'x'; 10238], b".tmp".to_vec()].concat();
+        std::fs::write(&path, [&long[..], b"\r\n\n*.bak"].concat()).unwrap();
         let mut m = ArchiveMatch::new();
         assert_eq!(m.exclude_pattern_from_file(&path, false), Status::Ok);
+        std::fs::write(&path, b"*.c\0dir\0").unwrap();
+        assert_eq!(m.include_pattern_from_file(&path, true), Status::Ok);
         std::fs::remove_file(&path).unwrap();
+        assert_eq!(m.path_excluded(&mut entry(&long)), Ok(true));
         assert_eq!(m.path_excluded(&mut entry(b"x.bak")), Ok(true));
         assert_eq!(m.path_excluded(&mut entry(b"x.c")), Ok(false));
-        assert_eq!(
-            m.include_pattern_from_file(Path::new(""), false),
-            Status::Failed
-        );
-        assert_eq!(error(&m), "pathname is empty");
+        assert_eq!(m.path_excluded(&mut entry(b"dir/y")), Ok(false));
+        assert_eq!(m.path_excluded(&mut entry(b"y")), Ok(true));
+
+        // A file that can't be read fails this call, not the handle.
+        let missing = Path::new("/nonexistent/api-match");
+        assert_eq!(m.include_pattern_from_file(missing, false), Status::Fatal);
+        assert_eq!(error(&m), "Failed to open '/nonexistent/api-match'");
+        assert_eq!(m.include_pattern(b"z"), Status::Ok);
     }
 
     #[test]
@@ -412,6 +415,8 @@ mod tests {
         assert_eq!(m.time_excluded(&mut new), Ok(false));
         assert_eq!(m.include_date(newer, b"not a date"), Status::Failed);
         assert_eq!(error(&m), "invalid date string");
+        // A date that comes to -1 is as bad.
+        assert_eq!(m.include_date(newer, b"@-1"), Status::Failed);
         assert_eq!(m.include_date(0, b"1970-01-01"), Status::Failed);
         assert_eq!(error(&m), "No time flag");
         assert_eq!(m.owner_excluded(&mut old), Ok(false));
