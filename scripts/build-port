@@ -70,10 +70,19 @@ print(next(e["command"] for e in json.load(open(sys.argv[1])) if e["file"].endsw
 read -ra cc <<<"$cc_cmd"
 (cd "$tbld" && "${cc[@]}" -o "$out/skipped_tests.o" -c "$skip") >>"$log" 2>&1
 
+# Upstream's link lines name the C codec libraries its libarchive.a needs. Ours needs none of
+# them, so let the linker drop every shared library nothing references: each one loaded costs
+# process startup time. Linux needs --as-needed ahead of the libraries it applies to.
+case "$(uname)" in
+  Darwin) as_needed=-Wl,-dead_strip_dylibs ;;
+  *)      as_needed=-Wl,--as-needed ;;
+esac
+
 # relink <CMakeFiles/x.dir with link.txt; links run from two levels up> <name>: swap oracle libarchive.a for ours, redirect -o, drop excluded objects.
 relink() {
   local dir=$1 name=$2 args=() prev= w ws
   read -ra ws <<<"$(cat "$dir/link.txt")"
+  args+=("${ws[0]}" "$as_needed"); ws=("${ws[@]:1}")
   for w in "${ws[@]}"; do
     if [ "$prev" = -o ]; then w="$out/bin/$name"
     elif [[ $w == *libarchive.a ]]; then args+=("$ours" "${native[@]}"); prev=$w; continue
