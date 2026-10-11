@@ -1,0 +1,228 @@
+[package]
+name = "libarchive-rust-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+name = "harness"
+path = "src/lib.rs"
+
+[dependencies]
+libarchive-rust = { path = ".." }
+libfuzzer-sys = "0.4"
+libc = "0.2"
+
+[workspace]
+
+[[bin]]
+name = "all"
+path = "fuzz_targets/all.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_tar"
+path = "fuzz_targets/format_tar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_zip"
+path = "fuzz_targets/format_zip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_7zip"
+path = "fuzz_targets/format_7zip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_rar"
+path = "fuzz_targets/format_rar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_rar5"
+path = "fuzz_targets/format_rar5.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_iso9660"
+path = "fuzz_targets/format_iso9660.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_cab"
+path = "fuzz_targets/format_cab.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_lha"
+path = "fuzz_targets/format_lha.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_xar"
+path = "fuzz_targets/format_xar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_cpio"
+path = "fuzz_targets/format_cpio.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_ar"
+path = "fuzz_targets/format_ar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_warc"
+path = "fuzz_targets/format_warc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_mtree"
+path = "fuzz_targets/format_mtree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_raw"
+path = "fuzz_targets/format_raw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_empty"
+path = "fuzz_targets/format_empty.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_gzip"
+path = "fuzz_targets/filter_gzip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_bzip2"
+path = "fuzz_targets/filter_bzip2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_xz"
+path = "fuzz_targets/filter_xz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_lzma"
+path = "fuzz_targets/filter_lzma.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_lzip"
+path = "fuzz_targets/filter_lzip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_zstd"
+path = "fuzz_targets/filter_zstd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_lz4"
+path = "fuzz_targets/filter_lz4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_compress"
+path = "fuzz_targets/filter_compress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_uu"
+path = "fuzz_targets/filter_uu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_lzop"
+path = "fuzz_targets/filter_lzop.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_rpm"
+path = "fuzz_targets/filter_rpm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_grzip"
+path = "fuzz_targets/filter_grzip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_lrzip"
+path = "fuzz_targets/filter_lrzip.rs"
+test = false
+doc = false
+bench = false
+
+# Same patched backends as the root workspace.
+[patch.crates-io]
+miniz_oxide = { path = "../vendor/miniz_oxide" }
+lzma-rust2 = { path = "../vendor/lzma-rust2" }
+ruzstd = { path = "../vendor/ruzstd" }

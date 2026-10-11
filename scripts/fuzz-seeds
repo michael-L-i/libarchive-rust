@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Seed fuzz/corpus/<target>/ from upstream's *.uu test fixtures.
+
+Each fixture is decoded and sorted into the target(s) for its format or
+filter by magic bytes (file name for formats without a magic). Every
+fixture also goes to `all`. Files are named by content hash.
+
+usage: scripts/fuzz-seeds [CORPUS_DIR]    (default: fuzz/corpus)
+"""
+import binascii
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(__file__).resolve().parent.parent
+fixtures = root / "upstream/libarchive/libarchive/test"
+out = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else root / "fuzz/corpus"
+
+PREFIX = [  # (magic at offset 0, targets)
+    (b"\x1f\x8b", ["filter_gzip"]),
+    (b"BZh", ["filter_bzip2"]),
+    (b"\xfd7zXZ\x00", ["filter_xz"]),
+    (b"\x5d\x00\x00", ["filter_lzma"]),
+    (b"LZIP", ["filter_lzip"]),
+    (b"\x28\xb5\x2f\xfd", ["filter_zstd"]),
+    (b"\x04\x22\x4d\x18", ["filter_lz4"]),
+    (b"\x02\x21\x4c\x18", ["filter_lz4"]),
+    (b"\x1f\x9d", ["filter_compress"]),
+    (b"begin", ["filter_uu"]),
+    (b"\x89LZO\x00", ["filter_lzop"]),
+    (b"\xed\xab\xee\xdb", ["filter_rpm"]),
+    (b"GRZipII", ["filter_grzip"]),
+    (b"LRZI", ["filter_lrzip"]),
+    (b"PK", ["format_zip"]),
+    (b"7z\xbc\xaf\x27\x1c", ["format_7zip"]),
+    (b"Rar!", ["format_rar", "format_rar5"]),
+    (b"MSCF", ["format_cab"]),
+    (b"!<arch>", ["format_ar"]),
+    (b"xar!", ["format_xar"]),
+    (b"WARC/", ["format_warc"]),
+    (b"07070", ["format_cpio"]),
+    (b"\xc7\x71", ["format_cpio"]),
+    (b"\x71\xc7", ["format_cpio"]),
+    (b"#mtree", ["format_mtree"]),
+]
+
+
+def decode(text):
+    lines = iter(text.splitlines())
+    for ln in lines:
+        if ln.startswith("begin"):
+            break
+    data = bytearray()
+    for ln in lines:
+        if ln == "end":
+            break
+        if ln:
+            try:
+                data += binascii.a2b_uu(ln)
+            except binascii.Error:
+                pass
+    return bytes(data)
+
+
+def targets(name, data):
+    t = ["all"]
+    for magic, ts in PREFIX:
+        if data.startswith(magic):
+            t += ts
+    if data[0x8001:0x8006] == b"CD001" or name.endswith(".iso"):
+        t.append("format_iso9660")
+    if data[2:5] in (b"-lh", b"-lz") or name.endswith(".lzh"):
+        t.append("format_lha")
+    if data[257:262] == b"ustar" or ".tar" in name or name.endswith((".tgz", ".tbz", ".txz")):
+        t.append("format_tar")
+    if b"PK\x03\x04" in data[:1 << 20] and "format_zip" not in t:
+        t.append("format_zip")  # self-extracting archives
+    return t
+
+
+n = 0
+for f in sorted(fixtures.glob("*.uu")):
+    text = f.read_text(errors="replace")
+    data = decode(text)
+    name = text.split("\n", 1)[0].split(" ", 2)[-1].lower()
+    if not data:
+        continue
+    ts = targets(name, data)
+    if "filter_uu" not in ts:
+        ts.append("filter_uu")  # the .uu wrapper itself is uuencoded input
+        blobs = {"filter_uu": text.encode()}
+    else:
+        blobs = {}
+    for t in ts:
+        d = out / t
+        d.mkdir(parents=True, exist_ok=True)
+        b = blobs.get(t, data)
+        (d / hashlib.sha1(b).hexdigest()).write_bytes(b)
+    n += 1
+print(f"seeded {n} fixtures into {out}")

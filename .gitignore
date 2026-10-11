@@ -4,3 +4,6 @@
 /bench/work/
 /bench/out/
 /bench/__pycache__/
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
