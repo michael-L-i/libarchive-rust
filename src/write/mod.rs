@@ -83,6 +83,11 @@ pub trait Format {
     fn options(&mut self, _a: &Base, _key: &[u8], _value: Option<&[u8]>) -> Result<c_int, Error> {
         Ok(ARCHIVE_WARN)
     }
+    /// The `archive_write_set_bytes_in_last_block` a successful `close`
+    /// made, if it made one.
+    fn bytes_in_last_block(&self) -> Option<c_int> {
+        None
+    }
 }
 
 /// Records a format's error and returns its code. A format call without
@@ -433,10 +438,15 @@ impl Write {
         if a.state.get() == state::DATA {
             r = self.finish_entry(a);
         }
-        if self.format.is_some()
-            && let Err(e) = self.run(a, |f, s| f.close(s))
-        {
-            r = r.min(report(a, e));
+        if self.format.is_some() {
+            match self.run(a, |f, s| f.close(s)) {
+                Ok(()) => {
+                    if let Some(n) = self.format.as_ref().and_then(|f| f.bytes_in_last_block()) {
+                        self.bytes_in_last_block = n;
+                    }
+                }
+                Err(e) => r = r.min(report(a, e)),
+            }
         }
         if let Some(output) = self.output.as_mut() {
             for i in 0..self.filters.len() {
@@ -699,6 +709,23 @@ mod tests {
             base.error_string().as_deref(),
             Some(b"Entry remaining bytes larger than 0".as_slice())
         );
+    }
+
+    #[test]
+    fn a_format_close_can_turn_off_padding() {
+        let base = Base::new(WRITE_MAGIC);
+        let mut writer = Write::default();
+        writer.set_format(&base, Box::new(format::shar::Shar::new(false)));
+        let out = Rc::new(RefCell::new(Vec::new()));
+        assert_eq!(
+            writer.open(&base, Box::new(Collect(out.clone()))),
+            ARCHIVE_OK
+        );
+        assert_eq!(writer.header(&base, &mut file(1)), ARCHIVE_OK);
+        assert_eq!(writer.data(&base, b"x"), 1);
+        assert_eq!(writer.close(&base), ARCHIVE_OK);
+        assert_eq!(writer.bytes_in_last_block, 1);
+        assert!(out.borrow().ends_with(b"exit\n"));
     }
 
     #[test]

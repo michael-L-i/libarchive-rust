@@ -346,6 +346,10 @@ impl Format for Shar {
         }
         Ok(())
     }
+    /// Shar output is never padded.
+    fn bytes_in_last_block(&self) -> Option<c_int> {
+        self.wrote_header.then_some(1)
+    }
 }
 
 #[cfg(test)]

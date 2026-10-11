@@ -1338,6 +1338,9 @@ impl Format for Mtree {
         }
         sink.write(&self.buf)
     }
+    fn bytes_in_last_block(&self) -> Option<c_int> {
+        Some(1)
+    }
 }
 
 #[cfg(test)]
