@@ -24,6 +24,14 @@ impl Stat {
     pub fn is_blk(&self) -> bool {
         self.kind() == u32::from(libc::S_IFBLK)
     }
+
+    pub fn is_chr(&self) -> bool {
+        self.kind() == u32::from(libc::S_IFCHR)
+    }
+
+    pub fn is_fifo(&self) -> bool {
+        self.kind() == u32::from(libc::S_IFIFO)
+    }
 }
 
 fn errno() -> c_int {

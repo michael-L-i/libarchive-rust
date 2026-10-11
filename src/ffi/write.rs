@@ -9,8 +9,6 @@ use crate::archive::*;
 use crate::util::Error;
 use crate::write::{Sink, Write};
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::io::Write as IoWrite;
-use std::os::unix::ffi::OsStrExt;
 
 fn writer<T>(h: &Handle, fallback: T, f: impl FnOnce(&mut Write) -> T) -> T {
     match &h.kind {
@@ -235,76 +233,13 @@ pub extern "C" fn archive_write_open(
     archive_write_open2(a, data, open, write, close, None)
 }
 
-struct FileSink(std::fs::File);
-impl Sink for FileSink {
-    fn write(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.0
-            .write_all(data)
-            .map_err(|e| Error::fatal(e.raw_os_error().unwrap_or(libc::EIO), "Write error"))
-    }
-}
-struct FdSink(super::sys::Fd);
-impl Sink for FdSink {
-    fn write(&mut self, mut data: &[u8]) -> Result<(), Error> {
-        while !data.is_empty() {
-            match self.0.write(data) {
-                Ok(0) => return Err(Error::fatal(libc::EIO, "Write error")),
-                Ok(n) => data = &data[n..],
-                Err(libc::EINTR) => {}
-                Err(e) => return Err(Error::fatal(e, "Write error")),
-            }
-        }
-        Ok(())
-    }
-}
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_open_fd(a: *mut Archive, fd: c_int) -> c_int {
-    checked!(
-        archive_write_open_fd,
-        a,
-        WRITE_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| writer(h, ARCHIVE_FATAL, |w| w
-            .open(&h.base, Box::new(FdSink(super::sys::Fd(fd)))))
-    )
+    with(a, ARCHIVE_FATAL, |h| h.write_open_fd(super::sys::Fd(fd)))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_open_filename(a: *mut Archive, name: *const c_char) -> c_int {
-    if name.is_null() {
-        return archive_write_open_fd(a, 1);
-    }
-    checked!(
-        archive_write_open_filename,
-        a,
-        WRITE_MAGIC,
-        state::NEW,
-        ARCHIVE_FATAL,
-        |h| {
-            // SAFETY: name is a NUL terminated filename supplied by caller.
-            let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-            if name.is_empty() {
-                return archive_write_open_fd(a, 1);
-            }
-            let path = std::ffi::OsStr::from_bytes(name);
-            match std::fs::File::create(path) {
-                Ok(f) => writer(h, ARCHIVE_FATAL, |w| {
-                    if w.bytes_in_last_block == -1 {
-                        w.bytes_in_last_block = 1;
-                    }
-                    use std::os::fd::AsRawFd;
-                    if let Ok(st) = super::sys::Fd(f.as_raw_fd()).fstat() {
-                        w.skip_file = Some((st.dev, st.ino));
-                    }
-                    w.open(&h.base, Box::new(FileSink(f)))
-                }),
-                Err(e) => h.base.raise(Error::fatal(
-                    e.raw_os_error().unwrap_or(libc::EIO),
-                    [b"Failed to open '".as_slice(), name, b"'"].concat(),
-                )),
-            }
-        }
-    )
+    with(a, ARCHIVE_FATAL, |h| h.write_open_filename(cbytes(name)))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn archive_write_open_file(a: *mut Archive, name: *const c_char) -> c_int {

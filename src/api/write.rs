@@ -5,6 +5,7 @@ use crate::archive::{
     ARCHIVE_ERRNO_MISC, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN, Base, Handle,
     Kind, WRITE_MAGIC, state,
 };
+use crate::ffi::sys::Fd;
 use crate::options;
 use crate::read::filter_code;
 use crate::string::until_nul;
@@ -13,10 +14,15 @@ use crate::write::format::{
     ar::Ar, cpio::Cpio, iso9660::Iso9660, mtree::Mtree, raw::Raw, sevenzip::SevenZip, shar::Shar,
     tar::Tar, warc::Warc, xar::Xar, zip::Zip,
 };
-use crate::write::{Format, Write, filter};
+use crate::write::{Format, Sink, Write, filter};
 use std::cell::RefCell;
-use std::ffi::c_int;
+use std::ffi::{OsStr, c_int};
+use std::fs::File;
+use std::io::Write as _;
 use std::ops::{Deref, DerefMut};
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 /// An `archive_write_set_format_X` function: the name its state check
 /// reports, and the format it sets.
@@ -177,6 +183,34 @@ const FILTER_NAMES: [(&[u8], AddFilter); 13] = [
     (b"xz", AddFilter::XZ),
     (b"zstd", AddFilter::ZSTD),
 ];
+
+/// `archive_write_open_filename`'s output.
+struct FileSink(File);
+
+impl Sink for FileSink {
+    fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.0
+            .write_all(data)
+            .map_err(|e| Error::fatal(e.raw_os_error().unwrap_or(libc::EIO), "Write error"))
+    }
+}
+
+/// `archive_write_open_fd`'s output: a descriptor the caller owns.
+struct FdSink(Fd);
+
+impl Sink for FdSink {
+    fn write(&mut self, mut data: &[u8]) -> Result<(), Error> {
+        while !data.is_empty() {
+            match self.0.write(data) {
+                Ok(0) => return Err(Error::fatal(libc::EIO, "Write error")),
+                Ok(n) => data = data.get(n..).unwrap_or_default(),
+                Err(libc::EINTR) => {}
+                Err(e) => return Err(Error::fatal(e, "Write error")),
+            }
+        }
+        Ok(())
+    }
+}
 
 impl Handle {
     /// `f` on the write state, after `archive_check_magic(a,
@@ -411,6 +445,68 @@ impl Handle {
             ARCHIVE_OK
         })
     }
+
+    /// `archive_write_open_fd`, with what its open callback sets up.
+    pub(crate) fn write_open_fd(&self, fd: Fd) -> c_int {
+        let func = "archive_write_open_fd";
+        self.write_checked(func, state::NEW, ARCHIVE_FATAL, |a, w| {
+            let st = match fd.fstat() {
+                Ok(st) => st,
+                Err(e) => return a.raise(Error::fatal(e, format!("Couldn't stat fd {}", fd.0))),
+            };
+            // If this is a regular file, don't add it to itself.
+            if st.is_reg() {
+                w.skip_file = Some((st.dev, st.ino));
+            }
+            // If the client hasn't explicitly set the last block handling,
+            // then set it here: if the output is a block or character
+            // device, fifo, or stdout, pad the last block, otherwise leave
+            // it unpadded.
+            if w.bytes_in_last_block < 0 {
+                let pad = st.is_chr() || st.is_blk() || st.is_fifo() || fd.0 == 1;
+                w.bytes_in_last_block = if pad { 0 } else { 1 };
+            }
+            w.open(a, Box::new(FdSink(fd)))
+        })
+    }
+
+    /// `archive_write_open_filename`: `None`, or an empty name, is standard
+    /// output.
+    pub(crate) fn write_open_filename(&self, name: Option<&[u8]>) -> c_int {
+        let Some(name) = name.filter(|n| !n.is_empty()) else {
+            return self.write_open_fd(Fd(1));
+        };
+        self.write_checked("open_filename", state::NEW, ARCHIVE_FATAL, |a, w| {
+            let file = match File::create(OsStr::from_bytes(name)) {
+                Ok(file) => file,
+                Err(e) => {
+                    let errno = e.raw_os_error().unwrap_or(libc::EIO);
+                    let msg = [b"Failed to open '", name, b"'"].concat();
+                    return a.raise(Error::fatal(errno, msg));
+                }
+            };
+            let st = match Fd(file.as_raw_fd()).fstat() {
+                Ok(st) => st,
+                Err(e) => {
+                    let msg = [b"Couldn't stat '", name, b"'"].concat();
+                    return a.raise(Error::fatal(e, msg));
+                }
+            };
+            // Set up default last block handling: pad the last block when
+            // writing to a device or FIFO, don't pad it otherwise.
+            if w.bytes_in_last_block < 0 {
+                let pad = st.is_chr() || st.is_blk() || st.is_fifo();
+                w.bytes_in_last_block = if pad { 0 } else { 1 };
+            }
+            // If the output file is a regular file, don't add it to itself.
+            // If it's a device file, it's okay to add the device entry to
+            // the output archive.
+            if st.is_reg() {
+                w.skip_file = Some((st.dev, st.ino));
+            }
+            w.open(a, Box::new(FileSink(file)))
+        })
+    }
 }
 
 /// `archive_write_new`.
@@ -424,6 +520,8 @@ pub(crate) fn new() -> Handle {
 /// A handle that writes an archive: `archive_write_new`.
 pub struct ArchiveWrite {
     a: Archive,
+    /// What `open_fd` was given, kept open while the handle may write it.
+    fds: Vec<Box<dyn AsFd>>,
 }
 
 /// The `archive_write_set_format_X` methods.
@@ -451,6 +549,7 @@ impl ArchiveWrite {
     pub fn new() -> Self {
         ArchiveWrite {
             a: Archive { h: new() },
+            fds: Vec::new(),
         }
     }
 
@@ -610,6 +709,22 @@ impl ArchiveWrite {
         Status::from_code(self.a.h.write_set_passphrase_callback(callback))
     }
 
+    /// `archive_write_open_fd`. The handle keeps `fd` (a `File`, `Stdout`,
+    /// or an `Rc` or `Arc` the caller shares) until it is dropped; upstream
+    /// leaves the descriptor open, and so does a shared owner.
+    pub fn open_fd(&mut self, fd: impl AsFd + 'static) -> Status {
+        let raw = Fd(fd.as_fd().as_raw_fd());
+        self.fds.push(Box::new(fd));
+        Status::from_code(self.a.h.write_open_fd(raw))
+    }
+
+    /// `archive_write_open_filename`: `None`, or an empty name, is standard
+    /// output.
+    pub fn open_filename(&mut self, filename: Option<&Path>) -> Status {
+        let name = filename.map(|p| until_nul(p.as_os_str().as_bytes()));
+        Status::from_code(self.a.h.write_open_filename(name))
+    }
+
     /// `archive_write_header`.
     pub fn header(&mut self, entry: &mut ArchiveEntry) -> Status {
         Status::from_code(self.a.h.write_header(&mut entry.0))
@@ -654,10 +769,26 @@ impl DerefMut for ArchiveWrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{AE_IFREG, ArchiveRead};
+    use std::rc::Rc;
 
     fn error(a: &Archive) -> String {
         let msg = a.error_string();
         msg.map_or_else(String::new, |m| String::from_utf8_lossy(&m).into_owned())
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("api-write-{tag}-{}", std::process::id()))
+    }
+
+    /// A file entry named `name` holding `data`.
+    fn write_file(a: &mut ArchiveWrite, name: &[u8], data: &[u8]) {
+        let mut e = ArchiveEntry::new();
+        e.set_pathname(Some(name));
+        e.set_mode(AE_IFREG | 0o644);
+        e.set_size(data.len() as i64);
+        assert_eq!(a.header(&mut e), Status::Ok);
+        assert_eq!(a.data(data), Ok(data.len()));
     }
 
     #[test]
@@ -742,5 +873,65 @@ mod tests {
         assert_eq!(error(&a), "Empty passphrase is unacceptable");
         assert_eq!(a.set_passphrase(b"secret"), Status::Ok);
         assert_eq!(a.set_passphrase_callback(|| None), Status::Ok);
+    }
+
+    #[test]
+    fn writes_a_file_that_reads_back() {
+        let path = temp_path("file");
+        let mut a = ArchiveWrite::new();
+        assert_eq!(a.set_format_ustar(), Status::Ok);
+        assert_eq!(a.add_filter_gzip(), Status::Ok);
+        assert_eq!(a.open_filename(Some(&path)), Status::Ok);
+        write_file(&mut a, b"hello", b"hello, world\n");
+        assert_eq!(a.close(), Status::Ok);
+        drop(a);
+
+        let mut r = ArchiveRead::new();
+        assert_eq!(r.support_filter_all(), Status::Ok);
+        assert_eq!(r.support_format_all(), Status::Ok);
+        assert_eq!(r.open_filename(Some(&path), 10240), Status::Ok);
+        assert_eq!(r.next_header(), Status::Ok);
+        assert_eq!(r.entry().pathname(), Some(b"hello".as_slice()));
+        let mut buf = [0; 64];
+        assert_eq!(r.data(&mut buf), Ok(13));
+        assert_eq!(r.filter_name(0).as_deref(), Some(b"gzip".as_slice()));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn open_fd_pads_only_what_upstream_pads() {
+        use std::os::unix::fs::MetadataExt;
+        // A regular file gets no padding, and is not added to itself.
+        let path = temp_path("fd");
+        let f = Rc::new(File::create(&path).unwrap());
+        let mut a = ArchiveWrite::new();
+        assert_eq!(a.set_format_ustar(), Status::Ok);
+        assert_eq!(a.open_fd(Rc::clone(&f)), Status::Ok);
+        write_file(&mut a, b"x", b"x");
+        let mut e = ArchiveEntry::new();
+        e.set_pathname(Some(b"self"));
+        let st = f.metadata().unwrap();
+        e.0.set_dev(st.dev() as _);
+        e.0.set_ino(st.ino() as i64);
+        assert_eq!(a.header(&mut e), Status::Failed);
+        assert_eq!(error(&a), "Can't add archive to itself");
+        assert_eq!(a.close(), Status::Ok);
+        drop(a);
+        // A header, a block of data and the two end blocks.
+        let back = std::fs::read(&path).unwrap();
+        assert_eq!((back.len(), &back[..1]), (4 * 512, b"x".as_slice()));
+        // The descriptor is still the caller's.
+        assert_eq!(f.metadata().unwrap().len(), 4 * 512);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn open_fails_on_a_missing_directory() {
+        let mut a = ArchiveWrite::new();
+        assert_eq!(a.set_format_raw(), Status::Ok);
+        let path = Path::new("/nonexistent/api-write-test");
+        assert_eq!(a.open_filename(Some(path)), Status::Fatal);
+        assert_eq!(a.errno(), libc::ENOENT);
+        assert_eq!(error(&a), "Failed to open '/nonexistent/api-write-test'");
     }
 }
