@@ -383,22 +383,168 @@ impl Xar {
         Ok(None)
     }
 }
-fn escape(s: &[u8]) -> String {
-    String::from_utf8_lossy(s)
-        .chars()
-        .map(|c| match c {
-            '&' => "&amp;".to_owned(),
-            '<' => "&lt;".to_owned(),
-            '>' => "&gt;".to_owned(),
-            '"' => "&quot;".to_owned(),
-            '\'' => "&apos;".to_owned(),
-            _ => c.to_string(),
-        })
-        .collect()
+/// libxml2's xmlTextWriter with indentation on, which upstream writes the
+/// TOC with: one space per level, a text-only element on one line, an
+/// empty one as `<name/>`, and base64 broken into 72-column CRLF lines.
+#[derive(Default)]
+struct Xml {
+    out: Vec<u8>,
+    /// Open elements, each with whether its start tag still lacks `>`.
+    open: Vec<(&'static str, bool)>,
+    doindent: bool,
 }
-fn element(xml: &mut String, key: &str, value: impl std::fmt::Display) {
-    use std::fmt::Write;
-    let _ = write!(xml, "<{key}>{value}</{key}>");
+impl Xml {
+    fn new() -> Self {
+        Self {
+            out: b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n".to_vec(),
+            ..Self::default()
+        }
+    }
+    fn indent(&mut self) {
+        let n = self.open.len().saturating_sub(1);
+        self.out.resize(self.out.len() + n, b' ');
+    }
+    /// Close a pending start tag before content.
+    fn content(&mut self) {
+        if let Some((_, pending)) = self.open.last_mut()
+            && *pending
+        {
+            self.out.push(b'>');
+            *pending = false;
+        }
+    }
+    fn start(&mut self, name: &'static str) {
+        if let Some((_, pending)) = self.open.last_mut()
+            && *pending
+        {
+            self.out.extend(b">\n");
+            *pending = false;
+        }
+        self.open.push((name, true));
+        self.indent();
+        self.out.push(b'<');
+        self.out.extend(name.as_bytes());
+    }
+    fn attribute(&mut self, key: &str, value: &str) {
+        self.out.push(b' ');
+        self.out.extend(key.as_bytes());
+        self.out.extend(b"=\"");
+        for &b in value.as_bytes() {
+            match b {
+                b'<' => self.out.extend(b"&lt;"),
+                b'>' => self.out.extend(b"&gt;"),
+                b'&' => self.out.extend(b"&amp;"),
+                b'"' => self.out.extend(b"&quot;"),
+                b'\n' => self.out.extend(b"&#10;"),
+                b'\r' => self.out.extend(b"&#13;"),
+                b'\t' => self.out.extend(b"&#9;"),
+                _ => self.out.push(b),
+            }
+        }
+        self.out.push(b'"');
+    }
+    /// xmlEncodeSpecialChars() escaping.
+    fn text(&mut self, text: &[u8]) {
+        self.content();
+        self.doindent = false;
+        for &b in text {
+            match b {
+                b'<' => self.out.extend(b"&lt;"),
+                b'>' => self.out.extend(b"&gt;"),
+                b'&' => self.out.extend(b"&amp;"),
+                b'"' => self.out.extend(b"&quot;"),
+                b'\r' => self.out.extend(b"&#13;"),
+                _ => self.out.push(b),
+            }
+        }
+    }
+    fn base64(&mut self, data: &[u8]) {
+        const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        self.content();
+        self.doindent = false;
+        for (i, group) in data.chunks(3).enumerate() {
+            if i > 0 && i % 18 == 0 {
+                self.out.extend(b"\r\n");
+            }
+            let a = group[0];
+            let b = group.get(1).copied().unwrap_or(0);
+            let c = group.get(2).copied().unwrap_or(0);
+            self.out.extend([
+                TABLE[usize::from(a >> 2)],
+                TABLE[usize::from((a & 3) << 4 | b >> 4)],
+                if group.len() > 1 {
+                    TABLE[usize::from((b & 15) << 2 | c >> 6)]
+                } else {
+                    b'='
+                },
+                if group.len() > 2 {
+                    TABLE[usize::from(c & 63)]
+                } else {
+                    b'='
+                },
+            ]);
+        }
+    }
+    fn end(&mut self) {
+        let Some(&(name, pending)) = self.open.last() else {
+            return;
+        };
+        if pending {
+            self.out.extend(b"/>");
+        } else {
+            if self.doindent {
+                self.indent();
+            }
+            self.out.extend(b"</");
+            self.out.extend(name.as_bytes());
+            self.out.push(b'>');
+        }
+        self.doindent = true;
+        self.out.push(b'\n');
+        self.open.pop();
+    }
+    fn element(&mut self, key: &'static str, value: impl AsRef<[u8]>) {
+        self.start(key);
+        self.text(value.as_ref());
+        self.end();
+    }
+    /// xmlwrite_time(): UTC, with `Z` only when asked for.
+    fn time(&mut self, name: &'static str, seconds: i64, z: bool) {
+        if let Some((tm, _, _)) = sys::date_clock(seconds, true) {
+            self.element(
+                name,
+                format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}",
+                    tm.year + 1900,
+                    tm.mon + 1,
+                    tm.mday,
+                    tm.hour,
+                    tm.min,
+                    tm.sec,
+                    if z { "Z" } else { "" }
+                ),
+            );
+        }
+    }
+    fn heap(&mut self, h: &Heap) {
+        self.element("length", h.length.to_string());
+        self.element("offset", h.offset.to_string());
+        self.element("size", h.size.to_string());
+        self.start("encoding");
+        self.attribute("style", h.compression.name());
+        self.end();
+        for (key, value) in [
+            ("archived-checksum", &h.archived),
+            ("extracted-checksum", &h.extracted),
+        ] {
+            if !value.is_empty() {
+                self.start(key);
+                self.attribute("style", h.sum.name());
+                self.text(hex(value).as_bytes());
+                self.end();
+            }
+        }
+    }
 }
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
@@ -408,80 +554,18 @@ fn hex(bytes: &[u8]) -> String {
     }
     s
 }
-fn base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
-    for group in bytes.chunks(3) {
-        let a = group[0];
-        let b = group.get(1).copied().unwrap_or(0);
-        let c = group.get(2).copied().unwrap_or(0);
-        for v in [
-            TABLE[usize::from(a >> 2)],
-            TABLE[usize::from((a & 3) << 4 | b >> 4)],
-            if group.len() > 1 {
-                TABLE[usize::from((b & 15) << 2 | c >> 6)]
-            } else {
-                b'='
-            },
-            if group.len() > 2 {
-                TABLE[usize::from(c & 63)]
-            } else {
-                b'='
-            },
-        ] {
-            result.push(char::from(v));
-        }
-    }
-    result
-}
-fn time(xml: &mut String, name: &str, seconds: i64) {
-    if let Some((tm, _, _)) = sys::date_clock(seconds, true) {
-        element(
-            xml,
-            name,
-            format!(
-                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-                tm.year + 1900,
-                tm.mon + 1,
-                tm.mday,
-                tm.hour,
-                tm.min,
-                tm.sec
-            ),
-        );
-    }
-}
-fn heap_xml(xml: &mut String, h: &Heap) {
-    element(xml, "length", h.length);
-    element(xml, "offset", h.offset);
-    element(xml, "size", h.size);
-    xml.push_str(&format!("<encoding style=\"{}\"/>", h.compression.name()));
-    for (key, value) in [
-        ("archived-checksum", &h.archived),
-        ("extracted-checksum", &h.extracted),
-    ] {
-        if !value.is_empty() {
-            xml.push_str(&format!(
-                "<{key} style=\"{}\">{}</{key}>",
-                h.sum.name(),
-                hex(value)
-            ));
-        }
-    }
-}
 impl Xar {
-    fn node_xml(&mut self, index: usize, xml: &mut String) {
+    fn node_xml(&mut self, index: usize, xml: &mut Xml) {
         let node = &mut self.nodes[index];
-        xml.push_str(&format!("<file id=\"{}\">", index + 1));
         let latin1 =
             std::str::from_utf8(&node.name).is_ok_and(|s| s.chars().all(|c| u32::from(c) <= 255));
         if latin1 {
-            element(xml, "name", escape(&node.name));
+            xml.element("name", &node.name);
         } else {
-            xml.push_str(&format!(
-                "<name enctype=\"base64\">{}</name>",
-                base64(&node.name)
-            ));
+            xml.start("name");
+            xml.attribute("enctype", "base64");
+            xml.base64(&node.name);
+            xml.end();
         }
         let entry = &mut node.entry;
         let kind = match entry.filetype() {
@@ -494,105 +578,117 @@ impl Xar {
             _ => "file",
         };
         if let Some(link) = node.link {
-            xml.push_str(&format!(
-                "<type link=\"{}\">hardlink</type>",
-                if link == index {
+            xml.start("type");
+            xml.attribute(
+                "link",
+                &if link == index {
                     "original".to_owned()
                 } else {
                     (link + 1).to_string()
-                }
-            ));
+                },
+            );
+            xml.text(b"hardlink");
+            xml.end();
         } else {
-            element(xml, "type", kind);
+            xml.element("type", kind);
         }
         if node.virtual_dir {
             return;
         }
         if let (Some(link), _) = entry.symlink_l(self.sc.as_deref()) {
-            xml.push_str(&format!("<link type=\"broken\">{}</link>", escape(link)));
+            xml.start("link");
+            xml.attribute("type", "broken");
+            xml.text(link);
+            xml.end();
         }
         if matches!(entry.filetype(), libc::S_IFCHR | libc::S_IFBLK) {
-            xml.push_str("<device>");
-            element(xml, "major", entry.rdevmajor());
-            element(xml, "minor", entry.rdevminor());
-            xml.push_str("</device>");
+            xml.start("device");
+            xml.element("major", entry.rdevmajor().to_string());
+            xml.element("minor", entry.rdevminor().to_string());
+            xml.end();
         }
-        element(xml, "inode", entry.ino());
+        xml.element("inode", entry.ino().to_string());
         if entry.dev() != 0 {
-            element(xml, "deviceno", entry.dev());
+            xml.element("deviceno", entry.dev().to_string());
         }
-        element(xml, "mode", format!("0{:03o}", entry.mode() & 0o777));
-        element(xml, "uid", entry.uid());
-        element(xml, "gid", entry.gid());
+        xml.element("mode", format!("0{:03o}", entry.mode() & 0o777));
+        xml.element("uid", entry.uid().to_string());
         if let (Some(name), _) = entry.uname_l(self.sc.as_deref())
             && !name.is_empty()
         {
-            element(xml, "user", escape(name));
+            xml.element("user", name);
         }
+        xml.element("gid", entry.gid().to_string());
         if let (Some(name), _) = entry.gname_l(self.sc.as_deref())
             && !name.is_empty()
         {
-            element(xml, "group", escape(name));
+            xml.element("group", name);
         }
         if entry.ctime_is_set() != 0 {
-            time(xml, "ctime", entry.ctime());
+            xml.time("ctime", entry.ctime(), true);
         }
         if entry.mtime_is_set() != 0 {
-            time(xml, "mtime", entry.mtime());
+            xml.time("mtime", entry.mtime(), true);
         }
         if entry.atime_is_set() != 0 {
-            time(xml, "atime", entry.atime());
+            xml.time("atime", entry.atime(), true);
         }
         if let Some(flags) = entry.fflags_text() {
             flags_xml(xml, flags.to_bytes());
         }
         for (i, (name, heap)) in node.xattrs.iter().enumerate() {
-            xml.push_str(&format!("<ea id=\"{}\">", i));
-            heap_xml(xml, heap);
-            element(xml, "name", escape(name));
-            xml.push_str("</ea>");
+            xml.start("ea");
+            xml.attribute("id", &i.to_string());
+            xml.heap(heap);
+            xml.element("name", name);
+            xml.end();
         }
         if !node.script.is_empty() {
-            xml.push_str("<content>");
-            element(xml, "interpreter", escape(&node.script));
-            element(xml, "type", "script");
-            xml.push_str("</content>");
+            xml.start("content");
+            xml.element("interpreter", &node.script);
+            xml.element("type", "script");
+            xml.end();
         }
         if let Some(data) = node.data.as_ref().filter(|d| d.length > 0) {
-            xml.push_str("<data>");
-            heap_xml(xml, data);
-            xml.push_str("</data>");
+            xml.start("data");
+            xml.heap(data);
+            xml.end();
         }
     }
-    fn toc(&mut self) -> String {
-        let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xar><toc>");
-        time(
-            &mut xml,
+    fn toc(&mut self) -> Vec<u8> {
+        let mut xml = Xml::new();
+        xml.start("xar");
+        xml.start("toc");
+        xml.time(
             "creation-time",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64,
+            false,
         );
         if self.toc_sum.size() != 0 {
-            xml.push_str(&format!(
-                "<checksum style=\"{}\"><offset>0</offset><size>{}</size></checksum>",
-                self.toc_sum.name(),
-                self.toc_sum.size()
-            ));
+            xml.start("checksum");
+            xml.attribute("style", self.toc_sum.name());
+            xml.element("offset", "0");
+            xml.element("size", self.toc_sum.size().to_string());
+            xml.end();
         }
         let mut stack: Vec<_> = self.roots.iter().rev().map(|&i| (i, false)).collect();
         while let Some((index, end)) = stack.pop() {
             if end {
-                xml.push_str("</file>");
+                xml.end();
                 continue;
             }
+            xml.start("file");
+            xml.attribute("id", &(index + 1).to_string());
             self.node_xml(index, &mut xml);
             stack.push((index, true));
             stack.extend(self.nodes[index].children.iter().rev().map(|&i| (i, false)));
         }
-        xml.push_str("</toc></xar>");
-        xml
+        xml.end();
+        xml.end();
+        xml.out
     }
 }
 impl Format for Xar {
@@ -825,7 +921,7 @@ impl Format for Xar {
         let mut compressed = Vec::new();
         deflate::Deflate::new(6, 15, 8)
             .ok_or_else(|| Error::fatal(-1, "Internal error initializing compression library"))?
-            .compress(toc.as_bytes(), &mut compressed)
+            .compress(&toc, &mut compressed)
             .map_err(crate::write::filter::gzip::failed)?;
         let mut sum = self.toc_sum.digest();
         if let Some(d) = sum.as_mut() {
@@ -909,78 +1005,61 @@ impl Format for Xar {
     }
 }
 
-fn flags_xml(xml: &mut String, text: &[u8]) {
-    let entries: &[(&[u8], &str)] = &[
-        (b"sappnd", "SystemAppend"),
-        (b"sappend", "SystemAppend"),
-        (b"arch", "SystemArchived"),
-        (b"archived", "SystemArchived"),
-        (b"schg", "SystemImmutable"),
-        (b"schange", "SystemImmutable"),
-        (b"simmutable", "SystemImmutable"),
-        (b"nosunlnk", "SystemNoUnlink"),
-        (b"nosunlink", "SystemNoUnlink"),
-        (b"snapshot", "SystemSnapshot"),
-        (b"uappnd", "UserAppend"),
-        (b"uappend", "UserAppend"),
-        (b"uchg", "UserImmutable"),
-        (b"uchange", "UserImmutable"),
-        (b"uimmutable", "UserImmutable"),
-        (b"nodump", "UserNoDump"),
-        (b"noopaque", "UserOpaque"),
-        (b"nouunlnk", "UserNoUnlink"),
-        (b"nouunlink", "UserNoUnlink"),
+/// Upstream's make_fflags_entry() passes a NULL value to xmlwrite_string(),
+/// which writes nothing, so a known flag only yields an empty `<flags/>` or
+/// `<ext2/>`.
+fn flags_xml(xml: &mut Xml, text: &[u8]) {
+    const BSD: &[&[u8]] = &[
+        b"sappnd",
+        b"sappend",
+        b"arch",
+        b"archived",
+        b"schg",
+        b"schange",
+        b"simmutable",
+        b"nosunlnk",
+        b"nosunlink",
+        b"snapshot",
+        b"uappnd",
+        b"uappend",
+        b"uchg",
+        b"uchange",
+        b"uimmutable",
+        b"nodump",
+        b"noopaque",
+        b"nouunlnk",
+        b"nouunlink",
     ];
-    let mut opened = false;
-    for flag in text.split(|&b| b == b',') {
-        if let Some((_, name)) = entries.iter().find(|(key, _)| *key == flag) {
-            if !opened {
-                xml.push_str("<flags>");
-                opened = true;
-            }
-            xml.push_str(&format!("<{name}/>"));
-        }
-    }
-    if opened {
-        xml.push_str("</flags>");
-    }
-    let entries: &[(&[u8], &str)] = &[
-        (b"sappnd", "AppendOnly"),
-        (b"sappend", "AppendOnly"),
-        (b"schg", "Immutable"),
-        (b"schange", "Immutable"),
-        (b"simmutable", "Immutable"),
-        (b"nodump", "NoDump"),
-        (b"nouunlnk", "Undelete"),
-        (b"nouunlink", "Undelete"),
-        (b"btree", "BTree"),
-        (b"comperr", "CompError"),
-        (b"compress", "Compress"),
-        (b"noatime", "NoAtime"),
-        (b"compdirty", "CompDirty"),
-        (b"comprblk", "CompBlock"),
-        (b"dirsync", "DirSync"),
-        (b"hashidx", "HashIndexed"),
-        (b"imagic", "iMagic"),
-        (b"journal", "Journaled"),
-        (b"securedeletion", "SecureDeletion"),
-        (b"sync", "Synchronous"),
-        (b"notail", "NoTail"),
-        (b"topdir", "TopDir"),
-        (b"reserved", "Reserved"),
+    const EXT2: &[&[u8]] = &[
+        b"sappnd",
+        b"sappend",
+        b"schg",
+        b"schange",
+        b"simmutable",
+        b"nodump",
+        b"nouunlnk",
+        b"nouunlink",
+        b"btree",
+        b"comperr",
+        b"compress",
+        b"noatime",
+        b"compdirty",
+        b"comprblk",
+        b"dirsync",
+        b"hashidx",
+        b"imagic",
+        b"journal",
+        b"securedeletion",
+        b"sync",
+        b"notail",
+        b"topdir",
+        b"reserved",
     ];
-    let mut opened = false;
-    for flag in text.split(|&b| b == b',') {
-        if let Some((_, name)) = entries.iter().find(|(key, _)| *key == flag) {
-            if !opened {
-                xml.push_str("<ext2>");
-                opened = true;
-            }
-            xml.push_str(&format!("<{name}/>"));
+    for (element, known) in [("flags", BSD), ("ext2", EXT2)] {
+        if text.split(|&b| b == b',').any(|flag| known.contains(&flag)) {
+            xml.start(element);
+            xml.end();
         }
-    }
-    if opened {
-        xml.push_str("</ext2>");
     }
 }
 
@@ -996,6 +1075,53 @@ mod tests {
             self.0.extend(data);
             Ok(())
         }
+    }
+    #[test]
+    fn toc_is_indented_like_libxml2() {
+        // libxml2's xmlTextWriter with indentation, as upstream uses it.
+        let mut xml = Xml::new();
+        xml.start("xar");
+        xml.start("toc");
+        xml.time("creation-time", 0, false);
+        xml.start("file");
+        xml.attribute("id", "1");
+        xml.start("name");
+        xml.attribute("enctype", "base64");
+        xml.base64(&[0xff; 57]);
+        xml.end();
+        xml.element("user", "a<&>\"'\r");
+        xml.time("mtime", 0, true);
+        flags_xml(&mut xml, b"uchg,nodump");
+        xml.start("encoding");
+        xml.attribute("style", "application/x-gzip");
+        xml.end();
+        xml.end();
+        xml.end();
+        xml.end();
+        assert_eq!(
+            String::from_utf8(xml.out).unwrap(),
+            [
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                "<xar>\n",
+                " <toc>\n",
+                "  <creation-time>1970-01-01T00:00:00</creation-time>\n",
+                "  <file id=\"1\">\n",
+                "   <name enctype=\"base64\">",
+                &"/".repeat(72),
+                "\r\n",
+                &"/".repeat(4),
+                "</name>\n",
+                "   <user>a&lt;&amp;&gt;&quot;'&#13;</user>\n",
+                "   <mtime>1970-01-01T00:00:00Z</mtime>\n",
+                "   <flags/>\n",
+                "   <ext2/>\n",
+                "   <encoding style=\"application/x-gzip\"/>\n",
+                "  </file>\n",
+                " </toc>\n",
+                "</xar>\n",
+            ]
+            .concat()
+        );
     }
     #[test]
     fn invalid_utf8_path_returns_warning_without_panicking() {
