@@ -1,0 +1,31 @@
+libarchive-rust is a port of libarchive (https://github.com/libarchive/libarchive)
+to Rust. Like libarchive, the distribution as a whole is subject to the
+BSD-2-Clause license in LICENSE.
+
+Each source file carries its own copyright and licensing statement at its
+beginning; those statements are controlling. A module ported from an upstream
+file keeps that file's statement unchanged. The following summarizes the
+exceptions, mirroring upstream's COPYING:
+
+* In whole or in part subject to a 3-clause UC Regents copyright:
+    src/read/filter/compress.rs   (archive_read_support_filter_compress.c)
+    src/write/filter/compress.rs  (archive_write_add_filter_compress.c)
+
+* In the public domain:
+    src/parse_date.rs             (archive_parse_date.c)
+    src/ppmd.rs, src/ppmd7.rs, src/ppmd8.rs  (Igor Pavlov's PPMd code)
+
+* Triple-licensed under CC0 1.0 Universal, OpenSSL or Apache 2.0:
+    src/blake2s_ref.rs, src/blake2sp_ref.rs
+
+* Patched copies of third-party crates under vendor/ keep their own
+  licenses; see the LICENSE files there:
+    vendor/miniz_oxide   MIT, Zlib or Apache-2.0
+    vendor/lzma-rust2    Apache-2.0
+    vendor/ruzstd        MIT
+
+* Crates fetched from crates.io (see Cargo.lock) are under their own
+  licenses, mostly MIT or Apache-2.0; xxhash-rust is BSL-1.0.
+
+* upstream/libarchive is a git submodule of the upstream project, used
+  only as the test oracle; see its own COPYING.
