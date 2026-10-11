@@ -143,7 +143,25 @@ per fixture and tags each with the filter it exercises, so a filter agent can fi
    and against ours. Diff `bsdtar -tvf` output, extracted trees and exit codes
    over the corpus: upstream's `*.uu` test archives plus oss-fuzz corpora.
 3. **Fuzzing.** One `cargo fuzz` target per reader. A crash, panic, hang or
-   unbounded allocation is a bug.
+   unbounded allocation is a bug. `fuzz/` is a nightly-only crate outside the
+   workspace: `format_*` per format, `filter_*` per filter (paired with the
+   raw format), and `all`. Each opens the input from memory, reads every
+   entry and aborts on panic (exports otherwise turn panics into
+   `ARCHIVE_FATAL`).
+
+   ```
+   scripts/fuzz-seeds                  # decode upstream .uu fixtures into fuzz/corpus/<target>/
+   cd fuzz
+   cargo +nightly fuzz run format_zip -- -timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=1024 -max_total_time=300
+   cargo +nightly fuzz build && for t in $(cargo +nightly fuzz list); do   # all targets, 30 s each
+     cargo +nightly fuzz run $t -- -max_total_time=30 -timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=1024 || break
+   done
+   ```
+
+   Corpora and crash artifacts are gitignored. Minimize a crash with
+   `cargo +nightly fuzz tmin <target> <artifact>`, check what upstream's
+   `bsdtar`/`bsdcat` does with it, fix the library, and keep the input as a
+   Rust `#[test]` next to the module.
 
 Run the narrowest check that covers the change. Keep harness output terse: pass
 and fail counts plus the first failure.
