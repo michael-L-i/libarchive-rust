@@ -66,6 +66,7 @@ fn execute_sequences_general(scratch: &mut DecoderScratch) -> Result<(), Execute
 fn execute_block(scratch: &mut DecoderScratch) -> bool {
     const BLOCK_SIZE: usize = 128 * 1024;
     const COPY_SIZE: usize = 16;
+    const SHORT_COPY_LIMIT: usize = 64;
     let output = &mut scratch.sequence_output;
     output.resize(BLOCK_SIZE + COPY_SIZE, 0);
     let (history1, history2) = scratch.buffer.history_slices();
@@ -91,9 +92,17 @@ fn execute_block(scratch: &mut DecoderScratch) -> bool {
             return false;
         }
         if ll != 0 {
-            if ll <= COPY_SIZE && literals.len() - literal_pos >= COPY_SIZE {
-                output[written..written + COPY_SIZE]
-                    .copy_from_slice(&literals[literal_pos..literal_pos + COPY_SIZE]);
+            // Padding permits rounded writes; the literal input still needs real slack.
+            let rounded = (ll + COPY_SIZE - 1) & !(COPY_SIZE - 1);
+            if ll <= SHORT_COPY_LIMIT && literals.len() - literal_pos >= rounded {
+                let dst = &mut output[written..written + rounded];
+                let src = &literals[literal_pos..literal_pos + rounded];
+                for (d, s) in dst
+                    .chunks_exact_mut(COPY_SIZE)
+                    .zip(src.chunks_exact(COPY_SIZE))
+                {
+                    d.copy_from_slice(s);
+                }
             } else {
                 output[written..match_start].copy_from_slice(&literals[literal_pos..literal_end]);
             }
@@ -123,11 +132,15 @@ fn execute_block(scratch: &mut DecoderScratch) -> bool {
             }
         }
         if written < end {
-            let source = written - offset;
             let length = end - written;
-            if length <= COPY_SIZE && offset >= COPY_SIZE {
-                output.copy_within(source..source + COPY_SIZE, written);
+            if length <= SHORT_COPY_LIMIT && offset >= COPY_SIZE {
+                while written < end {
+                    let source = written - offset;
+                    output.copy_within(source..source + COPY_SIZE, written);
+                    written += COPY_SIZE;
+                }
             } else {
+                let source = written - offset;
                 while written < end {
                     let count = (end - written).min(written - source);
                     output.copy_within(source..source + count, written);
@@ -323,6 +336,105 @@ mod tests {
                 sequences[failing_index] = failure;
                 for dictionary in [false, true] {
                     compare(125, &sequences, dictionary);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_kernel_boundaries_match_general() {
+        let lengths = [
+            3usize, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 66, 80, 127, 300, 2000,
+        ];
+        for (seed, &ml) in lengths.iter().enumerate() {
+            for offset in 1..=40u32 {
+                let sequences: alloc::vec::Vec<_> = (0..32)
+                    .map(|i| Sequence {
+                        ll: (lengths[(i + seed) % lengths.len()] % 70) as u32,
+                        ml: ml as u32,
+                        of: offset + 3,
+                    })
+                    .collect();
+                for prefix in [0, 125] {
+                    compare(prefix, &sequences, false);
+                }
+            }
+        }
+        for offset in [16, 17, 31, 32, 48] {
+            for ml in [33, 64] {
+                let mut sequences = vec![
+                    Sequence {
+                        ll: 0,
+                        ml: 3,
+                        of: 4
+                    };
+                    32
+                ];
+                sequences[0] = Sequence {
+                    ll: 0,
+                    ml,
+                    of: offset + 3,
+                };
+                compare(125, &sequences, false);
+            }
+        }
+        // Literal runs ending k bytes before the literal buffer end hit both the
+        // chunked (at least eight bytes of rounding slack) and exact literal paths.
+        for k in 0..24u32 {
+            let mut sequences = vec![
+                Sequence {
+                    ll: 40,
+                    ml: 20,
+                    of: 7 + 3
+                };
+                32
+            ];
+            sequences[0].ll = 6000 - 31 * 40 - k;
+            compare(65, &sequences, false);
+        }
+    }
+
+    #[test]
+    fn staged_terminal_copies_match_general() {
+        // The last run may overcopy into padding, but only logical output commits.
+        // One byte beyond the staging limit must retain the general fallback.
+        for size in [128 * 1024, 128 * 1024 + 1] {
+            for (ll, ml, rest) in [
+                (0, 1, 0),
+                (0, 15, 0),
+                (0, 16, 0),
+                (0, 17, 0),
+                (0, 33, 0),
+                (0, 63, 0),
+                (0, 64, 0),
+                (0, 65, 0),
+                (17, 0, 0),
+                (33, 0, 15),
+                (63, 0, 16),
+                (17, 3, 1),
+            ] {
+                for offset in [1, 2, 3, 7, 15, 16, 17, 33, size - rest - ml + 10] {
+                    let mut sequences = vec![
+                        Sequence {
+                            ll: 0,
+                            ml: 3,
+                            of: 4
+                        };
+                        32
+                    ];
+                    sequences[0] = Sequence {
+                        ll: 6000 - ll - rest,
+                        ml: size - 6000 - 30 * 3 - ml,
+                        of: 4,
+                    };
+                    sequences[31] = Sequence {
+                        ll,
+                        ml,
+                        of: offset + 3,
+                    };
+                    for prefix in [0, 125] {
+                        compare(prefix, &sequences, false);
+                    }
                 }
             }
         }

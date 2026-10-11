@@ -391,3 +391,30 @@ Twenty-one rotating same-C-input confirmations show raw decoding gains of
 cases range from 0.7% slower to 2% faster. All eight decoded hashes agree
 with C. These are backend timings, not complete archive extraction.
 Evidence, prompts and raw samples: sibling diagnostics/round9-zstd.
+
+## Medium sequence copies
+
+Extend the staged executor's fixed 16-byte copy path to literal and match
+runs of at most 64 bytes. Literal reads require enough real source slack;
+match chunks require a distance of at least 16 bytes. The existing staging
+padding absorbs at most 15 extra written bytes, which are overwritten or
+excluded from the committed output. Long runs, short offsets, repeat-offset
+resolution, dictionary fallback and error/partial-state behavior are unchanged.
+No new allocation, unsafe code or public API changes.
+
+Actual Claude Opus 5.5 designed the initial candidate and independently
+reviewed the final trimmed diff: PASS. Separate rotating measurements rejected
+its additional periodic-offset kernel and repeat-offset rewrite; the small
+medium-copy subset retained the gains. All 49 self-contained vendor tests
+pass with debug assertions and overflow checks, including new copy/slack
+boundaries, history-to-staging crossings and terminal 131072/131073-byte
+blocks compared with the general executor. All 175 valid/damaged ABI records
+retain exact status, errno, messages and output hashes. Release all-target
+Clippy with warnings denied and formatting checks pass.
+
+Twenty-one rotating same-C-input raw-decode confirmations show improvements
+of 6.2% source, 6.1% mixed, 4.5% compiled and 3.0% records; the remaining four
+cases range from 1.6% slower to 0.9% faster. All eight decoded hashes match C.
+These timings exclude filesystem extraction. Prompts, actual model usage,
+rejected variants, raw samples and validation logs: sibling
+diagnostics/round10-zstd.
