@@ -121,11 +121,6 @@ impl MatchState {
 }
 
 #[inline(always)]
-pub(crate) fn read16(src: &[u8], pos: usize) -> u16 {
-    src[pos..pos + 2].try_into().map_or(0, u16::from_le_bytes)
-}
-
-#[inline(always)]
 pub(crate) fn read32(src: &[u8], pos: usize) -> u32 {
     src[pos..pos + 4].try_into().map_or(0, u32::from_le_bytes)
 }
@@ -169,27 +164,19 @@ pub(crate) fn slot(table: &[u32], hash: usize) -> usize {
 /// `ZSTD_count()`: the length of the common prefix of `src[pos..]` and
 /// `src[at..]`, with `at < pos`.
 #[inline(always)]
-pub(crate) fn count(src: &[u8], mut pos: usize, mut at: usize) -> usize {
-    let start = pos;
-    let end = src.len();
-    while pos + 8 <= end {
-        let diff = read64(src, at) ^ read64(src, pos);
+pub(crate) fn count(src: &[u8], pos: usize, at: usize) -> usize {
+    let (Some(input), Some(found)) = (src.get(pos..), src.get(at..)) else {
+        return 0;
+    };
+    let mut len = 0;
+    for (a, b) in input.chunks_exact(8).zip(found.chunks_exact(8)) {
+        let diff =
+            a.try_into().map_or(0, u64::from_le_bytes) ^ b.try_into().map_or(0, u64::from_le_bytes);
         if diff != 0 {
-            return pos - start + (diff.trailing_zeros() >> 3) as usize;
+            return len + (diff.trailing_zeros() >> 3) as usize;
         }
-        pos += 8;
-        at += 8;
+        len += 8;
     }
-    if pos + 4 <= end && read32(src, at) == read32(src, pos) {
-        pos += 4;
-        at += 4;
-    }
-    if pos + 2 <= end && read16(src, at) == read16(src, pos) {
-        pos += 2;
-        at += 2;
-    }
-    if pos < end && src[at] == src[pos] {
-        pos += 1;
-    }
-    pos - start
+    let tail = input.iter().zip(found).skip(len);
+    len + tail.take_while(|(a, b)| a == b).count()
 }

@@ -597,3 +597,17 @@ periodic and text data at levels -3, 1, 3, 5, 6 and 8), and window logs 10,
 (opt-in root test). Sizes at level 3 on the eight benchmark tars are within
 -0.72% to 0% of libzstd's streaming output (text and random are equal).
 Evidence: sibling `diagnostics/round12-zstd-enc`.
+
+## Round 13: compressor speed
+
+Speed-only changes to the compressor port; the output stays the same byte
+for byte. Every commit reproduces the SHA-256 of the output for the eight
+benchmark tars and 49 edge inputs (empty, 1 to 4096 bytes, 128 KiB +-1 to
+384 KiB around block boundaries, zeros, random, periodic and mixed data) at
+levels -5, 1, 2, 3, 4, 5, 9, 12 and 19, plus window logs 10 and 17 and
+777-byte writes, in release builds with and without debug assertions.
+Instruction counts are per compression of the benchmark tars in
+10240-byte writes, as libarchive writes (`/usr/bin/time -l`).
+
+- `count()` compares 8 bytes at a time through `chunks_exact`, so its
+  loop has no bounds checks: -3% instructions at level 1, -1% at level 5.
