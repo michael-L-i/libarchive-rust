@@ -619,3 +619,8 @@ Instruction counts are per compression of the benchmark tars in
   `#[inline]`: forced into the double fast loop's six call sites, its
   iterator setup was no longer inlined. -8% to -12% instructions at
   level 3.
+- `ZSTD_seqToCodes()` is one pass that assigns the offset codes with
+  selects instead of branches (whether an offset repeats is
+  unpredictable), keeping the repeat offsets in registers, and writes the
+  three code arrays. Instructions are unchanged; cycles drop 4-6% at
+  level 1 and 2% at level 5.

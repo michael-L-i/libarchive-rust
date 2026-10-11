@@ -123,40 +123,34 @@ impl SeqStore {
 
 /// `ZSTD_updateRep()` from an actual offset: returns the offset code
 /// ("offBase": 1-3 for repeat offsets, offset + 3 otherwise), preferring the
-/// repeat codes whenever `offset` equals one.
+/// repeat codes whenever `offset` equals one. Without branches: whether an
+/// offset repeats is unpredictable.
+#[inline(always)]
 fn off_base(rep: &mut [u32; 3], offset: u32, ll0: bool) -> u32 {
-    let code = if !ll0 {
-        match offset {
-            o if o == rep[0] => 1,
-            o if o == rep[1] => 2,
-            o if o == rep[2] => 3,
-            _ => offset + 3,
-        }
+    let [rep0, rep1, rep2] = *rep;
+    // After no literals, the codes stand for the next repeat offsets.
+    let (code1, code2, code3) = if ll0 {
+        (rep1, rep2, rep0.wrapping_sub(1))
     } else {
-        match offset {
-            o if o == rep[1] => 1,
-            o if o == rep[2] => 2,
-            o if o == rep[0] - 1 => 3,
-            _ => offset + 3,
-        }
+        (rep0, rep1, rep2)
     };
-    if code > 3 {
-        *rep = [offset, rep[0], rep[1]];
+    let code = if offset == code1 {
+        1
+    } else if offset == code2 {
+        2
+    } else if offset == code3 {
+        3
     } else {
-        let rep_code = code - 1 + u32::from(ll0);
-        if rep_code > 0 {
-            let current = if rep_code == 3 {
-                rep[0] - 1
-            } else {
-                rep[rep_code as usize]
-            };
-            if rep_code >= 2 {
-                rep[2] = rep[1];
-            }
-            rep[1] = rep[0];
-            rep[0] = current;
-        }
-    }
+        offset + 3
+    };
+    // The offset moves to the front; repeat code 0 (rep0 again) keeps the
+    // order and repeat codes 0 and 1 keep rep2.
+    let rep_code = code - 1 + u32::from(ll0);
+    *rep = [
+        offset,
+        if rep_code == 0 { rep1 } else { rep0 },
+        if rep_code <= 1 { rep2 } else { rep1 },
+    ];
     code
 }
 
@@ -282,20 +276,26 @@ pub(crate) fn compress_block(
     op += 1;
 
     // ZSTD_seqToCodes()
-    let values = &mut scratch.values;
-    values.clear();
-    values.extend(store.seqs.iter().map(|seq| {
-        let off_base = off_base(rep, seq.offset, seq.lit_len == 0);
-        (seq.lit_len, seq.match_len - MIN_MATCH, off_base)
-    }));
-    scratch.ll_codes.clear();
-    scratch.ll_codes.extend(values.iter().map(|v| ll_code(v.0)));
-    scratch.ml_codes.clear();
-    scratch.ml_codes.extend(values.iter().map(|v| ml_code(v.1)));
-    scratch.of_codes.clear();
-    scratch
-        .of_codes
-        .extend(values.iter().map(|v| highbit32(v.2) as u8));
+    scratch.values.resize(nb_seq, (0, 0, 0));
+    scratch.ll_codes.resize(nb_seq, 0);
+    scratch.ml_codes.resize(nb_seq, 0);
+    scratch.of_codes.resize(nb_seq, 0);
+    let (values, ll_codes, ml_codes, of_codes) = (
+        &mut scratch.values[..nb_seq],
+        &mut scratch.ll_codes[..nb_seq],
+        &mut scratch.ml_codes[..nb_seq],
+        &mut scratch.of_codes[..nb_seq],
+    );
+    let mut reps = *rep;
+    for (i, seq) in store.seqs.iter().enumerate() {
+        let off_base = off_base(&mut reps, seq.offset, seq.lit_len == 0);
+        let ml_base = seq.match_len - MIN_MATCH;
+        values[i] = (seq.lit_len, ml_base, off_base);
+        ll_codes[i] = ll_code(seq.lit_len);
+        ml_codes[i] = ml_code(ml_base);
+        of_codes[i] = highbit32(off_base) as u8;
+    }
+    *rep = reps;
 
     // ZSTD_buildSequencesStatistics()
     let mut last_count_size = 0;
