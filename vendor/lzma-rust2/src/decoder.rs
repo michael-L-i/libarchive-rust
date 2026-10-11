@@ -227,12 +227,9 @@ impl LiteralSubDecoder {
         let mut symbol: u32 = 1;
         let liter = coder.state.is_literal();
         if liter {
-            loop {
+            for _ in 0..8 {
                 let b = rc.decode_bit(&mut self.coder.probs[symbol as usize]) as u32;
                 symbol = (symbol << 1) | b;
-                if symbol >= 0x100 {
-                    break;
-                }
             }
         } else {
             let r = coder.reps[0];
@@ -241,16 +238,13 @@ impl LiteralSubDecoder {
             let mut match_bit;
             let mut bit;
 
-            loop {
+            for _ in 0..8 {
                 match_byte <<= 1;
                 match_bit = match_byte & offset;
                 bit = rc.decode_bit(&mut self.coder.probs[(offset + match_bit + symbol) as usize])
                     as u32;
                 symbol = (symbol << 1) | bit;
                 offset &= (0u32.wrapping_sub(bit)) ^ !match_bit;
-                if symbol >= 0x100 {
-                    break;
-                }
             }
         }
         lz.put_byte(symbol as u8);

@@ -319,3 +319,52 @@ tokens, 2 uncached input tokens and 5,345 output tokens (3,268 thinking);
 final review 21,316 cache-creation input tokens, 2 uncached input tokens
 and 3,668 output tokens (2,157 thinking). Neither used cached reads or
 web searches. Full JSON records retain the provider metadata.
+
+## Expose the fixed eight-bit literal decode count
+
+Both normal and matched literals decode exactly eight bits: `symbol` starts
+at one and every range-decoded bit is zero or one, so after `k` iterations
+it lies in `[2^k, 2^(k+1)-1]`. Replace the symbol-dependent exit with an
+eight-iteration loop. Probability indices, update order, input reads,
+normalization, dictionary writes and errors are unchanged for valid and
+malformed input. No new unsafe code, dependency, allocation or format change.
+
+Validation on Apple Silicon, 2026-10-11, versus `3bd88f0`:
+
+- Current source/mixed/records profiles identify the main range decoder and
+  length decoder as the relevant hot paths. A separate fixed-array tree and
+  inlined-length experiment produces mostly 0-3% changes and is omitted.
+  The literal-only change retains the material gains with two loop edits.
+- ARM64 release assembly expands both literal paths into eight range-bit
+  steps, removing their loop backedges. The main slice-reader decoder grows
+  from 683 to 1,045 instructions; the rejected combined tree/literal trial
+  had 1,971. One bounds-panic call site disappears through compiler proof;
+  the source retains checked probability indexing.
+- Five alternating pairs, each timing a five-run XZ stream median:
+  records 35.555 -> 31.887 ms (10.3% faster), documents 33.370 -> 31.838 ms
+  (4.6%), mixed 220.929 -> 213.495 ms (3.4%). Text is 0.2% faster; random
+  and many-files 1.4% faster. Source is 1.5% slower and compiled 2.4% slower.
+  The earlier three-pair attribution screen improves mixed/records/documents
+  by 6.9%/9.2%/6.3% and compiled by 3.5%. Retain this variation rather than
+  claiming a uniform improvement. These 80 final medians cover 400 decodes;
+  archive-level validation and timing are separate.
+- All 14,400 baseline/candidate XZ and LZMA1 trace records match exactly,
+  covering 31,234,337 process calls. Records include the hash of every
+  consumed/produced/status tuple, output hash, final counts and exact error
+  text. Presets 0-9, dictionary wraps, fragmented input, one-byte output,
+  five truncations and six mutations per stream produce 3,948 successes
+  and 10,452 errors, with no stalls or harness limits reached. Trace SHA-256:
+  `2dcce229980605cf030e63fa365061360d3e29def4b53fa6a01f9cd9d9f49dd7`.
+- All 28 available vendor tests, strict all-target Clippy, changed-file
+  rustfmt and diff checks pass; eight BCJ tests need omitted fixture assets.
+- Fresh actual Claude Opus 5.5 provided architecture ideas and an independent
+  final review returned PASS on the exact literal-only diff. Both resolved
+  to `claude-opus-5-5`, provider `firstParty`. Design `modelUsage`: 31,715
+  cache-creation input tokens, 2 uncached input tokens and 6,475 output
+  tokens (3,164 thinking). Final review: 14,294 cache-creation input tokens,
+  2 uncached input tokens and 1,644 output tokens (396 thinking). Neither
+  used cached reads or web searches.
+- All samples, rejected variants, complete assembly, trace harness/results,
+  validation logs and authenticated review JSON are retained in sibling
+  `diagnostics/round11-lzma`. During the round the workspace was externally
+  renamed from `port-rs-lib` to `port-rs-libarchive`; source was preserved.
