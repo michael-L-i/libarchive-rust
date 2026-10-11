@@ -68,6 +68,7 @@ impl Bt4 {
         avail
     }
 
+    #[inline(always)]
     fn skip(
         &mut self,
         encoder: &mut super::LzEncoderData,
@@ -275,27 +276,141 @@ impl MatchFind for Bt4 {
     }
 
     fn skip(&mut self, encoder: &mut super::LzEncoderData, len: usize) {
-        let mut len = len as i32;
-        while {
-            let n = len > 0;
-            len -= 1;
-            n
-        } {
+        let mut remaining = len as i32;
+        let nice_len = encoder.nice_len as i32;
+        while remaining > 0 {
+            // These positions have a full nice-length window and cross neither
+            // the cyclic wrap nor position normalization.
+            let batch = remaining
+                .min(encoder.write_pos - encoder.read_pos - nice_len)
+                .min(MAX_POS - 1 - self.lz_pos)
+                .min(self.cyclic_size - 1 - self.cyclic_pos);
+            if batch > 0 {
+                for _ in 0..batch {
+                    encoder.read_pos += 1;
+                    self.lz_pos += 1;
+                    self.cyclic_pos += 1;
+                    self.hash.calc_hashes(encoder.read_buffer());
+                    let current_match = self.hash.get_hash4_pos();
+                    self.hash.update_tables(self.lz_pos);
+                    self.skip(encoder, nice_len, current_match);
+                }
+                remaining -= batch;
+                continue;
+            }
+
+            remaining -= 1;
             let mut nice_len_limit = encoder.nice_len as i32;
             let avail = self.move_pos(encoder);
-
             if avail < nice_len_limit {
                 if avail == 0 {
                     continue;
                 }
                 nice_len_limit = avail;
             }
-
             self.hash.calc_hashes(encoder.read_buffer());
             let current_match = self.hash.get_hash4_pos();
             self.hash.update_tables(self.lz_pos);
-
             self.skip(encoder, nice_len_limit, current_match);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference_skip(bt: &mut Bt4, encoder: &mut super::super::LzEncoderData, len: usize) {
+        for _ in 0..len {
+            let mut limit = encoder.nice_len as i32;
+            let avail = bt.move_pos(encoder);
+            if avail < limit {
+                if avail == 0 {
+                    continue;
+                }
+                limit = avail;
+            }
+            bt.hash.calc_hashes(encoder.read_buffer());
+            let current_match = bt.hash.get_hash4_pos();
+            bt.hash.update_tables(bt.lz_pos);
+            bt.skip(encoder, limit, current_match);
+        }
+    }
+
+    #[test]
+    fn batched_skip_matches_scalar_state_at_boundaries() {
+        for dict in [64, 257, 4096] {
+            for nice in [8, 64, 273] {
+                for finishing in [false, true] {
+                    for near_normalization in [false, true] {
+                        for repetitive in [false, true] {
+                            let mut actual = Bt4::new(dict, nice, 0);
+                            let mut expected = Bt4::new(dict, nice, 0);
+                            if near_normalization {
+                                actual.lz_pos = MAX_POS - 123;
+                                expected.lz_pos = MAX_POS - 123;
+                            }
+                            let mut a = LzEncoder::new_bt4(dict, 0, 0, nice, 273, 0).data;
+                            let mut b = LzEncoder::new_bt4(dict, 0, 0, nice, 273, 0).data;
+                            let mut seed = 0x239afb17u32;
+                            for i in 0..8193 {
+                                seed ^= seed << 13;
+                                seed ^= seed >> 17;
+                                seed ^= seed << 5;
+                                let byte = if repetitive {
+                                    (i % 13) as u8
+                                } else {
+                                    seed as u8
+                                };
+                                a.buf[i] = byte;
+                                b.buf[i] = byte;
+                            }
+                            a.write_pos = 8193;
+                            b.write_pos = 8193;
+                            a.finishing = finishing;
+                            b.finishing = finishing;
+                            let mut done = 0;
+                            let mut turn = 0;
+                            let mut cached_before_normalization = false;
+                            while done < 8193 {
+                                let len = [1, 7, 64, 273, 2, 33][turn % 6].min(8193 - done);
+                                if near_normalization && actual.lz_pos > MAX_POS - 123 {
+                                    cached_before_normalization |= actual.cached_distance != 0;
+                                }
+                                MatchFind::skip(&mut actual, &mut a, len);
+                                reference_skip(&mut expected, &mut b, len);
+                                assert_eq!(actual.tree, expected.tree);
+                                assert!(actual.hash == expected.hash);
+                                assert_eq!(
+                                    (
+                                        actual.lz_pos,
+                                        actual.cyclic_pos,
+                                        actual.cached_distance,
+                                        actual.cached_pos,
+                                        actual.cached_len
+                                    ),
+                                    (
+                                        expected.lz_pos,
+                                        expected.cyclic_pos,
+                                        expected.cached_distance,
+                                        expected.cached_pos,
+                                        expected.cached_len
+                                    ),
+                                );
+                                assert_eq!(
+                                    (a.read_pos, a.pending_size),
+                                    (b.read_pos, b.pending_size)
+                                );
+                                done += len;
+                                turn += 1;
+                            }
+                            if near_normalization && repetitive {
+                                assert!(cached_before_normalization);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

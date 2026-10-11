@@ -360,21 +360,30 @@ impl NormalEncoderMode {
         loop {
             let dist = encoder.lz.matches().dist[_match];
 
-            // Calculate the price of a match of len bytes from the nearest
-            // possible distance.
-            let match_and_len_price =
-                encoder.get_match_and_len_price(normal_match_price, dist as _, len, pos_state);
-            if match_and_len_price < self.opts[self.opt_cur + len as usize].price {
-                self.opts[self.opt_cur + len as usize].set1(
-                    match_and_len_price,
-                    self.opt_cur,
-                    dist + REPS as i32,
-                );
-            }
-            if len != encoder.lz.matches().len[_match] {
+            let end = encoder.lz.matches().len[_match];
+            let mut distance_price = encoder.get_match_distance_price(dist as _, len);
+            let match_and_len_price = loop {
+                let price = normal_match_price
+                    + encoder
+                        .match_len_encoder
+                        .get_price(len as usize, pos_state as usize)
+                    + distance_price;
+                if price < self.opts[self.opt_cur + len as usize].price {
+                    self.opts[self.opt_cur + len as usize].set1(
+                        price,
+                        self.opt_cur,
+                        dist + REPS as i32,
+                    );
+                }
+                if len == end {
+                    break price;
+                }
                 len += 1;
-                continue;
-            }
+                // All lengths from five onward share the same distance state.
+                if len < 6 {
+                    distance_price = encoder.get_match_distance_price(dist as _, len);
+                }
+            };
 
             // Try match + literal + rep0. First get the length of the rep0.
             let len2_limit = i32::min(encoder.data.nice_len as i32, avail - len as i32 - 1);
@@ -599,20 +608,28 @@ impl LzmaEncoderTrait for NormalEncoderMode {
 
                 loop {
                     let dist = encoder.lz.matches().dist[i];
-                    let price = encoder.get_match_and_len_price(
-                        normal_match_price,
-                        dist as _,
-                        len as _,
-                        pos_state,
-                    );
-                    if price < self.opts[len as usize].price {
-                        self.opts[len as usize].set1(price, 0, dist + REPS as i32);
-                    }
-                    if len == encoder.lz.matches().len[i] as i32 {
-                        i += 1;
-                        if i == encoder.lz.matches().count as usize {
+                    let end = encoder.lz.matches().len[i] as i32;
+                    let mut distance_price = encoder.get_match_distance_price(dist as _, len as _);
+                    loop {
+                        let price = normal_match_price
+                            + encoder
+                                .match_len_encoder
+                                .get_price(len as usize, pos_state as usize)
+                            + distance_price;
+                        if price < self.opts[len as usize].price {
+                            self.opts[len as usize].set1(price, 0, dist + REPS as i32);
+                        }
+                        if len == end {
                             break;
                         }
+                        len += 1;
+                        if len < 6 {
+                            distance_price = encoder.get_match_distance_price(dist as _, len as _);
+                        }
+                    }
+                    i += 1;
+                    if i == encoder.lz.matches().count as usize {
+                        break;
                     }
                     len += 1;
                 }

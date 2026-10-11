@@ -490,28 +490,16 @@ impl LzmaEncoder {
         long_rep_price + self.rep_len_encoder.get_price(len as _, pos_state as _)
     }
 
-    pub(crate) fn get_match_and_len_price(
-        &self,
-        normal_match_price: u32,
-        dist: u32,
-        len: u32,
-        pos_state: u32,
-    ) -> u32 {
-        let mut price =
-            normal_match_price + self.match_len_encoder.get_price(len as _, pos_state as _);
+    pub(crate) fn get_match_distance_price(&self, dist: u32, len: u32) -> u32 {
         let dist_state = get_dist_state(len);
-
         if dist < FULL_DISTANCES as u32 {
-            price += self.data.full_dist_prices[dist_state as usize][dist as usize];
+            self.data.full_dist_prices[dist_state as usize][dist as usize]
         } else {
-            // Note that distSlotPrices includes also
-            // the price of direct bits.
+            // dist_slot_prices includes the price of direct bits.
             let dist_slot = LzmaEncoder::get_dist_slot(dist);
-            price += self.data.dist_slot_prices[dist_state as usize][dist_slot as usize]
-                + self.data.align_prices[(dist & ALIGN_MASK as u32) as usize];
+            self.data.dist_slot_prices[dist_state as usize][dist_slot as usize]
+                + self.data.align_prices[(dist & ALIGN_MASK as u32) as usize]
         }
-
-        price
     }
 
     pub(crate) fn update_dist_prices(&mut self) {

@@ -202,3 +202,32 @@ Validation on Apple Silicon, 2026-10-09, versus baseline `fafa7a5`:
 - Raw samples, source snapshots, assembly, Opus prompts/results and validation
   harnesses are retained in sibling `diagnostics/round7-lzma-micro`.
   Integration and held-out archive validation remain separate.
+
+## Bounded BT4 skips and match distance prices
+
+BT4 skips now batch positions only while a full nice-length window remains
+and neither cyclic wrap nor position normalization can occur. Boundary
+positions retain the scalar path. The inner skip is inlined; hash updates,
+tree traversal, cached matches and search limits remain unchanged. The
+normal parser computes the distance price once per fixed-distance interval
+after the length-dependent states converge at length five. Addition order,
+candidate ordering, strict price ties and endpoint work are preserved.
+
+Validation on Apple Silicon, 2026-10-10:
+
+- Fresh actual Claude Opus 5.5 review approved both changes, conditional on
+  exact-stream tests. Its cached-state test concern was addressed by
+  asserting nonzero cached distance before synthetic normalization.
+- All 1,656 differential streams match the frozen encoder byte for byte,
+  including presets 0-9, flushes, dictionaries and write fragmentation.
+  A real stream crossing the 2.147 GB position normalization boundary also
+  matches the frozen output exactly.
+- A scalar-reference test compares every tree/hash/cache/position state
+  through 72 configurations of dictionary wraps, pending tails, nice
+  lengths and normalization, using random and repetitive input.
+- All 28 self-contained vendor tests pass; eight BCJ tests require fixtures
+  omitted from the vendor tree. Strict vendor Clippy and changed-file
+  rustfmt pass.
+- Differential harnesses, all timing samples (including runs affected by
+  other applications), and independent review records are retained in
+  sibling diagnostics/round8-lzma. Archive-level validation is separate.

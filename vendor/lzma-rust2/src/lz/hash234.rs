@@ -7,6 +7,7 @@ const HASH2_MASK: u32 = HASH2_SIZE - 1;
 const HASH3_SIZE: u32 = 1 << 16;
 const HASH3_MASK: u32 = HASH3_SIZE - 1;
 
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct Hash234 {
     hash2_table: Vec<i32>,
     hash3_table: Vec<i32>,
