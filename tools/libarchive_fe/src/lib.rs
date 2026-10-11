@@ -9,5 +9,6 @@
 #![deny(unsafe_code)]
 
 pub mod lafe_err;
+pub mod line_reader;
 #[allow(unsafe_code)]
 pub mod sys;
