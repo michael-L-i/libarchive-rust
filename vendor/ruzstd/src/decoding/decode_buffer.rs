@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use core::hash::Hasher;
 
 use super::ringbuffer::RingBuffer;
+use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::DecodeBufferError;
 
 pub struct DecodeBuffer {
@@ -33,20 +34,24 @@ impl Read for DecodeBuffer {
 
 impl DecodeBuffer {
     pub fn new(window_size: usize) -> DecodeBuffer {
-        DecodeBuffer {
+        let mut buffer = DecodeBuffer {
             buffer: RingBuffer::new(),
             dict_content: Vec::new(),
             window_size,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
-        }
+        };
+        buffer.reset(window_size);
+        buffer
     }
 
     pub fn reset(&mut self, window_size: usize) {
         self.window_size = window_size;
         self.buffer.clear();
-        self.buffer.reserve(self.window_size);
+        // Collecting keeps a window, and a block adds at most this much.
+        self.buffer
+            .reserve_exact(self.window_size.saturating_add(MAX_BLOCK_SIZE as usize));
         self.dict_content.clear();
         self.total_output_counter = 0;
         #[cfg(feature = "hash")]

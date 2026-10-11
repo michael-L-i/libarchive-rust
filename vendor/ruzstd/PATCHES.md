@@ -447,3 +447,16 @@ only the equivalent bounded div_ceil syntax cleanup; final-source vendor tests
 and Clippy passed afterward. The combined integration rebuild and matrix use
 the final source. Evidence, actual model usage, initial timeout, profiles,
 attribution runs and raw validation logs: sibling diagnostics/round11-zstd.
+
+## Round 12: reserve the decode window when a frame starts
+
+Only `DecodeBuffer::reset` reserved the window, and a decoder's first frame is
+built by `new`, so its ring grew from 128 KiB by power-of-two doubling to 4 MiB
+for a 2 MiB window, copying at every step. Both now reserve exactly the window
+plus one block (`RingBuffer::reserve_exact`): collecting keeps at most a
+window, and a block adds at most 128 KiB, so the ring no longer grows while a
+caller collects after each block. Bytes, errors and partial output are
+unchanged: 2256 valid, truncated, bit-flipped and overwritten archive cases
+match the baseline through the ABI (sibling `diagnostics/round12-zstd-dec`).
+`bsdtar -xOf` of the eight common C tar.zst archives touches about 340 fewer
+pages (~940 to ~600 page reclaims) and peak RSS falls from ~11.7 to ~6.4 MiB.

@@ -68,17 +68,31 @@ impl RingBuffer {
         self.reserve_amortized(amount - free);
     }
 
+    /// Ensure that there's space for `amount` elements in the buffer, growing
+    /// it to exactly that size if it is too small.
+    pub fn reserve_exact(&mut self, amount: usize) {
+        if self.free() < amount {
+            // Always have at least 1 unused element as the sentinel.
+            self.grow_to(self.len().saturating_add(amount).saturating_add(1));
+        }
+    }
+
     #[inline(never)]
     #[cold]
     fn reserve_amortized(&mut self, amount: usize) {
-        // SAFETY: if we were succesfully able to construct this layout when we allocated then it's also valid do so now
-        let current_layout = unsafe { Layout::array::<u8>(self.cap).unwrap_unchecked() };
-
         // Always have at least 1 unused element as the sentinel.
         let new_cap = usize::max(
             self.cap.next_power_of_two(),
             (self.cap + amount).next_power_of_two(),
         ) + 1;
+        self.grow_to(new_cap);
+    }
+
+    #[inline(never)]
+    #[cold]
+    fn grow_to(&mut self, new_cap: usize) {
+        // SAFETY: if we were succesfully able to construct this layout when we allocated then it's also valid do so now
+        let current_layout = unsafe { Layout::array::<u8>(self.cap).unwrap_unchecked() };
 
         // Check that the capacity isn't bigger than isize::MAX, which is the max allowed by LLVM, or that
         // we are on a >= 64 bit system which will never allow that much memory to be allocated
