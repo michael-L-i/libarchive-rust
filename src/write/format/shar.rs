@@ -32,23 +32,26 @@ use crate::write::{Format, Sink};
 use std::ffi::{CStr, c_int};
 pub struct Shar {
     dump: bool,
-    started: bool,
-    active: bool,
-    eol: bool,
+    end_of_line: bool,
     entry: Option<Entry>,
-    last_dir: Vec<u8>,
-    uu: Vec<u8>,
+    has_data: bool,
+    last_dir: Option<Vec<u8>>,
+    /// Line buffer for uuencoded dump format.
+    outbuff: [u8; 45],
+    outpos: usize,
+    wrote_header: bool,
 }
 impl Shar {
     pub fn new(dump: bool) -> Self {
         Self {
             dump,
-            started: false,
-            active: false,
-            eol: true,
+            end_of_line: false,
             entry: None,
-            last_dir: Vec::new(),
-            uu: Vec::new(),
+            has_data: false,
+            last_dir: None,
+            outbuff: [0; 45],
+            outpos: 0,
+            wrote_header: false,
         }
     }
 }
@@ -93,7 +96,7 @@ impl Format for Shar {
     fn module(&self) -> &'static [u8] {
         b"shar"
     }
-    fn header(&mut self, _: &Base, e: &mut Entry, sink: &mut dyn Sink) -> Result<c_int, Error> {
+    fn header(&mut self, a: &Base, e: &mut Entry, sink: &mut dyn Sink) -> Result<c_int, Error> {
         let name = e
             .pathname()
             .map(|s| s.to_bytes().to_vec())
@@ -105,26 +108,47 @@ impl Format for Shar {
                     "Can't record entry in shar file without pathname",
                 )
             })?;
-        if !self.started {
+        if !self.wrote_header {
             sink.write(b"#!/bin/sh\n# This is a shell archive\n")?;
-            self.started = true;
+            self.wrote_header = true;
         }
+        // Save the entry for the closing.
         self.entry = Some(e.clone_entry());
-        self.active = false;
-        self.eol = true;
-        if e.filetype() != 0o100000 {
-            e.set_size(0);
-        }
-        if e.filetype() == 0o040000 && matches!(name.as_slice(), b"." | b"./") {
-            return Ok(ARCHIVE_OK);
+        // Handle some preparatory issues. Only regular files have non-zero
+        // size. The early returns keep the previous entry's data state,
+        // as upstream's do.
+        match e.filetype() {
+            0o100000 => {}
+            0o040000 => {
+                e.set_size(0);
+                // Don't bother trying to recreate '.'
+                if matches!(name.as_slice(), b"." | b"./") {
+                    return Ok(ARCHIVE_OK);
+                }
+            }
+            0o010000 | 0o020000 | 0o060000 => e.set_size(0),
+            _ => {
+                e.set_size(0);
+                if e.hardlink().is_none() && e.symlink().is_none() {
+                    a.raise(crate::write::unsupported(e, b"shar"));
+                    return Ok(ARCHIVE_WARN);
+                }
+            }
         }
         let quoted = quote(&name, true);
         let mut out = [b"echo x ".as_slice(), &quoted, b"\n"].concat();
         if e.filetype() != 0o040000
             && let Some(i) = name.iter().rposition(|&b| b == b'/')
         {
+            // Try to avoid a lot of redundant mkdir commands: not
+            // "mkdir .", nor a dir we created, nor a parent of it.
             let parent = &name[..i];
-            if parent != b"." && parent != self.last_dir && !self.last_dir.starts_with(parent) {
+            if parent != b"."
+                && self
+                    .last_dir
+                    .as_ref()
+                    .is_none_or(|last| !last.starts_with(parent))
+            {
                 out.extend(
                     [
                         b"mkdir -p ".as_slice(),
@@ -133,9 +157,11 @@ impl Format for Shar {
                     ]
                     .concat(),
                 );
-                self.last_dir = parent.to_vec();
+                self.last_dir = Some(parent.to_vec());
             }
         }
+        // Handle file-type specific issues.
+        self.has_data = false;
         if let Some(link) = e.hardlink() {
             out.extend(
                 [
@@ -187,12 +213,15 @@ impl Format for Shar {
                                     .concat(),
                             );
                         }
-                        self.active = true;
+                        self.has_data = true;
+                        self.end_of_line = true;
+                        self.outpos = 0;
                     }
                 }
                 0o040000 => {
                     out.extend([b"mkdir -p ".as_slice(), &quoted, b" > /dev/null 2>&1\n"].concat());
-                    self.last_dir = name.strip_suffix(b"/").unwrap_or(&name).to_vec();
+                    // Record that we just created this directory.
+                    self.last_dir = Some(name.strip_suffix(b"/").unwrap_or(&name).to_vec());
                 }
                 0o010000 => out.extend([b"mkfifo ".as_slice(), &quoted, b"\n"].concat()),
                 0o020000 | 0o060000 => {
@@ -214,28 +243,41 @@ impl Format for Shar {
         Ok(ARCHIVE_OK)
     }
     fn data(&mut self, data: &[u8], sink: &mut dyn Sink) -> Result<usize, Error> {
-        if !self.active || data.is_empty() {
+        if !self.has_data || data.is_empty() {
             return Ok(0);
         }
         if self.dump {
-            for &b in data {
-                self.uu.push(b);
-                if self.uu.len() == 45 {
-                    sink.write(&uu_line(&self.uu))?;
-                    self.uu.clear();
+            let mut src = data;
+            if self.outpos != 0 {
+                let n = (45 - self.outpos).min(src.len());
+                self.outbuff[self.outpos..self.outpos + n].copy_from_slice(&src[..n]);
+                if self.outpos + n < 45 {
+                    self.outpos += n;
+                    return Ok(data.len());
                 }
+                sink.write(&uu_line(&self.outbuff))?;
+                src = &src[n..];
+            }
+            let mut lines = src.chunks_exact(45);
+            for line in &mut lines {
+                sink.write(&uu_line(line))?;
+            }
+            let rest = lines.remainder();
+            if !rest.is_empty() {
+                self.outbuff[..rest.len()].copy_from_slice(rest);
+                self.outpos = rest.len();
             }
         } else {
             for chunk in data.chunks(32768) {
                 let mut out = Vec::with_capacity(chunk.len() * 2);
                 for &b in chunk {
-                    if self.eol {
+                    if self.end_of_line {
                         out.push(b'X');
-                        self.eol = false;
+                        self.end_of_line = false;
                     }
                     out.push(b);
                     if b == b'\n' {
-                        self.eol = true;
+                        self.end_of_line = true;
                     }
                 }
                 sink.write(&out)?;
@@ -247,21 +289,23 @@ impl Format for Shar {
         let Some(mut e) = self.entry.take() else {
             return Ok(());
         };
-        if self.active {
+        // has_data and the line state are left for the next header: an
+        // entry it returns early for repeats the previous one's ending.
+        if self.has_data {
             if self.dump {
-                if !self.uu.is_empty() {
-                    sink.write(&uu_line(&self.uu))?;
-                    self.uu.clear();
+                // Finish uuencoded data.
+                if self.outpos > 0 {
+                    sink.write(&uu_line(&self.outbuff[..self.outpos]))?;
                 }
                 sink.write(b"`\nend\nSHAR_END\n")?;
             } else {
-                if !self.eol {
+                // Finish sed-encoded data: ensure last line ends.
+                if !self.end_of_line {
                     sink.write(b"\n")?;
                 }
                 sink.write(b"SHAR_END\n")?;
             }
         }
-        self.active = false;
         if self.dump {
             let name = e
                 .pathname()
@@ -297,9 +341,90 @@ impl Format for Shar {
         Ok(())
     }
     fn close(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
-        if self.started {
+        if self.wrote_header {
             sink.write(b"exit\n")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Output(Vec<u8>);
+    impl Sink for Output {
+        fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+            self.0.extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    fn entry(path: &[u8], filetype: u32, size: i64) -> Entry {
+        let mut e = Entry::new(None);
+        e.set_pathname(path);
+        e.set_filetype(filetype);
+        e.set_perm(0o644);
+        e.set_size(size);
+        e
+    }
+
+    fn write(shar: &mut Shar, entries: &mut [(Entry, &[u8])]) -> Vec<u8> {
+        let base = Base::new(WRITE_MAGIC);
+        let mut out = Output(Vec::new());
+        for (e, data) in entries {
+            assert_eq!(shar.header(&base, e, &mut out), Ok(ARCHIVE_OK));
+            shar.data(data, &mut out).unwrap();
+            shar.finish_entry(&mut out).unwrap();
+        }
+        shar.close(&mut out).unwrap();
+        out.0
+    }
+
+    // Upstream returns early for "." before resetting the data state, so
+    // the previous file's ending is written again (as bsdtar does for the
+    // sweep's src.tar).
+    #[test]
+    fn dot_directory_repeats_the_previous_files_ending() {
+        let out = write(
+            &mut Shar::new(false),
+            &mut [
+                (entry(b"f", 0o100000, 2), b"ab"),
+                (entry(b".", 0o040000, 0), b""),
+            ],
+        );
+        assert_eq!(
+            out,
+            b"#!/bin/sh\n# This is a shell archive\necho x f\n\
+              sed 's/^X//' > f << 'SHAR_END'\nXab\nSHAR_END\n\nSHAR_END\nexit\n"
+        );
+        let out = write(
+            &mut Shar::new(true),
+            &mut [
+                (entry(b"f", 0o100000, 2), b"ab"),
+                (entry(b"./", 0o040000, 0), b""),
+            ],
+        );
+        assert_eq!(
+            out,
+            b"#!/bin/sh\n# This is a shell archive\necho x f\n\
+              uudecode -p > f << 'SHAR_END'\nbegin 644 f\n\"86(`\n`\nend\nSHAR_END\n\
+              chmod 644 f\n\"86(`\n`\nend\nSHAR_END\nchmod 644 ./\nexit\n"
+        );
+    }
+
+    #[test]
+    fn unsupported_file_type_warns() {
+        let base = Base::new(WRITE_MAGIC);
+        let mut out = Output(Vec::new());
+        let mut e = entry(b"sock", 0o140000, 0);
+        assert_eq!(
+            Shar::new(false).header(&base, &mut e, &mut out),
+            Ok(ARCHIVE_WARN)
+        );
+        assert_eq!(
+            base.error_string().as_deref(),
+            Some(b"sock: shar format cannot archive sockets".as_slice())
+        );
     }
 }
