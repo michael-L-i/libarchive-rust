@@ -13,6 +13,8 @@ pub(crate) struct Bt4 {
     cached_distance: i32,
     cached_pos: i32,
     cached_len: i32,
+    hint_pos: i32,
+    hint_head: i32,
 }
 
 const MAX_POS: i32 = 0x7FFFFFFF;
@@ -42,6 +44,8 @@ impl Bt4 {
             cached_distance: 0,
             cached_pos: 0,
             cached_len: 0,
+            hint_pos: -1,
+            hint_head: 0,
         }
     }
 
@@ -59,6 +63,7 @@ impl Bt4 {
                 LzEncoder::normalize(&mut self.tree, normalization_offset);
                 self.lz_pos -= normalization_offset;
                 self.cached_distance = 0;
+                self.hint_pos = -1;
             }
             self.cyclic_pos += 1;
             if self.cyclic_pos == self.cyclic_size {
@@ -66,6 +71,17 @@ impl Bt4 {
             }
         }
         avail
+    }
+
+    #[inline(always)]
+    fn current_hash4_pos(&mut self) -> i32 {
+        if self.hint_pos == self.lz_pos {
+            self.hint_pos = -1;
+            debug_assert_eq!(self.hint_head, self.hash.get_hash4_pos());
+            self.hint_head
+        } else {
+            self.hash.get_hash4_pos()
+        }
     }
 
     #[inline(always)]
@@ -154,8 +170,19 @@ impl MatchFind for Bt4 {
         self.hash.calc_hashes(encoder.read_buffer());
         let mut delta2 = self.lz_pos - self.hash.get_hash2_pos();
         let delta3 = self.lz_pos - self.hash.get_hash3_pos();
-        let mut current_match = self.hash.get_hash4_pos();
+        let mut current_match = self.current_hash4_pos();
         self.hash.update_tables(self.lz_pos);
+        // Read after the current update to preserve same-slot collisions.
+        // Five available bytes keep the next hash entirely below write_pos,
+        // so refills and pending-byte rewinds cannot change the hint.
+        if encoder.write_pos - encoder.read_pos >= 5 {
+            self.hint_head = self
+                .hash
+                .peek_hash4_pos(&encoder.buf[(encoder.read_pos + 1) as usize..]);
+            self.hint_pos = self.lz_pos + 1;
+        } else {
+            self.hint_pos = -1;
+        }
 
         let mut len_best = 0;
 
@@ -290,7 +317,7 @@ impl MatchFind for Bt4 {
                 self.lz_pos += 1;
                 self.cyclic_pos += 1;
                 self.hash.calc_hashes(encoder.read_buffer());
-                let mut current_match = self.hash.get_hash4_pos();
+                let mut current_match = self.current_hash4_pos();
                 for position in 0..batch {
                     self.hash.update_tables(self.lz_pos);
                     let has_next = position + 1 < batch;
@@ -325,7 +352,7 @@ impl MatchFind for Bt4 {
                 nice_len_limit = avail;
             }
             self.hash.calc_hashes(encoder.read_buffer());
-            let current_match = self.hash.get_hash4_pos();
+            let current_match = self.current_hash4_pos();
             self.hash.update_tables(self.lz_pos);
             self.skip(encoder, nice_len_limit, current_match);
         }
@@ -392,14 +419,20 @@ mod tests {
                             let mut cached_before_normalization = false;
                             while done < 8193 {
                                 if turn % 3 == 0 {
-                                    let mut found = Matches::new(273);
-                                    let mut reference = Matches::new(273);
-                                    MatchFind::find_matches(&mut actual, &mut a, &mut found);
-                                    MatchFind::find_matches(&mut expected, &mut b, &mut reference);
-                                    assert_eq!(found.count, reference.count);
-                                    assert_eq!(found.len, reference.len);
-                                    assert_eq!(found.dist, reference.dist);
-                                    done += 1;
+                                    for _ in 0..2.min(8193 - done) {
+                                        let mut found = Matches::new(273);
+                                        let mut reference = Matches::new(273);
+                                        MatchFind::find_matches(&mut actual, &mut a, &mut found);
+                                        MatchFind::find_matches(
+                                            &mut expected,
+                                            &mut b,
+                                            &mut reference,
+                                        );
+                                        assert_eq!(found.count, reference.count);
+                                        assert_eq!(found.len, reference.len);
+                                        assert_eq!(found.dist, reference.dist);
+                                        done += 1;
+                                    }
                                 }
                                 let len = [1, 7, 64, 273, 2, 33][turn % 6].min(8193 - done);
                                 if near_normalization && actual.lz_pos > MAX_POS - 123 {

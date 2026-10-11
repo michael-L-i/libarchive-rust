@@ -75,6 +75,15 @@ impl Hash234 {
         self.hash4_value = (tmp & self.hash4_mask) as i32;
     }
 
+    #[inline(always)]
+    pub(crate) fn peek_hash4_pos(&self, buf: &[u8]) -> i32 {
+        let hash = CRC_TABLE[buf[0] as usize]
+            ^ u32::from(buf[1])
+            ^ (u32::from(buf[2]) << 8)
+            ^ (CRC_TABLE[buf[3] as usize] << 5);
+        self.hash4_table[(hash & self.hash4_mask) as usize]
+    }
+
     pub(crate) fn get_hash2_pos(&self) -> i32 {
         self.hash2_table[self.hash2_value as usize]
     }

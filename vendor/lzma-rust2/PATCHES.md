@@ -267,3 +267,55 @@ Validation on Apple Silicon, 2026-10-11, versus `eea9e56`:
 - Source snapshots, raw timings, profiles, assembly, exact-stream outputs,
   host-load evidence and authenticated review/model records are retained
   in sibling `diagnostics/round10-lzma`.
+
+## Carry the next BT4 hash head across match-finder calls
+
+After `find_matches` updates the current hash tables, load the next
+position's hash4 head before walking the current tree. Cache only the head
+and its absolute position; the next find or skip still calculates all hash
+indices normally. Reading after the current update preserves adjacent
+same-slot collisions. Five available bytes keep the hinted hash below the
+write boundary, so refills, window moves and pending-byte rewinds preserve
+its input. Consumption and position normalization invalidate the hint.
+Search effort, match ordering, presets, allocations and encoded bytes are
+unchanged; two `i32` fields replace a delayed hash-table load. No unsafe code
+is added. Debug builds compare every consumed hint with the live table.
+
+Validation on Apple Silicon, 2026-10-11, versus the accepted skip pipeline
+`9893d1c` (integrated as `e3fc144`):
+
+- Fresh actual Claude Opus 5.5 design and independent final implementation
+  review returned PASS. The reviewer requested refill coverage with live
+  assertions; all 1,656 frozen streams also pass an optimized build with
+  debug assertions enabled (7.7 seconds including compilation).
+- Five alternating raw preset-6 LZMA2 pairs: random median improves
+  2627.907 -> 2001.992 ms (23.8%), mixed 2350.098 -> 2059.524 ms (12.4%),
+  and compiled 644.279 -> 613.182 ms (4.8%). Source, records and documents
+  medians improve 0.4%, 1.8% and 1.3%; text is 0.7% slower. These smaller
+  changes are within observed timing variance. The earlier two-pair screen
+  also improves random, mixed and compiled by 26.4%, 11.6% and 6.1%.
+  All samples are retained; archive-level measurements are separate.
+- All 1,656 frozen XZ/LZMA/LZIP/LZMA2 streams remain byte-identical in
+  release and assertion-enabled builds, covering presets, fragmentation,
+  flushes, preset dictionaries and custom dictionary/search options.
+  The real 2,147,614,720-byte normalization input still produces exactly
+  401,263 bytes, SHA-256
+  `5ea1af6a4ff04040a6177b9eff83c0615bc5821fdf637ebf7ecd587ae4049187`.
+- The 144-configuration debug state test now includes consecutive finds
+  alongside scalar-reference skips, hash collisions, tails, dictionary
+  wraps and normalization. Live-head assertions provide an independent
+  check of the cached value. All 28 available vendor tests, strict
+  all-target Clippy, changed-file rustfmt and diff checks pass; eight BCJ
+  tests require omitted fixture assets.
+- Raw timing pairs, exact-stream outputs, assertion-enabled validation,
+  source snapshots and authenticated final review/model records are in
+  sibling `diagnostics/round10-lzma-hints`. The fresh design review is in
+  `diagnostics/round10-lzma/opus-find-hint-design.json`.
+
+The confirmation records 70 timings (seven corpora, five pairs); the screen
+records another 28. Both fresh reviews resolved to `claude-opus-5-5` via
+`firstParty`. Recorded `modelUsage`: design 18,772 cache-creation input
+tokens, 2 uncached input tokens and 5,345 output tokens (3,268 thinking);
+final review 21,316 cache-creation input tokens, 2 uncached input tokens
+and 3,668 output tokens (2,157 thinking). Neither used cached reads or
+web searches. Full JSON records retain the provider metadata.
