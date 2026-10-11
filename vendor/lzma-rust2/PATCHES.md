@@ -74,6 +74,18 @@ Validation on Apple Silicon, 2026-10-11, against liblzma 5.8.4 (Homebrew
   and LZMA2) are byte-identical, as is a flush with a preset dictionary.
 - Every `.xz` and `.lzma` output decodes with `xz -d`.
 
+### Encoder speed changes
+
+Output stays byte-identical to liblzma; each change was checked against
+the liblzma harness. Instruction counts are single `/usr/bin/time -l`
+runs of the preset-6 `.xz` harness on a 4 MiB slice of the source corpus
+and on the records corpus (the machine was shared with other jobs, so
+instructions retired, not time, judge these).
+
+- `memcmplen()` slices both inputs once, so its word loads need no
+  per-load bounds checks: 6.635 -> 6.394 G instructions on the source
+  slice, 11.14 -> 11.01 G on records.
+
 ## LZMA2 decoder resident dictionary pages
 
 `src/lz/lz_decoder.rs` and `src/lzma2_reader.rs` defer initialization of

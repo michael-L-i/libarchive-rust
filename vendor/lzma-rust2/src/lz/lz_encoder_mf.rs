@@ -2,7 +2,7 @@
 //! `lz/lz_encoder_hash.h`, `common/memcmplen.h`; Igor Pavlov, Lasse Collin;
 //! 0BSD).
 
-use super::lz_encoder::{Action, HASH_2_SIZE, Match, Mf, MfType};
+use super::lz_encoder::{Action, HASH_2_SIZE, MEMCMPLEN_EXTRA, Match, Mf, MfType};
 
 const HASH_2_MASK: u32 = HASH_2_SIZE as u32 - 1;
 const HASH_3_MASK: u32 = (1 << 16) - 1;
@@ -28,8 +28,11 @@ fn read_u64(buf: &[u8], pos: usize) -> u64 {
 #[inline(always)]
 pub(crate) fn memcmplen(buf: &[u8], a: usize, b: usize, mut len: u32, limit: u32) -> u32 {
     debug_assert!(len <= limit);
+    // Words starting below the limit end within these slices.
+    let end = limit as usize + MEMCMPLEN_EXTRA as usize - 1;
+    let (a, b) = (&buf[a..a + end], &buf[b..b + end]);
     while len < limit {
-        let x = read_u64(buf, a + len as usize) ^ read_u64(buf, b + len as usize);
+        let x = read_u64(a, len as usize) ^ read_u64(b, len as usize);
         if x != 0 {
             len += x.trailing_zeros() >> 3;
             return len.min(limit);
