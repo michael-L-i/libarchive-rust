@@ -3,7 +3,7 @@
 //! `zstd_double_fast.c`).
 
 use super::match_state::{
-    count, hash, hash_value, read32, read64, slot, MatchState, HASH_READ_SIZE, SEARCH_STRENGTH,
+    count, hash_value, slot, Input, MatchState, HASH_READ_SIZE, SEARCH_STRENGTH,
 };
 use super::sequences::SeqStore;
 
@@ -41,7 +41,10 @@ fn double_fast<const MLS: u32>(
     let iend = src.len();
     let prefix_lowest_index = ms.lowest_prefix_index(base + iend as u32);
     let prefix_lowest = (prefix_lowest_index - base) as usize;
-    let ilimit = iend.saturating_sub(HASH_READ_SIZE);
+    let Some(input) = Input::new(src) else {
+        return istart;
+    };
+    let ilimit = iend - HASH_READ_SIZE;
     let index = |pos: usize| base + pos as u32;
 
     let mut anchor = istart;
@@ -80,7 +83,7 @@ fn double_fast<const MLS: u32>(
             return anchor;
         }
         // The bytes at ip, read once for both hashes and every comparison.
-        let mut bytes = read64(src, ip);
+        let mut bytes = input.read64(ip);
         let mut hl0 = hash_value::<8>(bytes, hbits_long);
         let mut idxl0 = hash_long[slot(hash_long, hl0)];
         let mut curr;
@@ -95,18 +98,18 @@ fn double_fast<const MLS: u32>(
             hash_small[slot(hash_small, hs0)] = curr;
 
             // Check the repeat offset at ip + 1.
-            if (offset_1 > 0) & (read32(src, ip + 1 - offset_1 as usize) == (bytes >> 8) as u32) {
+            if (offset_1 > 0) & (input.read32(ip + 1 - offset_1 as usize) == (bytes >> 8) as u32) {
                 let length = count(src, ip + 1 + 4, ip + 1 + 4 - offset_1 as usize) + 4;
                 ip += 1;
                 store.store(src, anchor, ip, offset_1, length);
                 break (length, None);
             }
 
-            let bytes1 = read64(src, ip1);
+            let bytes1 = input.read64(ip1);
             let hl1 = hash_value::<8>(bytes1, hbits_long);
             // Check the long match at ip.
             let (mut m, valid) = candidate(idxl0);
-            if (read64(src, m) == bytes) & valid {
+            if (input.read64(m) == bytes) & valid {
                 let mut length = count(src, ip + 8, m + 8) + 8;
                 let offset = (ip - m) as u32;
                 while ip > anchor && m > prefix_lowest && src[ip - 1] == src[m - 1] {
@@ -120,11 +123,11 @@ fn double_fast<const MLS: u32>(
 
             // Check the short match at ip, then a long match at ip1.
             let (mut m, valid) = candidate(idxs0);
-            if (read32(src, m) == bytes as u32) & valid {
+            if (input.read32(m) == bytes as u32) & valid {
                 let mut length = count(src, ip + 4, m + 4) + 4;
                 let mut offset = (ip - m) as u32;
                 let (l1, valid) = candidate(idxl1);
-                if valid && idxl1 > prefix_lowest_index && read64(src, l1) == bytes1 {
+                if valid && idxl1 > prefix_lowest_index && input.read64(l1) == bytes1 {
                     let l1len = count(src, ip1 + 8, l1 + 8) + 8;
                     if l1len > length {
                         ip = ip1;
@@ -172,20 +175,20 @@ fn double_fast<const MLS: u32>(
             // Complementary insertion.
             let insert = curr + 2;
             let pos = (insert - base) as usize;
-            hash_long[slot(hash_long, hash::<8>(src, pos, hbits_long))] = insert;
-            hash_long[slot(hash_long, hash::<8>(src, ip - 2, hbits_long))] = index(ip - 2);
-            hash_small[slot(hash_small, hash::<MLS>(src, pos, hbits_short))] = insert;
-            hash_small[slot(hash_small, hash::<MLS>(src, ip - 1, hbits_short))] = index(ip - 1);
+            hash_long[slot(hash_long, input.hash::<8>(pos, hbits_long))] = insert;
+            hash_long[slot(hash_long, input.hash::<8>(ip - 2, hbits_long))] = index(ip - 2);
+            hash_small[slot(hash_small, input.hash::<MLS>(pos, hbits_short))] = insert;
+            hash_small[slot(hash_small, input.hash::<MLS>(ip - 1, hbits_short))] = index(ip - 1);
 
             // Check immediate repeat offsets.
             while ip <= ilimit
                 && offset_2 > 0
-                && read32(src, ip) == read32(src, ip - offset_2 as usize)
+                && input.read32(ip) == input.read32(ip - offset_2 as usize)
             {
                 let length = count(src, ip + 4, ip + 4 - offset_2 as usize) + 4;
                 core::mem::swap(&mut offset_1, &mut offset_2);
-                hash_small[slot(hash_small, hash::<MLS>(src, ip, hbits_short))] = index(ip);
-                hash_long[slot(hash_long, hash::<8>(src, ip, hbits_long))] = index(ip);
+                hash_small[slot(hash_small, input.hash::<MLS>(ip, hbits_short))] = index(ip);
+                hash_long[slot(hash_long, input.hash::<8>(ip, hbits_long))] = index(ip);
                 store.store(src, anchor, ip, offset_1, length);
                 ip += length;
                 anchor = ip;

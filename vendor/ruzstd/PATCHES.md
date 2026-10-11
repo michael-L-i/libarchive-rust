@@ -615,3 +615,7 @@ Instruction counts are per compression of the benchmark tars in
   only reads below that limit, so the clamp changes nothing, but it lets
   the compiler prove the reads in bounds: the search loop loses its bounds
   checks, -7% to -9% instructions at level 1.
+- The double fast loop reads through `Input` too, and `count()` is only
+  `#[inline]`: forced into the double fast loop's six call sites, its
+  iterator setup was no longer inlined. -8% to -12% instructions at
+  level 3.

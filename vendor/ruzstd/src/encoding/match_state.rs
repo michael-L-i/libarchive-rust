@@ -163,16 +163,11 @@ impl<'a> Input<'a> {
         read64(self.src, self.at(pos))
     }
 
+    /// `ZSTD_hashPtr()` for the `MLS` bytes at `pos`, of `bits` bits.
     #[inline(always)]
     pub(crate) fn hash<const MLS: u32>(self, pos: usize, bits: u32) -> usize {
         hash_value::<MLS>(self.read64(pos), bits)
     }
-}
-
-/// `ZSTD_hashPtr()` for the `MLS` bytes at `pos`, of `bits` bits.
-#[inline(always)]
-pub(crate) fn hash<const MLS: u32>(src: &[u8], pos: usize, bits: u32) -> usize {
-    hash_value::<MLS>(read64(src, pos), bits)
 }
 
 /// `ZSTD_hashPtr()` for the low `MLS` bytes of `value`, the bytes at a
@@ -202,7 +197,7 @@ pub(crate) fn slot(table: &[u32], hash: usize) -> usize {
 
 /// `ZSTD_count()`: the length of the common prefix of `src[pos..]` and
 /// `src[at..]`, with `at < pos`.
-#[inline(always)]
+#[inline]
 pub(crate) fn count(src: &[u8], pos: usize, at: usize) -> usize {
     let (Some(input), Some(found)) = (src.get(pos..), src.get(at..)) else {
         return 0;
