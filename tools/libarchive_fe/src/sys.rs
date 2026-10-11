@@ -1,9 +1,9 @@
 //! The libc calls the front-ends make that std has no wrapper for: signal
 //! dispositions, the terminal's echo, the umask, `strerror`, the locale and
 //! its character classes, `fnmatch`, regular expressions, `strtol`, local
-//! time, file times, the user and group databases, the effective user and
-//! `chroot`. This is the only `unsafe` code in the front-ends; every function
-//! here is safe to call.
+//! time, file times, the user and group databases, the effective user,
+//! `chroot` and `atexit`. This is the only `unsafe` code in the front-ends;
+//! every function here is safe to call.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_long};
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
@@ -193,6 +193,13 @@ pub fn nl_langinfo(item: libc::nl_item) -> Vec<u8> {
     unsafe { CStr::from_ptr(libc::nl_langinfo(item)) }
         .to_bytes()
         .to_vec()
+}
+
+/// `atexit(f)`: whether `f` will run when the program exits, as C's `exit`
+/// flushes stdio.
+pub fn atexit(f: extern "C" fn()) -> bool {
+    // SAFETY: `f` is a function with the C signature atexit takes.
+    unsafe { libc::atexit(f) == 0 }
 }
 
 /// `strtol(s, &end, base)` of the C string in `s`: the number it starts

@@ -10,7 +10,7 @@
 //! The -t and -x modes.
 
 use crate::util::{
-    do_chdir, edit_pathname, error_string, list_item_verbose, passphrase_callback, path,
+    Stdout, do_chdir, edit_pathname, error_string, list_item_verbose, passphrase_callback, path,
     safe_fputs, yes,
 };
 use crate::*;
@@ -215,7 +215,7 @@ fn read_archive(bsdtar: &mut Bsdtar, mode: u8, mut writer: Option<&mut ArchiveWr
         if mode == b't' {
             // Perversely, gtar uses -O to mean "send to stderr" when used
             // with -t.
-            let (mut stdout, mut stderr) = (io::stdout(), io::stderr());
+            let (mut stdout, mut stderr) = (Stdout, io::stderr());
             let out: &mut dyn Write = if bsdtar.flags & OPTFLAG_STDOUT != 0 {
                 &mut stderr
             } else {
@@ -312,7 +312,7 @@ fn read_archive(bsdtar: &mut Bsdtar, mode: u8, mut writer: Option<&mut ArchiveWr
             filter.as_deref().unwrap_or(b"(null)"),
             b"\n",
         ];
-        let _ = io::stdout().write_all(&line.concat());
+        let _ = Stdout.write_all(&line.concat());
     }
 }
 

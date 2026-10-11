@@ -2135,11 +2135,6 @@ single-hash matcher. Levels and options keep libarchive's meaning.
 ### Differences
 
 - `pathcmp` is not ported: nothing in tar/ calls it at the pin.
-- Standard output is Rust's line-buffered one where C's is fully buffered
-  when it is not a terminal. The bytes are the same; when standard output
-  and standard error are the same file, a newline that C holds back until
-  its next `fflush` (`-t` printing an entry, then a warning) comes before
-  the warning here.
 - `-tv`'s `strftime` buffer is 64 bytes, where upstream's is 100; a longer
   date (no locale makes one) would print as "-- -- ----".
 - The SIGINFO/SIGUSR1 progress report during `-x` divides by the bytes

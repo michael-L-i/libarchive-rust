@@ -15,12 +15,69 @@ use libarchive_fe::passphrase::lafe_readpassphrase;
 use libarchive_fe::sys;
 use libarchive_rust::{AE_IFBLK, AE_IFCHR, Archive, ArchiveEntry};
 use std::ffi::{CStr, OsStr};
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, IsTerminal, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::exit;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
+
+/// Standard output, buffered as C's stdout is: line by line on a terminal
+/// (as Rust's is), else in blocks of its preferred I/O size until `flush`
+/// or exit. What bsdtar prints there then interleaves with its messages on
+/// standard error as C bsdtar's does when both go to one file.
+pub struct Stdout;
+
+/// What `Stdout` holds back, when standard output is not a terminal.
+static PENDING: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// The size of `Stdout`'s blocks, or `None` on a terminal.
+fn block_size() -> Option<usize> {
+    static SIZE: OnceLock<Option<usize>> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let out = io::stdout();
+        if out.is_terminal() {
+            return None;
+        }
+        let fd = out.as_fd().try_clone_to_owned().ok();
+        let size = fd.and_then(|fd| File::from(fd).metadata().ok());
+        // BUFSIZ, if fstat can't tell.
+        Some(size.map_or(1024, |m| m.blksize()).max(1) as usize)
+    })
+}
+
+impl Write for Stdout {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let Some(size) = block_size() else {
+            return io::stdout().write(data);
+        };
+        let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
+        pending.extend_from_slice(data);
+        let full = pending.len() - pending.len() % size;
+        if full > 0 {
+            let mut out = io::stdout().lock();
+            out.write_all(&pending[..full])?;
+            out.flush()?;
+            pending.drain(..full);
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut out = io::stdout().lock();
+        out.write_all(&pending)?;
+        pending.clear();
+        out.flush()
+    }
+}
+
+/// Flushes `Stdout` at exit, as C's `exit` flushes stdio.
+pub extern "C" fn flush_stdout() {
+    let _ = Stdout.flush();
+}
 
 /// A file name given as bytes.
 pub fn path(name: &[u8]) -> &Path {

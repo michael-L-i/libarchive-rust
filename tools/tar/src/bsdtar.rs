@@ -329,6 +329,8 @@ fn main() {
     // Do not ignore SIGCHLD.
     sys::default_signal(libc::SIGCHLD);
 
+    sys::atexit(util::flush_stdout);
+
     // Set lafe_progname before calling lafe_warnc.
     let argv: VecDeque<_> = std::env::args_os().map(OsString::into_vec).collect();
     lafe_setprogname(argv.front().map(|a| OsStr::from_bytes(a)), "bsdtar");
@@ -1064,7 +1066,7 @@ fn usage() -> ! {
 
 fn version() -> ! {
     let details = version_details();
-    let _ = writeln!(io::stdout(), "bsdtar {BSDTAR_VERSION_STRING} - {details} ");
+    let _ = writeln!(util::Stdout, "bsdtar {BSDTAR_VERSION_STRING} - {details} ");
     exit(0)
 }
 
@@ -1118,6 +1120,6 @@ fn long_help() -> ! {
         }
         out.extend_from_slice(part.as_bytes());
     }
-    let _ = io::stdout().write_all(&out);
+    let _ = util::Stdout.write_all(&out);
     version()
 }
