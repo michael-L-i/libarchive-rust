@@ -448,10 +448,13 @@ impl State {
     /// with 32 bit values at the expense of memory usage).
     fn slide_hash(&mut self) {
         let wsize = self.w_size as u16;
-        for p in self.head.iter_mut().chain(self.prev.iter_mut()) {
-            // If p is not on any hash chain, prev[p] is garbage but its value
+        for m in self.head.iter_mut() {
+            *m = m.saturating_sub(wsize);
+        }
+        for m in &mut self.prev[..self.w_size] {
+            // If n is not on any hash chain, prev[n] is garbage but its value
             // will never be used.
-            *p = p.saturating_sub(wsize);
+            *m = m.saturating_sub(wsize);
         }
     }
 
