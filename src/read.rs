@@ -683,15 +683,14 @@ impl Stage {
 
             // We can't satisfy the request from the copy buffer or the
             // existing client data, so we need to copy more client data
-            // over to the copy buffer.
-            if let Err(e) = self.make_room(min) {
+            // over to the copy buffer. Don't waste time buffering more than
+            // we need to, or more than is available.
+            let tocopy = (min - self.avail).min(self.client_avail);
+            if let Err(e) = self.make_room(min, tocopy) {
                 self.fatal = true;
                 up.a.raise(e);
                 return Err(Error::recorded(ARCHIVE_FATAL));
             }
-            // Don't waste time buffering more than we need to, or more than
-            // is available.
-            let tocopy = (min - self.avail).min(self.client_avail);
             let end = self.client_next.saturating_add(tocopy);
             debug_assert_eq!(
                 self.client_total,
@@ -715,7 +714,7 @@ impl Stage {
 
     /// Ensures the copy buffer can take data up to `min` bytes: grows it
     /// (doubling, watching for overflow) or moves the data forward.
-    fn make_room(&mut self, min: usize) -> Result<(), Error> {
+    fn make_room(&mut self, min: usize, tocopy: usize) -> Result<(), Error> {
         let no_memory = || Error::fatal(libc::ENOMEM, "Unable to allocate copy buffer");
         if min > self.buffer_size {
             let mut size = if self.buffer_size == 0 {
@@ -727,9 +726,13 @@ impl Stage {
                 size = size.checked_mul(2).ok_or_else(no_memory)?;
             }
             // Now size >= min, so allocate a new buffer and move the data
-            // into it.
+            // into it. `min` comes from the archive and may exceed the input,
+            // so reserve at most 1 MiB up front; `fill` grows it as data
+            // arrives.
             let mut buffer = Vec::new();
-            buffer.try_reserve_exact(size).map_err(|_| no_memory())?;
+            buffer
+                .try_reserve_exact(size.min(1 << 20))
+                .map_err(|_| no_memory())?;
             buffer.extend_from_slice(self.data(Loc::Copy));
             self.buffer = buffer;
             self.buffer_size = size;
@@ -739,7 +742,7 @@ impl Stage {
             self.buffer.drain(..self.next);
             self.next = 0;
         }
-        Ok(())
+        self.buffer.try_reserve(tocopy).map_err(|_| no_memory())
     }
 
     /// `advance_file_pointer`: moves the file pointer forward by up to
@@ -2288,6 +2291,17 @@ mod tests {
         rd.consume(3).unwrap();
         assert_eq!(rd.position(), 3);
         assert_eq!(rd.peek_available(1).unwrap(), &data[3..4]);
+    }
+
+    /// A header field can ask for far more than the input holds (found by
+    /// fuzzing rar): that is a short read, not an allocation of that size.
+    #[test]
+    fn read_ahead_of_an_absurd_size_is_a_short_read() {
+        let data = text(10);
+        let (mem, _) = Mem::new(&data, 4);
+        let (mut r, a) = setup(mem);
+        let mut rd = r.reader(&a);
+        assert!(rd.read_ahead(0x7fff_ffff_0000_0000).unwrap().is_none());
     }
 
     #[test]
