@@ -130,6 +130,45 @@ pub(crate) fn read64(src: &[u8], pos: usize) -> u64 {
     src[pos..pos + 8].try_into().map_or(0, u64::from_le_bytes)
 }
 
+/// A block's input for the match finders' hot loops, which read only below
+/// `src.len() - 8`. Positions are clamped to that limit: the loops' bounds
+/// make it a no-op, and it lets the compiler drop the bounds checks.
+#[derive(Copy, Clone)]
+pub(crate) struct Input<'a> {
+    pub src: &'a [u8],
+    limit: usize,
+}
+
+impl<'a> Input<'a> {
+    /// `None` if `src` holds less than 8 bytes.
+    #[inline(always)]
+    pub(crate) fn new(src: &'a [u8]) -> Option<Self> {
+        let limit = src.len().checked_sub(8)?;
+        Some(Self { src, limit })
+    }
+
+    #[inline(always)]
+    fn at(self, pos: usize) -> usize {
+        debug_assert!(pos <= self.limit);
+        pos.min(self.limit)
+    }
+
+    #[inline(always)]
+    pub(crate) fn read32(self, pos: usize) -> u32 {
+        read32(self.src, self.at(pos))
+    }
+
+    #[inline(always)]
+    pub(crate) fn read64(self, pos: usize) -> u64 {
+        read64(self.src, self.at(pos))
+    }
+
+    #[inline(always)]
+    pub(crate) fn hash<const MLS: u32>(self, pos: usize, bits: u32) -> usize {
+        hash_value::<MLS>(self.read64(pos), bits)
+    }
+}
+
 /// `ZSTD_hashPtr()` for the `MLS` bytes at `pos`, of `bits` bits.
 #[inline(always)]
 pub(crate) fn hash<const MLS: u32>(src: &[u8], pos: usize, bits: u32) -> usize {

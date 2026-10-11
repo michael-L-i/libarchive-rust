@@ -1,7 +1,7 @@
 //! The fast block compressor (levels 1-2 and negative levels), ported from
 //! libzstd 1.5.7 (`ZSTD_compressBlock_fast_noDict_generic()` in `zstd_fast.c`).
 
-use super::match_state::{count, hash, read32, slot, MatchState, HASH_READ_SIZE, SEARCH_STRENGTH};
+use super::match_state::{count, slot, Input, MatchState, HASH_READ_SIZE, SEARCH_STRENGTH};
 use super::sequences::SeqStore;
 
 /// Find the sequences of the block `src[start..]`; `src[..start]` is the
@@ -38,7 +38,10 @@ fn fast<const MLS: u32>(
     let iend = src.len();
     let prefix_start_index = ms.lowest_prefix_index(base + iend as u32);
     let prefix_start = (prefix_start_index - base) as usize;
-    let ilimit = iend.saturating_sub(HASH_READ_SIZE);
+    let Some(input) = Input::new(src) else {
+        return istart;
+    };
+    let ilimit = iend - HASH_READ_SIZE;
     let index = |pos: usize| base + pos as u32;
 
     let mut anchor = istart;
@@ -56,7 +59,7 @@ fn fast<const MLS: u32>(
     let found = |pos: usize, match_index: u32| {
         debug_assert!(match_index < index(pos));
         match_index >= prefix_start_index
-            && read32(src, (match_index - base) as usize) == read32(src, pos)
+            && input.read32((match_index - base) as usize) == input.read32(pos)
     };
 
     loop {
@@ -68,17 +71,17 @@ fn fast<const MLS: u32>(
         if ip3 >= ilimit {
             break;
         }
-        let mut hash0 = hash::<MLS>(src, ip0, hlog);
-        let mut hash1 = hash::<MLS>(src, ip1, hlog);
+        let mut hash0 = input.hash::<MLS>(ip0, hlog);
+        let mut hash1 = input.hash::<MLS>(ip1, hlog);
         let mut match_index = table[slot(table, hash0)];
         let mut current0;
 
         // Search: ends with a repeat offset match or a table match at ip0.
         let repeat = loop {
-            let rval = read32(src, ip2 - rep1 as usize);
+            let rval = input.read32(ip2 - rep1 as usize);
             current0 = index(ip0);
             table[slot(table, hash0)] = current0;
-            if read32(src, ip2) == rval && rep1 > 0 {
+            if input.read32(ip2) == rval && rep1 > 0 {
                 ip0 = ip2;
                 table[slot(table, hash1)] = index(ip1);
                 break true;
@@ -89,7 +92,7 @@ fn fast<const MLS: u32>(
             }
             match_index = table[slot(table, hash1)];
             hash0 = hash1;
-            hash1 = hash::<MLS>(src, ip2, hlog);
+            hash1 = input.hash::<MLS>(ip2, hlog);
             ip0 = ip1;
             ip1 = ip2;
             ip2 = ip3;
@@ -104,7 +107,7 @@ fn fast<const MLS: u32>(
             }
             match_index = table[slot(table, hash1)];
             hash0 = hash1;
-            hash1 = hash::<MLS>(src, ip2, hlog);
+            hash1 = input.hash::<MLS>(ip2, hlog);
             ip0 = ip1;
             ip1 = ip2;
             ip2 = ip0 + step;
@@ -145,13 +148,13 @@ fn fast<const MLS: u32>(
         // Fill the table and check for immediate repeat offsets.
         if ip0 <= ilimit {
             let pos = (current0 - base) as usize + 2;
-            table[slot(table, hash::<MLS>(src, pos, hlog))] = current0 + 2;
-            table[slot(table, hash::<MLS>(src, ip0 - 2, hlog))] = index(ip0 - 2);
+            table[slot(table, input.hash::<MLS>(pos, hlog))] = current0 + 2;
+            table[slot(table, input.hash::<MLS>(ip0 - 2, hlog))] = index(ip0 - 2);
             if rep2 > 0 {
-                while ip0 <= ilimit && read32(src, ip0) == read32(src, ip0 - rep2 as usize) {
+                while ip0 <= ilimit && input.read32(ip0) == input.read32(ip0 - rep2 as usize) {
                     let length = count(src, ip0 + 4, ip0 + 4 - rep2 as usize) + 4;
                     core::mem::swap(&mut rep1, &mut rep2);
-                    table[slot(table, hash::<MLS>(src, ip0, hlog))] = index(ip0);
+                    table[slot(table, input.hash::<MLS>(ip0, hlog))] = index(ip0);
                     store.store(src, anchor, ip0, rep1, length);
                     ip0 += length;
                     anchor = ip0;

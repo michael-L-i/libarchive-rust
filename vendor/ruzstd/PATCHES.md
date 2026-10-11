@@ -611,3 +611,7 @@ Instruction counts are per compression of the benchmark tars in
 
 - `count()` compares 8 bytes at a time through `chunks_exact`, so its
   loop has no bounds checks: -3% instructions at level 1, -1% at level 5.
+- `Input` reads the fast loop's positions clamped to `len - 8`. The loop
+  only reads below that limit, so the clamp changes nothing, but it lets
+  the compiler prove the reads in bounds: the search loop loses its bounds
+  checks, -7% to -9% instructions at level 1.
