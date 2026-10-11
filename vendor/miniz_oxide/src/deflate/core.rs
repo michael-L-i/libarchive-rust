@@ -1986,32 +1986,29 @@ fn compress_normal(d: &mut CompressorOxide, callback: &mut CallbackOxide) -> boo
             && num_bytes_to_process > 0
         {
             let dictb = &mut d.dict.b;
-            let dictionary = &mut *dictb.dict;
-            let next = &mut *dictb.next;
-            let hash_table = &mut *dictb.hash;
 
             let mut dst_pos = (lookahead_pos + lookahead_size) & LZ_DICT_SIZE_MASK;
             let mut ins_pos = lookahead_pos + lookahead_size - 2;
             // Start the hash value from the first two bytes
             let mut hash = update_hash(
-                u16::from(dictionary[ins_pos & LZ_DICT_SIZE_MASK]),
-                dictionary[(ins_pos + 1) & LZ_DICT_SIZE_MASK],
+                u16::from(dictb.dict[ins_pos & LZ_DICT_SIZE_MASK]),
+                dictb.dict[(ins_pos + 1) & LZ_DICT_SIZE_MASK],
             );
 
             lookahead_size += num_bytes_to_process;
 
             for &c in bytes_to_process {
                 // Add byte to input buffer.
-                dictionary[dst_pos] = c;
+                dictb.dict[dst_pos] = c;
                 if dst_pos < MAX_MATCH_LEN - 1 {
-                    dictionary[LZ_DICT_SIZE + dst_pos] = c;
+                    dictb.dict[LZ_DICT_SIZE + dst_pos] = c;
                 }
 
                 // Generate hash from the current byte,
                 hash = update_hash(hash, c);
-                next[ins_pos & LZ_DICT_SIZE_MASK] = hash_table[hash as usize];
+                dictb.next[ins_pos & LZ_DICT_SIZE_MASK] = dictb.hash[hash as usize];
                 // and insert it into the hash chain.
-                hash_table[hash as usize] = ins_pos as u16;
+                dictb.hash[hash as usize] = ins_pos as u16;
                 dst_pos = (dst_pos + 1) & LZ_DICT_SIZE_MASK;
                 ins_pos += 1;
             }
@@ -2019,28 +2016,25 @@ fn compress_normal(d: &mut CompressorOxide, callback: &mut CallbackOxide) -> boo
             src_pos += num_bytes_to_process;
         } else {
             let dictb = &mut d.dict.b;
-            let dictionary = &mut *dictb.dict;
-            let next = &mut *dictb.next;
-            let hash_table = &mut *dictb.hash;
             for &c in bytes_to_process {
                 let dst_pos = (lookahead_pos + lookahead_size) & LZ_DICT_SIZE_MASK;
-                dictionary[dst_pos] = c;
+                dictb.dict[dst_pos] = c;
                 if dst_pos < MAX_MATCH_LEN - 1 {
-                    dictionary[LZ_DICT_SIZE + dst_pos] = c;
+                    dictb.dict[LZ_DICT_SIZE + dst_pos] = c;
                 }
 
                 lookahead_size += 1;
                 if lookahead_size + d.dict.size >= MIN_MATCH_LEN.into() {
                     let ins_pos = lookahead_pos + lookahead_size - 3;
-                    let hash = ((u32::from(dictionary[ins_pos & LZ_DICT_SIZE_MASK])
+                    let hash = ((u32::from(dictb.dict[ins_pos & LZ_DICT_SIZE_MASK])
                         << (LZ_HASH_SHIFT * 2))
-                        ^ ((u32::from(dictionary[(ins_pos + 1) & LZ_DICT_SIZE_MASK])
+                        ^ ((u32::from(dictb.dict[(ins_pos + 1) & LZ_DICT_SIZE_MASK])
                             << LZ_HASH_SHIFT)
                             ^ u32::from(c)))
                         & (LZ_HASH_SIZE as u32 - 1);
 
-                    next[ins_pos & LZ_DICT_SIZE_MASK] = hash_table[hash as usize];
-                    hash_table[hash as usize] = ins_pos as u16;
+                    dictb.next[ins_pos & LZ_DICT_SIZE_MASK] = dictb.hash[hash as usize];
+                    dictb.hash[hash as usize] = ins_pos as u16;
                 }
             }
 
