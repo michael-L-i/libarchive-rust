@@ -15,6 +15,9 @@
 //! Windows alone, are not ported.
 
 #![deny(unsafe_code)]
+// mode_t is 16 bits on Apple platforms but 32 on Linux, so widening it is a
+// no-op there.
+#![cfg_attr(not(target_vendor = "apple"), allow(clippy::useless_conversion))]
 
 mod cmdline;
 
