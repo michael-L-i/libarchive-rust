@@ -1865,8 +1865,8 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   pax binary fallbacks follow upstream. Pax alignment is bounded to 1 MiB.
 - ar and cpio variants, raw, shar, mtree and WARC writers are native safe ports.
   Mtree hashes are computed incrementally, including replacement of preset
-  entry digests when data is supplied. Its paths are capped at 1 MiB and its
-  directory hierarchy at 1000 levels rather than using unbounded recursion.
+  entry digests when data is supplied. Its directory tree is walked without
+  recursion.
 - ZIP streams stored and compressed entries, ZIP64 records, traditional
   encryption and WinZip AES. Compression uses the safe filter backends described
   above; compressed bytes can differ from upstream. Passphrase copies are
@@ -1874,6 +1874,59 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - ZIP LZMA properties use the safe encoder's actual preset dictionary size.
   Encryption covers the ZIP-LZMA prefix as well as compressed bytes, including
   the AES authentication checksum.
+## Writer byte-identity sweep
+
+Upstream bsdtar was compared with upstream bsdtar over this library, both
+writing every format from the same tree and from a tar of entries a disk
+can't hold (invalid UTF-8, big ids, devices, pathological names), in a
+UTF-8 and the C locale, plus xattr, ACL and mac-metadata runs. All
+outputs match byte for byte, with the same messages and exit codes,
+except the ones listed under "Still different".
+
+Kept on purpose:
+
+- A negative entry size is no data. Upstream's gnutar and pax writers take
+  it as about 2^64 bytes still to write and pad toward that forever.
+- mtree's `rmd160digest`: the macOS oracle is built without RIPEMD-160 and
+  omits the keyword; this library always has it (see Crypto).
+- The cpio trailer is written by `close`, which has no handle, so a
+  `hdrcharset` that can't convert `TRAILER!!!` doesn't warn as upstream's
+  close does.
+- WARC dates print the year as `{:04}`, as macOS `strftime("%Y")` does;
+  glibc doesn't zero-pad years before 1000.
+
+Upstream quirks ported as-is:
+
+- pax: each ACL attribute's result replaces the header's return code, so a
+  charset warning before it is lost. The main ustar header's format errors
+  are ignored but their messages stay on the handle. The GNU sparse map is
+  written by the first data call, so a sparse entry with no data written
+  lacks it.
+- gnutar: a symlink target that won't convert is reported under the
+  hardlink's name, `(null)`.
+- shar: a `.` directory or an unsupported type returns before the entry
+  state resets, so the next entry repeats the previous file's `SHAR_END`
+  (and shardump its last partial line).
+- ar: a member rejected with `ARCHIVE_WARN` pads again for the odd-sized
+  member before it.
+- xar: the heap is copied for its whole length starting after the TOC
+  checksum slot, so archives end with the first checksum-size bytes of the
+  compressed TOC. fflags are written as empty `<flags/>` and `<ext2/>`.
+- 7zip: the first non-empty file's encoder setup replaces the return code
+  of a pathname-conversion warning. zip sets the UTF-8 flag on non-ASCII
+  names that aren't valid UTF-8. ISO9660's Joliet name for `dir/.` is `.`.
+
+Still different:
+
+- ISO9660 images: directory extent order, Rock Ridge field placement
+  (upstream caps in-record fields at 226 bytes and splits NM/SL), PX link
+  counts, empty files' extent numbers and duplicate-name suffixes. The
+  writer is a reimplementation; matching needs a port of upstream's layout,
+  `set_directory_record_rr` and `idr` code.
+- xar in a non-UTF-8 locale escapes a non-ASCII symlink target differently.
+- 7zip compression names are matched in any case, and invalid levels have
+  other messages than upstream's.
+
 ## 7zip and ISO9660 writers
 
 - The 7zip writer uses a seekable anonymous temporary file for encoded data
