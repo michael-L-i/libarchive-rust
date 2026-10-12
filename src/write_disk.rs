@@ -148,7 +148,15 @@ impl WriteDisk {
                 return a.raise(Error::new(ARCHIVE_FAILED, ARCHIVE_ERRNO_MISC, msg));
             }
         }
-        let options = self.options;
+        let mut options = self.options;
+        // On Apple, Mac metadata holds the ACLs and extended attributes too:
+        // when it is restored, the entry's own are not.
+        if cfg!(target_vendor = "apple")
+            && options & MAC_METADATA != 0
+            && entry.mac_metadata().is_some_and(|m| !m.is_empty())
+        {
+            options &= !(ACL | XATTR);
+        }
         let secure = options & SECURE_SYMLINKS != 0;
         if secure
             && let Err((code, errno, msg)) =
@@ -1128,6 +1136,36 @@ mod tests {
         assert_eq!(*base.error_string().unwrap(), *expected);
         assert_eq!(disk.close(&base), ARCHIVE_OK);
         assert_eq!(std::fs::read(output.0.join("file")).unwrap(), b"xy");
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn mac_metadata_replaces_acls_and_extended_attributes() {
+        let output = Output::new();
+        for with_metadata in [false, true] {
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = WriteDisk::default();
+            disk.options = XATTR | MAC_METADATA;
+            let mut entry = Entry::new(None);
+            entry.set_pathname(output.path().as_os_str().as_bytes());
+            entry.set_mode(libc::S_IFREG | 0o644);
+            // An attribute name the filesystem refuses.
+            entry.xattr_add(&std::ffi::CString::new([b'x'; 200]).unwrap(), b"v");
+            if with_metadata {
+                entry.copy_mac_metadata(b"metadata");
+            }
+            assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+            let restored = disk.finish_entry(&base);
+            // Only the metadata is restored, and it is no AppleDouble file.
+            assert_eq!(restored, ARCHIVE_WARN);
+            let message = base.error_string().unwrap().to_vec();
+            let expected: &[u8] = if with_metadata {
+                b"Failed to restore metadata"
+            } else {
+                b"Can't restore extended attributes"
+            };
+            assert_eq!(message, expected);
+        }
     }
 
     #[test]
