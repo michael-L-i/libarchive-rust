@@ -41,7 +41,7 @@ def main():
     cases = [
         ("incompressible-blocks", random_data[:131072], random_data[:131072], 65536, False),
         ("buffered-tail", random_data, random_data, 65536, False),
-        ("split-zero-block", bytes(32768) + random_data[:32768], bytes(32768) + random_data[:32768], 1000, False),
+        ("split-zero-block", bytes(32768) + random_data[:32768], bytes(32768) + random_data[:32768], "1000+65536", False),
         ("precompressed-whole", encoded(boot_data), boot_data, 65536, False),
         ("precompressed-split", encoded(boot_data), boot_data, 16, False),
         ("boot-random", encoded(boot_data), boot_data, 65536, True),
@@ -55,15 +55,21 @@ def main():
         subprocess.run([os.environ.get("CC", "cc"), "-O1", "-Wall", "-Wextra", "-Werror",
                         "-I", str(root / "upstream/libarchive/libarchive"), str(root / "tests/iso9660-zisofs.c"),
                         "-L", str(library), "-larchive", "-Wl,-rpath," + str(library),
-                        "-o", str(driver)], check=True)
+                        "-o", str(driver)], check=True, timeout=30)
         for name, original, expected, chunk, boot in cases:
             source, image, extraction = directory / (name + ".bin"), directory / (name + ".iso"), directory / name
             source.write_bytes(original)
             extraction.mkdir()
             path = "boot.img" if boot else "f"
             options = "iso9660:zisofs" + (",boot=boot.img" if boot else "")
-            write = subprocess.run([str(driver), str(image), options, str(source), str(chunk), path], capture_output=True)
-            extract = subprocess.run([str(reader), "-xf", str(image), "-C", str(extraction)], capture_output=True)
+            try:
+                write = subprocess.run([str(driver), str(image), options, str(source), str(chunk), path], capture_output=True, timeout=90)
+                extract = subprocess.run([str(reader), "-xf", str(image), "-C", str(extraction)], capture_output=True, timeout=90)
+            except subprocess.TimeoutExpired:
+                print("FAIL " + name)
+                sys.stderr.write(name + ": subprocess timed out\n")
+                failed += 1
+                continue
             output = extraction / path
             same = write.returncode == 0 and extract.returncode == 0 and output.is_file() and output.read_bytes() == expected
             print(("PASS " if same else "FAIL ") + name)

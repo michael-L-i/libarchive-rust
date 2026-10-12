@@ -3,6 +3,7 @@
 #include <archive_entry.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 int main(int argc, char **argv)
 {
@@ -12,7 +13,9 @@ int main(int argc, char **argv)
     long size = ftell(input);
     if (size < 0 || fseek(input, 0, SEEK_SET) != 0) return 2;
     size_t chunk = (size_t)strtoul(argv[4], NULL, 10);
-    if (chunk == 0 || chunk > 65536) return 2;
+    const char *tail = strchr(argv[4], '+');
+    size_t later = tail == NULL ? chunk : (size_t)strtoul(tail + 1, NULL, 10);
+    if (chunk == 0 || chunk > 65536 || later == 0 || later > 65536) return 2;
     unsigned char buffer[65536];
     struct archive *a = archive_write_new();
     struct archive_entry *e = archive_entry_new();
@@ -29,6 +32,7 @@ int main(int argc, char **argv)
         size_t n = fread(buffer, 1, chunk, input);
         if (n == 0) break;
         if (archive_write_data(a, buffer, n) != (la_ssize_t)n) r = ARCHIVE_FATAL;
+        chunk = later;
     }
     if (r == ARCHIVE_OK && ferror(input)) r = ARCHIVE_FATAL;
     if (r == ARCHIVE_OK) r = archive_write_close(a);
