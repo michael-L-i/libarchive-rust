@@ -523,7 +523,7 @@ fn level_three_writes_multi_extent_records_from_a_declared_size() {
     while image[at] != 0 {
         let len = image[at] as usize;
         let record = &image[at..at + len];
-        if &record[33..33 + record[32] as usize] == b"HUGE;1" {
+        if &record[33..33 + record[32] as usize] == b"HUGE.;1" {
             records.push((le(&record[2..6]), le(&record[10..14]), record[25]));
         }
         at += len;
@@ -534,4 +534,145 @@ fn level_three_writes_multi_extent_records_from_a_declared_size() {
     assert_eq!(records[1].1, 6144);
     assert_eq!(records[1].2, 0);
     assert_eq!(records[1].0 - records[0].0, 2097151);
+}
+
+fn random_bytes(size: usize) -> Vec<u8> {
+    let mut state = 0x12345678u32;
+    (0..size)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect()
+}
+
+fn read_file(image: Vec<u8>, path: &[u8]) -> Vec<u8> {
+    let mut reader = crate::ArchiveRead::new();
+    assert_eq!(reader.support_format_all(), crate::Status::Ok);
+    assert_eq!(reader.open_memory(image), crate::Status::Ok);
+    while reader.next_header() == crate::Status::Ok {
+        if reader.entry().pathname() != Some(path) {
+            continue;
+        }
+        let mut data = Vec::new();
+        let mut block = [0; 65536];
+        loop {
+            match reader.data(&mut block) {
+                Ok(0) => return data,
+                Ok(n) => data.extend_from_slice(&block[..n]),
+                Err(status) => panic!("{status:?}: {:?}", reader.error_string()),
+            }
+        }
+    }
+    panic!("file missing");
+}
+
+#[test]
+fn incompressible_zisofs_streams_and_large_buffered_tails_round_trip() {
+    for size in [32768, 131072, 300001] {
+        let data = random_bytes(size);
+        let mut iso = Iso::new(&[("zisofs", Some("1"))]);
+        assert_eq!(iso.add("f", file(), &data), ARCHIVE_OK);
+        assert_eq!(iso.close().0, ARCHIVE_OK);
+        assert_eq!(read_file(iso.out.borrow().clone(), b"f"), data);
+    }
+}
+
+#[test]
+fn a_split_zero_block_followed_by_data_keeps_the_next_output_position() {
+    let mut data = vec![0; 32768];
+    data.extend(random_bytes(32768));
+    let mut iso = Iso::new(&[("zisofs", Some("1"))]);
+    let mut entry = Entry::new(None);
+    entry.set_pathname(b"f");
+    entry.set_mode(file() as _);
+    entry.set_size(data.len() as i64);
+    assert_eq!(iso.writer.header(&iso.base, &mut entry), ARCHIVE_OK);
+    assert_eq!(iso.writer.data(&iso.base, &data[..1000]), 1000);
+    assert_eq!(
+        iso.writer.data(&iso.base, &data[1000..]),
+        (data.len() - 1000) as isize
+    );
+    assert_eq!(iso.close().0, ARCHIVE_OK);
+    assert_eq!(read_file(iso.out.borrow().clone(), b"f"), data);
+}
+
+fn precompressed_zisofs(data: &[u8]) -> Vec<u8> {
+    let blocks = data.len().div_ceil(32768);
+    let mut result = vec![0; 16 + 4 * (blocks + 1)];
+    result[..8].copy_from_slice(&[0x37, 0xE4, 0x53, 0x96, 0xC9, 0xDB, 0xD6, 0x07]);
+    result[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    result[12] = 4;
+    result[13] = 15;
+    for (i, block) in data.chunks(32768).enumerate() {
+        let offset = result.len() as u32;
+        result[16 + i * 4..20 + i * 4].copy_from_slice(&offset.to_le_bytes());
+        if block.iter().any(|&b| b != 0) {
+            result.extend(miniz_oxide::deflate::compress_to_vec_zlib(block, 6));
+        }
+    }
+    let offset = result.len() as u32;
+    result[16 + blocks * 4..20 + blocks * 4].copy_from_slice(&offset.to_le_bytes());
+    result
+}
+
+#[test]
+fn precompressed_zisofs_headers_survive_whole_and_split_detection() {
+    let data = random_bytes(70000);
+    let encoded = precompressed_zisofs(&data);
+    for chunk in [encoded.len(), 16] {
+        let mut iso = Iso::new(&[("zisofs", Some("1"))]);
+        let mut entry = Entry::new(None);
+        entry.set_pathname(b"f");
+        entry.set_mode(file() as _);
+        entry.set_size(encoded.len() as i64);
+        assert_eq!(iso.writer.header(&iso.base, &mut entry), ARCHIVE_OK);
+        for part in encoded.chunks(chunk) {
+            assert_eq!(iso.writer.data(&iso.base, part), part.len() as isize);
+        }
+        assert_eq!(iso.close().0, ARCHIVE_OK);
+        assert_eq!(read_file(iso.out.borrow().clone(), b"f"), data);
+    }
+}
+
+#[test]
+fn zisofs_boot_images_decode_multiple_blocks_and_trailing_holes() {
+    for data in [random_bytes(70000), vec![b'x'; 70000], vec![0; 70000]] {
+        let encoded = precompressed_zisofs(&data);
+        let mut iso = Iso::new(&[("zisofs", Some("1")), ("boot", Some("boot.img"))]);
+        assert_eq!(iso.add("boot.img", file(), &encoded), ARCHIVE_OK);
+        assert_eq!(iso.close().0, ARCHIVE_OK);
+        assert_eq!(read_file(iso.out.borrow().clone(), b"boot.img"), data);
+    }
+}
+
+#[test]
+fn a_short_prefix_is_preserved_and_declared_data_is_zero_filled() {
+    let mut iso = Iso::new(&[("zisofs", Some("1"))]);
+    let mut entry = Entry::new(None);
+    entry.set_pathname(b"f");
+    entry.set_mode(file() as _);
+    entry.set_size(4096);
+    assert_eq!(iso.writer.header(&iso.base, &mut entry), ARCHIVE_OK);
+    assert_eq!(iso.writer.data(&iso.base, b"short prefix"), 12);
+    assert_eq!(iso.close().0, ARCHIVE_OK);
+    let mut expected = vec![0; 4096];
+    expected[..12].copy_from_slice(b"short prefix");
+    assert_eq!(read_file(iso.out.borrow().clone(), b"f"), expected);
+}
+
+#[test]
+fn extending_a_partly_filled_temp_buffer_counts_the_bytes_written() {
+    let mut format = Iso9660 {
+        temp: Some(crate::write::temp_file().unwrap()),
+        ..Iso9660::default()
+    };
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let mut sink = Collect(out);
+    format.write_null(&mut sink, 16).unwrap();
+    let offset = WB_BUFFMAX as i64 + 32;
+    format.wb_set_offset(&mut sink, offset).unwrap();
+    assert_eq!(format.wb_offset(), offset);
 }

@@ -1209,7 +1209,7 @@ impl Iso9660 {
             while ext_bytes >= self.wbuff_remaining as i64 {
                 let n = self.wbuff_remaining;
                 self.write_null(out, n)?;
-                ext_bytes -= self.wbuff_remaining as i64;
+                ext_bytes -= n as i64;
             }
             if ext_bytes > 0 {
                 self.write_null(out, ext_bytes as usize)?;

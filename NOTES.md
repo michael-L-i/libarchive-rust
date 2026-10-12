@@ -1974,10 +1974,10 @@ Still different:
   `idr`, `record`, `descriptor`, `boot` and `zisofs`. Linked lists are
   vectors of indices, except the path tables' `ptnext` chains, which
   deep-directory relocation shares between levels. Everything goes through
-  upstream's 64 KiB write buffer and an unlinked temporary file, so where
-  upstream misplaces bytes in that buffer, so does this.
-- Images match upstream's byte for byte, with the same messages and exit
-  codes, in the 3,493 cases of `../diagnostics/round14-iso9660` (every
+  upstream's 64 KiB write buffer and an unlinked temporary file, with the
+  output-corruption fixes described below.
+- Before the output-corruption fixes below, images matched upstream's byte
+  for byte, with the same messages and exit codes, in the 3,493 cases of `../diagnostics/round14-iso9660` (every
   option, every level, Joliet and Rock Ridge variants, zisofs, El Torito,
   deep trees, 3,000 random archives and an API probe): 3,459 on macOS, and
   3,457 on Linux (glibc 2.41, aarch64) against upstream built there. The
@@ -1989,18 +1989,16 @@ Still different:
 - Path tables are sorted the way upstream's `qsort` sorts them on each
   platform. Upstream's comparison only looks at the part of a directory
   name before its last dot, so `A.B` and `A.C` compare equal and their
-  order is whatever libc leaves: on Apple platforms that of Apple Libc's
-  unstable `qsort`, ported in `qsort.rs`; elsewhere that of a stable merge
-  sort, which glibc's `qsort` is (checked against upstream on glibc 2.41).
-  Other libcs (musl, the BSDs) may order such entries differently and are
-  not matched.
+  order is whatever libc leaves. A safe wrapper in `src/ffi/qsort.rs`
+  calls the platform's actual libc sort, carries its comparator with the
+  elements, and catches panics before they cross the C ABI. macOS and
+  glibc tie cases are checked against their respective upstream builds.
 - Sizes from entries use checked or wrapping arithmetic as upstream's
   types do; the block pointer table (up to 128 MiB for a 4 GiB file with
   128-byte zisofs blocks), path tables and resolver pools allocate
   fallibly. Unmaking a zisofs boot image streams through a 32 KiB buffer
-  as upstream does, so it needs no size cap; it inflates with miniz_oxide,
-  whose consumption can differ from zlib's only after output space runs
-  out, which upstream's dropped input (below) has already broken.
+  with bounded miniz_oxide output. It counts consumed input and expected
+  output per block, handles trailing holes and rejects truncated streams.
 
 Where upstream reads or writes through a null or wild pointer, this fails
 with `ARCHIVE_FATAL` (bsdtar exits 1 where upstream's dies of SIGSEGV):
@@ -2032,35 +2030,37 @@ a path component longer than NAME_MAX in an option's file name, which is
 not found here where upstream looks up an unset name and steps back a
 byte before the string.
 
-Upstream bugs ported as-is:
+Output-corruption bugs fixed with the user's approval (deliberate deviations):
 
-- zisofs truncates a block's zlib stream when its output doesn't fit the
-  write buffer: zisofs_write_to_temp() stops calling deflate() once the
-  input is consumed and then resets the stream. Incompressible blocks
-  usually hit it.
-- zisofs_finish_entry() moves back to the file's start to write its header
-  and block pointers. If that start has been flushed, the partial block
-  still buffered is dropped and the header lands on it, so the file's last
-  bytes are replaced. Files whose compressed data outgrows the buffer hit
-  it.
-- After an all-zero zisofs block moves the write position back,
-  deflate() keeps writing where the position was, so a later block in
-  the same call lands off by the bytes the zero block had produced (its
-  zlib header when its data came in more than one call).
-- A file holding an mkzftree image is detected after its zisofs header has
-  been reserved: its own header goes into the 'ZF' entry but its data
-  follows the zeros reserved for a new one, so readers reject it ("Illegal
-  zisofs file body"). Detected only once compression has begun (data in
-  pieces under 64 bytes), it keeps the compressed start and the rest
-  follows raw.
-- Unmaking a zisofs boot image hands each 32 KiB read to zisofs_extract()
-  once and drops what it leaves, so only single-block images survive;
-  others fail with "Can't read temporary file(0)" or "Illegal zisofs block
-  pointers(cannot seek)".
+- Keep calling deflate with `Z_FINISH` until stream end before resetting
+  each zisofs block. Upstream resets after consuming input even when the
+  compressor still holds the final bytes and trailer.
+- Patch a zisofs header directly in the flushed temporary file and in
+  buffered bytes, retaining the compressed tail. Upstream's backwards
+  buffer seek drops that tail once the file start has been flushed.
+- Refresh deflate's output slice after an all-zero block rewinds the
+  position. Upstream keeps a stale output pointer when the same call
+  continues into a nonzero block.
+- When detecting an existing mkzftree body, roll back the new header
+  reservation and any compression of its short prefix, then replay the
+  original prefix. Upstream leaves reserved zeros or a compressed prefix
+  ahead of the original body, which readers reject.
+- Decode every block of a zisofs boot image, retaining unread bytes from
+  each 32 KiB read and finishing trailing holes. Upstream drops unread
+  input after a single decoder call. Track expected output and reject
+  malformed block sizes and incomplete streams.
+- Count the bytes actually zero-filled when extending the temporary write
+  buffer. Upstream subtracts the *new* free capacity after a flush, so a
+  forward seek from a partly filled buffer can end short of its offset.
 
-  Together these corrupt zisofs files that upstream's own reader then
-  rejects ("zisofs decompression failed (-3)"); the reimplementation this
-  replaces wrote them correctly.
+`tests.rs` covers these transitions and exact decoded contents, including
+short prefixes. `scripts/test-iso-zisofs` drives whole and split public-API
+writes and verifies eight deterministic images using the independently
+built upstream reader. These images now extract their original bytes;
+affected images intentionally differ from upstream's corrupt output.
+
+Other upstream edge cases retained:
+
 - Relocation runs its second pass over level 8 on entries the first pass
   already relocated, so a tree deeper than 13 levels fails with "Unable to
   insert rr_moved entry"; so do two relocated directories of one name.
@@ -2098,8 +2098,9 @@ Upstream bugs ported as-is:
 - The hash key is computed from each string's three bytes instead of
   zlib's running ins_h; with hash_shift * MIN_MATCH >= hash_bits the keys
   are the same.
-- zisofs output is byte-identical to upstream's, including the blocks whose
-  zlib streams upstream truncates (see "ISO9660 writer").
+- The zisofs writer now finishes each zlib stream and fixes upstream's
+  corrupt output cases (see "ISO9660 writer"); the compressor itself
+  retains zlib's byte identity for equivalent calls.
 - Unchanged here: the gzip filter writes any original-filename, where
   upstream ignores one of 32K or more with a warning.
 
