@@ -669,9 +669,15 @@ impl WriteDisk {
         if a.state.get() == state::FATAL {
             return ARCHIVE_FATAL;
         }
-        let mut ret = self.finish_entry(a);
+        let ret = self.finish_entry(a);
+        // Upstream fixes up only what is still a directory, and ignores failures.
         while let Some((entry, mut target, options, mode)) = self.directories.pop() {
-            ret = ret.min(self.restore(a, &entry, &mut target, options, mode));
+            if target
+                .stat()
+                .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+            {
+                let _ = self.restore(a, &entry, &mut target, options, mode);
+            }
         }
         a.state.set(state::CLOSED);
         ret
@@ -966,6 +972,29 @@ mod tests {
         assert_eq!(*base.error_string().unwrap(), *expected);
         assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
         assert_eq!(std::fs::read(output.path()).unwrap(), b"data");
+    }
+
+    #[test]
+    fn close_skips_directories_that_are_gone_or_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        for replaced in [false, true] {
+            let output = Output::new();
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = WriteDisk::default();
+            disk.options = TIME;
+            directory(&output, &mut disk, &base, 0o700);
+            std::fs::remove_dir(output.path()).unwrap();
+            if replaced {
+                std::fs::write(output.path(), b"").unwrap();
+                std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+            assert_eq!(disk.close(&base), ARCHIVE_OK);
+            if replaced {
+                let metadata = std::fs::metadata(output.path()).unwrap();
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+            }
+        }
     }
 
     #[test]
