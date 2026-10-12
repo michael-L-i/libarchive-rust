@@ -1086,7 +1086,9 @@ mod tests {
             // Unwritable, as a deny-write ACL makes it: upstream unlinks it, never opens it.
             std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o444))
                 .unwrap();
-            let inode = std::fs::metadata(output.path()).unwrap().ino();
+            // A second link keeps the old inode from being reused for the new file.
+            let old = output.0.join("old");
+            std::fs::hard_link(output.path(), &old).unwrap();
             let base = Base::new(WRITE_DISK_MAGIC);
             let mut disk = WriteDisk::default();
             disk.options = options;
@@ -1094,7 +1096,11 @@ mod tests {
             assert_eq!(disk.data(&base, b"new"), 3);
             assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
             assert_eq!(std::fs::read(output.path()).unwrap(), b"new");
-            assert_ne!(std::fs::metadata(output.path()).unwrap().ino(), inode);
+            assert_eq!(std::fs::read(&old).unwrap(), b"old");
+            assert_ne!(
+                std::fs::metadata(output.path()).unwrap().ino(),
+                std::fs::metadata(&old).unwrap().ino()
+            );
         }
     }
 
@@ -1237,6 +1243,9 @@ mod tests {
     #[test]
     fn failed_parent_mkdir_names_the_directory() {
         use std::os::unix::fs::PermissionsExt;
+        if euid() == 0 {
+            return; // Permission bits don't stop root.
+        }
         let output = Output::new();
         let locked = output.0.join("locked");
         std::fs::create_dir(&locked).unwrap();
