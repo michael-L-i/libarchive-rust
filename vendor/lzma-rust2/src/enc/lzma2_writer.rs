@@ -438,6 +438,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_writes_and_flushes_do_not_initialize_nodes() {
+        for preset in [0, 2, 6] {
+            let mut options = Lzma2Options::with_preset(preset);
+            options.lzma_options.dict_size = 4096;
+            let mut writer = Lzma2Writer::new(Vec::new(), options);
+            assert_eq!(writer.write(&[]).unwrap(), 0);
+            writer.flush().unwrap();
+            writer.flush().unwrap();
+            assert!(writer.mf.son.is_empty());
+            assert_eq!(writer.mf.buffer.len(), 8);
+            assert_eq!(writer.finish().unwrap(), [0]);
+        }
+    }
+
+    #[test]
     fn partial_match_finder_initialization_preserves_streams() {
         let mut seed = 0x82f6_eab9u32;
         let data: Vec<u8> = (0..160_003)

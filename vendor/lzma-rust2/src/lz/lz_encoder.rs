@@ -340,3 +340,128 @@ pub(crate) fn memusage(o: &LzOptions) -> u64 {
     let sons = (u64::from(o.dict_size) + 1) * if o.match_finder == MfType::Bt4 { 2 } else { 1 };
     (hash + sons) * 4 + u64::from(buffer_size(o))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(kind: MfType, dict_size: u32) -> (Mf, Mf) {
+        let options = LzOptions {
+            before_size: 16,
+            dict_size,
+            after_size: 32,
+            match_len_max: 273,
+            nice_len: 32,
+            match_finder: kind,
+            depth: 0,
+            preset_dict: None,
+        };
+        let lazy = Mf::new(&options);
+        let mut full = Mf::new(&options);
+        full.buffer.resize(full.buffer.capacity(), 0);
+        full.son.resize(full.son.capacity(), 0);
+        (lazy, full)
+    }
+
+    fn same_state(lazy: &Mf, full: &Mf) {
+        assert_eq!(lazy.offset, full.offset);
+        assert_eq!(lazy.read_pos, full.read_pos);
+        assert_eq!(lazy.read_ahead, full.read_ahead);
+        assert_eq!(lazy.write_pos, full.write_pos);
+        assert_eq!(lazy.read_limit, full.read_limit);
+        assert_eq!(lazy.cyclic_pos, full.cyclic_pos);
+        assert_eq!(lazy.pending, full.pending);
+        assert_eq!(lazy.hash4_hint, full.hash4_hint);
+        assert_eq!(
+            (lazy.run.delta, lazy.run.start, lazy.run.len),
+            (full.run.delta, full.run.start, full.run.len)
+        );
+        assert_eq!(lazy.hash2, full.hash2);
+        assert_eq!(lazy.hash3, full.hash3);
+        assert_eq!(lazy.hash, full.hash);
+        assert_eq!(lazy.son, full.son[..lazy.son.len()]);
+        assert!(full.son[lazy.son.len()..].iter().all(|&v| v == 0));
+        let end = lazy.write_pos as usize + MEMCMPLEN_EXTRA as usize;
+        assert_eq!(lazy.buffer[..end], full.buffer[..end]);
+    }
+
+    fn drain(lazy: &mut Mf, full: &mut Mf) {
+        let mut a = [Match::default(); 273];
+        let mut b = a;
+        while lazy.read_pos < lazy.read_limit {
+            let found = lazy.find(&mut a);
+            assert_eq!(found, full.find(&mut b));
+            for (a, b) in a.iter().zip(&b).take(found.1 as usize) {
+                assert_eq!((a.len, a.dist), (b.len, b.dist));
+            }
+            let skip = (lazy.read_limit - lazy.read_pos).min(7);
+            lazy.skip(skip);
+            full.skip(skip);
+            lazy.read_ahead = 0;
+            full.read_ahead = 0;
+        }
+        same_state(lazy, full);
+    }
+
+    #[test]
+    fn partial_nodes_preserve_matches_through_window_moves_and_ring_wraps() {
+        let data: Vec<u8> = (0..600_003)
+            .map(|i| ((i % 251) ^ ((i / 997) % 17)) as u8)
+            .collect();
+        for kind in [MfType::Hc3, MfType::Hc4, MfType::Bt4] {
+            let (mut lazy, mut full) = pair(kind, 4096);
+            let capacities = (lazy.buffer.capacity(), lazy.son.capacity());
+            let mut wrapped = false;
+            let mut pending = false;
+            let mut pos = 0;
+            while pos < data.len() {
+                let part = &data[pos..data.len().min(pos + 4093)];
+                let used = lazy.fill_window(part, Action::Run);
+                assert_eq!(used, full.fill_window(part, Action::Run));
+                assert!(used > 0);
+                pos += used;
+                let cyclic = lazy.cyclic_pos;
+                drain(&mut lazy, &mut full);
+                wrapped |= lazy.cyclic_pos < cyclic;
+                lazy.fill_window(&[], Action::SyncFlush);
+                full.fill_window(&[], Action::SyncFlush);
+                drain(&mut lazy, &mut full);
+                pending |= lazy.pending > 0;
+                lazy.action = Action::Run;
+                full.action = Action::Run;
+            }
+            assert!(lazy.offset > lazy.cyclic_size);
+            assert!(wrapped && pending);
+            assert_eq!(capacities, (lazy.buffer.capacity(), lazy.son.capacity()));
+        }
+    }
+
+    #[test]
+    fn partial_nodes_normalize_with_pending_bytes_and_empty_fills() {
+        let data: Vec<u8> = (0..601).map(|i| (i % 17) as u8).collect();
+        for kind in [MfType::Hc3, MfType::Hc4, MfType::Bt4] {
+            let (mut lazy, mut full) = pair(kind, 65536);
+            assert!(lazy.buffer.is_empty() && lazy.son.is_empty());
+            lazy.offset = u32::MAX - 257;
+            full.offset = lazy.offset;
+            for action in [Action::Run, Action::SyncFlush, Action::Finish] {
+                assert_eq!(lazy.fill_window(&[], action), 0);
+                assert_eq!(full.fill_window(&[], action), 0);
+                same_state(&lazy, &full);
+            }
+            for part in data.chunks(127) {
+                lazy.action = Action::Run;
+                full.action = Action::Run;
+                assert_eq!(
+                    lazy.fill_window(part, Action::SyncFlush),
+                    full.fill_window(part, Action::SyncFlush)
+                );
+                drain(&mut lazy, &mut full);
+                assert!(lazy.pending > 0);
+            }
+            assert!(lazy.offset < lazy.cyclic_size);
+            assert!(lazy.son.len() < full.son.len());
+            assert_eq!(lazy.buffer.len(), data.len() + MEMCMPLEN_EXTRA as usize);
+        }
+    }
+}
