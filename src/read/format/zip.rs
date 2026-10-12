@@ -1128,6 +1128,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
         r.consume(to_consume)?;
         self.entry_bytes_remaining -= to_consume as i64;
         self.entry_compressed_bytes_read += to_consume as i64;
+        r.decoded(written)?;
         self.entry_uncompressed_bytes_read += written as i64;
 
         if self.end_of_entry
@@ -2021,6 +2022,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
             // We're done with the regular data; get the filename and extra
             // data.
             r.consume(46)?;
+            let budget = r.budget;
             let p = match r.read_ahead(filename_length + extra_length) {
                 Ok(Some(p)) => p,
                 _ => return Err(truncated_header()),
@@ -2039,6 +2041,12 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
                 ..e
             })?;
 
+            budget.check_entries(
+                self.zip_entries
+                    .len()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::fatal(libc::ENOMEM, "No memory for ZIP entries"))?,
+            )?;
             if self.zip_entries.try_reserve(1).is_err() {
                 return Err(Error::fatal(libc::ENOMEM, "Can't allocate zip entry"));
             }

@@ -208,7 +208,7 @@ impl Format for Mtree {
                 }
             }
             if !me.used {
-                let (status, use_next) = self.parse_file(a, entry, idx);
+                let (status, use_next) = self.parse_file(a, entry, idx)?;
                 if !use_next {
                     return Ok(status);
                 }
@@ -236,6 +236,7 @@ impl Format for Mtree {
                 return Ok(Data::Warn { offset: 0 });
             }
         };
+        r.decoded(bytes_read)?;
         if bytes_read == 0 {
             return Ok(Data::Eof { offset });
         }
@@ -665,6 +666,47 @@ fn detect_form(r: &mut Reader<'_>) -> (c_int, bool) {
     (0, false)
 }
 
+fn mtree_no_memory() -> Error {
+    Error::fatal(libc::ENOMEM, "No memory for mtree metadata")
+}
+
+fn try_bytes(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| mtree_no_memory())?;
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+fn try_parse_escapes(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| mtree_no_memory())?;
+    parse_escapes_into(until_nul(bytes), &mut out);
+    Ok(out)
+}
+
+fn mutable_global<'a>(
+    r: &Reader<'_>,
+    global: &'a mut Rc<Vec<Vec<u8>>>,
+) -> Result<&'a mut Vec<Vec<u8>>, Error> {
+    if Rc::strong_count(global) > 1 {
+        let size = global
+            .iter()
+            .try_fold(0usize, |n, token| n.checked_add(token.len()))
+            .ok_or_else(mtree_no_memory)?;
+        r.metadata(size)?;
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(global.len())
+            .map_err(|_| mtree_no_memory())?;
+        for token in global.iter() {
+            copy.push(try_bytes(token)?);
+        }
+        *global = Rc::new(copy);
+    }
+    Rc::get_mut(global).ok_or_else(mtree_no_memory)
+}
+
 /// Adds `token` (`keyword` or `keyword=value`) to `options`, replacing the
 /// option of the same keyword.
 fn set_option<T: AsRef<[u8]>>(options: &mut Vec<T>, token: T) {
@@ -707,6 +749,11 @@ fn tokens(line: &[u8], start: usize, end: usize) -> impl Iterator<Item = &[u8]> 
 fn parse_escapes(src: &[u8]) -> Vec<u8> {
     let src = until_nul(src);
     let mut dest = Vec::with_capacity(src.len());
+    parse_escapes_into(src, &mut dest);
+    dest
+}
+
+fn parse_escapes_into(src: &[u8], dest: &mut Vec<u8>) {
     let octal = |c: u8| (b'0'..=b'7').contains(&c);
     let mut i = 0;
 
@@ -746,7 +793,6 @@ fn parse_escapes(src: &[u8]) -> Vec<u8> {
     }
     // The result is a C string.
     dest.truncate(dest.iter().position(|&c| c == 0).unwrap_or(dest.len()));
-    dest
 }
 
 /// Parse a hex digit. Note that this implementation does not (and should
@@ -1033,7 +1079,21 @@ impl Mtree {
     /// changes the global defaults and if it does, it is processed accordingly.
     /// Otherwise, the options of the line are merged with the current
     /// global options.
-    fn process_add_entry(&mut self, global: &Rc<Vec<Vec<u8>>>, line: &[u8], is_form_d: bool) {
+    fn process_add_entry(
+        &mut self,
+        r: &Reader<'_>,
+        global: &Rc<Vec<Vec<u8>>>,
+        line: &[u8],
+        is_form_d: bool,
+    ) -> Result<(), Error> {
+        r.check_entries(
+            self.entries
+                .len()
+                .checked_add(1)
+                .ok_or_else(mtree_no_memory)?,
+        )?;
+        r.metadata(std::mem::size_of::<MtreeEntry>())?;
+        self.entries.try_reserve(1).map_err(|_| mtree_no_memory())?;
         let (name, start, end) = if is_form_d {
             // Filename is last item on line.
             // Trim trailing whitespace.
@@ -1061,22 +1121,33 @@ impl Mtree {
         let full = raw_name == b"." || raw_name.contains(&b'/');
         let idx = self.entries.len();
         let mut entry = MtreeEntry {
-            name: parse_escapes(name),
+            name: try_parse_escapes(name)?,
             global: Rc::clone(global),
             own: Vec::new(),
             full,
             used: false,
         };
         if full {
-            self.by_name
-                .entry(entry.name.clone())
-                .or_default()
-                .push(idx);
+            self.by_name.try_reserve(1).map_err(|_| mtree_no_memory())?;
+            r.metadata(
+                entry
+                    .name
+                    .len()
+                    .checked_add(std::mem::size_of::<usize>())
+                    .ok_or_else(mtree_no_memory)?,
+            )?;
+            let key = try_bytes(&entry.name)?;
+            let indexes = self.by_name.entry(key).or_default();
+            indexes.try_reserve(1).map_err(|_| mtree_no_memory())?;
+            indexes.push(idx);
         }
         for token in tokens(line, start, end) {
-            set_option(&mut entry.own, token.to_vec());
+            r.metadata(std::mem::size_of::<Vec<u8>>())?;
+            entry.own.try_reserve(1).map_err(|_| mtree_no_memory())?;
+            set_option(&mut entry.own, try_bytes(token)?);
         }
         self.entries.push(entry);
+        Ok(())
     }
 
     fn read_mtree(&mut self, r: &mut Reader<'_>) -> Result<(), Error> {
@@ -1113,13 +1184,16 @@ impl Mtree {
             }
             let text = until_nul(p);
             if at(p, 0) != b'/' {
-                self.process_add_entry(&global, p, is_form_d);
+                self.process_add_entry(r, &global, p, is_form_d)?;
             } else if p.len() > 4 && p.starts_with(b"/set") {
                 if !matches!(at(p, 4), b' ' | b'\t') {
                     break;
                 }
                 for token in tokens(text, 4, text.len()) {
-                    set_option(Rc::make_mut(&mut global), token.to_vec());
+                    r.metadata(std::mem::size_of::<Vec<u8>>())?;
+                    let options = mutable_global(r, &mut global)?;
+                    options.try_reserve(1).map_err(|_| mtree_no_memory())?;
+                    set_option(options, try_bytes(token)?);
                 }
             } else if p.len() > 6 && p.starts_with(b"/unset") {
                 if !matches!(at(p, 6), b' ' | b'\t') {
@@ -1136,7 +1210,7 @@ impl Mtree {
                     if token == b"all" {
                         global = Rc::default();
                     } else {
-                        remove_option(Rc::make_mut(&mut global), token);
+                        remove_option(mutable_global(r, &mut global)?, token);
                     }
                 }
             } else {
@@ -1165,8 +1239,13 @@ impl Mtree {
         // Accumulate line in a line buffer.
         loop {
             // Read some more.
-            let Ok(Some(t)) = r.read_ahead(1) else {
-                return Ok(0);
+            let budget = r.budget;
+            let t = match r.read_ahead(1) {
+                Ok(Some(t)) => t,
+                _ => {
+                    budget.check()?;
+                    return Ok(0);
+                }
             };
             let nl = t.iter().position(|&c| c == b'\n');
             // If we found '\n', trim the read to end exactly there.
@@ -1178,8 +1257,11 @@ impl Mtree {
             {
                 return Err(Error::fatal(ARCHIVE_ERRNO_FILE_FORMAT, "Line too long"));
             }
+            budget.check_metadata(bytes_read)?;
             // Append new bytes to string.
             line.truncate(total_size);
+            line.try_reserve(bytes_read)
+                .map_err(|_| mtree_no_memory())?;
             line.extend_from_slice(t.get(..bytes_read).unwrap_or_default());
             r.consume(bytes_read)?;
             total_size += bytes_read;
@@ -1233,16 +1315,31 @@ impl Mtree {
     }
 
     /// Each line contains a sequence of keywords.
-    fn parse_line(&mut self, a: &Base, entry: &mut Entry, idx: usize, kws: &mut u32) -> Status {
+    fn parse_line(
+        &mut self,
+        a: &Base,
+        entry: &mut Entry,
+        idx: usize,
+        kws: &mut u32,
+    ) -> Result<Status, Error> {
         let Some(mp) = self.entries.get(idx) else {
-            return Status::Ok;
+            return Ok(Status::Ok);
         };
         let mut r = Status::Ok;
         // An entry starts with the global options, each added to the front
         // of its list, which reverses their order. Its own options follow,
         // each replacing an option of the same keyword. Parsing goes from
         // the front of the list, which is the end here.
-        let mut options: Vec<&[u8]> = mp.global.iter().rev().map(|o| o.as_slice()).collect();
+        let mut options: Vec<&[u8]> = Vec::new();
+        let count = mp
+            .global
+            .len()
+            .checked_add(mp.own.len())
+            .ok_or_else(mtree_no_memory)?;
+        options
+            .try_reserve_exact(count)
+            .map_err(|_| mtree_no_memory())?;
+        options.extend(mp.global.iter().rev().map(|o| o.as_slice()));
         for token in &mp.own {
             set_option(&mut options, token);
         }
@@ -1252,24 +1349,29 @@ impl Mtree {
             }
         }
         if r == Status::Ok && *kws & HAS_TYPE == 0 {
-            return a.warn(
+            return Ok(a.warn(
                 ARCHIVE_ERRNO_FILE_FORMAT,
                 "Missing type keyword in mtree specification",
-            );
+            ));
         }
-        r
+        Ok(r)
     }
 
     /// A single file can have multiple lines contribute specifications.
     /// Parse as many lines as necessary, then pull additional information
     /// from a backing file on disk as necessary. The flag says to go on to
     /// the next entry instead of returning this one.
-    fn parse_file(&mut self, a: &Base, entry: &mut Entry, idx: usize) -> (Status, bool) {
+    fn parse_file(
+        &mut self,
+        a: &Base,
+        entry: &mut Entry,
+        idx: usize,
+    ) -> Result<(Status, bool), Error> {
         let Some(mentry) = self.entries.get_mut(idx) else {
-            return (Status::Ok, false);
+            return Ok((Status::Ok, false));
         };
         mentry.used = true;
-        let (full, name) = (mentry.full, mentry.name.clone());
+        let (full, name) = (mentry.full, try_bytes(&mentry.name)?);
 
         // Initialize reasonable defaults.
         entry.set_filetype(u32::from(AE_IFREG));
@@ -1278,7 +1380,7 @@ impl Mtree {
 
         // Parse options from this line.
         let mut parsed_kws = 0;
-        let mut r = self.parse_line(a, entry, idx, &mut parsed_kws);
+        let mut r = self.parse_line(a, entry, idx, &mut parsed_kws)?;
 
         if full {
             entry.set_pathname(&name);
@@ -1290,7 +1392,13 @@ impl Mtree {
             // "relative" and "full" entries would require dealing
             // with pathname canonicalization, which is a very
             // tricky subject.)
-            for mp in self.by_name.get(&name).cloned().unwrap_or_default() {
+            let indexes = self.by_name.get(&name).map_or(&[][..], Vec::as_slice);
+            let mut matching = Vec::new();
+            matching
+                .try_reserve_exact(indexes.len())
+                .map_err(|_| mtree_no_memory())?;
+            matching.extend_from_slice(indexes);
+            for mp in matching {
                 let Some(m) = self.entries.get_mut(mp) else {
                     continue;
                 };
@@ -1299,7 +1407,7 @@ impl Mtree {
                 }
                 // Later lines override earlier ones.
                 m.used = true;
-                if self.parse_line(a, entry, mp, &mut parsed_kws) == Status::Warn {
+                if self.parse_line(a, entry, mp, &mut parsed_kws)? == Status::Warn {
                     r = Status::Warn;
                 }
             }
@@ -1308,6 +1416,9 @@ impl Mtree {
             // the full path and possibly update the
             // current directory.
             let n = self.current_dir.len();
+            self.current_dir
+                .try_reserve(name.len().checked_add(1).ok_or_else(mtree_no_memory)?)
+                .map_err(|_| mtree_no_memory())?;
             if n > 0 {
                 self.current_dir.push(b'/');
             }
@@ -1376,7 +1487,7 @@ impl Mtree {
                 if parsed_kws & HAS_OPTIONAL != 0 {
                     // It's not an error for an optional
                     // entry to not match disk.
-                    return (r, true);
+                    return Ok((r, true));
                 }
                 if r == Status::Ok {
                     let pathname = entry.pathname().map(|p| p.to_bytes().to_vec());
@@ -1388,7 +1499,7 @@ impl Mtree {
                         ]),
                     );
                 }
-                return (r, false);
+                return Ok((r, false));
             }
 
             // If there is a contents file on disk, pick some of the
@@ -1434,13 +1545,13 @@ impl Mtree {
                 // Couldn't open the entry, stat it or the on-disk type
                 // didn't match.  If this entry is optional, just
                 // ignore it and read the next header entry.
-                return (Status::Ok, true);
+                return Ok((Status::Ok, true));
             }
         }
 
         self.cur_size = entry.size();
         self.offset = 0;
 
-        (r, false)
+        Ok((r, false))
     }
 }

@@ -38,6 +38,7 @@ pub use crate::matching::{
     CTIME as ARCHIVE_MATCH_CTIME, EQUAL as ARCHIVE_MATCH_EQUAL, MTIME as ARCHIVE_MATCH_MTIME,
     NEWER as ARCHIVE_MATCH_NEWER, OLDER as ARCHIVE_MATCH_OLDER,
 };
+pub use crate::read::ReadLimits;
 pub use entry::{ArchiveEntry, ArchiveEntryLinkresolver};
 pub use matching::ArchiveMatch;
 pub use read::ArchiveRead;

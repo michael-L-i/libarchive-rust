@@ -114,8 +114,11 @@ impl FilterBidder for Bidder {
         }
     }
 
-    fn init(&mut self, _up: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error> {
-        Ok(Box::new(Xz::new(self.0)))
+    fn init(&mut self, up: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error> {
+        Ok(Box::new(Xz::new(
+            self.0,
+            up.decoder_memory(u64::from(MEM_LIMIT_KIB) * 1024),
+        )))
     }
 }
 
@@ -270,14 +273,15 @@ struct Xz {
 
 impl Xz {
     /// Sets up bounded decoders for xz and lzma.
-    fn new(kind: Kind) -> Self {
+    fn new(kind: Kind, mem_limit: u64) -> Self {
+        let mem_limit_kib = u32::try_from(mem_limit / 1024).unwrap_or(MEM_LIMIT_KIB);
         let stream = match kind {
             Kind::Xz => Some(Stream::Xz(Box::new(XzStream::new_mem_limit(
                 true,
-                MEM_LIMIT_KIB,
+                mem_limit_kib,
             )))),
             Kind::Lzma => Some(Stream::Lzma(Box::new(LzmaStream::new_mem_limit(
-                MEM_LIMIT_KIB,
+                mem_limit_kib,
                 None,
             )))),
             Kind::Lzip => None,
@@ -331,7 +335,7 @@ impl Xz {
             dicsize -= (dicsize / 16) * u32::from(log2dic >> 5);
         }
 
-        if u64::from(dicsize) > u64::from(MEM_LIMIT_KIB) * 1024 {
+        if u64::from(dicsize) > up.decoder_memory(u64::from(MEM_LIMIT_KIB) * 1024) {
             return Err(Error::fatal(
                 libc::ENOMEM,
                 "Lzma library error: Out of memory",

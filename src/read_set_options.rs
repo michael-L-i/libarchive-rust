@@ -43,6 +43,9 @@ impl Read {
         o: &[u8],
         v: Option<&[u8]>,
     ) -> c_int {
+        if m == Some(b"limits") {
+            return self.resource_option(a, o, v);
+        }
         let (mut rv, mut matched_modules) = (ARCHIVE_WARN, 0);
 
         for i in 0..self.formats.len() {

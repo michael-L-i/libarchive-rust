@@ -571,6 +571,17 @@ impl ArchiveRead {
         Status::from_code(self.a.h.read_open_fd(raw, block_size))
     }
 
+    /// Sets opt-in processing budgets before opening the archive.
+    /// See [`crate::ReadLimits`] for accounting and decoder coverage.
+    pub fn set_limits(&mut self, limits: read::ReadLimits) -> Status {
+        Status::from_code(self.h.read_checked(
+            "archive_read_set_limits",
+            state::NEW,
+            ARCHIVE_FATAL,
+            |r, a| r.set_limits(a, limits),
+        ))
+    }
+
     /// `archive_read_open_memory`: reads the archive in `data`.
     pub fn open_memory(&mut self, data: impl AsRef<[u8]> + 'static) -> Status {
         let size = data.as_ref().len();
@@ -690,6 +701,9 @@ impl DerefMut for ArchiveRead {
         &mut self.a
     }
 }
+
+#[cfg(test)]
+mod resource_tests;
 
 #[cfg(test)]
 mod tests {

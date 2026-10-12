@@ -670,6 +670,9 @@ fn read_bytes_to_string(
         return ARCHIVE_FATAL;
     }
 
+    if let Err(e) = r.budget.check_metadata(size) {
+        return a.raise(e);
+    }
     // Read the body into the string.
     let Some(src) = ahead(r, size).and_then(|s| s.get(..size)) else {
         *unconsumed = 0;
@@ -681,6 +684,9 @@ fn read_bytes_to_string(
         );
     };
     out.clear();
+    if out.try_reserve_exact(size).is_err() {
+        return fail(a, libc::ENOMEM, "No memory for tar metadata", ARCHIVE_FATAL);
+    }
     out.extend_from_slice(src);
     *unconsumed += size as i64;
     ARCHIVE_OK
