@@ -1966,6 +1966,10 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   asks about the directory too.
 - FIEMAP extents are read until the last one, as upstream; a map that
   doesn't move on stops rather than repeat forever.
+- Kept, stricter than upstream: FS_IOC_GETFLAGS (and so FS_IOC_SETFLAGS)
+  goes only to a descriptor fstat shows is a regular file or directory.
+  Upstream opens a name it stat'ed as one, and a device swapped in between
+  would get the ioctl in its driver; here that fails with ENOTTY.
 - The umask is read from /proc/self/status, as upstream's
   __archive_get_umask does in a threaded process, rather than set and
   restored, which other threads creating files could see.

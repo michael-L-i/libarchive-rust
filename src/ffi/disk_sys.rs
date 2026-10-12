@@ -229,9 +229,18 @@ pub const FS_NODUMP_FL: u32 = 0x40;
 #[cfg(target_os = "linux")]
 pub const FS_JOURNAL_DATA_FL: u32 = 0x4000;
 
-/// FS_IOC_GETFLAGS: the inode flags of what `fd` is open on.
+/// FS_IOC_GETFLAGS: the inode flags of the regular file or directory
+/// `fd` is open on. Anything else that a race put under a name opened for
+/// its flags gets no ioctl, which a device's driver would take, and fails
+/// with ENOTTY, as a file without flags does.
 #[cfg(target_os = "linux")]
 pub fn get_flags(fd: libc::c_int) -> std::io::Result<u32> {
+    let mut st = super::entry::zeroed_stat();
+    // SAFETY: writable stat; a descriptor that isn't open only fails.
+    result(unsafe { libc::fstat(fd, &mut st) })?;
+    if ![libc::S_IFREG, libc::S_IFDIR].contains(&(st.st_mode & libc::S_IFMT)) {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTTY));
+    }
     let mut flags: libc::c_int = 0;
     // SAFETY: the ioctl writes one int, to `flags`, which outlives the
     // call; a descriptor that isn't open only fails.
