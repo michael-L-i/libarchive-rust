@@ -221,7 +221,10 @@ impl Mf {
             .copy_within(move_offset as usize..(move_offset + move_size) as usize, 0);
         self.offset = self.offset.wrapping_add(move_offset);
         self.read_pos -= move_offset;
-        self.read_limit -= move_offset;
+        // read_limit can be below the offset (a preset dictionary leaves it
+        // at 0); liblzma's unsigned subtraction wraps, and fill_window sets
+        // it again before it is read.
+        self.read_limit = self.read_limit.wrapping_sub(move_offset);
         self.write_pos -= move_offset;
     }
 
