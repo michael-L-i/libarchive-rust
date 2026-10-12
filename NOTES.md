@@ -2001,9 +2001,6 @@ Still different:
   as upstream does, so it needs no size cap; it inflates with miniz_oxide,
   whose consumption can differ from zlib's only after output space runs
   out, which upstream's dropped input (below) has already broken.
-- The boot information table's size field is 32 bits; a larger boot image
-  is rejected ("Boot image size exceeds its information table") where
-  upstream truncates the size.
 
 Where upstream reads or writes through a null or wild pointer, this fails
 with `ARCHIVE_FATAL` (bsdtar exits 1 where upstream's dies of SIGSEGV):
