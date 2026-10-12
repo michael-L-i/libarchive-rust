@@ -23,6 +23,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::rc::Rc;
 
 /// An `archive_write_set_format_X` function: the name its state check
 /// reports, and the format it sets.
@@ -192,6 +193,36 @@ impl Sink for FileSink {
         self.0
             .write_all(data)
             .map_err(|e| Error::fatal(e.raw_os_error().unwrap_or(libc::EIO), "Write error"))
+    }
+}
+
+struct MemorySink {
+    output: Rc<RefCell<Vec<u8>>>,
+    max_size: usize,
+}
+
+impl Sink for MemorySink {
+    fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        let mut output = self
+            .output
+            .try_borrow_mut()
+            .map_err(|_| Error::fatal(libc::EBUSY, "Memory output buffer is borrowed"))?;
+        if data.len() > self.max_size.saturating_sub(output.len()) || output.len() > self.max_size {
+            return Err(Error::fatal(libc::ENOMEM, "Buffer exhausted"));
+        }
+        let needed = output.len() + data.len();
+        if needed > output.capacity() {
+            let capacity = needed
+                .max(output.capacity().saturating_mul(2))
+                .max(64)
+                .min(self.max_size);
+            let additional = capacity - output.len();
+            output
+                .try_reserve_exact(additional)
+                .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate memory output buffer"))?;
+        }
+        output.extend_from_slice(data);
+        Ok(())
     }
 }
 
@@ -507,6 +538,29 @@ impl Handle {
             w.open(a, Box::new(FileSink(file)))
         })
     }
+
+    pub(crate) fn write_open_memory(&self, output: Rc<RefCell<Vec<u8>>>, max_size: usize) -> c_int {
+        self.write_checked(
+            "archive_write_open_memory",
+            state::NEW,
+            ARCHIVE_FATAL,
+            |a, w| {
+                match output.try_borrow_mut() {
+                    Ok(mut data) => data.clear(),
+                    Err(_) => {
+                        return a.raise(Error::fatal(
+                            libc::EBUSY,
+                            "Memory output buffer is borrowed",
+                        ));
+                    }
+                }
+                if w.bytes_in_last_block < 0 {
+                    w.bytes_in_last_block = 1;
+                }
+                w.open(a, Box::new(MemorySink { output, max_size }))
+            },
+        )
+    }
 }
 
 /// `archive_write_new`.
@@ -725,6 +779,18 @@ impl ArchiveWrite {
         Status::from_code(self.a.h.write_open_filename(name))
     }
 
+    /// Writes into an owned, shared memory buffer, clearing its previous bytes.
+    /// The writer keeps the buffer alive until it is dropped. Call `close` and
+    /// check its status before using the completed archive.
+    ///
+    /// At most `max_size` output bytes are retained by the sink; this does not
+    /// limit format or filter working memory. Exhaustion returns `Fatal` with
+    /// `ENOMEM`. Do not modify the buffer or hold a borrow while the writer is
+    /// active; a conflicting borrow returns `Fatal` with `EBUSY`.
+    pub fn open_memory(&mut self, output: Rc<RefCell<Vec<u8>>>, max_size: usize) -> Status {
+        Status::from_code(self.a.h.write_open_memory(output, max_size))
+    }
+
     /// `archive_write_header`.
     pub fn header(&mut self, entry: &mut ArchiveEntry) -> Status {
         Status::from_code(self.a.h.write_header(&mut entry.0))
@@ -789,6 +855,154 @@ mod tests {
         e.set_size(data.len() as i64);
         assert_eq!(a.header(&mut e), Status::Ok);
         assert_eq!(a.data(data), Ok(data.len()));
+    }
+
+    #[test]
+    fn memory_tar_and_zip_round_trip() {
+        for format in [b"ustar".as_slice(), b"zip"] {
+            let output = Rc::new(RefCell::new(vec![0xff; 32]));
+            let mut a = ArchiveWrite::new();
+            assert_eq!(a.set_format_by_name(format), Status::Ok);
+            assert_eq!(a.open_memory(output.clone(), 64 * 1024), Status::Ok);
+            assert!(output.borrow().is_empty());
+
+            let files = [
+                (b"empty".as_slice(), b"".as_slice()),
+                (b"message.txt", b"hello from a memory archive\n"),
+                (b"binary", b"\0\xff\x01\x80\n\0"),
+            ];
+            for (name, data) in files {
+                let mut e = ArchiveEntry::new();
+                e.set_pathname(Some(name));
+                e.set_mode(AE_IFREG | 0o644);
+                e.set_size(data.len() as i64);
+                assert_eq!(a.header(&mut e), Status::Ok);
+                for chunk in data.chunks(3) {
+                    assert_eq!(a.data(chunk), Ok(chunk.len()));
+                }
+                assert_eq!(a.finish_entry(), Status::Ok);
+            }
+            assert_eq!(a.close(), Status::Ok);
+            assert_eq!(a.close(), Status::Ok);
+            let bytes = output.borrow().clone();
+            assert!(!bytes.is_empty());
+            assert_eq!(a.open_memory(output.clone(), 64 * 1024), Status::Fatal);
+            assert_eq!(*output.borrow(), bytes);
+            drop(a);
+
+            let mut r = ArchiveRead::new();
+            assert_eq!(r.support_format_all(), Status::Ok);
+            assert_eq!(r.open_memory(bytes), Status::Ok);
+            for (name, data) in files {
+                assert_eq!(r.next_header(), Status::Ok);
+                assert_eq!(r.entry().pathname(), Some(name));
+                assert_eq!(r.entry().size(), data.len() as i64);
+                let mut recovered = Vec::new();
+                let mut chunk = [0; 2];
+                loop {
+                    let n = r.data(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    recovered.extend_from_slice(&chunk[..n]);
+                }
+                assert_eq!(recovered, data);
+            }
+            assert_eq!(r.next_header(), Status::Eof);
+            assert_eq!(r.close(), Status::Ok);
+        }
+    }
+
+    #[test]
+    fn memory_output_small_writes_grow_geometrically_within_limit() {
+        let max_size = 8193;
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = MemorySink {
+            output: output.clone(),
+            max_size,
+        };
+        let mut capacity = 0;
+        let mut growths = 0;
+        for i in 0..max_size {
+            sink.write(&[i as u8]).unwrap();
+            let data = output.borrow();
+            assert!(data.capacity() <= max_size);
+            if data.capacity() != capacity {
+                capacity = data.capacity();
+                growths += 1;
+            }
+        }
+        assert!(growths <= 9, "small writes reallocated {growths} times");
+        let expected: Vec<_> = (0..max_size).map(|i| i as u8).collect();
+        assert_eq!(*output.borrow(), expected);
+        let error = sink.write(&[0]).unwrap_err();
+        assert_eq!(error.code, ARCHIVE_FATAL);
+        assert_eq!(error.errno, libc::ENOMEM);
+        assert_eq!(*output.borrow(), expected);
+    }
+
+    #[test]
+    fn memory_output_is_owned_until_writer_drop() {
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let weak = Rc::downgrade(&output);
+        let mut a = ArchiveWrite::new();
+        assert_eq!(a.set_format_ustar(), Status::Ok);
+        assert_eq!(a.open_memory(output, 4096), Status::Ok);
+        assert!(weak.upgrade().is_some());
+        write_file(&mut a, b"file", b"owned output");
+        assert_eq!(a.close(), Status::Ok);
+        assert!(!weak.upgrade().unwrap().borrow().is_empty());
+        drop(a);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn memory_output_exhaustion_reports_write_and_close_errors() {
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let mut a = ArchiveWrite::new();
+        assert_eq!(a.set_format_ustar(), Status::Ok);
+        assert_eq!(a.set_bytes_per_block(0), Status::Ok);
+        assert_eq!(a.open_memory(output.clone(), 511), Status::Ok);
+        let mut e = ArchiveEntry::new();
+        e.set_pathname(Some(b"file"));
+        e.set_mode(AE_IFREG | 0o644);
+        e.set_size(0);
+        assert_eq!(a.header(&mut e), Status::Fatal);
+        assert_eq!(a.errno(), libc::ENOMEM);
+        assert_eq!(error(&a), "Buffer exhausted");
+        assert!(output.borrow().is_empty());
+        drop(a);
+
+        let mut a = ArchiveWrite::new();
+        assert_eq!(a.set_format_ustar(), Status::Ok);
+        assert_eq!(a.open_memory(output.clone(), 512), Status::Ok);
+        write_file(&mut a, b"file", b"data buffered until close");
+        assert_eq!(a.close(), Status::Fatal);
+        assert_eq!(a.errno(), libc::ENOMEM);
+        assert_eq!(error(&a), "Buffer exhausted");
+        assert!(output.borrow().len() <= 512);
+    }
+
+    #[test]
+    fn memory_output_borrow_conflicts_return_errors() {
+        let output = Rc::new(RefCell::new(vec![1, 2, 3]));
+        let mut a = ArchiveWrite::new();
+        assert_eq!(a.set_format_ustar(), Status::Ok);
+        let borrowed = output.borrow();
+        assert_eq!(a.open_memory(output.clone(), 4096), Status::Fatal);
+        assert_eq!(a.errno(), libc::EBUSY);
+        assert_eq!(*borrowed, [1, 2, 3]);
+        drop(borrowed);
+
+        let mut a = ArchiveWrite::new();
+        assert_eq!(a.set_format_ustar(), Status::Ok);
+        assert_eq!(a.open_memory(output.clone(), 4096), Status::Ok);
+        write_file(&mut a, b"file", b"data buffered until close");
+        let borrowed = output.borrow();
+        assert_eq!(a.close(), Status::Fatal);
+        assert_eq!(a.errno(), libc::EBUSY);
+        assert_eq!(error(&a), "Memory output buffer is borrowed");
+        assert!(borrowed.is_empty());
     }
 
     #[test]
