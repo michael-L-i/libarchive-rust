@@ -210,9 +210,17 @@ impl Sink for MemorySink {
         if data.len() > self.max_size.saturating_sub(output.len()) || output.len() > self.max_size {
             return Err(Error::fatal(libc::ENOMEM, "Buffer exhausted"));
         }
-        output
-            .try_reserve_exact(data.len())
-            .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate memory output buffer"))?;
+        let needed = output.len() + data.len();
+        if needed > output.capacity() {
+            let capacity = needed
+                .max(output.capacity().saturating_mul(2))
+                .max(64)
+                .min(self.max_size);
+            let additional = capacity - output.len();
+            output
+                .try_reserve_exact(additional)
+                .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate memory output buffer"))?;
+        }
         output.extend_from_slice(data);
         Ok(())
     }
@@ -903,6 +911,34 @@ mod tests {
             assert_eq!(r.next_header(), Status::Eof);
             assert_eq!(r.close(), Status::Ok);
         }
+    }
+
+    #[test]
+    fn memory_output_small_writes_grow_geometrically_within_limit() {
+        let max_size = 8193;
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = MemorySink {
+            output: output.clone(),
+            max_size,
+        };
+        let mut capacity = 0;
+        let mut growths = 0;
+        for i in 0..max_size {
+            sink.write(&[i as u8]).unwrap();
+            let data = output.borrow();
+            assert!(data.capacity() <= max_size);
+            if data.capacity() != capacity {
+                capacity = data.capacity();
+                growths += 1;
+            }
+        }
+        assert!(growths <= 9, "small writes reallocated {growths} times");
+        let expected: Vec<_> = (0..max_size).map(|i| i as u8).collect();
+        assert_eq!(*output.borrow(), expected);
+        let error = sink.write(&[0]).unwrap_err();
+        assert_eq!(error.code, ARCHIVE_FATAL);
+        assert_eq!(error.errno, libc::ENOMEM);
+        assert_eq!(*output.borrow(), expected);
     }
 
     #[test]
