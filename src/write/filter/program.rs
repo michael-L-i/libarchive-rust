@@ -128,6 +128,9 @@ impl Filter for Program {
     fn name(&self) -> &CStr {
         &self.name
     }
+    fn has_options(&self) -> bool {
+        self.code != filter_code::PROGRAM
+    }
     fn options(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<i32, Error> {
         match key {
             b"compression-level" if matches!(self.code, filter_code::LRZIP | filter_code::LZOP) => {

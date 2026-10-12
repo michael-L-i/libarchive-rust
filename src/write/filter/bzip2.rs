@@ -81,6 +81,9 @@ impl Filter for Bzip2 {
     fn code(&self) -> i32 {
         filter_code::BZIP2
     }
+    fn has_options(&self) -> bool {
+        true
+    }
     fn options(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<i32, Error> {
         if key != b"compression-level" {
             return Ok(ARCHIVE_WARN);

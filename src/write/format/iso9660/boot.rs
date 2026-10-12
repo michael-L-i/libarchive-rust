@@ -36,7 +36,7 @@ impl Iso9660 {
         Ok(())
     }
 
-    pub(super) fn isoent_create_boot_catalog(&mut self) -> Result<(), Error> {
+    pub(super) fn isoent_create_boot_catalog(&mut self, a: Option<&Base>) -> Result<(), Error> {
         // Create the entry which is the "boot.catalog" file.
         let file = self.isofile_new(None);
         let (uid, gid) = crate::ffi::sys::user_ids();
@@ -52,7 +52,7 @@ impl Iso9660 {
         e.set_mode(AE_IFREG | 0o444);
         e.set_nlink(1);
 
-        self.isofile_gen_utility_names(None, file)?;
+        self.isofile_gen_utility_names(a, file)?;
         let f = &mut self.files[file];
         f.boot = Boot::Catalog;
         f.content[0].size = LOGICAL_BLOCK_SIZE as i64;
@@ -206,20 +206,13 @@ impl Iso9660 {
         if size == 0 {
             size = entry_size;
         }
-        // Upstream truncates a size its 32-bit field can't hold.
-        let size = u32::try_from(size).map_err(|_| {
-            Error::fatal(
-                libc::EOVERFLOW,
-                "Boot image size exceeds its information table",
-            )
-        })?;
         let mut table = [0u8; 56];
         // Set the location of Primary Volume Descriptor.
         table[0..4].copy_from_slice(&num_731(SYSTEM_AREA_BLOCK as u32));
         // Set the location of the boot file.
         table[4..8].copy_from_slice(&num_731(content.location));
-        // Set the size of the boot file.
-        table[8..12].copy_from_slice(&num_731(size));
+        // Set the size of the boot file. A size past 32 bits is truncated.
+        table[8..12].copy_from_slice(&num_731(size as u32));
         // Set the sum of the boot file.
         table[12..16].copy_from_slice(&num_731(sum));
         // Clear reserved bytes: 16 to 56.

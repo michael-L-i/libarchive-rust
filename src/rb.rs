@@ -52,6 +52,7 @@ struct Node {
     position: usize,
 }
 
+#[derive(Default)]
 pub(crate) struct RbTree {
     nodes: Vec<Node>,
     root: Option<usize>,
@@ -59,11 +60,11 @@ pub(crate) struct RbTree {
 
 impl RbTree {
     /// `__archive_rb_tree_init` for nodes `0..capacity`.
-    pub(crate) fn new(capacity: usize) -> Self {
-        RbTree {
-            nodes: vec![Node::default(); capacity],
-            root: None,
-        }
+    pub(crate) fn new(capacity: usize) -> Result<Self, std::collections::TryReserveError> {
+        let mut nodes = Vec::new();
+        nodes.try_reserve_exact(capacity)?;
+        nodes.resize(capacity, Node::default());
+        Ok(RbTree { nodes, root: None })
     }
 
     fn red(&self, n: Option<usize>) -> bool {
@@ -158,11 +159,10 @@ impl RbTree {
 
         // Exchange properties between new_father and new_child. The only
         // change is that new_child's position is now on the other side.
-        let (red, position) = (self.nodes[new_father].red, self.nodes[new_father].position);
+        let red = self.nodes[new_father].red;
         self.nodes[new_father].red = self.nodes[new_child].red;
         self.nodes[new_father].position = self.nodes[new_child].position;
         self.nodes[new_child].red = red;
-        self.nodes[new_child].position = position;
         self.nodes[new_child].position = other;
 
         // Make sure to reparent the new child to ourself.
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn inserts_keep_order_and_balance() {
         let keys: Vec<i32> = (0..200).map(|i| (i * 7919) % 211).collect();
-        let mut t = RbTree::new(keys.len() + 1);
+        let mut t = RbTree::new(keys.len() + 1).unwrap();
         for (id, &k) in keys.iter().enumerate() {
             assert!(t.insert_node(id, |n| k - keys[n]));
             assert!(!t.red(t.root));
@@ -296,7 +296,7 @@ mod tests {
     fn a_self_contradicting_comparison_follows_the_tree_shape() {
         // Node 1 claims to be smaller than node 0 and node 0 smaller than
         // node 1: the later insertion goes left of the earlier one.
-        let mut t = RbTree::new(2);
+        let mut t = RbTree::new(2).unwrap();
         assert!(t.insert_node(0, |_| -1));
         assert!(t.insert_node(1, |_| -1));
         assert_eq!(t.in_order(), vec![1, 0]);

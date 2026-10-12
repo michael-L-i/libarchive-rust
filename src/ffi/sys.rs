@@ -248,27 +248,13 @@ pub fn gmtime(secs: i64) -> Option<Tm> {
 
 /// `localtime_r` and the `tm_gmtoff` it reports, or `None` if it fails.
 pub fn localtime_gmtoff(secs: i64) -> Option<(Tm, i64)> {
-    let secs = libc::time_t::try_from(secs).ok()?;
-    // SAFETY: `secs` and `t` are valid for the call; localtime_r writes
-    // only to `t`, and on success `t` is fully initialized.
-    let t = unsafe {
-        let mut t = std::mem::zeroed::<libc::tm>();
-        if libc::localtime_r(&secs, &mut t).is_null() {
-            return None;
-        }
-        t
-    };
-    Some((
-        Tm {
-            year: t.tm_year,
-            mon: t.tm_mon,
-            mday: t.tm_mday,
-            hour: t.tm_hour,
-            min: t.tm_min,
-            sec: t.tm_sec,
-        },
-        t.tm_gmtoff as i64,
-    ))
+    unsafe extern "C" {
+        fn tzset();
+    }
+    // SAFETY: tzset has no arguments and initializes libc's timezone state,
+    // as upstream does before localtime_r.
+    unsafe { tzset() };
+    date_clock(secs, false).map(|(tm, west, dst)| (tm, -west + if dst { 3600 } else { 0 }))
 }
 
 /// `ctime_r`: the local time as "Thu Jan  1 00:00:00 1970\n", or `None`

@@ -208,6 +208,9 @@ impl Filter for Gzip {
     fn code(&self) -> i32 {
         filter_code::GZIP
     }
+    fn has_options(&self) -> bool {
+        true
+    }
     fn options(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<i32, Error> {
         match key {
             b"compression-level" => self.level = digit(value, 0, 9, "compression-level invalid")?,

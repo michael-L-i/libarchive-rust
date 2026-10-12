@@ -148,7 +148,8 @@ impl Idr {
         self.idrent_pool
             .try_reserve(cnt)
             .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate memory"))?;
-        self.rbtree = RbTree::new(cnt);
+        self.rbtree =
+            RbTree::new(cnt).map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate memory"))?;
         self.wait_list.clear();
         self.num_size = num_size;
         self.null_size = null_size;
@@ -188,7 +189,7 @@ impl Iso9660 {
         }
         Idr {
             idrent_pool: Vec::new(),
-            rbtree: RbTree::new(0),
+            rbtree: RbTree::default(),
             wait_list: Vec::new(),
             num_size: 0,
             null_size: 0,

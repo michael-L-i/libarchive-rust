@@ -63,6 +63,9 @@ pub trait Filter {
     fn close(&mut self, sink: &mut dyn Sink) -> Result<(), Error>;
     fn code(&self) -> c_int;
     fn name(&self) -> &CStr;
+    fn has_options(&self) -> bool {
+        false
+    }
     fn options(&mut self, _key: &[u8], _value: Option<&[u8]>) -> Result<c_int, Error> {
         Ok(ARCHIVE_WARN)
     }
@@ -80,6 +83,9 @@ pub trait Format {
     fn data(&mut self, data: &[u8], sink: &mut dyn Sink) -> Result<usize, Error>;
     fn finish_entry(&mut self, sink: &mut dyn Sink) -> Result<(), Error>;
     fn close(&mut self, sink: &mut dyn Sink) -> Result<(), Error>;
+    fn close_with_base(&mut self, _a: &Base, sink: &mut dyn Sink) -> Result<(), Error> {
+        self.close(sink)
+    }
     fn options(&mut self, _a: &Base, _key: &[u8], _value: Option<&[u8]>) -> Result<c_int, Error> {
         Ok(ARCHIVE_WARN)
     }
@@ -439,7 +445,7 @@ impl Write {
             r = self.finish_entry(a);
         }
         if self.format.is_some() {
-            match self.run(a, |f, s| f.close(s)) {
+            match self.run(a, |f, s| f.close_with_base(a, s)) {
                 Ok(()) => {
                     if let Some(n) = self.format.as_ref().and_then(|f| f.bytes_in_last_block()) {
                         self.bytes_in_last_block = n;
@@ -505,6 +511,9 @@ impl Write {
     ) -> c_int {
         let mut rv = ARCHIVE_WARN;
         for f in filters {
+            if !f.has_options() {
+                continue;
+            }
             if module.is_some_and(|m| m != f.name().to_bytes()) {
                 continue;
             }
@@ -844,5 +853,24 @@ mod tests {
         assert!(writer.filters.is_empty());
         assert_eq!(writer.free(&base), ARCHIVE_OK);
         assert_eq!(events.borrow().len(), 3);
+    }
+    #[test]
+    fn filters_without_option_handlers_are_unknown_modules() {
+        let base = Base::new(WRITE_MAGIC);
+        let mut filters: Vec<Box<dyn Filter>> =
+            vec![filter::by_code(crate::read::filter_code::COMPRESS).unwrap()];
+        assert_eq!(
+            Write::filter_option(&mut filters, &base, Some(b"compress"), b"foo", Some(b"1")),
+            crate::options::UNKNOWN_MODULE
+        );
+        assert_eq!(
+            Write::filter_option(&mut filters, &base, None, b"foo", Some(b"1")),
+            ARCHIVE_WARN
+        );
+        filters.push(filter::by_code(crate::read::filter_code::GZIP).unwrap());
+        assert_eq!(
+            Write::filter_option(&mut filters, &base, Some(b"gzip"), b"foo", Some(b"1")),
+            ARCHIVE_WARN
+        );
     }
 }

@@ -4,7 +4,7 @@
 use super::descriptor::num_731;
 use super::*;
 use crate::read::ARCHIVE_ERRNO_FILE_FORMAT;
-use deflate::Flush;
+use deflate::{Flush, Status as DeflateStatus};
 use miniz_oxide::inflate::stream::{InflateState, inflate};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 
@@ -34,6 +34,10 @@ struct ZisofsExtract {
     block_pointers_avail: usize,
     block_off: usize,
     block_avail: u32,
+    block_active: bool,
+    block_hole: bool,
+    block_remaining: usize,
+    output_remaining: u64,
 
     stream: Option<Box<InflateState>>,
 }
@@ -206,17 +210,37 @@ impl Iso9660 {
         self.zisofs.making = false;
     }
 
+    pub(super) fn zisofs_check_magic(
+        &mut self,
+        out: &mut dyn Sink,
+        buff: &[u8],
+    ) -> Result<(), Error> {
+        let making = self.zisofs.making;
+        let previous = self.zisofs.magic_cnt.max(0) as usize;
+        self.zisofs_detect_magic(buff);
+        if making && !self.zisofs.making {
+            // The original bytes are already zisofs: discard the reserved
+            // new header and any compression done before detection finished.
+            let offset = self.cur_content()?.offset_of_temp;
+            self.wb_set_offset(out, offset)?;
+            let prefix = self
+                .zisofs
+                .magic_buffer
+                .get(..previous)
+                .ok_or_else(|| misc("Invalid zisofs magic length"))?
+                .to_vec();
+            self.wb_write_to_temp(out, &prefix)?;
+            self.cur_content()?.size = previous as i64;
+        }
+        Ok(())
+    }
+
     /// Compress data and write it to a temporary file.
     pub(super) fn zisofs_write_to_temp(
         &mut self,
         out: &mut dyn Sink,
         buff: &[u8],
     ) -> Result<(), Error> {
-        // Where deflate() writes. Upstream sets these only here and after
-        // each deflate() call, so they are stale after an all-zero block
-        // moves the write position.
-        let mut next_out = self.wb_buffptr();
-        let mut avail_out = self.wbuff_remaining;
         let mut b = 0;
         let mut s = buff.len();
         loop {
@@ -244,10 +268,10 @@ impl Iso9660 {
 
             // If current data block are all zero, we do not use compressed
             // data.
-            if flush == Flush::Finish
+            let hole = flush == Flush::Finish
                 && self.zisofs.allzero
-                && avail as u64 + self.zisofs.total_in == ZF_BLOCK_SIZE
-            {
+                && avail as u64 + self.zisofs.total_in == ZF_BLOCK_SIZE;
+            if hole {
                 let c = *self.cur_content()?;
                 if self.zisofs.block_offset != c.size {
                     self.wb_set_offset(out, c.offset_of_temp + self.zisofs.block_offset)?;
@@ -259,7 +283,11 @@ impl Iso9660 {
             }
 
             // Compress file data.
-            while avail_in > 0 {
+            let mut stream_end = false;
+            while avail_in > 0 || (flush == Flush::Finish && !hole && !stream_end) {
+                // An all-zero block may have moved the write position.
+                let next_out = self.wb_buffptr();
+                let avail_out = self.wbuff_remaining;
                 let (z, wbuff) = (&mut self.zisofs, &mut self.wbuff);
                 let stream = z
                     .stream
@@ -271,15 +299,17 @@ impl Iso9660 {
                     flush,
                 );
                 match r {
-                    Ok((_, used, csize)) => {
+                    Ok((status, used, csize)) => {
+                        stream_end = status == DeflateStatus::StreamEnd;
+                        if used == 0 && csize == 0 && !stream_end {
+                            return Err(misc("Compression failed: deflate() made no progress"));
+                        }
                         next_in += used;
                         avail_in -= used;
                         z.total_in += used as u64;
                         self.wb_consume(out, csize)?;
                         self.zisofs.total_size += csize as i64;
                         self.cur_content()?.size += csize as i64;
-                        next_out = self.wb_buffptr();
-                        avail_out = self.wbuff_remaining;
                     }
                     Err(e) => {
                         return Err(misc(format!(
@@ -312,14 +342,11 @@ impl Iso9660 {
         Ok(())
     }
 
-    pub(super) fn zisofs_finish_entry(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
+    pub(super) fn zisofs_finish_entry(&mut self, _out: &mut dyn Sink) -> Result<(), Error> {
         let f = self.cur_file.ok_or_else(|| misc("No current file"))?;
 
         // Direct temp file stream to zisofs temp file stream.
         self.files[f].entry.set_size(self.zisofs.total_size);
-
-        // Save a file pointer which points the end of current zisofs data.
-        let tail = self.wb_offset();
 
         // Make a header.
         //
@@ -354,34 +381,58 @@ impl Iso9660 {
         buff[13] = file.zisofs.log2_bs;
         // Reserved: 14 and 15
 
-        // Move to the right position to write the header. Upstream ignores
-        // how that went.
-        let _ = self.wb_set_offset(out, file.content[0].offset_of_temp);
-
-        // Write the header.
-        self.wb_write_to_temp(out, &buff)?;
-
-        // Write zisofs Block Pointers.
-        let s = self.zisofs.block_pointers_cnt as usize * 4;
-        let block_pointers = std::mem::take(&mut self.zisofs.block_pointers);
-        let r = match block_pointers.get(..s) {
-            Some(p) => self.wb_write_to_temp(out, p),
-            None => Err(misc("Too many zisofs blocks")),
+        // Patch bytes already flushed in the temporary file, and bytes
+        // still buffered in place. Seeking the write buffer backwards
+        // would discard the compressed tail.
+        let mut offset = file.content[0].offset_of_temp;
+        let buffer_offset = self.wbuff_offset;
+        let used = self.wb_buffptr();
+        let mut patch = |mut bytes: &[u8]| -> Result<(), Error> {
+            if offset < buffer_offset {
+                let n = bytes.len().min((buffer_offset - offset) as usize);
+                let temp = self
+                    .temp
+                    .as_mut()
+                    .ok_or_else(|| misc("Couldn't create temporary file"))?;
+                let pos =
+                    u64::try_from(offset).map_err(|_| misc("Invalid zisofs header offset"))?;
+                temp.seek(SeekFrom::Start(pos))
+                    .map_err(|e| misc(e.to_string()))?;
+                temp.write_all(&bytes[..n])
+                    .map_err(|e| misc(e.to_string()))?;
+                temp.seek(SeekFrom::Start(buffer_offset as u64))
+                    .map_err(|e| misc(e.to_string()))?;
+                offset += n as i64;
+                bytes = &bytes[n..];
+            }
+            if !bytes.is_empty() {
+                let at = usize::try_from(offset - buffer_offset)
+                    .map_err(|_| misc("Invalid zisofs header offset"))?;
+                let end = at
+                    .checked_add(bytes.len())
+                    .filter(|&end| end <= used)
+                    .ok_or_else(|| misc("Invalid zisofs header offset"))?;
+                self.wbuff
+                    .get_mut(at..end)
+                    .ok_or_else(|| misc("Invalid zisofs header offset"))?
+                    .copy_from_slice(bytes);
+                offset += bytes.len() as i64;
+            }
+            Ok(())
         };
-        self.zisofs.block_pointers = block_pointers;
-        r?;
-
-        // Set a file pointer back to the end of the temporary file.
-        let _ = self.wb_set_offset(out, tail);
+        patch(&buff)?;
+        let s = self.zisofs.block_pointers_cnt as usize * 4;
+        let pointers = self
+            .zisofs
+            .block_pointers
+            .get(..s)
+            .ok_or_else(|| misc("Too many zisofs blocks"))?;
+        patch(pointers)?;
 
         Ok(())
     }
 
-    fn zisofs_extract_init(
-        &self,
-        zisofs: &mut ZisofsExtract,
-        mut p: &[u8],
-    ) -> Result<usize, Error> {
+    fn zisofs_extract_init(zisofs: &mut ZisofsExtract, mut p: &[u8]) -> Result<usize, Error> {
         let mut avail = p.len();
 
         // Allocate block pointers buffer.
@@ -449,7 +500,7 @@ impl Iso9660 {
         let mut start = 0;
 
         if !zisofs.initialized {
-            let rs = self.zisofs_extract_init(zisofs, p)?;
+            let rs = Self::zisofs_extract_init(zisofs, p)?;
             if !zisofs.initialized {
                 // We need more data.
                 zisofs.pz_offset = zisofs.pz_offset.wrapping_add(bytes as u32);
@@ -462,7 +513,10 @@ impl Iso9660 {
         }
 
         // Get block offsets from block pointers.
-        if zisofs.block_avail == 0 {
+        if !zisofs.block_active {
+            if zisofs.output_remaining == 0 {
+                return Ok(bytes);
+            }
             if zisofs.block_off + 4 >= zisofs.block_pointers_size {
                 // There isn't a pair of offsets.
                 return Err(illegal("Illegal zisofs block pointers"));
@@ -477,6 +531,11 @@ impl Iso9660 {
             }
             zisofs.block_avail = bed - bst;
             zisofs.block_off += 4;
+            zisofs.block_active = true;
+            zisofs.block_hole = bed == bst;
+            zisofs.block_remaining = zisofs
+                .uncompressed_buffer_size
+                .min(zisofs.output_remaining as usize);
 
             // Initialize compression library for new block.
             match &mut zisofs.stream {
@@ -486,16 +545,19 @@ impl Iso9660 {
         }
 
         // Make uncompressed data.
-        if zisofs.block_avail == 0 {
+        if zisofs.block_hole {
             // It's basically 32K bytes NUL data.
-            let mut size = zisofs.uncompressed_buffer_size;
+            let mut size = zisofs.block_remaining;
             while size > 0 {
                 let wb = self.wb_buffptr();
                 let wsize = size.min(self.wbuff_remaining);
                 self.wbuff[wb..wb + wsize].fill(0);
                 self.wb_consume(out, wsize)?;
                 size -= wsize;
+                zisofs.output_remaining -= wsize as u64;
             }
+            zisofs.block_remaining = 0;
+            zisofs.block_active = false;
         } else {
             let n = avail.min(zisofs.block_avail as usize);
             let stream = zisofs
@@ -506,7 +568,10 @@ impl Iso9660 {
             let res = inflate(
                 stream,
                 &p[start..start + n],
-                &mut self.wbuff[wb..],
+                &mut self.wbuff[wb..wb
+                    + self
+                        .wbuff_remaining
+                        .min(zisofs.block_remaining.saturating_add(1))],
                 MZFlush::None,
             );
             let failed = |code: i32| misc(format!("zisofs decompression failed ({code})"));
@@ -519,15 +584,26 @@ impl Iso9660 {
             }
             avail -= res.bytes_consumed;
             zisofs.block_avail -= res.bytes_consumed as u32;
+            if res.bytes_written > zisofs.block_remaining {
+                return Err(illegal("Illegal zisofs block size"));
+            }
             self.wb_consume(out, res.bytes_written)?;
+            zisofs.block_remaining -= res.bytes_written;
+            zisofs.output_remaining -= res.bytes_written as u64;
+            if res.status == Ok(MZStatus::StreamEnd) {
+                if zisofs.block_avail != 0 || zisofs.block_remaining != 0 {
+                    return Err(illegal("Illegal zisofs block size"));
+                }
+                zisofs.block_active = false;
+            }
         }
-        zisofs.pz_offset = zisofs.pz_offset.wrapping_add(bytes as u32);
-        Ok(bytes - avail)
+        let consumed = bytes - avail;
+        zisofs.pz_offset = zisofs.pz_offset.wrapping_add(consumed as u32);
+        Ok(consumed)
     }
 
     /// zisofs_rewind_boot_file(): uncompress a zisofs'ed boot image to the
-    /// end of the temporary file. Like upstream, each read of the file
-    /// goes to zisofs_extract() once, which drops what it leaves unused.
+    /// end of the temporary file, feeding every byte and every hole.
     pub(super) fn zisofs_rewind_boot_file(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
         let boot = self
             .el_torito
@@ -546,6 +622,7 @@ impl Iso9660 {
         let mut zext = ZisofsExtract {
             pz_uncompressed_size: u64::from(header.uncompressed_size),
             pz_log2_bs: header.log2_bs,
+            output_remaining: u64::from(header.uncompressed_size),
             ..ZisofsExtract::default()
         };
 
@@ -587,12 +664,32 @@ impl Iso9660 {
             // Put the file pointer back to write.
             temp_seek(&mut self.temp, write_offset);
 
-            if let Err(e) = self.zisofs_extract(out, &mut zext, &rbuff[..rs]) {
-                ret = Err(e);
+            let mut at = 0;
+            while at < rs || (remaining == 0 && (zext.output_remaining > 0 || zext.block_active)) {
+                let before = (zext.block_off, zext.output_remaining, zext.block_active);
+                let consumed = match self.zisofs_extract(out, &mut zext, &rbuff[at..rs]) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        ret = Err(e);
+                        break;
+                    }
+                };
+                at += consumed;
+                if consumed == 0
+                    && before == (zext.block_off, zext.output_remaining, zext.block_active)
+                {
+                    ret = Err(illegal("Truncated zisofs boot image"));
+                    break;
+                }
+            }
+            if ret.is_err() {
                 break;
             }
         }
 
+        if ret.is_ok() && (zext.output_remaining != 0 || zext.block_active) {
+            ret = Err(illegal("Truncated zisofs boot image"));
+        }
         if ret.is_ok() {
             // Change the boot file content from zisofs'ed data to plain
             // data.

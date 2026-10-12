@@ -110,6 +110,9 @@ impl Filter for Encoder {
     fn code(&self) -> i32 {
         self.code
     }
+    fn has_options(&self) -> bool {
+        true
+    }
     fn options(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<i32, Error> {
         match key {
             b"compression-level" => self.level = digit(value, 0, 9, "compression-level invalid")?,

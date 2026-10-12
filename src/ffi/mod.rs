@@ -25,6 +25,7 @@ mod write_filter;
 mod stubs;
 pub(crate) mod charset;
 pub(crate) mod filter_fork;
+pub(crate) mod qsort;
 pub(crate) mod sys;
 
 macro_rules! opaque {

@@ -690,7 +690,8 @@ impl Iso9660 {
         let vdd = self.vdd_mut(which);
         vdd.path_table_size = size;
         let ptbs = PATH_TABLE_BLOCK_SIZE as i32;
-        vdd.path_table_block = ((size + ptbs - 1) / ptbs) * (ptbs / LOGICAL_BLOCK_SIZE as i32);
+        vdd.path_table_block =
+            (size.wrapping_add(ptbs - 1) / ptbs) * (ptbs / LOGICAL_BLOCK_SIZE as i32);
     }
 
     /// _write_path_table(): the records of one depth; returns their size.
@@ -705,10 +706,13 @@ impl Iso9660 {
         if pt.cnt == 0 {
             return Ok(0);
         }
-        let ptbl: Vec<EntId> = pt.sorted.iter().take(pt.cnt as usize).copied().collect();
-        if ptbl.len() != pt.cnt as usize {
+        if pt.cnt < 0 || pt.sorted.len() != pt.cnt as usize {
             return Err(misc("Path table entries are not sorted"));
         }
+        let mut ptbl = Vec::new();
+        ptbl.try_reserve_exact(pt.sorted.len())
+            .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate memory"))?;
+        ptbl.extend_from_slice(&pt.sorted);
 
         let mut wsize = 0;
         let mut wb = self.wb_buffptr();
@@ -951,7 +955,10 @@ impl Iso9660 {
                 for i in 0..self.ents[np].extr_rec_list.len() {
                     let extr = &self.ents[np].extr_rec_list[i];
                     let mut block = [0u8; LOGICAL_BLOCK_SIZE];
-                    let n = (extr.offset.max(0) as usize).min(LOGICAL_BLOCK_SIZE);
+                    let n = usize::try_from(extr.offset)
+                        .ok()
+                        .filter(|&n| n <= LOGICAL_BLOCK_SIZE && n <= extr.buf.len())
+                        .ok_or_else(|| misc("Directory Record overflow"))?;
                     block[..n].copy_from_slice(&extr.buf[..n]);
                     self.wb_put_block(out, &block)?;
                 }

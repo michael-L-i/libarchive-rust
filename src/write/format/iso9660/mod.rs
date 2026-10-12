@@ -49,7 +49,6 @@ use std::sync::Arc;
 mod boot;
 mod descriptor;
 mod idr;
-mod qsort;
 mod record;
 mod tree;
 mod zisofs;
@@ -909,7 +908,7 @@ impl Iso9660 {
             let head = buff.get(..ts).ok_or_else(|| misc("Invalid extent size"))?;
 
             if self.zisofs.detect_magic {
-                self.zisofs_detect_magic(head);
+                self.zisofs_check_magic(out, head)?;
             }
 
             if self.zisofs.making {
@@ -944,7 +943,7 @@ impl Iso9660 {
         }
 
         if self.zisofs.detect_magic {
-            self.zisofs_detect_magic(buff);
+            self.zisofs_check_magic(out, buff)?;
         }
 
         if self.zisofs.making {
@@ -1010,7 +1009,7 @@ impl Iso9660 {
         Ok(())
     }
 
-    fn iso9660_close(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
+    fn iso9660_close(&mut self, a: Option<&Base>, out: &mut dyn Sink) -> Result<(), Error> {
         // Write remaining data out to the temporary file.
         if self.wbuff_remaining > 0 {
             self.wb_write_out(out)?;
@@ -1032,7 +1031,7 @@ impl Iso9660 {
                 self.wb_write_out(out)?;
             }
             // Create the boot catalog.
-            self.isoent_create_boot_catalog()?;
+            self.isoent_create_boot_catalog(a)?;
         }
 
         // Prepare joliet extensions.
@@ -1304,8 +1303,11 @@ impl Format for Iso9660 {
     fn finish_entry(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
         self.iso9660_finish_entry(out)
     }
+    fn close_with_base(&mut self, a: &Base, out: &mut dyn Sink) -> Result<(), Error> {
+        self.iso9660_close(Some(a), out)
+    }
     fn close(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
-        self.iso9660_close(out)
+        self.iso9660_close(None, out)
     }
 }
 
