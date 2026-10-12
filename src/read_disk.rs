@@ -36,6 +36,7 @@ use std::collections::VecDeque;
 use std::ffi::c_int;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -333,10 +334,29 @@ impl ReadDisk {
             if self.can_descend {
                 self.ancestors.push((st.st_dev as u64, st.st_ino));
             }
+            // Honor nodump flag. Linux reads it through a descriptor, which
+            // then serves the rest of the metadata.
             #[cfg(target_vendor = "apple")]
             if self.behavior & 2 != 0 && st.st_flags & libc::UF_NODUMP != 0 {
                 continue;
             }
+            #[cfg(target_os = "linux")]
+            let fd = if self.behavior & 2 != 0
+                && matches!(entry.filetype(), libc::S_IFREG | libc::S_IFDIR)
+            {
+                disk_sys::open_read(&path, libc::O_NONBLOCK).ok()
+            } else {
+                None
+            };
+            #[cfg(target_os = "linux")]
+            if fd.as_ref().is_some_and(|file| {
+                disk_sys::get_flags(file.as_raw_fd())
+                    .is_ok_and(|flags| flags & disk_sys::FS_NODUMP_FL != 0)
+            }) {
+                continue;
+            }
+            #[cfg(not(target_os = "linux"))]
+            let fd: Option<File> = None;
             self.restore = RestoreTime {
                 atime: (entry.atime(), entry.atime_nsec()),
                 mtime: (entry.mtime(), entry.mtime_nsec()),
@@ -369,7 +389,13 @@ impl ReadDisk {
                 continue;
             }
             entry.set_sourcepath(path.as_os_str().as_bytes());
-            let ret = self.fill_metadata(a, entry, &path, followed);
+            let ret = self.fill_metadata(
+                a,
+                entry,
+                &path,
+                followed,
+                fd.as_ref().map(AsRawFd::as_raw_fd),
+            );
             if ret < 0 {
                 return ret;
             }
@@ -477,21 +503,47 @@ impl ReadDisk {
         }
     }
     /// Upstream's `archive_read_disk_entry_from_file` after the stat: names,
-    /// the link target, then ACLs, extended attributes, Mac metadata and
-    /// sparse extents; a failure among those last four warns or fails but
-    /// the rest are still read, and the worst result is returned.
+    /// Linux's file flags, the link target, then ACLs, extended attributes,
+    /// Mac metadata and sparse extents; a failure among those last four
+    /// warns or fails but the rest are still read, and the worst result is
+    /// returned. On Linux these go through `fd`, or one opened for the
+    /// flags.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     pub fn fill_metadata(
         &mut self,
         a: &Base,
         entry: &mut Entry,
         path: &Path,
         follow: bool,
+        fd: Option<c_int>,
     ) -> c_int {
         if let Some(name) = self.user.lookup(entry.uid(), false) {
             entry.set_uname(name.to_bytes());
         }
         if let Some(name) = self.group.lookup(entry.gid(), true) {
             entry.set_gname(name.to_bytes());
+        }
+        // Linux takes a descriptor to read the file flags, which then
+        // serves the rest of the metadata too.
+        #[cfg(target_os = "linux")]
+        let read_flags =
+            self.behavior & 0x40 == 0 && matches!(entry.filetype(), libc::S_IFREG | libc::S_IFDIR);
+        #[cfg(target_os = "linux")]
+        let opened;
+        #[cfg(target_os = "linux")]
+        let fd = match fd {
+            None if read_flags => {
+                opened = disk_sys::open_read(path, libc::O_NONBLOCK).ok();
+                opened.as_ref().map(AsRawFd::as_raw_fd)
+            }
+            fd => fd,
+        };
+        #[cfg(target_os = "linux")]
+        if read_flags
+            && let Some(flags) = fd.and_then(|fd| disk_sys::get_flags(fd).ok())
+            && flags != 0
+        {
+            entry.set_fflags(flags as c_int as std::ffi::c_ulong, 0);
         }
         if entry.filetype() == libc::S_IFLNK {
             match fs::read_link(path) {

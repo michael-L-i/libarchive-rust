@@ -142,7 +142,8 @@ impl Handle {
                 };
                 entry.copy_stat(&stat);
             }
-            d.fill_metadata(a, entry, &path, d.symlinks != 0)
+            let fd = (fd >= 0).then_some(fd);
+            d.fill_metadata(a, entry, &path, d.symlinks != 0, fd)
         })
     }
 

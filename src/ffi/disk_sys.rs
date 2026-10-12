@@ -219,6 +219,19 @@ pub fn read_xattrs(
     Ok(())
 }
 
+/// The Linux inode flag (`<linux/fs.h>`) of files not to dump.
+#[cfg(target_os = "linux")]
+pub const FS_NODUMP_FL: u32 = 0x40;
+
+/// FS_IOC_GETFLAGS: the inode flags of what `fd` is open on.
+#[cfg(target_os = "linux")]
+pub fn get_flags(fd: libc::c_int) -> std::io::Result<u32> {
+    let mut flags: libc::c_int = 0;
+    // SAFETY: the ioctl writes one int, to `flags`, which outlives the
+    // call; a descriptor that isn't open only fails.
+    result(unsafe { libc::ioctl(fd, libc::FS_IOC_GETFLAGS, &mut flags) })?;
+    Ok(flags as u32)
+}
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Component;
