@@ -422,8 +422,10 @@ pub extern "C" fn archive_read_extract(
             let Kind::Read(r) = &h.kind else {
                 return ARCHIVE_FATAL;
             };
-            // SAFETY: entry is a live caller-supplied entry or NULL.
-            let Some(entry) = (unsafe { entry.cast::<Entry>().as_ref() }) else {
+            // SAFETY: entry is a live caller-supplied entry or NULL, and
+            // nothing else refers to it during the call; the header sets its
+            // size as upstream's does.
+            let Some(entry) = (unsafe { entry.cast::<Entry>().as_mut() }) else {
                 return ARCHIVE_FATAL;
             };
             let mut r = r.borrow_mut();
@@ -578,7 +580,7 @@ mod tests {
         let base = Base::new(archive::WRITE_DISK_MAGIC);
         let mut disk = write_disk::WriteDisk::default();
         disk.options = 0x40000;
-        assert_eq!(disk.header(&base, &entry), 0);
+        assert_eq!(disk.header(&base, &mut entry), 0);
         assert_eq!(disk.data(&base, b"new"), 3);
         assert_eq!(std::fs::read(&path).unwrap(), b"old");
         assert_eq!(disk.finish_entry(&base), 0);

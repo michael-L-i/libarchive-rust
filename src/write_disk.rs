@@ -117,7 +117,7 @@ fn failure(a: &Base, err: std::io::Error, action: &str, path: &Path) -> c_int {
 }
 
 impl WriteDisk {
-    pub fn header(&mut self, a: &Base, entry: &Entry) -> c_int {
+    pub fn header(&mut self, a: &Base, entry: &mut Entry) -> c_int {
         if self.finish_entry(a) == ARCHIVE_FATAL {
             return ARCHIVE_FATAL;
         }
@@ -126,7 +126,8 @@ impl WriteDisk {
         self.skipped = false;
         self.permissions_created = false;
         self.new_directory = false;
-        let mut entry = entry.clone_entry();
+        let caller = entry;
+        let mut entry = caller.clone_entry();
         let raw = entry
             .pathname()
             .map_or(Vec::new(), |p| p.to_bytes().to_vec());
@@ -161,7 +162,13 @@ impl WriteDisk {
         if entry.hardlink_is_set() != 0 && entry.size_is_set() == 0 {
             self.limit = Some(0);
         }
-        let target = match self.restore_entry(a, &path, &mut entry) {
+        let restored = self.restore_entry(a, &path, &mut entry);
+        // Tell the client not to write to what isn't open: dirs, links and so on.
+        if self.file.is_none() {
+            caller.set_size(0);
+            self.limit = Some(0);
+        }
+        let target = match restored {
             Ok(target) => target,
             Err(code) => return code,
         };
@@ -391,19 +398,17 @@ impl WriteDisk {
         {
             return ARCHIVE_FATAL as isize;
         }
-        if !data.is_empty() && (self.limit == Some(0) || (!self.skipped && self.file.is_none())) {
-            return a.warn(0, "Attempt to write to an empty file").code() as isize;
-        }
+        let Some(file) = self.file.as_mut().filter(|_| self.limit != Some(0)) else {
+            if data.is_empty() {
+                return 0;
+            }
+            return a
+                .warn(libc::EIO, "Attempt to write to an empty file")
+                .code() as isize;
+        };
         let len = self.limit.map_or(data.len(), |n| {
             data.len().min(n.saturating_sub(self.offset) as usize)
         });
-        if self.skipped {
-            self.offset += len as u64;
-            return len as isize;
-        }
-        let Some(file) = &mut self.file else {
-            return 0;
-        };
         let sparse = self.options & 0x1000 != 0;
         let chunk_size = if sparse { 4096 } else { len.max(1) };
         let result = data[..len].chunks(chunk_size).try_for_each(|chunk| {
@@ -458,11 +463,14 @@ impl WriteDisk {
             }
         }
         self.offset = offset;
-        let result = self.data(a, data);
-        if result < 0 {
-            result as c_int
-        } else {
-            ARCHIVE_OK
+        match self.data(a, data) {
+            result if result < 0 => result as c_int,
+            result if (result as usize) < data.len() => {
+                let size = self.limit.unwrap_or_default();
+                let msg = format!("Too much data: Truncating file at {size} bytes");
+                a.warn(libc::EOVERFLOW, msg).code()
+            }
+            _ => ARCHIVE_OK,
         }
     }
 
@@ -774,7 +782,7 @@ mod tests {
             if let Some(size) = size {
                 entry.set_size(size);
             }
-            assert_eq!(disk.header(base, &entry), ARCHIVE_OK);
+            assert_eq!(disk.header(base, &mut entry), ARCHIVE_OK);
         }
     }
     impl Drop for Output {
@@ -801,10 +809,13 @@ mod tests {
                 entry.set_pathname(output.path().as_os_str().as_bytes());
                 entry.set_mode(libc::S_IFREG | 0o640);
                 entry.set_size(3);
-                assert_eq!(disk.header(&base, &entry), ARCHIVE_OK);
-                assert_eq!(disk.data(&base, b"new"), 3);
-                assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+                assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+                // A skipped file isn't open: writing to it is an error.
                 let skipped = existing && options == NO_OVERWRITE;
+                assert_eq!(entry.size(), if skipped { 0 } else { 3 });
+                let written = if skipped { ARCHIVE_WARN as isize } else { 3 };
+                assert_eq!(disk.data(&base, b"new"), written);
+                assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
                 assert_eq!(
                     std::fs::read(output.path()).unwrap(),
                     if skipped { b"old" } else { b"new" }
@@ -860,7 +871,7 @@ mod tests {
             entry.set_pathname(output.path().as_os_str().as_bytes());
             entry.set_mode(kind | 0o644);
             entry.set_size(1);
-            assert_eq!(disk.header(&base, &entry), ARCHIVE_OK);
+            assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
             assert_eq!(disk.data(&base, b"x"), 1);
             assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
             let metadata = std::fs::symlink_metadata(output.path()).unwrap();
@@ -879,7 +890,7 @@ mod tests {
         entry.set_pathname(output.path().as_os_str().as_bytes());
         entry.set_mode(libc::S_IFLNK | 0o640);
         entry.set_symlink(b"target");
-        assert_eq!(disk.header(&base, &entry), ARCHIVE_OK);
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
         assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
         let mode = std::fs::symlink_metadata(output.path())
             .unwrap()
@@ -905,7 +916,7 @@ mod tests {
         entry.set_size(8192);
         entry.set_mtime(1_000_000_000, 0);
         entry.set_fflags(libc::UF_COMPRESSED as std::ffi::c_ulong, 0);
-        assert_eq!(disk.header(&base, &entry), ARCHIVE_OK);
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
         assert_eq!(disk.data(&base, &[b'a'; 8192]), 8192);
         assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
         let metadata = std::fs::metadata(output.path()).unwrap();
@@ -918,7 +929,7 @@ mod tests {
         entry.set_pathname(output.path().as_os_str().as_bytes());
         entry.set_mode(libc::S_IFDIR | mode);
         entry.set_mtime(1_000_000_000, 0);
-        assert_eq!(disk.header(base, &entry), ARCHIVE_OK);
+        assert_eq!(disk.header(base, &mut entry), ARCHIVE_OK);
         assert_eq!(disk.finish_entry(base), ARCHIVE_OK);
     }
 
@@ -974,7 +985,7 @@ mod tests {
         entry.set_mode(libc::S_IFREG | 0o644);
         entry.set_size(i64::MAX);
         entry.set_mtime(1_000_000_000, 0);
-        assert_eq!(disk.header(&base, &entry), ARCHIVE_OK);
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
         assert_eq!(disk.finish_entry(&base), ARCHIVE_FATAL);
         let message = base.error_string().unwrap().to_vec();
         assert!(matches!(
@@ -998,7 +1009,7 @@ mod tests {
         let mut entry = Entry::new(None);
         entry.set_pathname(locked.join("dir/file").as_os_str().as_bytes());
         entry.set_mode(libc::S_IFREG | 0o644);
-        assert_eq!(disk.header(&base, &entry), ARCHIVE_FAILED);
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_FAILED);
         let dir = locked.join("dir");
         let expected = [b"Failed to create dir '", dir.as_os_str().as_bytes(), b"'"].concat();
         assert_eq!(*base.error_string().unwrap(), *expected);
@@ -1027,7 +1038,7 @@ mod tests {
         let mut disk = WriteDisk::default();
         let mut entry = Entry::new(None);
         entry.set_mode(libc::S_IFREG | 0o644);
-        assert_eq!(disk.header(&base, &entry), ARCHIVE_FAILED);
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_FAILED);
         assert_eq!(base.errno.get(), ARCHIVE_ERRNO_MISC);
         assert_eq!(*base.error_string().unwrap(), *b"Invalid empty pathname");
     }
@@ -1075,7 +1086,7 @@ mod tests {
             let mut entry = Entry::new(None);
             entry.set_pathname(&at(&entry_path));
             entry.set_mode(libc::S_IFREG | 0o644);
-            assert_eq!(disk.header(&base, &entry), code, "{options:#x}");
+            assert_eq!(disk.header(&base, &mut entry), code, "{options:#x}");
             assert_eq!(base.errno.get(), errno, "{options:#x}");
             assert_eq!(base.error_string().map(|m| m.to_vec()), message);
             assert_eq!(file.is_dir(), code == ARCHIVE_OK);
@@ -1088,10 +1099,35 @@ mod tests {
         let mut entry = Entry::new(None);
         entry.set_pathname(&at(&link.join("x")));
         entry.set_mode(libc::S_IFREG | 0o644);
-        assert_eq!(disk.header(&base, &entry), ARCHIVE_FAILED);
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_FAILED);
         assert_eq!(base.errno.get(), libc::EEXIST);
         let expected = quoted(b"Failed to create dir '", &link);
         assert_eq!(*base.error_string().unwrap(), *expected);
+    }
+
+    #[test]
+    fn writes_beyond_the_entry_are_refused_as_upstream_does() {
+        let output = Output::new();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        let mut entry = Entry::new(None);
+        entry.set_pathname(output.0.join("dir").as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFDIR | 0o755);
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+        assert_eq!((entry.size_is_set() != 0, entry.size()), (true, 0));
+        assert_eq!(disk.data(&base, b"x"), ARCHIVE_WARN as isize);
+        assert_eq!(base.errno.get(), libc::EIO);
+        let mut entry = Entry::new(None);
+        entry.set_pathname(output.0.join("file").as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFREG | 0o644);
+        entry.set_size(2);
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+        assert_eq!(disk.data_block(&base, b"xyz", 0), ARCHIVE_WARN);
+        assert_eq!(base.errno.get(), libc::EOVERFLOW);
+        let expected = b"Too much data: Truncating file at 2 bytes";
+        assert_eq!(*base.error_string().unwrap(), *expected);
+        assert_eq!(disk.close(&base), ARCHIVE_OK);
+        assert_eq!(std::fs::read(output.0.join("file")).unwrap(), b"xy");
     }
 
     #[test]
@@ -1105,7 +1141,7 @@ mod tests {
         entry.set_pathname(&[name.as_os_str().as_bytes(), b"/"].concat());
         entry.set_hardlink(name.as_os_str().as_bytes());
         entry.set_mode(libc::S_IFREG | 0o644);
-        assert_eq!(disk.header(&base, &entry), ARCHIVE_WARN);
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_WARN);
         let expected = [
             b"Skipping hardlink pointing to itself: ",
             name.as_os_str().as_bytes(),
@@ -1159,7 +1195,7 @@ mod tests {
             } else {
                 ARCHIVE_OK
             };
-            assert_eq!(disk.header(&base, &entry), expected);
+            assert_eq!(disk.header(&base, &mut entry), expected);
             if options == 0 {
                 assert_eq!(base.errno.get(), libc::EIO);
             }

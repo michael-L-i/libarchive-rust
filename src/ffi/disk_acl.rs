@@ -316,7 +316,7 @@ mod tests {
             let base = Base::new(WRITE_DISK_MAGIC);
             let mut disk = crate::write_disk::WriteDisk::default();
             disk.options = 0x20 | 0x40 | 0x2;
-            assert_eq!(disk.header(&base, &entry), 0);
+            assert_eq!(disk.header(&base, &mut entry), 0);
             assert_eq!(disk.finish_entry(&base), 0);
             assert_eq!(disk.close(&base), 0);
             use std::os::unix::fs::PermissionsExt;
