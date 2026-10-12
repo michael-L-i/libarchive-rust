@@ -268,6 +268,136 @@ fn supports_nofollow_any() -> bool {
     })
 }
 
+/// Upstream's la_opendirat: a directory opened only to look names up in it.
+fn open_dir(dir: libc::c_int, name: &CStr, follow: bool) -> std::io::Result<File> {
+    #[cfg(target_vendor = "apple")]
+    let search = libc::O_SEARCH;
+    #[cfg(not(target_vendor = "apple"))]
+    let search = libc::O_RDONLY;
+    let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+    // SAFETY: dir is AT_FDCWD or a live descriptor and name is terminated.
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            search | libc::O_DIRECTORY | libc::O_CLOEXEC | nofollow,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new descriptor that nothing else owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+fn stat_at(dir: &File, name: &CStr, follow: bool) -> std::io::Result<libc::stat> {
+    let mut st = super::entry::zeroed_stat();
+    let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+    // SAFETY: live descriptor, terminated name and writable stat.
+    result(unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, flags) })?;
+    Ok(st)
+}
+
+/// Why `check_symlinks` refused a path: upstream's status, errno and
+/// message, which goes before the path.
+pub type SymlinkError = (libc::c_int, libc::c_int, &'static str);
+
+/// Upstream's check_symlinks_fsobj, the variant with openat: walks `path`
+/// (cleaned up) and refuses a symlink along it, or removes it: the last
+/// element, unless it is a hardlink's target (`linkname`), and any other
+/// with `unlink`. Without `secure` it follows a symlink to a directory.
+pub fn check_symlinks(
+    path: &[u8],
+    unlink: bool,
+    secure: bool,
+    linkname: bool,
+) -> Result<(), SymlinkError> {
+    use crate::archive::{ARCHIVE_FAILED, ARCHIVE_FATAL};
+    let errno = |e: std::io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+    if path.is_empty() {
+        return Ok(());
+    }
+    let mut dir = open_dir(libc::AT_FDCWD, c".", true)
+        .map_err(|e| (ARCHIVE_FATAL, errno(e), "Could not open "))?;
+    let mut head = 0;
+    let mut tail = usize::from(path.starts_with(b"/"));
+    loop {
+        while path.get(tail) == Some(&b'/') {
+            tail += 1;
+        }
+        while path.get(tail).is_some_and(|&b| b != b'/') {
+            tail += 1;
+        }
+        let last = tail + 1 >= path.len();
+        let Ok(segment) = CString::new(path.get(head..tail).unwrap_or_default()) else {
+            return Err((ARCHIVE_FAILED, libc::EINVAL, "Could not stat "));
+        };
+        match stat_at(&dir, &segment, false) {
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+            Err(e) => return Err((ARCHIVE_FAILED, errno(e), "Could not stat ")),
+            Ok(st) if st.st_mode & libc::S_IFMT == libc::S_IFDIR => {
+                if !last {
+                    dir = open_dir(dir.as_raw_fd(), &segment, false)
+                        .map_err(|e| (ARCHIVE_FATAL, errno(e), "Could not chdir "))?;
+                    head = tail + 1;
+                }
+            }
+            Ok(st) if st.st_mode & libc::S_IFMT == libc::S_IFLNK => {
+                // Hardlinks to symlinks are safe: linkat does not follow them.
+                if last && linkname {
+                    return Ok(());
+                }
+                if last || unlink {
+                    // SAFETY: live descriptor and terminated name.
+                    if unsafe { libc::unlinkat(dir.as_raw_fd(), segment.as_ptr(), 0) } != 0 {
+                        return Err(if last {
+                            let e = std::io::Error::last_os_error();
+                            (ARCHIVE_FAILED, errno(e), "Could not remove symlink ")
+                        } else {
+                            (
+                                ARCHIVE_FAILED,
+                                libc::EIO,
+                                "Cannot remove intervening symlink ",
+                            )
+                        });
+                    }
+                    if last {
+                        return Ok(());
+                    }
+                } else if !secure {
+                    // Follow a symlink to a directory; hardlinks over symlinks need it.
+                    match stat_at(&dir, &segment, true) {
+                        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+                        Err(e) => return Err((ARCHIVE_FAILED, errno(e), "Could not stat ")),
+                        Ok(st) if st.st_mode & libc::S_IFMT == libc::S_IFDIR => {
+                            dir = open_dir(dir.as_raw_fd(), &segment, true)
+                                .map_err(|e| (ARCHIVE_FATAL, errno(e), "Could not chdir "))?;
+                            head = tail + 1;
+                        }
+                        Ok(_) => {
+                            return Err((
+                                ARCHIVE_FAILED,
+                                libc::ELOOP,
+                                "Cannot extract through symlink ",
+                            ));
+                        }
+                    }
+                } else {
+                    return Err((
+                        ARCHIVE_FAILED,
+                        libc::ELOOP,
+                        "Cannot extract through symlink ",
+                    ));
+                }
+            }
+            Ok(_) => {}
+        }
+        if last {
+            return Ok(());
+        }
+        tail += 1;
+    }
+}
+
 /// Why `Target::prepare` failed: creating a missing parent directory, or
 /// anything else.
 #[derive(Debug)]
@@ -313,12 +443,7 @@ impl Target {
         // SAFETY: successful open returns a uniquely owned descriptor.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
-    pub fn prepare(
-        path: &Path,
-        secure: bool,
-        unlink: bool,
-        autodir: bool,
-    ) -> Result<Self, PrepareError> {
+    pub fn prepare(path: &Path, secure: bool, autodir: bool) -> Result<Self, PrepareError> {
         let mut components = path.components();
         let last = components
             .next_back()
@@ -382,25 +507,7 @@ impl Target {
             let mut fd = unsafe { libc::openat(parent.as_raw_fd(), part.as_ptr(), flags) };
             if fd < 0 {
                 let error = std::io::Error::last_os_error();
-                if secure && unlink {
-                    let mut st = super::entry::zeroed_stat();
-                    // SAFETY: writable stat and parent/name are valid.
-                    if unsafe {
-                        libc::fstatat(
-                            parent.as_raw_fd(),
-                            part.as_ptr(),
-                            &mut st,
-                            libc::AT_SYMLINK_NOFOLLOW,
-                        )
-                    } == 0
-                        && st.st_mode & libc::S_IFMT == libc::S_IFLNK
-                    {
-                        // SAFETY: unlinkat uses the live parent and component.
-                        result(unsafe { libc::unlinkat(parent.as_raw_fd(), part.as_ptr(), 0) })?;
-                    } else if error.raw_os_error() != Some(libc::ENOENT) {
-                        return Err(error.into());
-                    }
-                } else if error.raw_os_error() != Some(libc::ENOENT) {
+                if error.raw_os_error() != Some(libc::ENOENT) {
                     return Err(error.into());
                 }
                 if !autodir {
@@ -486,10 +593,8 @@ impl Target {
             libc::symlinkat(path.as_ptr(), self.parent.as_raw_fd(), self.name.as_ptr())
         })
     }
-    pub fn hardlink(&self, source: &Target, secure: bool) -> std::io::Result<()> {
-        if secure && source.stat()?.st_mode & libc::S_IFMT == libc::S_IFLNK {
-            return Err(std::io::Error::from_raw_os_error(libc::EPERM));
-        }
+    pub fn hardlink(&self, source: &Target) -> std::io::Result<()> {
+        // linkat without AT_SYMLINK_FOLLOW links a symlink itself.
         // SAFETY: live source/dest parent fds and names; no pointer is retained.
         result(unsafe {
             libc::linkat(
@@ -1000,7 +1105,7 @@ mod tests {
             (root.0.join("dir/.."), root.0.join("dir"), ".."),
             (root.0.join("dir/"), root.0.clone(), "dir"),
         ] {
-            let target = Target::prepare(&path, true, false, false).unwrap();
+            let target = Target::prepare(&path, true, false).unwrap();
             let actual = target.parent.metadata().unwrap();
             let expected = std::fs::metadata(parent).unwrap();
             assert_eq!(
@@ -1013,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn target_parent_keeps_symlink_unlink_and_autodir_rules() {
+    fn target_parent_keeps_symlink_and_autodir_rules() {
         use std::io::Write;
         let root = Directory::new();
         let outside = root.0.join("outside");
@@ -1021,31 +1126,53 @@ mod tests {
         let link = root.0.join("link");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let path = link.join("file");
-        assert!(Target::prepare(&path, true, false, true).is_err());
+        assert!(Target::prepare(&path, true, true).is_err());
         assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
-        Target::prepare(&path, false, false, false)
+        Target::prepare(&path, false, false)
             .unwrap()
             .open(0o600, true)
             .unwrap()
             .write_all(b"followed")
             .unwrap();
         assert_eq!(std::fs::read(outside.join("file")).unwrap(), b"followed");
-        assert!(Target::prepare(&path, true, true, false).is_err());
-        assert!(!link.exists());
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
-        Target::prepare(&path, true, true, true)
-            .unwrap()
-            .open(0o600, true)
-            .unwrap()
-            .write_all(b"inside")
-            .unwrap();
-        assert!(!std::fs::symlink_metadata(&link).unwrap().is_symlink());
-        assert_eq!(std::fs::read(&path).unwrap(), b"inside");
-        assert_eq!(std::fs::read(outside.join("file")).unwrap(), b"followed");
         let missing = root.0.join("missing/nested/file");
-        assert!(Target::prepare(&missing, true, false, false).is_err());
+        assert!(Target::prepare(&missing, true, false).is_err());
         assert!(!root.0.join("missing").exists());
-        assert!(Target::prepare(&missing, true, false, true).is_ok());
+        assert!(Target::prepare(&missing, true, true).is_ok());
+    }
+
+    #[test]
+    fn check_symlinks_refuses_or_removes_symlinks_as_upstream_does() {
+        use crate::archive::ARCHIVE_FAILED;
+        let root = Directory::new();
+        let bytes = |p: &std::path::Path| p.as_os_str().as_bytes().to_vec();
+        std::fs::create_dir(root.0.join("dir")).unwrap();
+        std::fs::write(root.0.join("file"), b"").unwrap();
+        let link = root.0.join("link");
+        std::os::unix::fs::symlink(root.0.join("dir"), &link).unwrap();
+        let through = bytes(&link.join("x"));
+        let refused = Err((
+            ARCHIVE_FAILED,
+            libc::ELOOP,
+            "Cannot extract through symlink ",
+        ));
+        assert_eq!(check_symlinks(&through, false, true, false), refused);
+        // Without SECURE_SYMLINKS a symlink to a directory is followed.
+        assert_eq!(check_symlinks(&through, false, false, false), Ok(()));
+        std::os::unix::fs::symlink(root.0.join("file"), root.0.join("filelink")).unwrap();
+        let to_file = bytes(&root.0.join("filelink/x"));
+        assert_eq!(check_symlinks(&to_file, false, false, false), refused);
+        let in_file = bytes(&root.0.join("file/x"));
+        let not_dir = Err((ARCHIVE_FAILED, libc::ENOTDIR, "Could not stat "));
+        assert_eq!(check_symlinks(&in_file, false, true, false), not_dir);
+        // A hardlink may point at a symlink; any other last symlink goes.
+        assert_eq!(check_symlinks(&bytes(&link), false, true, true), Ok(()));
+        assert!(link.exists());
+        assert_eq!(check_symlinks(&bytes(&link), false, true, false), Ok(()));
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        std::os::unix::fs::symlink(root.0.join("dir"), &link).unwrap();
+        assert_eq!(check_symlinks(&through, true, true, false), Ok(()));
+        assert!(std::fs::symlink_metadata(&link).is_err());
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1072,7 +1199,7 @@ mod tests {
             .0
             .set_permissions(std::fs::Permissions::from_mode(0o111))
             .unwrap();
-        let target = Target::prepare(&ancestor.join("parent/file"), true, false, false).unwrap();
+        let target = Target::prepare(&ancestor.join("parent/file"), true, false).unwrap();
         target.open(0o600, true).unwrap();
         assert!(ancestor.join("parent/file").exists());
     }
@@ -1098,7 +1225,7 @@ mod tests {
         let _cleanup = Cleanup(root.clone());
         let path = root.join("file");
         std::fs::write(&path, b"keep").unwrap();
-        let target = Target::prepare(&path, true, false, false).unwrap();
+        let target = Target::prepare(&path, true, false).unwrap();
         assert_eq!(
             target.open(0o600, true).unwrap_err().raw_os_error(),
             Some(libc::EEXIST)
@@ -1128,7 +1255,7 @@ mod tests {
         let root = std::fs::canonicalize(root).unwrap();
         std::fs::create_dir(root.join("parent")).unwrap();
         std::fs::create_dir(root.join("outside")).unwrap();
-        let target = Target::prepare(&root.join("parent/file"), true, false, false).unwrap();
+        let target = Target::prepare(&root.join("parent/file"), true, false).unwrap();
         std::fs::rename(root.join("parent"), root.join("original")).unwrap();
         std::os::unix::fs::symlink(root.join("outside"), root.join("parent")).unwrap();
         target
@@ -1138,7 +1265,7 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(root.join("original/file")).unwrap(), b"safe");
         assert!(!root.join("outside/file").exists());
-        assert!(Target::prepare(&root.join("parent/other"), true, false, false).is_err());
+        assert!(Target::prepare(&root.join("parent/other"), true, false).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

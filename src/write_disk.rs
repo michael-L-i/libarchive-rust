@@ -34,7 +34,7 @@ use crate::archive::{
     ARCHIVE_ERRNO_MISC, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN, Base, state,
 };
 use crate::entry::Entry;
-use crate::ffi::disk_sys::{PrepareError, Target};
+use crate::ffi::disk_sys::{PrepareError, Target, check_symlinks};
 use crate::util::Error;
 use std::ffi::c_int;
 use std::fs::File;
@@ -151,12 +151,11 @@ impl WriteDisk {
             }
         }
         let secure = self.options & SECURE_SYMLINKS != 0;
-        let mut target = match Target::prepare(
-            &path,
-            secure,
-            self.options & UNLINK != 0,
-            self.options & NO_AUTODIR == 0,
-        ) {
+        let unlink = self.options & UNLINK != 0;
+        if secure && let Err((code, errno, msg)) = check_symlinks(&name, unlink, secure, false) {
+            return a.raise(Error::new(code, errno, [msg.as_bytes(), &name].concat()));
+        }
+        let mut target = match Target::prepare(&path, secure, self.options & NO_AUTODIR == 0) {
             Ok(t) => t,
             Err(PrepareError::Mkdir(dir, e)) => return failure(a, e, "Failed to create dir", &dir),
             Err(PrepareError::Other(e)) => {
@@ -172,7 +171,7 @@ impl WriteDisk {
                 .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFLNK)
             && let Ok(real) = std::fs::canonicalize(&path)
         {
-            match Target::prepare(&real, false, false, false) {
+            match Target::prepare(&real, false, false) {
                 Ok(t) => target = t,
                 Err(e) => return failure(a, e.into(), "Can't follow directory", &path),
             }
@@ -245,9 +244,17 @@ impl WriteDisk {
                     cfg!(target_vendor = "apple") && self.options & PERM == 0;
                 Ok(())
             } else if let Some(source) = hardlink {
-                Target::prepare(&source, secure, false, false)
+                let clean = cleanup_pathname(source.as_os_str().as_bytes(), 0).unwrap_or_default();
+                if let Err((_, errno, msg)) = check_symlinks(&clean, unlink, secure, true) {
+                    return a.raise(Error::new(
+                        ARCHIVE_FAILED,
+                        errno,
+                        [msg.as_bytes(), &clean].concat(),
+                    ));
+                }
+                Target::prepare(&source, secure, false)
                     .map_err(std::io::Error::from)
-                    .and_then(|source| target.hardlink(&source, secure))
+                    .and_then(|source| target.hardlink(&source))
             } else if let Some(link) = link {
                 self.limit = Some(0);
                 target.symlink(&link)
