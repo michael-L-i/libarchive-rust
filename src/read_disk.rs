@@ -389,12 +389,19 @@ impl ReadDisk {
                 continue;
             }
             entry.set_sourcepath(path.as_os_str().as_bytes());
+            // Upstream names the file in its messages as it reached it: by
+            // its name in the directory being read.
+            let access = path
+                .file_name()
+                .filter(|_| !root)
+                .unwrap_or(path.as_os_str());
             let ret = self.fill_metadata(
                 a,
                 entry,
                 &path,
                 followed,
                 fd.as_ref().map(AsRawFd::as_raw_fd),
+                access.as_bytes(),
             );
             if ret < 0 {
                 return ret;
@@ -507,7 +514,7 @@ impl ReadDisk {
     /// Mac metadata and sparse extents; a failure among those last four
     /// warns or fails but the rest are still read, and the worst result is
     /// returned. On Linux these go through `fd`, or one opened for the
-    /// flags.
+    /// flags; `access` is the path upstream's messages name.
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     pub fn fill_metadata(
         &mut self,
@@ -516,6 +523,7 @@ impl ReadDisk {
         path: &Path,
         follow: bool,
         fd: Option<c_int>,
+        access: &[u8],
     ) -> c_int {
         if let Some(name) = self.user.lookup(entry.uid(), false) {
             entry.set_uname(name.to_bytes());
@@ -593,6 +601,7 @@ impl ReadDisk {
         {
             ret = ret.min(failure(a, ARCHIVE_FAILED, e, b"Can't read Mac metadata"));
         }
+        #[cfg(not(target_os = "linux"))]
         if self.behavior & 0x80 == 0 && entry.filetype() == libc::S_IFREG {
             match disk_sys::sparse(path, self.symlinks != 0, entry.size()) {
                 Ok(extents) => {
@@ -602,6 +611,10 @@ impl ReadDisk {
                 }
                 Err(e) => ret = ret.min(failure(a, ARCHIVE_FAILED, e, b"Can't read sparse data")),
             }
+        }
+        #[cfg(target_os = "linux")]
+        if self.behavior & 0x80 == 0 {
+            ret = ret.min(setup_sparse(a, entry, fd, path, access));
         }
         ret
     }
@@ -837,6 +850,159 @@ fn setup_xattrs(a: &Base, entry: &mut Entry, src: disk_sys::Source) -> c_int {
     ARCHIVE_OK
 }
 
+/// Sparse maps hold at most this many extents.
+#[cfg(target_os = "linux")]
+const MAX_EXTENTS: usize = 1 << 20;
+
+/// Upstream's setup_sparse with SEEK_HOLE and SEEK_DATA, through `fd` or
+/// the file opened, which falls back to FIEMAP where seeking a hole fails.
+#[cfg(target_os = "linux")]
+fn setup_sparse(
+    a: &Base,
+    entry: &mut Entry,
+    fd: Option<c_int>,
+    path: &Path,
+    access: &[u8],
+) -> c_int {
+    use libc::{SEEK_CUR, SEEK_DATA, SEEK_END, SEEK_HOLE, SEEK_SET};
+    let failed = |errno, msg: &[u8]| a.raise(Error::new(ARCHIVE_FAILED, errno, msg));
+    let errno = |e: std::io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+    if entry.filetype() != libc::S_IFREG || entry.size() <= 0 || entry.hardlink().is_some() {
+        return ARCHIVE_OK;
+    }
+    let opened;
+    let (fd, initial) = match fd {
+        Some(fd) => {
+            let initial = disk_sys::seek(fd, 0, SEEK_CUR).unwrap_or(-1);
+            if initial != 0 {
+                let _ = disk_sys::seek(fd, 0, SEEK_SET);
+            }
+            (fd, initial)
+        }
+        None => match disk_sys::open_read(path, libc::O_NONBLOCK) {
+            Ok(file) => {
+                opened = file;
+                (opened.as_raw_fd(), 0)
+            }
+            Err(e) => return failed(errno(e), &[b"Can't open `", access, b"'"].concat()),
+        },
+    };
+    // Check if the underlying filesystem supports seek hole.
+    match disk_sys::seek(fd, 0, SEEK_HOLE) {
+        Err(_) => return setup_sparse_fiemap(a, entry, fd),
+        Ok(hole) if hole > 0 => {
+            let _ = disk_sys::seek(fd, 0, SEEK_SET);
+        }
+        Ok(_) => {}
+    }
+    let size = entry.size();
+    let mut ret = ARCHIVE_OK;
+    let mut check_fully_sparse = false;
+    let mut off_s = 0;
+    while off_s < size {
+        off_s = match disk_sys::seek(fd, off_s, SEEK_DATA) {
+            Ok(off) => off,
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                // no more hole; with no data, potentially a fully-sparse file.
+                check_fully_sparse = entry.sparse_count() == 0;
+                break;
+            }
+            Err(e) => {
+                ret = failed(errno(e), b"lseek(SEEK_HOLE) failed");
+                break;
+            }
+        };
+        let off_e = match disk_sys::seek(fd, off_s, SEEK_HOLE) {
+            Ok(off) => off,
+            Err(e) => {
+                let e = match e.raw_os_error() {
+                    Some(libc::ENXIO) => match disk_sys::seek(fd, 0, SEEK_END) {
+                        Ok(_) => break, // no more data
+                        Err(e) => e,
+                    },
+                    _ => e,
+                };
+                ret = failed(errno(e), b"lseek(SEEK_DATA) failed");
+                break;
+            }
+        };
+        if off_s == 0 && off_e == size {
+            break; // This is not sparse.
+        }
+        if entry.sparse.len() >= MAX_EXTENTS {
+            ret = failed(libc::ENOMEM, b"Can't read sparse data");
+            break;
+        }
+        entry.sparse_add(off_s, off_e - off_s);
+        off_s = off_e;
+    }
+    if check_fully_sparse
+        && disk_sys::seek(fd, 0, SEEK_HOLE).is_ok_and(|off| off == 0)
+        && disk_sys::seek(fd, 0, SEEK_END).is_ok_and(|off| off == size)
+    {
+        // Fully sparse file; insert a zero-length "data" entry.
+        entry.sparse_add(0, 0);
+    }
+    let _ = disk_sys::seek(fd, initial, SEEK_SET);
+    ret
+}
+
+/// Upstream's setup_sparse_fiemap on `fd`: the written extents FIEMAP
+/// reports. An error leaves the file as it is, since kernels before
+/// 2.6.28 can't map extents.
+#[cfg(target_os = "linux")]
+fn setup_sparse_fiemap(a: &Base, entry: &mut Entry, fd: c_int) -> c_int {
+    let size = entry.size();
+    let mut map = disk_sys::Fiemap::new();
+    for iter in 0.. {
+        if map.map(fd).is_err() {
+            break;
+        }
+        let extents = map.extents();
+        let Some(last) = extents.last() else {
+            if iter == 0 {
+                // Fully sparse file; insert a zero-length "data" entry.
+                entry.sparse_add(0, 0);
+            }
+            break;
+        };
+        let mut more = true;
+        for fe in extents {
+            if fe.fe_flags & disk_sys::FIEMAP_EXTENT_UNWRITTEN == 0 {
+                // The fe_length of the last block does not adjust itself
+                // to its size files.
+                let mut length = fe.fe_length as i64;
+                let end = fe.fe_logical.wrapping_add(length as u64);
+                if end > size as u64 {
+                    length = (length as u64).wrapping_sub(end.wrapping_sub(size as u64)) as i64;
+                }
+                if fe.fe_logical == 0 && length == size {
+                    // This is not sparse.
+                    more = false;
+                    break;
+                }
+                if entry.sparse.len() >= MAX_EXTENTS {
+                    let e = Error::new(ARCHIVE_FAILED, libc::ENOMEM, "Can't read sparse data");
+                    return a.raise(e);
+                }
+                if length > 0 {
+                    entry.sparse_add(fe.fe_logical as i64, length);
+                }
+            }
+            if fe.fe_flags & disk_sys::FIEMAP_EXTENT_LAST != 0 {
+                more = false;
+            }
+        }
+        let start = last.fe_logical.wrapping_add(last.fe_length);
+        // A map that doesn't move on would be asked for forever.
+        if !more || start <= map.fm_start {
+            break;
+        }
+        map.fm_start = start;
+    }
+    ARCHIVE_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,6 +1140,49 @@ mod tests {
         } else {
             assert_eq!(blocks.last(), Some(&(ARCHIVE_EOF, 0, 65536)));
         }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fiemap_finds_the_extents_seek_hole_does() {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+        let root = std::env::temp_dir().join(format!("libarchive-fiemap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let path = root.join("sparse");
+        let mut file = File::create(&path).unwrap();
+        file.set_len(1 << 20).unwrap();
+        file.write_all_at(&[1; 4096], 256 * 1024).unwrap();
+        file.write_all_at(&[2; 10], (1 << 20) - 10).unwrap();
+        file.flush().unwrap();
+        let a = Base::new(READ_DISK_MAGIC);
+        let extents = |fiemap: bool| {
+            let mut entry = Entry::new(None);
+            entry.set_mode(libc::S_IFREG | 0o644);
+            entry.set_size(1 << 20);
+            let file = File::open(&path).unwrap();
+            let code = if fiemap {
+                setup_sparse_fiemap(&a, &mut entry, file.as_raw_fd())
+            } else {
+                setup_sparse(&a, &mut entry, Some(file.as_raw_fd()), &path, b"sparse")
+            };
+            assert_eq!(code, ARCHIVE_OK);
+            entry.sparse_count();
+            entry
+                .sparse
+                .iter()
+                .map(|s| (s.offset, s.length))
+                .collect::<Vec<_>>()
+        };
+        let seek = extents(false);
+        let mapped = extents(true);
+        // Where FIEMAP is not supported, upstream leaves the file as it is.
+        if !mapped.is_empty() {
+            assert_eq!(mapped, seek);
+        }
+        assert!(seek.iter().any(|&(offset, _)| offset == 256 * 1024));
         fs::remove_dir_all(&root).unwrap();
     }
 }

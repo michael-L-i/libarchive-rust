@@ -142,8 +142,9 @@ impl Handle {
                 };
                 entry.copy_stat(&stat);
             }
+            let access = path.as_os_str().as_bytes();
             let fd = (fd >= 0).then_some(fd);
-            d.fill_metadata(a, entry, &path, d.symlinks != 0, fd)
+            d.fill_metadata(a, entry, &path, d.symlinks != 0, fd, access)
         })
     }
 

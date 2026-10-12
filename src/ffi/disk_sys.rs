@@ -312,6 +312,81 @@ impl Source<'_> {
     }
 }
 
+/// lseek on a descriptor.
+#[cfg(target_os = "linux")]
+pub fn seek(fd: libc::c_int, offset: i64, whence: libc::c_int) -> std::io::Result<i64> {
+    // SAFETY: lseek takes no pointers; a descriptor that isn't open fails.
+    let at = unsafe { libc::lseek(fd, offset, whence) };
+    if at < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(at)
+}
+
+/// The extents one FS_IOC_FIEMAP call returns: as many as fit in
+/// upstream's 4096-byte buffer.
+#[cfg(target_os = "linux")]
+const FIEMAP_EXTENTS: usize = (4096 - 32) / 56;
+#[cfg(target_os = "linux")]
+pub const FIEMAP_FLAG_SYNC: u32 = 0x1;
+#[cfg(target_os = "linux")]
+pub const FIEMAP_EXTENT_LAST: u32 = 0x1;
+#[cfg(target_os = "linux")]
+pub const FIEMAP_EXTENT_UNWRITTEN: u32 = 0x800;
+
+/// `<linux/fiemap.h>`'s struct fiemap_extent.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FiemapExtent {
+    pub fe_logical: u64,
+    pub fe_physical: u64,
+    pub fe_length: u64,
+    fe_reserved64: [u64; 2],
+    pub fe_flags: u32,
+    fe_reserved: [u32; 3],
+}
+
+/// `<linux/fiemap.h>`'s struct fiemap, with room for its extents.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+pub struct Fiemap {
+    pub fm_start: u64,
+    pub fm_length: u64,
+    pub fm_flags: u32,
+    pub fm_mapped_extents: u32,
+    pub fm_extent_count: u32,
+    fm_reserved: u32,
+    fm_extents: [FiemapExtent; FIEMAP_EXTENTS],
+}
+#[cfg(target_os = "linux")]
+impl Fiemap {
+    /// Upstream's request: every extent from the start, synced first.
+    pub fn new() -> Self {
+        Fiemap {
+            fm_start: 0,
+            fm_length: !0,
+            fm_flags: FIEMAP_FLAG_SYNC,
+            fm_mapped_extents: 0,
+            fm_extent_count: FIEMAP_EXTENTS as u32,
+            fm_reserved: 0,
+            fm_extents: [FiemapExtent::default(); FIEMAP_EXTENTS],
+        }
+    }
+    /// FS_IOC_FIEMAP on `fd` (struct fiemap is 32 bytes before its extents).
+    pub fn map(&mut self, fd: libc::c_int) -> std::io::Result<()> {
+        const FS_IOC_FIEMAP: libc::Ioctl = libc::_IOWR::<[u64; 4]>(b'f' as u32, 11);
+        // SAFETY: `self` is a struct fiemap whose fm_extent_count is the
+        // length of its extent array, which bounds what the kernel writes.
+        result(unsafe { libc::ioctl(fd, FS_IOC_FIEMAP, self as *mut Self) })
+    }
+    /// The extents the last call mapped.
+    pub fn extents(&self) -> &[FiemapExtent] {
+        let n = (self.fm_mapped_extents as usize).min(FIEMAP_EXTENTS);
+        self.fm_extents.get(..n).unwrap_or_default()
+    }
+}
+
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Component;
@@ -1347,6 +1422,7 @@ pub fn filesystem(
     })
 }
 
+#[cfg(not(target_os = "linux"))]
 pub fn sparse(path: &Path, follow: bool, size: i64) -> std::io::Result<Vec<(i64, i64)>> {
     if size <= 0 {
         return Ok(Vec::new());
