@@ -1801,10 +1801,13 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   Actual Opus 5.5 design/final review, primary kernel sources, filesystem
   differential checks and rotating six-format measurements are retained in
   `../diagnostics/round9-system`.
-- The parent-path checks retain two pre-existing errno differences: rejection
-  of a symlink ancestor reports ENOTDIR here versus ELOOP in C; unlinking that
-  symlink with NO_AUTODIR reports ENOTDIR here versus ENOENT in C. Return status
-  and filesystem effects agree, and the optimized path preserves Rust's errno.
+- `SECURE_SYMLINKS` runs upstream's check_symlinks walk (its openat variant)
+  before anything is created, with its messages and errnos, and still opens
+  each parent with O_NOFOLLOW afterwards, so a symlink swapped in after the
+  walk can't redirect the write. Missing parents are made by a port of
+  create_dir that works relative to each opened parent rather than by path;
+  it follows symlinks as upstream's stat() does, except under
+  SECURE_SYMLINKS, where the walk has already removed or refused them.
 - Ordinary non-atomic regular files first attempt exclusive creation after all
   path/security checks, like upstream. Success proves the destination was absent
   and avoids its pre-create stat; any error follows the original existing-file
@@ -1816,17 +1819,33 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   permissions, links and deferred directories retain their previous handling.
   Actual Opus 5.5 design/final review, C ABI mode/status checks and five-rotation
   six-format extraction results are retained in `../diagnostics/round8-system`.
-- The focused extraction comparisons also record an existing deviation that
-  this optimization leaves unchanged. With NO_OVERWRITE on an existing regular
-  file, Rust reports the supplied byte count and preserves its mode; C reports
-  ARCHIVE_WARN for the attempted data write and restores the archive mode.
+- Kept: with NO_OVERWRITE (or NO_OVERWRITE_NEWER) on an existing
+  non-directory, upstream still restores the entry's metadata onto the file it
+  kept, by path: its chmod follows a symlink there (without SECURE_SYMLINKS,
+  which removes one). Here the kept file's metadata is left alone. Data writes
+  to it fail with "Attempt to write to an empty file" as upstream's do.
 - Disk writes keep each parent directory open and create/open/link children
   relative to its descriptor. `SECURE_SYMLINKS` opens every ancestor with
   `O_NOFOLLOW`; replacing an ancestor after the check cannot redirect a write.
   `SECURE_NODOTDOT` and `SECURE_NOABSOLUTEPATHS` check both destination and
   hardlink source. Symlink targets remain literal, as upstream permits.
-- Directory metadata is deferred until close, with each entry's extraction
-  options retained; data-less hardlinks leave the target's metadata alone.
+- Metadata is restored in upstream's order and with its messages. As
+  upstream, a new directory's times and mode, any directory's ACLs and Mac
+  metadata, and immutable or append-only flags wait for close, which applies
+  them deepest path first to what still has the entry's type; data-less
+  hardlinks leave the target's metadata alone. Kept: upstream's close-time
+  flags fixup starts from the flags of the last entry's path (its stat cache
+  is filled from `a->name`), and skips the fixup if that path is gone; here
+  each file's own flags are used. "Can't set UID=%jd" carries whatever errno
+  upstream last saw, which isn't meaningful; here it is EPERM. A SAFE_WRITES
+  temporary file is renamed into place before its metadata is restored rather
+  than after; the result is the same. A failure to build an ACL warns "Failed
+  to set acl..." rather than with upstream's ARCHIVE_FAILED messages for
+  acl_create_entry and the like, which only fail on ENOMEM.
+- Ported as-is: upstream makes a missing parent directory with mode
+  (0777 & ~umask | 0700) & 0775 and records a fixup to 0777 & ~umask, but the
+  fixup never applies because create_dir doesn't set its file type, so under a
+  umask such as 0 parents end up 0775, not 0777.
   Short writes are extended to the entry size and block writes seek to their
   explicit offsets. Cached physical position and length avoid seeks for
   contiguous writes and resizing files already at their target length. Sparse
