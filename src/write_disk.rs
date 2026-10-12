@@ -56,12 +56,20 @@ pub const MAC_METADATA: c_int = 0x2000;
 pub const SECURE_NOABSOLUTEPATHS: c_int = 0x10000;
 pub const SAFE_WRITES: c_int = 0x40000;
 
-/// File flags that would get in the way of the rest of the extraction.
-#[cfg(target_vendor = "apple")]
-const CRITICAL_FLAGS: std::ffi::c_ulong =
-    (libc::SF_IMMUTABLE | libc::UF_IMMUTABLE | libc::SF_APPEND | libc::UF_APPEND) as _;
-#[cfg(not(target_vendor = "apple"))]
-const CRITICAL_FLAGS: std::ffi::c_ulong = 0;
+/// Whether `flags` hold one that would get in the way of the rest of the
+/// extraction. Only Apple platforms restore file flags here.
+fn has_critical_flags(flags: std::ffi::c_ulong) -> bool {
+    #[cfg(target_vendor = "apple")]
+    return flags
+        & (libc::SF_IMMUTABLE | libc::UF_IMMUTABLE | libc::SF_APPEND | libc::UF_APPEND)
+            as std::ffi::c_ulong
+        != 0;
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = flags;
+        false
+    }
+}
 
 /// What close restores on an entry. It holds no descriptor: close finds
 /// the entry again by name, and only if it is still the same file.
@@ -624,7 +632,7 @@ impl WriteDisk {
                 entry.hardlink_is_set() != 0 && (entry.size_is_set() == 0 || entry.size() <= 0);
             let todo = if link_only { 0 } else { options };
             // Flags that forbid changes wait for close, after any hardlinks.
-            let mut deferred = if entry.fflags().0 & CRITICAL_FLAGS != 0 {
+            let mut deferred = if has_critical_flags(entry.fflags().0) {
                 FFLAGS
             } else {
                 0

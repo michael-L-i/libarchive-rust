@@ -497,6 +497,7 @@ impl Target {
         self.live = Some(file);
     }
     /// Whether metadata goes through a descriptor kept open for it.
+    #[cfg(target_vendor = "apple")]
     pub fn is_open(&self) -> bool {
         self.live.is_some()
     }
