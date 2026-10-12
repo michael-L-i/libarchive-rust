@@ -270,9 +270,11 @@ fn supports_nofollow_any() -> bool {
 
 /// Upstream's la_opendirat: a directory opened only to look names up in it.
 fn open_dir(dir: libc::c_int, name: &CStr, follow: bool) -> std::io::Result<File> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let search = libc::O_PATH;
     #[cfg(target_vendor = "apple")]
     let search = libc::O_SEARCH;
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     let search = libc::O_RDONLY;
     let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
     // SAFETY: dir is AT_FDCWD or a live descriptor and name is terminated.
