@@ -134,6 +134,20 @@ impl WriteDisk {
             .symlink()
             .map(|p| PathBuf::from(std::ffi::OsStr::from_bytes(p.to_bytes())));
         if let Some(target) = &hardlink {
+            // Upstream compares the cleaned-up pathname with the link as given.
+            let name: PathBuf = path
+                .components()
+                .filter(|c| *c != Component::CurDir)
+                .collect();
+            if name.as_os_str() == target.as_os_str() {
+                let msg = [
+                    b"Skipping hardlink pointing to itself: ",
+                    name.as_os_str().as_bytes(),
+                ];
+                return a
+                    .warn(crate::archive::ARCHIVE_ERRNO_MISC, msg.concat())
+                    .code();
+            }
             if self.options & SECURE_NOABSOLUTEPATHS != 0 && target.is_absolute() {
                 return a.raise(Error::new(
                     ARCHIVE_FAILED,
@@ -930,6 +944,28 @@ mod tests {
         let dir = locked.join("dir");
         let expected = [b"Failed to create dir '", dir.as_os_str().as_bytes(), b"'"].concat();
         assert_eq!(*base.error_string().unwrap(), *expected);
+    }
+
+    #[test]
+    fn hardlink_to_itself_is_skipped() {
+        let output = Output::new();
+        std::fs::write(output.path(), b"data").unwrap();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        let mut entry = Entry::new(None);
+        let name = output.path();
+        entry.set_pathname(&[name.as_os_str().as_bytes(), b"/"].concat());
+        entry.set_hardlink(name.as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFREG | 0o644);
+        assert_eq!(disk.header(&base, &entry), ARCHIVE_WARN);
+        let expected = [
+            b"Skipping hardlink pointing to itself: ",
+            name.as_os_str().as_bytes(),
+        ]
+        .concat();
+        assert_eq!(*base.error_string().unwrap(), *expected);
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+        assert_eq!(std::fs::read(output.path()).unwrap(), b"data");
     }
 
     #[test]
