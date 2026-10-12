@@ -100,13 +100,13 @@ impl FilterBidder for Bidder {
         Ok(bid(up).unwrap_or(0))
     }
 
-    fn init(&mut self, _up: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error> {
+    fn init(&mut self, up: &mut Reader<'_>) -> Result<Box<dyn Filter>, Error> {
         let mut out = Vec::new();
         out.try_reserve_exact(BLOCK).map_err(|_| {
             Error::fatal(libc::ENOMEM, "Can't allocate data for zstd decompression")
         })?;
         let mut decoder = FrameDecoder::new();
-        decoder.set_max_window_size(MAX_WINDOW);
+        decoder.set_max_window_size(up.decoder_memory(MAX_WINDOW));
         Ok(Box::new(Zstd {
             decoder,
             in_frame: false,

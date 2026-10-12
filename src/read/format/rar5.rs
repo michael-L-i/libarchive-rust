@@ -1117,6 +1117,9 @@ impl Rar5 {
             return Err(format_error("Declared dictionary size is not supported"));
         }
         // Values up to 64M fit every type.
+        if window_size > r.decoder_memory(u64::MAX) {
+            return Err(fatal(libc::ENOMEM, "RAR5 window requires too much memory"));
+        }
         let window_size = window_size as i64;
 
         if self.file.solid {
@@ -1399,10 +1402,13 @@ impl Rar5 {
     /// skip the <magic> block, <MAIN> block, and then we're standing on the
     /// proper <FILE> block.
     fn process_base_block(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Res<Step> {
-        const SMALLEST_RAR5_BLOCK_SIZE: usize = 3;
-
-        // Skip any unprocessed data for this file.
+        // Skip any unprocessed data for this file before accounting its header.
         self.skip_unprocessed_bytes(r)?;
+        r.with_metadata(|r| self.process_base_block_inner(r, entry))
+    }
+
+    fn process_base_block_inner(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Res<Step> {
+        const SMALLEST_RAR5_BLOCK_SIZE: usize = 3;
 
         // Read the expected CRC32 checksum.
         let hdr_crc = read_u32(r).ok_or(Stop::Eof)?;
@@ -1964,6 +1970,7 @@ impl Rar5 {
         //
         // In case too many bytes will be generated, calling this function
         // again will resume the uncompression operation.
+        let before_decode = self.cstate.write_ptr;
         if self.cstate.block_in_push_buf {
             let buf = std::mem::take(&mut self.vol.push_buf);
             let ret = self.decode_block(a, &buf, new_block);
@@ -1975,6 +1982,13 @@ impl Rar5 {
             let p = ahead(r, need).ok_or(Stop::Eof)?;
             self.decode_block(a, p, new_block)?;
         }
+
+        r.decoded(
+            self.cstate
+                .write_ptr
+                .checked_sub(before_decode)
+                .ok_or_else(|| fatal(libc::EOVERFLOW, "RAR decoded byte count overflow"))?,
+        )?;
 
         if self.cstate.block_parsing_finished
             && !self.cstate.switch_multivolume

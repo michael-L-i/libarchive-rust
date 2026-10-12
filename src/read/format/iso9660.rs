@@ -1010,6 +1010,7 @@ impl Iso9660 {
         r.consume(LOGICAL_BLOCK_SIZE as i64 * i64::from(vd.location))?;
         self.current_position = (LOGICAL_BLOCK_SIZE as i64 * i64::from(vd.location)) as u64;
 
+        let budget = r.budget;
         let Some(block) = r.read_ahead(vd.size as usize)? else {
             return Err(no_full_block());
         };
@@ -1020,7 +1021,7 @@ impl Iso9660 {
         let seen_joliet = self.seen_joliet; // Save flag.
         self.seen_joliet = 0;
         let mut file =
-            self.parse_file_info(None, block.get(..vd.size as usize).unwrap_or(block))?;
+            self.parse_file_info(budget, None, block.get(..vd.size as usize).unwrap_or(block))?;
         self.seen_joliet = seen_joliet;
 
         // If the iso image has both RockRidge and Joliet, we preferentially
@@ -1041,7 +1042,8 @@ impl Iso9660 {
                 return Err(no_full_block());
             };
             self.seen_joliet = 0;
-            file = self.parse_file_info(None, block.get(..vd.size as usize).unwrap_or(block))?;
+            file =
+                self.parse_file_info(budget, None, block.get(..vd.size as usize).unwrap_or(block))?;
             self.seen_joliet = seen_joliet;
         }
 
@@ -1089,11 +1091,13 @@ impl Iso9660 {
 
         let lbs = self.lbs();
         let step = usize::try_from(psize.div_ceil(lbs) * lbs).unwrap_or(usize::MAX);
+        let budget = r.budget;
+        budget.check_metadata(step)?;
         let Some(b) = r.read_ahead(step)? else {
             return Err(no_full_block());
         };
         self.current_position = self.current_position.wrapping_add(step as u64);
-        let scanned = self.scan_directory(parent, b.get(..step).unwrap_or(b));
+        let scanned = self.scan_directory(budget, parent, b.get(..step).unwrap_or(b));
         let _ = r.consume(step);
         scanned?;
 
@@ -1103,7 +1107,12 @@ impl Iso9660 {
     }
 
     /// Parses the directory records in the blocks of a directory.
-    fn scan_directory(&mut self, parent: usize, blocks: &[u8]) -> Result<(), Error> {
+    fn scan_directory(
+        &mut self,
+        budget: &crate::read::limits::Budget,
+        parent: usize,
+        blocks: &[u8],
+    ) -> Result<(), Error> {
         let lbs = self.lbs() as usize;
         let mut multi: Option<usize> = None;
         for b in blocks.chunks_exact(lbs) {
@@ -1122,7 +1131,7 @@ impl Iso9660 {
                 if byte(rec, DR_NAME_LEN) == 1 && byte(rec, DR_NAME) <= 1 {
                     continue;
                 }
-                let child = self.parse_file_info(Some(parent), rec)?;
+                let child = self.parse_file_info(budget, Some(parent), rec)?;
                 let c = &self.files[child];
                 if c.cl_offset == 0 && (c.multi_extent || multi.is_some()) {
                     let con = Content {
@@ -1171,7 +1180,22 @@ impl Iso9660 {
 
     /// This routine parses a single ISO directory record, makes sense of any
     /// extensions, and stores the result in memory.
-    fn parse_file_info(&mut self, parent: Option<usize>, rec: &[u8]) -> Result<usize, Error> {
+    fn parse_file_info(
+        &mut self,
+        budget: &crate::read::limits::Budget,
+        parent: Option<usize>,
+        rec: &[u8],
+    ) -> Result<usize, Error> {
+        budget.check_entries(
+            self.files
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| misc("ISO entry count overflow"))?,
+        )?;
+        budget.metadata(std::mem::size_of::<FileInfo>())?;
+        self.files
+            .try_reserve(1)
+            .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for ISO entries"))?;
         let reclen = rec.len();
         let dr_len = if reclen != 0 {
             usize::from(byte(rec, DR_LENGTH))
@@ -2066,6 +2090,7 @@ impl Iso9660 {
             }
         }
 
+        r.decoded(uncompressed_size)?;
         // next_data:
         let consumed = bytes_read - avail;
         let offset = self.entry_sparse_offset;

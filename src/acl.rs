@@ -187,6 +187,21 @@ fn nonempty<T: PartialEq + From<u8>>(name: Option<&[T]>) -> Option<&[T]> {
 }
 
 impl Acl {
+    pub(crate) fn resource_metadata_size(&self) -> Option<usize> {
+        let entries = self.entries.iter().try_fold(0usize, |n, e| {
+            n.checked_add(std::mem::size_of::<AclEntry>())?
+                .checked_add(e.name.resource_metadata_size()?)
+        })?;
+        entries
+            .checked_add(self.text.as_ref().map_or(0, Vec::len))?
+            .checked_add(
+                self.text_w
+                    .as_ref()
+                    .map_or(0, Vec::len)
+                    .checked_mul(std::mem::size_of::<wchar_t>())?,
+            )
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
         self.text_w = None;

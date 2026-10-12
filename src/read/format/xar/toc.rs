@@ -355,7 +355,11 @@ pub(super) struct Toc {
 
 impl Toc {
     /// `xml2_read_toc`: reads the XML from `source` and fills in the files.
-    pub fn parse(&mut self, source: impl io::Read) -> Result<(), Error> {
+    pub fn parse(
+        &mut self,
+        source: impl io::Read,
+        budget: Option<&crate::read::limits::Budget>,
+    ) -> Result<(), Error> {
         let mut reader = ParserConfig::new()
             .ignore_comments(false)
             .allow_multiple_root_elements(false)
@@ -376,7 +380,7 @@ impl Toc {
                         .iter()
                         .map(|a| (a.name.local_name.as_str(), a.value.as_str()))
                         .collect();
-                    self.start(&name.local_name, &attrs)?;
+                    self.start(&name.local_name, &attrs, budget)?;
                 }
                 Ok(XmlEvent::EndElement { name }) => {
                     depth = depth.saturating_sub(1);
@@ -533,6 +537,15 @@ impl Toc {
                 id = atou64(value.as_bytes(), 10).ok_or_else(failed)?;
             }
         }
+        self.files
+            .try_reserve(1)
+            .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for XAR entries"))?;
+        self.names
+            .try_reserve(1)
+            .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for XAR names"))?;
+        self.queue
+            .try_reserve(1)
+            .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for XAR entries"))?;
         self.files.push(XarFile::new(id, self.file));
         self.names.push(Name::default());
         self.file = self.files.len().checked_sub(1);
@@ -559,6 +572,9 @@ impl Toc {
             .iter()
             .position(|x| id < x.id)
             .unwrap_or(file.xattrs.len());
+        file.xattrs
+            .try_reserve(1)
+            .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for XAR attributes"))?;
         file.xattrs.insert(
             pos,
             Xattr {
@@ -648,7 +664,12 @@ impl Toc {
     }
 
     /// `xml_start`.
-    fn start(&mut self, name: &str, attrs: &[(&str, &str)]) -> Result<(), Error> {
+    fn start(
+        &mut self,
+        name: &str,
+        attrs: &[(&str, &str)],
+        budget: Option<&crate::read::limits::Budget>,
+    ) -> Result<(), Error> {
         self.base64text = false;
         let flag = |table: &'static [(&'static str, &'static str)]| {
             table.iter().find(|(element, _)| *element == name)
@@ -672,8 +693,23 @@ impl Toc {
             return Ok(());
         };
         match next {
-            TocFile => self.file_new(attrs)?,
-            FileEa => self.xattr_new(attrs)?,
+            TocFile => {
+                if let Some(budget) = budget {
+                    budget.check_entries(self.files.len().checked_add(1).ok_or_else(failed)?)?;
+                    budget.metadata(
+                        std::mem::size_of::<XarFile>()
+                            + std::mem::size_of::<Name>()
+                            + std::mem::size_of::<usize>(),
+                    )?;
+                }
+                self.file_new(attrs)?;
+            }
+            FileEa => {
+                if let Some(budget) = budget {
+                    budget.metadata(std::mem::size_of::<Xattr>())?;
+                }
+                self.xattr_new(attrs)?;
+            }
             FileType => self.type_links(attrs)?,
             FileName => {
                 self.base64text = attrs
@@ -1195,7 +1231,7 @@ mod tests {
 
     fn toc(xml: &str) -> Result<Toc, Error> {
         let mut toc = Toc::default();
-        toc.parse(xml.as_bytes())?;
+        toc.parse(xml.as_bytes(), None)?;
         toc.connect_hardlinks();
         Ok(toc)
     }

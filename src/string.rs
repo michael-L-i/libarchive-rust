@@ -1503,6 +1503,14 @@ fn as_cstr(z: &[u8]) -> &CStr {
 }
 
 impl MString {
+    pub(crate) fn resource_metadata_size(&self) -> Option<usize> {
+        self.mbs
+            .len()
+            .checked_add(self.utf8.len())?
+            .checked_add(self.wcs.len().checked_mul(std::mem::size_of::<wchar_t>())?)?
+            .checked_add(self.mbs_in_locale.len())
+    }
+
     /// Mark the string as not set (upstream's copy of a NULL pointer).
     pub(crate) fn clear(&mut self) {
         self.set = 0;

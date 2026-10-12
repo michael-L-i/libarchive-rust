@@ -339,6 +339,34 @@ fn fix_ns(mut t: i64, mut ns: i64) -> Time {
 }
 
 impl Entry {
+    pub(crate) fn resource_metadata_size(&self) -> Option<u64> {
+        let text = [
+            &self.fflags_text,
+            &self.gname,
+            &self.linkname,
+            &self.pathname,
+            &self.uname,
+            &self.sourcepath,
+        ]
+        .iter()
+        .try_fold(0usize, |n, s| n.checked_add(s.resource_metadata_size()?))?;
+        let attrs = self.xattrs.iter().try_fold(0usize, |n, x| {
+            n.checked_add(std::mem::size_of::<crate::entry_xattr::Xattr>())?
+                .checked_add(x.name.as_bytes_with_nul().len())?
+                .checked_add(x.value.len())
+        })?;
+        let total = text
+            .checked_add(self.acl.resource_metadata_size()?)?
+            .checked_add(self.mac_metadata.len())?
+            .checked_add(attrs)?
+            .checked_add(
+                self.sparse
+                    .len()
+                    .checked_mul(std::mem::size_of::<crate::entry_sparse::Sparse>())?,
+            )?;
+        u64::try_from(total).ok()
+    }
+
     /// `archive_entry_new2`: an entry that converts text with the
     /// conversions of an archive, if given.
     pub fn new(cache: Option<Cache>) -> Entry {

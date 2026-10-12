@@ -120,6 +120,9 @@ pub mod format_code {
 mod ar_example;
 pub mod filter;
 pub mod format;
+mod limits;
+use limits::Budget;
+pub use limits::ReadLimits;
 
 /// A seek origin, as `lseek` and the client seek callback take it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -635,6 +638,13 @@ impl Stage {
             return Err(Error::recorded(ARCHIVE_FATAL));
         }
         let n = self.imp.filter().block().len();
+        if let Err(e) = up.budget.decoded(n) {
+            self.client_total = 0;
+            self.client_avail = 0;
+            self.fatal = true;
+            up.a.raise(e);
+            return Err(Error::recorded(ARCHIVE_FATAL));
+        }
         self.client_total = n;
         self.client_avail = n;
         self.end_of_file = n == 0;
@@ -776,6 +786,7 @@ impl Stage {
                 if get == 0 {
                     break;
                 }
+                up.budget.decoded(u64::try_from(get).unwrap_or(u64::MAX))?;
                 self.position = self.position.saturating_add(get);
                 skipped += get;
                 request -= get;
@@ -799,6 +810,8 @@ impl Stage {
                 self.fatal = true;
                 return Err(Error::recorded(ARCHIVE_FATAL));
             }
+            up.budget
+                .decoded(u64::try_from(request).unwrap_or(u64::MAX))?;
             self.position = after;
             skipped += request;
             return Ok(skipped);
@@ -931,6 +944,8 @@ fn eat(next: &mut usize, avail: &mut usize, request: i64) -> i64 {
 /// returns is a bare status that is safe to `?` upward.
 pub struct Reader<'a> {
     chain: &'a mut [Stage],
+    budget: &'a Budget,
+    metadata: bool,
     a: &'a Base,
     passphrases: &'a mut Passphrases,
     /// The handle's own entry (upstream's `a->entry`), for the calls a
@@ -939,6 +954,37 @@ pub struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    /// Charges newly decoded format output, including hidden headers and skips.
+    pub(crate) fn decoded(&self, n: impl TryInto<u64>) -> Result<(), Error> {
+        self.budget.decoded(n)
+    }
+
+    /// Checks an eagerly parsed entry table before allocating its next entry.
+    pub(crate) fn check_entries(&self, n: impl TryInto<u64>) -> Result<(), Error> {
+        self.budget.check_entries(n)
+    }
+
+    /// Charges metadata retained outside the ordinary header input stream.
+    pub(crate) fn metadata(&self, n: impl TryInto<u64>) -> Result<(), Error> {
+        self.budget.metadata(n)
+    }
+
+    /// Includes headers read internally while seeking or changing volumes.
+    pub(crate) fn with_metadata<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let metadata = std::mem::replace(&mut self.metadata, true);
+        let result = f(self);
+        self.metadata = metadata;
+        result
+    }
+
+    /// The configured per-decoder memory cap, bounded by the existing hard cap.
+    pub(crate) fn decoder_memory(&self, hard_cap: u64) -> u64 {
+        self.budget
+            .limits
+            .decoder_memory
+            .map_or(hard_cap, |n| n.min(hard_cap))
+    }
+
     /// The handle, to record warnings and set the format. The reference does
     /// not borrow the reader, so it can be used while a `read_ahead` slice is
     /// held: take it first, `let a = r.base();`.
@@ -951,6 +997,8 @@ impl<'a> Reader<'a> {
         let (top, below) = self.chain.split_last_mut()?;
         let up = Reader {
             chain: below,
+            budget: self.budget,
+            metadata: false,
             a: self.a,
             passphrases: &mut *self.passphrases,
             entry: None,
@@ -1001,6 +1049,7 @@ impl<'a> Reader<'a> {
     /// (empty at the end of input). Check the length before indexing it:
     /// `peek_available(512)?[..512]` panics on a short archive.
     pub fn peek_available(&mut self, min: usize) -> Result<&[u8], Error> {
+        self.budget.check()?;
         self.flush()?;
         let Some((top, mut up)) = self.split() else {
             return Ok(&[]);
@@ -1017,7 +1066,11 @@ impl<'a> Reader<'a> {
         let Some(data) = self.read_ahead(n)? else {
             return Ok(None);
         };
-        let bytes = data.get(..n).unwrap_or_default().to_vec();
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(n)
+            .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for archive input"))?;
+        bytes.extend_from_slice(data.get(..n).unwrap_or_default());
         self.consume(n)?;
         Ok(Some(bytes))
     }
@@ -1047,6 +1100,7 @@ impl<'a> Reader<'a> {
 
     /// `consume` without the flush.
     fn consume_now(&mut self, n: impl TryInto<i64>) -> Result<(), Error> {
+        self.budget.check()?;
         let a = self.a;
         let request = match n.try_into() {
             Ok(n) if n >= 0 => n,
@@ -1055,9 +1109,19 @@ impl<'a> Reader<'a> {
         if request == 0 {
             return Ok(());
         }
+        if self.metadata {
+            self.budget
+                .metadata(u64::try_from(request).unwrap_or(u64::MAX))?;
+        }
         let skipped = match self.split() {
             // A failure counts as nothing skipped.
-            Some((top, mut up)) => top.advance(&mut up, request).unwrap_or(0),
+            Some((top, mut up)) => match top.advance(&mut up, request) {
+                Ok(n) => n,
+                Err(_) => {
+                    up.budget.check()?;
+                    0
+                }
+            },
             None => 0,
         };
         if skipped == request {
@@ -1074,12 +1138,13 @@ impl<'a> Reader<'a> {
     /// A handle for `consume_later`. Like `base()` it does not borrow the
     /// reader, so it can be taken before `read_ahead` and used while the
     /// slice is held.
-    pub fn consume_later(&self) -> ConsumeLater {
+    pub fn consume_later(&self) -> ConsumeLater<'a> {
         ConsumeLater(
             self.chain
                 .last()
                 .map(|s| Rc::clone(&s.later))
                 .unwrap_or_default(),
+            self.metadata.then_some(self.budget),
         )
     }
 
@@ -1088,7 +1153,10 @@ impl<'a> Reader<'a> {
     /// format. A failure is exactly the one an explicit `consume` would give.
     pub(crate) fn flush(&mut self) -> Result<(), Error> {
         let n = self.chain.last().map_or(0, |s| s.later.take());
-        self.consume_now(n)
+        let metadata = std::mem::replace(&mut self.metadata, false);
+        let result = self.consume_now(n);
+        self.metadata = metadata;
+        result
     }
 
     /// Moves the file pointer forward by up to `n` bytes, using the client's
@@ -1181,12 +1249,15 @@ impl<'a> Reader<'a> {
 /// format to return a `read_ahead` slice from `read_data` and still move
 /// the position past it, since the slice must stay valid until then. See
 /// `Reader::consume_later`.
-pub struct ConsumeLater(Rc<Cell<usize>>);
+pub struct ConsumeLater<'a>(Rc<Cell<usize>>, Option<&'a Budget>);
 
-impl ConsumeLater {
+impl ConsumeLater<'_> {
     /// Consumes `n` more bytes before the reader's next call that reads or
     /// moves the position. Only bytes that `read_ahead` showed were there.
     pub fn consume(&self, n: usize) {
+        if let Some(budget) = self.1 {
+            let _ = budget.metadata(n);
+        }
         self.0.set(self.0.get().saturating_add(n));
     }
 }
@@ -1197,6 +1268,7 @@ pub struct Read {
     /// The client first, then each filter on top of the one before; the last
     /// stage is what formats read.
     chain: Vec<Stage>,
+    budget: Rc<Budget>,
     pub(crate) passphrases: Passphrases,
     /// Registered filter bidders, in registration order.
     bidders: Vec<Box<dyn FilterBidder>>,
@@ -1236,11 +1308,83 @@ pub fn new() -> Handle {
 }
 
 impl Read {
+    pub(crate) fn set_limits(&mut self, a: &Base, limits: ReadLimits) -> c_int {
+        let depth = self
+            .chain
+            .iter()
+            .filter(|s| matches!(s.imp, Imp::Filter(_)))
+            .count();
+        if depth != 0 && limits.decoder_memory != self.budget.limits.decoder_memory {
+            return a.raise(Error::new(
+                ARCHIVE_FAILED,
+                libc::EINVAL,
+                "Decoder memory limit must be configured before appending filters",
+            ));
+        }
+        if limits.filter_depth.is_some_and(|max| depth > max) {
+            return a.raise(Error::new(
+                ARCHIVE_FAILED,
+                libc::EINVAL,
+                "Configured filter depth is below the appended filter count",
+            ));
+        }
+        let Some(budget) = Rc::get_mut(&mut self.budget) else {
+            return a.raise(Error::fatal(libc::EINVAL, "Archive limits are in use"));
+        };
+        budget.limits = limits;
+        ARCHIVE_OK
+    }
+
+    pub(crate) fn resource_option(&mut self, a: &Base, o: &[u8], v: Option<&[u8]>) -> c_int {
+        let value = match v {
+            Some(b"unlimited") | None => None,
+            Some(v) => {
+                let parsed = v.iter().try_fold(0u64, |n, &b| {
+                    if !b.is_ascii_digit() {
+                        return None;
+                    }
+                    n.checked_mul(10)?.checked_add(u64::from(b - b'0'))
+                });
+                let Some(n) = parsed.filter(|_| !v.is_empty()) else {
+                    return a.raise(Error::new(
+                        ARCHIVE_FAILED,
+                        libc::EINVAL,
+                        "Invalid archive resource limit: expected an unsigned decimal integer",
+                    ));
+                };
+                Some(n)
+            }
+        };
+        let mut limits = self.budget.limits;
+        match o {
+            b"decoded-bytes" => limits.decoded_bytes = value,
+            b"entries" => limits.entries = value,
+            b"metadata-bytes" => limits.metadata_bytes = value,
+            b"decoder-memory" => limits.decoder_memory = value,
+            b"filter-depth" => {
+                limits.filter_depth = match value.map(usize::try_from).transpose() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return a.raise(Error::new(
+                            ARCHIVE_FAILED,
+                            libc::EINVAL,
+                            "Invalid archive resource limit: filter depth is too large",
+                        ));
+                    }
+                };
+            }
+            _ => return ARCHIVE_WARN,
+        }
+        self.set_limits(a, limits)
+    }
+
     /// A reader over the whole chain.
     #[cfg(test)]
     pub fn reader<'a>(&'a mut self, a: &'a Base) -> Reader<'a> {
         Reader {
             chain: &mut self.chain,
+            budget: &self.budget,
+            metadata: false,
             a,
             passphrases: &mut self.passphrases,
             entry: None,
@@ -1517,6 +1661,7 @@ impl Read {
             chain,
             passphrases,
             bidders,
+            budget,
             ..
         } = self;
         let Some(bidder) = bidders.last_mut() else {
@@ -1525,8 +1670,13 @@ impl Read {
                 "Internal error: no bidder to append",
             ));
         };
+        if let Err(e) = budget.filter_depth(chain.len() + 1) {
+            return a.raise(e);
+        }
         let mut rd = Reader {
             chain,
+            budget,
+            metadata: false,
             a,
             passphrases,
             entry: None,
@@ -1553,6 +1703,8 @@ impl Read {
             for (i, bidder) in self.bidders.iter_mut().enumerate() {
                 let mut rd = Reader {
                     chain: &mut self.chain,
+                    budget: &self.budget,
+                    metadata: false,
                     a,
                     passphrases: &mut self.passphrases,
                     entry: None,
@@ -1572,6 +1724,8 @@ impl Read {
             }
             let mut rd = Reader {
                 chain: &mut self.chain,
+                budget: &self.budget,
+                metadata: false,
                 a,
                 passphrases: &mut self.passphrases,
                 entry: None,
@@ -1585,6 +1739,11 @@ impl Read {
                 }
                 return ARCHIVE_OK;
             };
+            if let Err(e) = rd.budget.filter_depth(rd.chain.len()) {
+                a.raise(e);
+                self.free_filters(a);
+                return ARCHIVE_FATAL;
+            }
             match self.bidders[best].init(&mut rd) {
                 Ok(filter) => self.chain.push(Stage::new(Imp::Filter(filter))),
                 Err(e) => {
@@ -1608,10 +1767,13 @@ impl Read {
         };
         let mut rd = Reader {
             chain: &mut self.chain,
+            budget: &self.budget,
+            metadata: false,
             a,
             passphrases: &mut self.passphrases,
             entry: None,
         };
+        rd.metadata = true;
         // An error from a bidder, say a failed read, is fatal.
         let Ok(bid) = format.bid(&mut rd, best_bid).map_err(|e| a.raise(e)) else {
             return ARCHIVE_FATAL;
@@ -1668,6 +1830,7 @@ impl Read {
         a.clear_error();
         a.state.set(state::OPEN);
 
+        self.budget.reset();
         // Open data source.
         if let Err(e) = self.open_client(a, client) {
             a.state.set(state::FATAL);
@@ -1679,6 +1842,9 @@ impl Read {
             // Build out the input pipeline.
             if self.choose_filters(a) < ARCHIVE_WARN {
                 a.state.set(state::FATAL);
+                if let Err(e) = self.budget.check() {
+                    a.raise(e);
+                }
                 return ARCHIVE_FATAL;
             }
         }
@@ -1689,6 +1855,9 @@ impl Read {
                 None => {
                     self.close_filters(a);
                     a.state.set(state::FATAL);
+                    if let Err(e) = self.budget.check() {
+                        a.raise(e);
+                    }
                     return ARCHIVE_FATAL;
                 }
             },
@@ -1700,11 +1869,18 @@ impl Read {
                     ));
                     self.close_filters(a);
                     a.state.set(state::FATAL);
+                    if let Err(e) = self.budget.check() {
+                        a.raise(e);
+                    }
                     return ARCHIVE_FATAL;
                 }
             }
         }
 
+        if let Err(e) = self.budget.check() {
+            a.state.set(state::FATAL);
+            return a.raise(e);
+        }
         a.state.set(state::HEADER);
 
         // Ensure libarchive starts from the first node in a multivolume set.
@@ -1747,7 +1923,8 @@ fn copy_out(
     out_off: &mut i64,
     blk_off: &mut i64,
     data: &[u8],
-) -> usize {
+    budget: &Budget,
+) -> Result<usize, Error> {
     let total = dest.len();
     // Compute the amount of zero padding needed.
     let space = i64::try_from(total - *written).unwrap_or(i64::MAX);
@@ -1758,6 +1935,7 @@ fn copy_out(
     } else {
         0
     };
+    budget.decoded(gap)?;
     if let Some(zeros) = dest.get_mut(*written..*written + gap) {
         zeros.fill(0);
     }
@@ -1773,7 +1951,7 @@ fn copy_out(
     let n64 = i64::try_from(n).unwrap_or(0);
     *out_off = out_off.saturating_add(n64);
     *blk_off = blk_off.saturating_add(n64);
-    n
+    Ok(n)
 }
 
 impl Read {
@@ -1782,6 +1960,8 @@ impl Read {
     fn flush(&mut self, a: &Base) -> Result<(), Error> {
         Reader {
             chain: &mut self.chain,
+            budget: &self.budget,
+            metadata: false,
             a,
             passphrases: &mut self.passphrases,
             entry: None,
@@ -1807,6 +1987,8 @@ impl Read {
         let format = self.formats.get_mut(self.format?)?;
         let rd = Reader {
             chain: &mut self.chain,
+            budget: &self.budget,
+            metadata: false,
             a,
             passphrases: &mut self.passphrases,
             entry,
@@ -1834,9 +2016,13 @@ impl Read {
                 "Internal error: No format->read_data function registered",
             )));
         };
+        let budget = rd.budget;
         match format.read_data(&mut rd) {
-            Ok(data) => Ok(f(data)),
-            Err(e) => Err(Self::fail(a, e)),
+            Ok(data) => match budget.check() {
+                Ok(()) => Ok(f(data)),
+                Err(e) => Err(Self::fail(a, e)),
+            },
+            Err(e) => Err(Self::fail(a, budget.check().err().unwrap_or(e))),
         }
     }
 
@@ -1847,6 +2033,7 @@ impl Read {
             Some((format, mut rd)) => format.read_data_skip(&mut rd),
             None => Ok(Status::Ok),
         });
+        let r = self.budget.check().and(r);
         let code = match r {
             Ok(Status::Warn) => ARCHIVE_WARN,
             Ok(_) => ARCHIVE_OK,
@@ -1917,6 +2104,8 @@ impl Read {
                 a.read_data_requested.set(Some(dest.len() - written));
                 let mut leftover = Vec::new();
                 let mut out_of_order = false;
+                let mut copy_error = None;
+                let budget = Rc::clone(&self.budget);
                 let mut eof = false;
                 let mut warned = false;
                 let got = self.read_data_block(a, entry.as_deref_mut(), |d| match d {
@@ -1931,10 +2120,32 @@ impl Read {
                             out_of_order = true;
                             return;
                         }
-                        let n = copy_out(dest, &mut written, &mut out_off, &mut blk_off, data);
-                        leftover = data[n..].to_vec();
+                        match copy_out(
+                            dest,
+                            &mut written,
+                            &mut out_off,
+                            &mut blk_off,
+                            data,
+                            &budget,
+                        ) {
+                            Ok(n) => {
+                                let rest = data.get(n..).unwrap_or_default();
+                                if leftover.try_reserve_exact(rest.len()).is_err() {
+                                    copy_error = Some(Error::fatal(
+                                        libc::ENOMEM,
+                                        "No memory for archive data",
+                                    ));
+                                } else {
+                                    leftover.extend_from_slice(rest);
+                                }
+                            }
+                            Err(e) => copy_error = Some(e),
+                        }
                     }
                 });
+                if let Some(e) = copy_error {
+                    break Self::fail(a, e) as isize;
+                }
                 if let Err(code) = got {
                     break 'read code as isize;
                 }
@@ -1967,8 +2178,12 @@ impl Read {
                 &mut st.output_offset,
                 &mut st.offset,
                 st.pending.get(st.pos..).unwrap_or_default(),
+                &self.budget,
             );
-            st.pos += n;
+            match n {
+                Ok(n) => st.pos += n,
+                Err(e) => break Self::fail(a, e) as isize,
+            }
         };
         self.read_data = st;
         result
@@ -2046,15 +2261,48 @@ impl Read {
         // Record start-of-header offset in uncompressed stream.
         self.header_position = self.chain.last().map_or(0, |s| s.position);
 
-        a.file_count.set(a.file_count.get() + 1);
-        let r2 = match flushed.map(|()| self.active(a, None)) {
-            Ok(Some((format, mut rd))) => match format.read_header(&mut rd, entry) {
-                Ok(status) => status.code(),
-                Err(e) => a.raise(e),
-            },
+        let Some(file_count) = a.file_count.get().checked_add(1) else {
+            return Self::fail(
+                a,
+                Error::fatal(libc::EOVERFLOW, "Archive entry count overflow"),
+            );
+        };
+        a.file_count.set(file_count);
+        let mut r2 = match flushed.map(|()| self.active(a, None)) {
+            Ok(Some((format, mut rd))) => {
+                rd.metadata = true;
+                match format.read_header(&mut rd, entry) {
+                    Ok(status) => status.code(),
+                    Err(e) => a.raise(e),
+                }
+            }
             Ok(None) => ARCHIVE_FATAL,
             Err(e) => a.raise(e),
         };
+
+        if matches!(r2, ARCHIVE_OK | ARCHIVE_WARN)
+            && let Err(e) = self.budget.entry()
+        {
+            r2 = a.raise(e);
+        }
+        if matches!(r2, ARCHIVE_OK | ARCHIVE_WARN) && self.budget.limits.metadata_bytes.is_some() {
+            match entry.resource_metadata_size() {
+                Some(size) => {
+                    if let Err(e) = self.budget.metadata(size) {
+                        r2 = a.raise(e);
+                    }
+                }
+                None => {
+                    r2 = a.raise(Error::fatal(
+                        libc::EOVERFLOW,
+                        "Archive metadata size overflow",
+                    ))
+                }
+            }
+        }
+        if let Err(e) = self.budget.check() {
+            r2 = a.raise(e);
+        }
 
         // EOF and FATAL are persistent at this layer. By modifying the
         // state, we guarantee that future calls to read a header or read
