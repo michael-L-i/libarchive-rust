@@ -63,6 +63,18 @@ const CRITICAL_FLAGS: std::ffi::c_ulong =
 #[cfg(not(target_vendor = "apple"))]
 const CRITICAL_FLAGS: std::ffi::c_ulong = 0;
 
+/// What close restores on an entry. It holds no descriptor: close finds
+/// the entry again by name, and only if it is still the same file.
+struct Fixup {
+    name: Vec<u8>,
+    entry: Entry,
+    /// The ARCHIVE_EXTRACT_* bits to restore, and the mode to set, if any.
+    todo: c_int,
+    mode: Option<u32>,
+    /// The device and inode finish_entry found.
+    id: (u64, u64),
+}
+
 #[derive(Default)]
 pub struct WriteDisk {
     pub options: c_int,
@@ -72,9 +84,7 @@ pub struct WriteDisk {
     pub group: crate::ffi::disk::IdLookup,
     file: Option<File>,
     current: Option<(PathBuf, Entry, Target, c_int)>,
-    /// What close restores: name, entry, target, ARCHIVE_EXTRACT_* bits and
-    /// whether to set the mode.
-    fixups: Vec<(Vec<u8>, Entry, Target, c_int, bool)>,
+    fixups: Vec<Fixup>,
     start_time: i64,
     offset: u64,
     max_offset: u64,
@@ -616,10 +626,16 @@ impl WriteDisk {
             let mode = mode && !link_only;
             let now = todo & !deferred;
             ret = ret.min(self.restore(a, name, &entry, &mut target, now, mode && !directory));
-            if todo & deferred != 0 || (directory && mode) {
-                let todo = todo & (deferred | PERM);
-                self.fixups
-                    .push((name.to_vec(), entry, target, todo, directory && mode));
+            if (todo & deferred != 0 || (directory && mode))
+                && let Ok(st) = target.stat()
+            {
+                self.fixups.push(Fixup {
+                    name: name.to_vec(),
+                    todo: todo & (deferred | SECURE_SYMLINKS),
+                    mode: (directory && mode).then(|| final_mode(&entry, options)),
+                    entry,
+                    id: (st.st_dev as u64, st.st_ino),
+                });
             }
             a.state.set(state::HEADER);
             return ret;
@@ -811,21 +827,36 @@ impl WriteDisk {
         let ret = self.finish_entry(a);
         // Deepest first, so a directory's mode can't lock out its contents.
         let mut fixups = std::mem::take(&mut self.fixups);
-        fixups.sort_by(|x, y| y.0.cmp(&x.0));
+        fixups.sort_by(|x, y| y.name.cmp(&x.name));
         // Upstream fixes up only what still has the entry's type, and its
-        // failures leave a message but don't change the result.
-        for (_, entry, mut target, todo, mode) in fixups {
-            if !target
-                .stat()
-                .is_ok_and(|st| st.st_mode & libc::S_IFMT == entry.filetype())
-            {
+        // failures leave a message but don't change the result. The parents
+        // are walked again as when the entry was made (without following
+        // symlinks under SECURE_SYMLINKS), the entry itself is never
+        // followed, and anything but the file finish_entry saw is skipped.
+        for Fixup {
+            name,
+            entry,
+            todo,
+            mode,
+            id,
+        } in fixups
+        {
+            let path = Path::new(std::ffi::OsStr::from_bytes(&name));
+            let Ok(mut target) = Target::prepare(path, todo & SECURE_SYMLINKS != 0) else {
+                continue;
+            };
+            let directory = entry.filetype() == libc::S_IFDIR;
+            let Ok(file) = target.fixup_file(directory) else {
+                continue;
+            };
+            use std::os::unix::fs::MetadataExt;
+            if !file.metadata().is_ok_and(|st| {
+                (st.dev(), st.ino()) == id
+                    && st.mode() & libc::S_IFMT as u32 == u32::from(entry.filetype())
+            }) {
                 continue;
             }
-            if entry.filetype() == libc::S_IFDIR
-                && let Ok(file) = target.directory_file()
-            {
-                target.retain_file(file);
-            }
+            target.retain_file(file);
             if todo & TIME != 0 && (entry.mtime_is_set() != 0 || entry.atime_is_set() != 0) {
                 let start = (self.start_time, 0);
                 let time = |set, sec, nsec| if set != 0 { (sec, nsec) } else { start };
@@ -839,8 +870,8 @@ impl WriteDisk {
                     let _ = a.warn(e.raw_os_error().unwrap_or(libc::EIO), "Can't restore time");
                 }
             }
-            if mode {
-                let _ = target.chmod(final_mode(&entry, todo));
+            if let Some(mode) = mode {
+                let _ = target.chmod(mode);
             }
             #[cfg(target_vendor = "apple")]
             if todo & ACL != 0 {
@@ -1539,6 +1570,63 @@ mod tests {
                 assert!(read.xattrs.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn waiting_directories_hold_no_descriptors() {
+        let open = || std::fs::read_dir("/dev/fd").map_or(0, |d| d.count());
+        let output = Output::new();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        disk.options = TIME | PERM;
+        let before = open();
+        for i in 0..100 {
+            let mut entry = Entry::new(None);
+            entry.set_pathname(output.0.join(format!("d{i}")).as_os_str().as_bytes());
+            entry.set_mode(libc::S_IFDIR | 0o750);
+            entry.set_mtime(1_000_000_000, 0);
+            assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+        }
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+        assert_eq!(disk.fixups.len(), 100);
+        // Other tests open files meanwhile; a descriptor per directory would
+        // add at least 100.
+        assert!(open() < before + 50, "{before} -> {}", open());
+        assert_eq!(disk.close(&base), ARCHIVE_OK);
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(output.0.join("d99")).unwrap();
+        assert_eq!(
+            (metadata.mode() & 0o777, metadata.mtime()),
+            (0o750, 1_000_000_000)
+        );
+    }
+
+    #[test]
+    fn close_skips_a_directory_whose_parent_was_swapped() {
+        use std::os::unix::fs::MetadataExt;
+        let output = Output::new();
+        let root = std::fs::canonicalize(&output.0).unwrap();
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        let before = std::fs::metadata(outside.join("sub")).unwrap().mtime();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        disk.options = TIME | PERM | SECURE_SYMLINKS;
+        for name in ["q", "q/sub"] {
+            let mut entry = Entry::new(None);
+            entry.set_pathname(root.join(name).as_os_str().as_bytes());
+            entry.set_mode(libc::S_IFDIR | 0o777);
+            entry.set_mtime(1_000_000_000, 0);
+            assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+        }
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+        std::fs::rename(root.join("q"), root.join("q.orig")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("q")).unwrap();
+        assert_eq!(disk.close(&base), ARCHIVE_OK);
+        assert_eq!(
+            std::fs::metadata(outside.join("sub")).unwrap().mtime(),
+            before
+        );
     }
 
     #[test]

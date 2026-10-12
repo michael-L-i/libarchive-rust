@@ -493,6 +493,24 @@ impl Target {
     pub fn is_open(&self) -> bool {
         self.live.is_some()
     }
+    /// Opens the entry for its fixup at close: never a symlink, never
+    /// waiting on a FIFO.
+    pub fn fixup_file(&self, directory: bool) -> std::io::Result<File> {
+        let directory = if directory { libc::O_DIRECTORY } else { 0 };
+        // SAFETY: live parent/name; openat returns a new owned descriptor.
+        let fd = unsafe {
+            libc::openat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | directory,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful open returns a uniquely owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
     pub fn directory_file(&self) -> std::io::Result<File> {
         // SAFETY: live parent/name; directory-only open never follows a final symlink.
         let fd = unsafe {
