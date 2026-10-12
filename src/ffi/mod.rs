@@ -11,6 +11,8 @@ pub(crate) mod client;
 pub(crate) mod disk;
 #[cfg(target_vendor = "apple")]
 pub(crate) mod disk_acl;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod disk_acl_linux;
 pub(crate) mod disk_sys;
 pub(crate) mod entry;
 mod entry_link_resolver;

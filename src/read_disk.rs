@@ -565,6 +565,13 @@ impl ReadDisk {
         }
         #[cfg(target_os = "linux")]
         let cpath = disk_sys::path_c(path).ok();
+        #[cfg(target_os = "linux")]
+        if self.behavior & 0x20 == 0
+            && let Some(cpath) = &cpath
+        {
+            let (user, group) = (&mut self.user, &mut self.group);
+            crate::ffi::disk_acl_linux::read(entry, fd, cpath, follow, user, group);
+        }
         #[cfg(not(target_os = "linux"))]
         if self.behavior & 0x10 == 0
             && let Err((e, msg)) = disk_sys::read_xattrs(path, entry, follow)

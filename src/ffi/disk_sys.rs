@@ -297,6 +297,19 @@ impl Source<'_> {
             }
         })
     }
+    /// fstat, stat or lstat.
+    pub fn stat(self) -> std::io::Result<libc::stat> {
+        let mut st = super::entry::zeroed_stat();
+        // SAFETY: the path is terminated and `st` writable.
+        result(unsafe {
+            match self {
+                Source::Fd(fd) => libc::fstat(fd, &mut st),
+                Source::Path(p, true) => libc::stat(p.as_ptr(), &mut st),
+                Source::Path(p, false) => libc::lstat(p.as_ptr(), &mut st),
+            }
+        })?;
+        Ok(st)
+    }
 }
 
 use std::fs::File;
@@ -559,7 +572,6 @@ impl Target {
         self.live = Some(file);
     }
     /// Whether metadata goes through a descriptor kept open for it.
-    #[cfg(target_vendor = "apple")]
     pub fn is_open(&self) -> bool {
         self.live.is_some()
     }
@@ -989,6 +1001,15 @@ impl Target {
     /// by its name without following a symlink there, as upstream's
     /// fsetxattr and lsetxattr.
     pub fn xattr(&self, name: &CStr, value: &[u8]) -> std::io::Result<()> {
+        self.set_xattr(name, value, false)
+    }
+    /// Sets an ACL's attribute through the entry's descriptor, or else by
+    /// its name following a symlink there, as libacl's acl_set_fd and
+    /// acl_set_file.
+    pub fn acl(&self, name: &CStr, value: &[u8]) -> std::io::Result<()> {
+        self.set_xattr(name, value, true)
+    }
+    fn set_xattr(&self, name: &CStr, value: &[u8], follow: bool) -> std::io::Result<()> {
         if let Some(file) = &self.live {
             // SAFETY: live descriptor, terminated name, and a value
             // readable for its length; the kernel copies it.
@@ -1008,10 +1029,15 @@ impl Target {
         path.extend_from_slice(self.name.as_bytes());
         let path =
             CString::new(path).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let set = if follow {
+            libc::setxattr
+        } else {
+            libc::lsetxattr
+        };
         // SAFETY: terminated path and name, and a value readable for its
         // length; the kernel copies it.
         result(unsafe {
-            libc::lsetxattr(
+            set(
                 path.as_ptr(),
                 name.as_ptr(),
                 value.as_ptr().cast(),

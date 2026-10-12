@@ -854,30 +854,47 @@ impl WriteDisk {
         {
             warn(&mut ret, errno(e), b"Failed to restore metadata".to_vec());
         }
-        #[cfg(target_vendor = "apple")]
         if todo & ACL != 0 {
-            ret = ret.min(self.set_acls(a, entry, target));
+            ret = ret.min(self.set_acls(a, entry, target, entry.mode() as u32));
         }
         ret
     }
 
-    /// Upstream's archive_write_disk_set_acls on Darwin.
-    #[cfg(target_vendor = "apple")]
-    fn set_acls(&mut self, a: &Base, entry: &Entry, target: &Target) -> c_int {
-        let set = target.metadata_file().and_then(|file| {
-            crate::ffi::disk_acl::write(&file, entry, &mut self.user, &mut self.group)
-        });
-        match set {
-            // The filesystem doesn't support ACLs.
-            Err(e) if e.raw_os_error() != Some(libc::EOPNOTSUPP) => {
-                let msg = if target.is_open() {
-                    "Failed to set acl on fd: nfs4"
-                } else {
-                    "Failed to set acl: nfs4"
-                };
-                a.warn(e.raw_os_error().unwrap_or(libc::EIO), msg).code()
+    /// Upstream's archive_write_disk_set_acls, given the mode it is (on
+    /// Linux, only the file type matters).
+    fn set_acls(&mut self, a: &Base, entry: &Entry, target: &Target, mode: u32) -> c_int {
+        #[cfg(target_os = "linux")]
+        return crate::ffi::disk_acl_linux::write(
+            a,
+            target,
+            entry,
+            mode,
+            &mut self.user,
+            &mut self.group,
+        );
+        #[cfg(target_vendor = "apple")]
+        {
+            let _ = mode;
+            let set = target.metadata_file().and_then(|file| {
+                crate::ffi::disk_acl::write(&file, entry, &mut self.user, &mut self.group)
+            });
+            match set {
+                // The filesystem doesn't support ACLs.
+                Err(e) if e.raw_os_error() != Some(libc::EOPNOTSUPP) => {
+                    let msg = if target.is_open() {
+                        "Failed to set acl on fd: nfs4"
+                    } else {
+                        "Failed to set acl: nfs4"
+                    };
+                    a.warn(e.raw_os_error().unwrap_or(libc::EIO), msg).code()
+                }
+                _ => ARCHIVE_OK,
             }
-            _ => ARCHIVE_OK,
+        }
+        #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+        {
+            let _ = (a, entry, target, mode);
+            ARCHIVE_OK
         }
     }
 
@@ -937,9 +954,15 @@ impl WriteDisk {
             if let Some(mode) = mode {
                 let _ = target.chmod(mode);
             }
-            #[cfg(target_vendor = "apple")]
             if todo & ACL != 0 {
-                let _ = self.set_acls(a, &entry, &target);
+                // Upstream's fixup has the entry's mode only if its mode,
+                // times or flags waited too (see NOTES.md).
+                let waited = mode.is_some()
+                    || todo & FFLAGS != 0
+                    || (todo & TIME != 0
+                        && (entry.mtime_is_set() != 0 || entry.atime_is_set() != 0));
+                let mode = if waited { entry.mode() as u32 } else { 0 };
+                let _ = self.set_acls(a, &entry, &target, mode);
             }
             if todo & FFLAGS != 0
                 && let Err(e) = set_fflags_platform(&target, entry.filetype(), entry.fflags().0, 0)
