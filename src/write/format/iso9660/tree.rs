@@ -968,7 +968,8 @@ impl Iso9660 {
 
         qsort::qsort(&mut enttbl, &mut |p1, p2| {
             self.compare_path_table(p1, p2, joliet)
-        });
+        })
+        .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate memory"))?;
         for &n in &enttbl {
             self.ents[n].dir_number = *dir_number;
             *dir_number = dir_number.wrapping_add(1);

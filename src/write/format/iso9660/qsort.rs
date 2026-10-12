@@ -27,23 +27,69 @@
  * SUCH DAMAGE.
  */
 
-// Ported from Apple Libc's stdlib/FreeBSD/qsort.c and heapsort.c.
+// Ported from Apple Libc's stdlib/FreeBSD/qsort.c and heapsort.c (the
+// macOS sort); the merge sort is this file's own.
 
 //! The `qsort(3)` upstream sorts its path tables with. Its comparisons
 //! call distinct directories equal (they only look at the name before the
-//! last dot), and libc's quicksort is not stable, so the order of equal
-//! entries is whatever this algorithm leaves. This is macOS's: Bentley &
-//! McIlroy's "Engineering a Sort Function" with an insertion-sort cutoff
-//! and a heapsort fallback past the recursion limit.
+//! last dot), so the order of equal entries is whatever the platform's libc
+//! leaves. On Apple platforms that is Bentley & McIlroy's "Engineering a
+//! Sort Function" with an insertion-sort cutoff and a heapsort fallback
+//! past the recursion limit, which is not stable. glibc's qsort is a stable
+//! merge sort, which the other platforms use.
 
 use std::cmp::min;
+use std::collections::TryReserveError;
 
-/// `qsort` of `a` by `cmp`, element for element as macOS orders it.
-pub(super) fn qsort<T: Copy>(a: &mut [T], cmp: &mut impl FnMut(T, T) -> i32) {
+/// `qsort` of `a` by `cmp`, element for element as the platform's libc
+/// orders it.
+pub(super) fn qsort<T: Copy>(
+    a: &mut [T],
+    cmp: &mut impl FnMut(T, T) -> i32,
+) -> Result<(), TryReserveError> {
+    if cfg!(target_vendor = "apple") {
+        apple_qsort(a, cmp);
+        Ok(())
+    } else {
+        let mut tmp = Vec::new();
+        tmp.try_reserve_exact(a.len())?;
+        merge_sort(a, cmp, &mut tmp);
+        Ok(())
+    }
+}
+
+/// Apple Libc's `qsort`.
+fn apple_qsort<T: Copy>(a: &mut [T], cmp: &mut impl FnMut(T, T) -> i32) {
     let n = a.len();
     // DEPTH(x): 2 * (flsl(x) - 1).
     let depth = 2 * (usize::BITS as i32 - n.leading_zeros() as i32 - 1);
     sort(a, cmp, depth);
+}
+
+/// A stable merge sort, as glibc's `qsort` is: sort the first `n / 2`
+/// elements and the rest, then merge, the first half winning ties.
+fn merge_sort<T: Copy>(a: &mut [T], cmp: &mut impl FnMut(T, T) -> i32, tmp: &mut Vec<T>) {
+    let n = a.len();
+    if n <= 1 {
+        return;
+    }
+    let (b1, b2) = a.split_at_mut(n / 2);
+    merge_sort(b1, cmp, tmp);
+    merge_sort(b2, cmp, tmp);
+    tmp.clear();
+    let (mut i, mut j) = (0, 0);
+    while i < b1.len() && j < b2.len() {
+        if cmp(b1[i], b2[j]) <= 0 {
+            tmp.push(b1[i]);
+            i += 1;
+        } else {
+            tmp.push(b2[j]);
+            j += 1;
+        }
+    }
+    // What is left of the second half is in place already.
+    tmp.extend_from_slice(&b1[i..]);
+    a[..tmp.len()].copy_from_slice(tmp);
 }
 
 /// Simple insertion sort routine. False if it gave up after `swap_limit`
@@ -280,17 +326,32 @@ mod tests {
             14, 15, 12, 24, 23, 1,
         ];
         let mut a = input;
-        qsort(&mut a, &mut |_, _| 0);
+        apple_qsort(&mut a, &mut |_, _| 0);
         assert_eq!(a, expect);
 
         for n in [0, 1, 2, 7, 8, 40, 41, 100, 1000] {
             let mut v: Vec<i64> = (0..n).map(|i| (i * 7919 + 13) % 101).collect();
             let mut w = v.clone();
-            qsort(&mut v, &mut |x, y| (x - y) as i32);
+            apple_qsort(&mut v, &mut |x, y| (x - y) as i32);
             w.sort();
             assert_eq!(v, w);
             heapsort(&mut w, &mut |x, y| (y - x) as i32);
             assert!(w.windows(2).all(|p| p[0] >= p[1]));
         }
+    }
+
+    #[test]
+    fn the_merge_sort_is_stable() {
+        for n in [0, 1, 2, 3, 7, 8, 41, 100, 1000] {
+            let mut v: Vec<(i64, usize)> =
+                (0..n).map(|i| ((i as i64 * 7919 + 13) % 7, i)).collect();
+            let mut w = v.clone();
+            merge_sort(&mut v, &mut |x, y| (x.0 - y.0) as i32, &mut Vec::new());
+            w.sort();
+            assert_eq!(v, w);
+        }
+        let mut v = [3, 1, 2];
+        assert!(qsort(&mut v, &mut |x, y| x - y).is_ok());
+        assert_eq!(v, [1, 2, 3]);
     }
 }
