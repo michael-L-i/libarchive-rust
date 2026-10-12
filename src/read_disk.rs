@@ -1216,6 +1216,273 @@ mod tests {
     use super::*;
     use crate::archive::READ_DISK_MAGIC;
 
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "libarchive-race-{label}-{}-{serial}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn concurrent_parent_replacement_before_descent_keeps_the_original_tree() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let root = Directory::new("descent");
+        let parent = root.0.join("parent");
+        let moved = root.0.join("moved");
+        let outside = root.0.join("outside");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(parent.join("file"), b"original").unwrap();
+        fs::write(outside.join("file"), b"replaced").unwrap();
+        let original_ino = fs::metadata(parent.join("file")).unwrap().ino();
+        let a = Base::new(READ_DISK_MAGIC);
+        let mut disk = ReadDisk::new();
+        let mut entry = Entry::new(None);
+        assert_eq!(disk.open(&a, parent.as_os_str().as_bytes()), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        let (start, started) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        let replacement = parent.clone();
+        let worker = std::thread::spawn(move || {
+            started.recv().unwrap();
+            fs::rename(&replacement, &moved).unwrap();
+            symlink(outside, replacement).unwrap();
+            done.send(()).unwrap();
+        });
+        start.send(()).unwrap();
+        finished.recv().unwrap();
+        assert_eq!(disk.descend(&a), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        assert_eq!(
+            entry.pathname().unwrap().to_bytes(),
+            parent.join("file").as_os_str().as_bytes()
+        );
+        assert_eq!(entry.ino(), original_ino as i64);
+        assert_eq!(
+            disk.data_block(&a).unwrap(),
+            (ARCHIVE_OK, &b"original"[..], 0)
+        );
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_EOF);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_parent_replacement_in_metadata_callback_keeps_child_metadata_and_data() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let root = Directory::new("metadata");
+        let parent = root.0.join("parent");
+        let moved = root.0.join("moved");
+        let outside = root.0.join("outside");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(parent.join("file"), b"original").unwrap();
+        fs::write(outside.join("file"), b"replaced").unwrap();
+        let attr = std::ffi::CString::new("user.libarchive-race").unwrap();
+        disk_sys::Target::prepare(&parent.join("file"), false)
+            .unwrap()
+            .xattr(&attr, b"original")
+            .unwrap();
+        disk_sys::Target::prepare(&outside.join("file"), false)
+            .unwrap()
+            .xattr(&attr, b"replaced")
+            .unwrap();
+        let ino = fs::metadata(parent.join("file")).unwrap().ino();
+        let (start, started) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        let replaced = parent.clone();
+        let worker = std::thread::spawn(move || {
+            started.recv().unwrap();
+            fs::rename(&replaced, moved).unwrap();
+            symlink(outside, replaced).unwrap();
+            done.send(()).unwrap();
+        });
+        let a = Base::new(READ_DISK_MAGIC);
+        let mut disk = ReadDisk::new();
+        disk.metadata_filter = Some(Box::new(move |_, entry| {
+            if entry.filetype() == libc::S_IFREG {
+                start.send(()).unwrap();
+                finished.recv().unwrap();
+            }
+            true
+        }));
+        let mut entry = Entry::new(None);
+        assert_eq!(disk.open(&a, parent.as_os_str().as_bytes()), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        assert_eq!(disk.descend(&a), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        assert_eq!(entry.ino(), ino as i64);
+        assert!(
+            entry
+                .xattrs
+                .iter()
+                .any(|x| x.name == attr && x.value == b"original")
+        );
+        assert!(!entry.xattrs.iter().any(|x| x.value == b"replaced"));
+        assert_eq!(
+            disk.data_block(&a).unwrap(),
+            (ARCHIVE_OK, &b"original"[..], 0)
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_leaf_symlink_replacement_before_data_is_refused() {
+        use std::os::unix::fs::symlink;
+        let root = Directory::new("data");
+        let path = root.0.join("file");
+        let moved = root.0.join("moved");
+        let outside = root.0.join("outside");
+        fs::write(&path, b"original").unwrap();
+        fs::write(&outside, b"replaced").unwrap();
+        for policy in [0, 1, 2] {
+            let a = Base::new(READ_DISK_MAGIC);
+            let mut disk = ReadDisk::new();
+            disk.symlinks = policy;
+            let mut entry = Entry::new(None);
+            assert_eq!(disk.open(&a, path.as_os_str().as_bytes()), ARCHIVE_OK);
+            assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+            let (start, started) = std::sync::mpsc::channel();
+            let (done, finished) = std::sync::mpsc::channel();
+            let (path, moved, outside) = (path.clone(), moved.clone(), outside.clone());
+            let worker = std::thread::spawn(move || {
+                started.recv().unwrap();
+                fs::rename(&path, &moved).unwrap();
+                symlink(&outside, &path).unwrap();
+                done.send(()).unwrap();
+                (path, moved)
+            });
+            start.send(()).unwrap();
+            finished.recv().unwrap();
+            assert_eq!(disk.data_block(&a).unwrap().0, ARCHIVE_FAILED);
+            assert!([libc::ELOOP, libc::ESTALE].contains(&a.errno.get()));
+            let (path, moved) = worker.join().unwrap();
+            fs::remove_file(&path).unwrap();
+            fs::rename(moved, path).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_symlink_replacement_in_callback_keeps_the_observed_link_text() {
+        use std::os::unix::fs::symlink;
+        let root = Directory::new("link");
+        let path = root.0.join("link");
+        symlink("original", &path).unwrap();
+        let moved = root.0.join("moved");
+        let replacement = path.clone();
+        let (start, started) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.recv().unwrap();
+            fs::rename(&replacement, moved).unwrap();
+            symlink("replacement", replacement).unwrap();
+            done.send(()).unwrap();
+        });
+        let a = Base::new(READ_DISK_MAGIC);
+        let mut disk = ReadDisk::new();
+        // Linux symlink xattrs require name lookup; exercise the pinned readlink independently.
+        disk.behavior = 0x10 | 0x20;
+        disk.metadata_filter = Some(Box::new(move |_, _| {
+            start.send(()).unwrap();
+            finished.recv().unwrap();
+            true
+        }));
+        let mut entry = Entry::new(None);
+        assert_eq!(disk.open(&a, path.as_os_str().as_bytes()), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        assert_eq!(entry.symlink().unwrap().to_bytes(), b"original");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn data_open_honors_permission_changes_in_metadata_callback() {
+        use std::os::unix::fs::PermissionsExt;
+        if disk_sys::euid() == 0 {
+            return;
+        }
+        let root = Directory::new("permissions");
+        let path = root.0.join("file");
+        fs::write(&path, b"data").unwrap();
+        for (before, after) in [(0, 0o600), (0o600, 0)] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(before)).unwrap();
+            let a = Base::new(READ_DISK_MAGIC);
+            let mut disk = ReadDisk::new();
+            disk.behavior = 0xf0; // No optional metadata needs a readable descriptor.
+            let changed = path.clone();
+            disk.metadata_filter = Some(Box::new(move |_, _| {
+                fs::set_permissions(&changed, fs::Permissions::from_mode(after)).unwrap();
+                true
+            }));
+            let mut entry = Entry::new(None);
+            assert_eq!(disk.open(&a, path.as_os_str().as_bytes()), ARCHIVE_OK);
+            assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+            if after == 0 {
+                assert_eq!(disk.data_block(&a).unwrap().0, ARCHIVE_FAILED);
+                assert_eq!(a.errno.get(), libc::EACCES);
+            } else {
+                assert_eq!(disk.data_block(&a).unwrap(), (ARCHIVE_OK, &b"data"[..], 0));
+            }
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn empty_root_keeps_the_missing_path_error() {
+        let a = Base::new(READ_DISK_MAGIC);
+        let mut disk = ReadDisk::new();
+        let mut entry = Entry::new(None);
+        assert_eq!(disk.open(&a, b""), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_FAILED);
+        assert_eq!(a.errno.get(), libc::ENOENT);
+    }
+
+    #[test]
+    fn fifo_metadata_never_waits_for_a_writer() {
+        let root = Directory::new("fifo");
+        let path = root.0.join("fifo");
+        disk_sys::Target::prepare(&path, false)
+            .unwrap()
+            .special(libc::S_IFIFO as u32 | 0o600, 0)
+            .unwrap();
+        let a = Base::new(READ_DISK_MAGIC);
+        let mut disk = ReadDisk::new();
+        let mut entry = Entry::new(None);
+        assert_eq!(disk.open(&a, path.as_os_str().as_bytes()), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        assert_eq!(entry.filetype(), libc::S_IFIFO);
+        assert_eq!(disk.data_block(&a).unwrap().0, ARCHIVE_EOF);
+    }
+
+    #[test]
+    fn replaced_regular_file_cannot_make_data_open_wait_on_a_fifo() {
+        let root = Directory::new("fifo-swap");
+        let path = root.0.join("file");
+        fs::write(&path, b"data").unwrap();
+        let a = Base::new(READ_DISK_MAGIC);
+        let mut disk = ReadDisk::new();
+        let mut entry = Entry::new(None);
+        assert_eq!(disk.open(&a, path.as_os_str().as_bytes()), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        fs::rename(&path, root.0.join("moved")).unwrap();
+        disk_sys::Target::prepare(&path, false)
+            .unwrap()
+            .special(libc::S_IFIFO as u32 | 0o600, 0)
+            .unwrap();
+        assert_eq!(disk.data_block(&a).unwrap().0, ARCHIVE_FAILED);
+        assert_eq!(a.errno.get(), libc::ESTALE);
+    }
+
     #[test]
     fn ascent_restores_the_directory_opened_before_a_rename() {
         use std::os::unix::fs::MetadataExt;

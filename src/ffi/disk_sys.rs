@@ -70,7 +70,7 @@ impl ReadPath {
         let parent =
             CString::new(parent).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
         let parent = std::rc::Rc::new(open_dir(initial.as_raw_fd(), &parent, true)?);
-        Self::child(parent, if name.is_empty() { b"." } else { name })
+        Self::child(parent, if bytes == b"/" { b"." } else { name })
     }
     pub fn child(parent: std::rc::Rc<File>, name: &[u8]) -> std::io::Result<Self> {
         Ok(Self {
@@ -2080,6 +2080,65 @@ mod tests {
     }
 
     #[test]
+    fn retained_target_survives_concurrent_leaf_symlink_replacement() {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let root = Directory::new();
+        let path = root.0.join("file");
+        let moved = root.0.join("moved");
+        let outside = root.0.join("outside");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let original_outside = std::fs::metadata(&outside).unwrap();
+        let mut target = Target::prepare(&path, true).unwrap();
+        let mut file = target.open(0o600, true).unwrap();
+        target.retain_file(file.try_clone().unwrap());
+        let (start, started) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        let replacement = path.clone();
+        let destination = outside.clone();
+        let worker = std::thread::spawn(move || {
+            started.recv().unwrap();
+            std::fs::rename(&replacement, &moved).unwrap();
+            symlink(destination, replacement).unwrap();
+            done.send(()).unwrap();
+            moved
+        });
+        start.send(()).unwrap();
+        finished.recv().unwrap();
+        file.write_all(b"original").unwrap();
+        let attr = c"user.libarchive-race";
+        target.xattr(attr, b"original").unwrap();
+        target.chmod(0o400).unwrap();
+        target
+            .times((1_000_000_000, 0), (1_000_000_000, 0))
+            .unwrap();
+        target
+            .owner(original_outside.uid().into(), original_outside.gid().into())
+            .unwrap();
+        let moved = worker.join().unwrap();
+        assert_eq!(std::fs::read(&moved).unwrap(), b"original");
+        let original = std::fs::metadata(&moved).unwrap();
+        assert_eq!(
+            (original.mode() & 0o777, original.mtime()),
+            (0o400, 1_000_000_000)
+        );
+        assert_eq!(target.stat().unwrap().st_ino, original.ino());
+        assert!(std::fs::symlink_metadata(path).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        let after = std::fs::metadata(&outside).unwrap();
+        assert_eq!(
+            (after.mode(), after.mtime(), after.uid(), after.gid()),
+            (
+                original_outside.mode(),
+                original_outside.mtime(),
+                original_outside.uid(),
+                original_outside.gid()
+            )
+        );
+    }
+
+    #[test]
     fn secured_target_stays_in_opened_parent_after_symlink_swap() {
         use std::io::Write;
         let unique = std::time::SystemTime::now()
@@ -2093,8 +2152,12 @@ mod tests {
         std::fs::create_dir(root.join("parent")).unwrap();
         std::fs::create_dir(root.join("outside")).unwrap();
         let target = Target::prepare(&root.join("parent/file"), true).unwrap();
-        std::fs::rename(root.join("parent"), root.join("original")).unwrap();
-        std::os::unix::fs::symlink(root.join("outside"), root.join("parent")).unwrap();
+        let replaced = root.clone();
+        let worker = std::thread::spawn(move || {
+            std::fs::rename(replaced.join("parent"), replaced.join("original")).unwrap();
+            std::os::unix::fs::symlink(replaced.join("outside"), replaced.join("parent")).unwrap();
+        });
+        worker.join().unwrap();
         target
             .open(0o600, false)
             .unwrap()
