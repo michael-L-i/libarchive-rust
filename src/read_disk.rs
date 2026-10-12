@@ -660,6 +660,20 @@ impl ReadDisk {
                 b"Couldn't open metadata descriptor",
             );
         }
+        #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+        if anchored.is_some()
+            && fd.is_none()
+            && self.behavior & 0x80 == 0
+            && entry.filetype() == libc::S_IFREG
+        {
+            // Sparse discovery must not reopen the unanchored display path.
+            return failure(
+                a,
+                ARCHIVE_WARN,
+                std::io::Error::from_raw_os_error(libc::EACCES),
+                b"Couldn't open metadata descriptor",
+            );
+        }
         // Linux takes a descriptor to read the file flags, which then
         // serves the rest of the metadata too.
         #[cfg(target_os = "linux")]
@@ -696,6 +710,9 @@ impl ReadDisk {
                 Err(e) => return io_error(a, e, "Couldn't read link data"),
             }
         }
+        // Linux cannot query symlink xattrs through an O_PATH descriptor.
+        // Bracket anchored name lookups to detect replacement; an ABA swap
+        // during the native xattr calls can still evade these checks.
         #[cfg(target_os = "linux")]
         if self.behavior & 0x10 == 0
             && entry.filetype() == libc::S_IFLNK
@@ -1375,6 +1392,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn concurrent_symlink_replacement_in_callback_keeps_the_observed_link_text() {
         use std::os::unix::fs::symlink;

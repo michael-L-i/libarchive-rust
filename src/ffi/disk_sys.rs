@@ -33,11 +33,7 @@ pub fn stat(path: &Path, fd: libc::c_int, follow: bool) -> std::io::Result<libc:
     Ok(st)
 }
 /// Opens `path` for reading, following symlinks, with `flags` added.
-#[cfg(any(
-    test,
-    target_os = "linux",
-    not(any(target_vendor = "apple", target_os = "linux"))
-))]
+#[cfg(any(test, target_os = "linux"))]
 pub fn open_read(path: &Path, flags: libc::c_int) -> std::io::Result<File> {
     let path = path_c(path)?;
     // SAFETY: the path is terminated; a successful open returns a new descriptor.
@@ -83,14 +79,19 @@ impl ReadPath {
         })
     }
     pub fn pin_link(&mut self, expected: &libc::stat) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        let flags = libc::O_PATH;
-        #[cfg(target_vendor = "apple")]
-        let flags = libc::O_SYMLINK;
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        {
+            #[cfg(target_os = "linux")]
+            let flags = libc::O_PATH;
+            #[cfg(target_vendor = "apple")]
+            let flags = libc::O_SYMLINK;
+            self.link = Some(std::rc::Rc::new(self.open(flags, false, expected)?));
+            Ok(())
+        }
+        // POSIX has no portable way to open a symlink itself. Validate the
+        // anchored name here and bracket readlinkat with identity checks.
         #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-        let flags = libc::O_NONBLOCK;
-        self.link = Some(std::rc::Rc::new(self.open(flags, false, expected)?));
-        Ok(())
+        same_file(expected, &self.stat(false)?)
     }
     pub fn stat(&self, follow: bool) -> std::io::Result<libc::stat> {
         if !follow && let Some(link) = &self.link {
@@ -278,15 +279,50 @@ impl Iterator for ReadDir {
     type Item = std::io::Result<std::ffi::OsString>;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "hurd",
+                target_os = "emscripten",
+                target_os = "redox",
+                target_os = "fuchsia",
+                target_os = "l4re"
+            ))]
             // SAFETY: errno belongs to this thread.
             unsafe {
                 *libc::__errno_location() = 0;
             }
-            #[cfg(target_vendor = "apple")]
+            #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
             // SAFETY: errno belongs to this thread.
             unsafe {
                 *libc::__error() = 0;
+            }
+            #[cfg(any(
+                target_os = "android",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "cygwin",
+                target_os = "nuttx",
+                target_env = "newlib"
+            ))]
+            // SAFETY: errno belongs to this thread.
+            unsafe {
+                *libc::__errno() = 0;
+            }
+            #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+            // SAFETY: errno belongs to this thread.
+            unsafe {
+                *libc::___errno() = 0;
+            }
+            #[cfg(target_os = "aix")]
+            // SAFETY: errno belongs to this thread.
+            unsafe {
+                *libc::_Errno() = 0;
+            }
+            #[cfg(target_os = "haiku")]
+            // SAFETY: errno belongs to this thread.
+            unsafe {
+                *libc::_errnop() = 0;
             }
             // SAFETY: DIR is live; readdir's storage is copied before the next call.
             let entry = unsafe { libc::readdir(self.0) };
@@ -512,7 +548,7 @@ pub fn read_xattrs_fd(
     }
     Ok(())
 }
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+#[cfg(all(test, not(any(target_vendor = "apple", target_os = "linux"))))]
 pub fn read_xattrs(
     _path: &Path,
     _entry: &mut Entry,
@@ -1864,6 +1900,53 @@ mod tests {
     impl Drop for Directory {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn reader_link_keeps_non_utf8_bytes() {
+        let root = Directory::new();
+        #[cfg(not(target_vendor = "apple"))]
+        let name = std::ffi::OsStr::from_bytes(b"link\xff");
+        // APFS filenames must be UTF-8; symlink contents remain arbitrary bytes.
+        #[cfg(target_vendor = "apple")]
+        let name = std::ffi::OsStr::new("link");
+        let text = std::ffi::OsStr::from_bytes(b"target\xfe");
+        std::os::unix::fs::symlink(text, root.0.join(name)).unwrap();
+        let mut access =
+            ReadPath::root(ReadPath::initial_dir().unwrap(), &root.0.join(name)).unwrap();
+        let st = access.stat(false).unwrap();
+        access.pin_link(&st).unwrap();
+        assert_eq!(access.read_link(&st).unwrap().as_os_str(), text);
+    }
+
+    #[test]
+    fn unopened_reader_link_refuses_replacement() {
+        let root = Directory::new();
+        let path = root.0.join("link");
+        std::os::unix::fs::symlink("original", &path).unwrap();
+        let access = ReadPath::root(ReadPath::initial_dir().unwrap(), &path).unwrap();
+        let st = access.stat(false).unwrap();
+        // This is the portable fallback on systems without symlink descriptors.
+        std::fs::rename(&path, root.0.join("moved")).unwrap();
+        std::os::unix::fs::symlink("replacement", &path).unwrap();
+        assert_eq!(
+            access.read_link(&st).unwrap_err().raw_os_error(),
+            Some(libc::ESTALE)
+        );
+    }
+
+    #[test]
+    fn reader_directory_eof_ignores_stale_errno() {
+        let root = Directory::new();
+        let access = ReadPath::root(ReadPath::initial_dir().unwrap(), &root.0).unwrap();
+        let anchor = access
+            .directory(false, &access.stat(false).unwrap())
+            .unwrap();
+        let (mut reader, _) = ReadDir::open(&anchor).unwrap();
+        for _ in 0..2 {
+            assert!(stat(&root.0.join("missing"), -1, false).is_err());
+            assert!(reader.next().is_none());
         }
     }
 
