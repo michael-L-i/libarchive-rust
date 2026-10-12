@@ -245,7 +245,7 @@ impl WriteDisk {
             let msg = [b"Hard-link target '", link.to_bytes(), b"' does not exist"].concat();
             return Err(a.raise(Error::new(ARCHIVE_FAILED, en, msg)));
         }
-        if let Some(mut existing) = target.take_if(|_| en == libc::EEXIST) {
+        if let Some(existing) = target.take_if(|_| en == libc::EEXIST) {
             if options & NO_OVERWRITE != 0 {
                 self.skipped = true;
                 return Ok(existing);
@@ -299,16 +299,9 @@ impl WriteDisk {
                 }
                 (target, en) = self.create(a, path, entry);
             } else {
-                // A directory in the way of a directory is kept as it is.
-                if !secure
-                    && existing
-                        .stat()
-                        .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFLNK)
-                {
-                    existing = std::fs::canonicalize(path)
-                        .and_then(|real| Target::prepare(&real, false))
-                        .or_else(|e| failed(errno(e), "Can't follow directory"))?;
-                }
+                // A directory in the way of a directory is kept as it is. If it
+                // is a symlink to one, the entry's metadata goes on the link
+                // itself, and close skips it: it isn't a directory.
                 return Ok(existing);
             }
         }
@@ -1502,6 +1495,49 @@ mod tests {
             assert_eq!(*base.error_string().unwrap(), *b"Path contains '..'");
             // Upstream unlinks what is in the way before it looks at the link.
             assert_eq!(output.path().exists(), options & UNLINK == 0);
+        }
+    }
+
+    #[test]
+    fn directory_entry_over_a_symlink_leaves_its_target_alone() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for options in [PERM | TIME | XATTR | FFLAGS, PERM | TIME | UNLINK] {
+            let output = Output::new();
+            let outside = output.0.join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o750)).unwrap();
+            std::os::unix::fs::symlink(&outside, output.path()).unwrap();
+            let before = std::fs::metadata(&outside).unwrap();
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = WriteDisk::default();
+            disk.options = options;
+            let mut entry = Entry::new(None);
+            entry.set_pathname(output.path().as_os_str().as_bytes());
+            entry.set_mode(libc::S_IFDIR | 0o777);
+            entry.set_mtime(1_000_000_000, 0);
+            entry.xattr_add(c"user.dir", b"v");
+            #[cfg(target_vendor = "apple")]
+            entry.set_fflags(libc::UF_HIDDEN as std::ffi::c_ulong, 0);
+            assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+            assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+            assert_eq!(disk.close(&base), ARCHIVE_OK);
+            // Upstream keeps the symlink and touches only the link itself.
+            assert!(
+                std::fs::symlink_metadata(output.path())
+                    .unwrap()
+                    .is_symlink()
+            );
+            let after = std::fs::metadata(&outside).unwrap();
+            assert_eq!(after.permissions().mode() & 0o7777, 0o750);
+            assert_eq!(after.mtime(), before.mtime());
+            #[cfg(target_vendor = "apple")]
+            {
+                use std::os::macos::fs::MetadataExt;
+                assert_eq!(after.st_flags(), before.st_flags());
+                let mut read = Entry::new(None);
+                crate::ffi::disk_sys::read_xattrs(&outside, &mut read, true).unwrap();
+                assert!(read.xattrs.is_empty());
+            }
         }
     }
 
