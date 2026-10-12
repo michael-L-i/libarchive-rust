@@ -30,7 +30,7 @@
 #[cfg(target_vendor = "apple")]
 mod hfs;
 
-use crate::archive::{ARCHIVE_FAILED, ARCHIVE_OK, ARCHIVE_WARN, Base, state};
+use crate::archive::{ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN, Base, state};
 use crate::entry::Entry;
 use crate::ffi::disk_sys::Target;
 use crate::util::Error;
@@ -87,9 +87,8 @@ fn failure(a: &Base, err: std::io::Error, action: &str, path: &Path) -> c_int {
 
 impl WriteDisk {
     pub fn header(&mut self, a: &Base, entry: &Entry) -> c_int {
-        let previous = self.finish_entry(a);
-        if previous < ARCHIVE_OK {
-            return previous;
+        if self.finish_entry(a) == ARCHIVE_FATAL {
+            return ARCHIVE_FATAL;
         }
         a.clear_error();
         a.state.set(state::HEADER);
@@ -320,7 +319,7 @@ impl WriteDisk {
             "archive_write_data",
         ) < ARCHIVE_OK
         {
-            return crate::archive::ARCHIVE_FATAL as isize;
+            return ARCHIVE_FATAL as isize;
         }
         if !data.is_empty() && (self.limit == Some(0) || (!self.skipped && self.file.is_none())) {
             return a.warn(0, "Attempt to write to an empty file").code() as isize;
@@ -404,13 +403,39 @@ impl WriteDisk {
         a.state.set(state::HEADER);
         let permissions_created = std::mem::take(&mut self.permissions_created);
         if !self.skipped {
-            let file = self.file.take();
+            let mut file = self.file.take();
             let length = self.limit.unwrap_or(self.max_offset);
-            if let Some(file) = &file
+            if let Some(file) = &mut file
                 && self.file_len != Some(length)
                 && let Err(e) = file.set_len(length)
             {
-                return failure(a, e, "Can't truncate", &path);
+                let errno = |e: std::io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+                if length == 0 {
+                    return a.raise(Error::new(
+                        ARCHIVE_FAILED,
+                        errno(e),
+                        "File size could not be restored",
+                    ));
+                }
+                // Not all platforms extend files with ftruncate; then upstream
+                // writes the last byte.
+                if !file.metadata().is_ok_and(|m| m.len() >= length) {
+                    let failed = match file.seek(SeekFrom::Start(length - 1)) {
+                        Err(e) => Some((e, "Seek failed")),
+                        Ok(_) => file
+                            .write_all(&[0])
+                            .err()
+                            .map(|e| (e, "Write to restore size failed")),
+                    };
+                    if let Some((e, msg)) = failed {
+                        // The entry stays current, as upstream's does, so the next
+                        // call restores its metadata.
+                        self.current = Some((path, entry, target, options));
+                        self.permissions_created = permissions_created;
+                        a.state.set(state::DATA);
+                        return a.raise(Error::fatal(errno(e), msg));
+                    }
+                }
             }
             if let Some(destination) = self.atomic.take() {
                 if let Err(e) = target.rename_to(&destination) {
@@ -624,7 +649,7 @@ impl WriteDisk {
 
     pub fn close(&mut self, a: &Base) -> c_int {
         if a.state.get() == state::FATAL {
-            return crate::archive::ARCHIVE_FATAL;
+            return ARCHIVE_FATAL;
         }
         let mut ret = self.finish_entry(a);
         while let Some((entry, mut target, options, mode)) = self.directories.pop() {
@@ -859,6 +884,30 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, if options == PERM { 0o700 } else { 0o777 });
         }
+    }
+
+    #[test]
+    fn unrestorable_size_is_fatal_and_metadata_follows() {
+        use std::os::unix::fs::MetadataExt;
+        let output = Output::new();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        disk.options = TIME;
+        let mut entry = Entry::new(None);
+        entry.set_pathname(output.path().as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFREG | 0o644);
+        entry.set_size(i64::MAX);
+        entry.set_mtime(1_000_000_000, 0);
+        assert_eq!(disk.header(&base, &entry), ARCHIVE_OK);
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_FATAL);
+        let message = base.error_string().unwrap().to_vec();
+        assert!(matches!(
+            message.as_slice(),
+            b"Write to restore size failed" | b"Seek failed"
+        ));
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+        let metadata = std::fs::metadata(output.path()).unwrap();
+        assert_eq!((metadata.len(), metadata.mtime()), (0, 1_000_000_000));
     }
 
     #[test]
