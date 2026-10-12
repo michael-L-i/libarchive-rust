@@ -24,1259 +24,1263 @@
  */
 
 // Ported from libarchive/archive_write_set_format_iso9660.c.
-use crate::archive::*;
-use crate::entry::Entry;
+
+//! The ISO9660 writer. Upstream's sections map to submodules: `tree`
+//! (isofile/isoent and the directory tree), `idr` (identifiers), `record`
+//! (Directory Records and Rock Ridge), `descriptor` (volume descriptors,
+//! path tables and the image layout), `boot` (El Torito) and `zisofs`.
+//! Upstream's linked lists are vectors of arena indices (`FileId`,
+//! `EntId`), except the path tables' `ptnext` chains, whose sharing between
+//! lists after deep-directory relocation is part of the behavior.
+
+use crate::archive::{
+    ARCHIVE_ERRNO_MISC, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN, Base,
+};
+use crate::entry::{AE_IFLNK, AE_IFREG, Cache, Entry};
+use crate::string::StringConv;
 use crate::util::Error;
-use crate::write::{Format, Sink, zeros};
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::write::{Format, Sink};
+use std::collections::BTreeMap;
 use std::ffi::{CStr, c_int};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-const BLOCK: usize = 2048;
-const ER:&[u8]=b"ER\xed\x01\x0aT\x87\x01RRIP_1991ATHE ROCK RIDGE INTERCHANGE PROTOCOL PROVIDES SUPPORT FOR POSIX FILE SYSTEM SEMANTICSPLEASE CONTACT DISC PUBLISHER FOR SPECIFICATION SOURCE.  SEE PUBLISHER IDENTIFIER IN PRIMARY VOLUME DESCRIPTOR FOR CONTACT INFORMATION.";
-// boot.rs is implemented independently by the integration agent.
+use std::sync::Arc;
+
 mod boot;
-mod info;
-use boot::{Boot, Media};
-struct Node {
-    entry: Entry,
-    name: Vec<u8>,
-    path: Vec<u8>,
-    parent: usize,
-    children: Vec<usize>,
-    ident: [Vec<u8>; 2],
-    directory: bool,
-    virtual_dir: bool,
-    offset: u64,
-    size: u64,
-    extent: u32,
-    hardlink: Option<usize>,
-    symlink: Vec<u8>,
-    zisofs: Option<(u32, u8, u8)>,
-    rr_child: Option<usize>,
-    rr_parent: Option<usize>,
-    joliet_hidden: bool,
-    mb_len: usize,
+mod descriptor;
+mod idr;
+mod qsort;
+mod record;
+mod tree;
+mod zisofs;
+
+const LOGICAL_BLOCK_BITS: u32 = 11;
+const LOGICAL_BLOCK_SIZE: usize = 2048;
+const PATH_TABLE_BLOCK_SIZE: usize = 4096;
+
+const SYSTEM_AREA_BLOCK: i32 = 16;
+const PRIMARY_VOLUME_DESCRIPTOR_BLOCK: i32 = 1;
+const SUPPLEMENTARY_VOLUME_DESCRIPTOR_BLOCK: i32 = 1;
+const BOOT_RECORD_DESCRIPTOR_BLOCK: i32 = 1;
+const VOLUME_DESCRIPTOR_SET_TERMINATOR_BLOCK: i32 = 1;
+const NON_ISO_FILE_SYSTEM_INFORMATION_BLOCK: i32 = 1;
+const RRIP_ER_BLOCK: i32 = 1;
+const PADDING_BLOCK: i32 = 150;
+
+const MULTI_EXTENT_SIZE: i64 = 1 << 32; // 4Gi bytes.
+const MAX_DEPTH: i32 = 8;
+
+/// The write buffer: file data on its way to the temporary file, then the
+/// image on its way out.
+const WB_BUFFMAX: usize = LOGICAL_BLOCK_SIZE * 32;
+
+/// What `archive_write` hands `finish_entry` to pad an entry: `a->nulls`.
+const NULLS: [u8; 1024] = [0; 1024];
+
+type FileId = usize;
+type EntId = usize;
+
+/// One extent of a file's contents. A file over 4 GiB has more than one.
+#[derive(Clone, Copy, Default)]
+struct Content {
+    offset_of_temp: i64,
+    size: i64,
+    blocks: i32,
+    location: u32,
 }
-impl Node {
-    fn new(mut entry: Entry, path: Vec<u8>, parent: usize, virtual_dir: bool) -> Self {
-        let name = path
-            .rsplit(|&b| b == b'/')
-            .next()
-            .unwrap_or_default()
-            .to_vec();
-        let directory = entry.filetype() == 0o40000;
-        let symlink = entry
-            .symlink()
-            .map_or_else(Vec::new, |s| s.to_bytes().to_vec());
-        Self {
-            entry,
-            name,
-            path,
-            parent,
-            children: Vec::new(),
-            ident: [Vec::new(), Vec::new()],
-            directory,
-            virtual_dir,
-            offset: 0,
-            size: 0,
-            extent: 0,
-            hardlink: None,
-            symlink,
-            zisofs: None,
-            rr_child: None,
-            rr_parent: None,
-            joliet_hidden: false,
-            mb_len: 0,
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Boot {
+    No,
+    Catalog,
+    Image,
+}
+
+/// The RRIP 'ZF' fields of a file.
+#[derive(Clone, Copy, Default)]
+struct ZisofsHeader {
+    header_size: u8,
+    log2_bs: u8,
+    uncompressed_size: u32,
+}
+
+/// `struct isofile`: an entry shared by the primary and Joliet trees.
+struct IsoFile {
+    hardlink_target: Option<FileId>,
+    entry: Entry,
+    // Used for making a directory tree.
+    parentdir: Vec<u8>,
+    basename: Vec<u8>,
+    basename_utf16: Vec<u8>,
+    symlink: Vec<u8>,
+    /// The number of elements of its parent directory.
+    dircnt: i32,
+    /// `content` and the extents chained after it.
+    content: Vec<Content>,
+    /// `cur_content`: an index into `content`, `None` where upstream's
+    /// pointer has run off the end of the chain.
+    cur_content: Option<usize>,
+    write_content: bool,
+    boot: Boot,
+    zisofs: ZisofsHeader,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DrLen {
+    vd: i32,
+    self_: i32,
+    parent: i32,
+    normal: i32,
+}
+
+/// An extra record: a block of Rock Ridge data that didn't fit its
+/// Directory Record, reached through a "CE" entry.
+struct ExtrRec {
+    location: i32,
+    offset: i32,
+    buf: Box<[u8; LOGICAL_BLOCK_SIZE]>,
+}
+
+/// `struct isoent`: a node of the primary or the Joliet tree.
+struct IsoEnt {
+    file: FileId,
+    parent: EntId,
+    children: Vec<EntId>,
+    /// `rbtree`: the children by basename.
+    child_names: BTreeMap<Vec<u8>, EntId>,
+    subdirs: Vec<EntId>,
+    children_sorted: Vec<EntId>,
+    ptnext: Option<EntId>,
+
+    // Used for making a Directory Record.
+    dir_number: i32,
+    dr_len: DrLen,
+    dir_location: u32,
+    dir_block: i32,
+
+    /// On primary, the ISO9660 file/directory name; on Joliet, the UCS2
+    /// name, as a NUL-terminated buffer of upstream's allocation size.
+    /// ext_off: offset of identifier extension.
+    /// ext_len: length of identifier extension.
+    /// id_len: byte size of identifier; on primary, this is ext_off +
+    ///   ext_len + version length; on joliet, this is ext_off + ext_len.
+    /// mb_len: length of multibyte-character of identifier; on primary,
+    ///   mb_len and id_len are always the same.
+    identifier: Option<Vec<u8>>,
+    ext_off: i32,
+    ext_len: i32,
+    id_len: i32,
+    mb_len: i32,
+
+    // Used for making a Rockridge extension.
+    rr_parent: Option<EntId>,
+    rr_child: Option<EntId>,
+
+    /// The extra records of this directory's entries.
+    extr_rec_list: Vec<ExtrRec>,
+    extr_rec_current: Option<usize>,
+
+    r#virtual: bool,
+    /// If set, this file type is a directory.
+    dir: bool,
+}
+
+struct Hardlink {
+    nlink: u32,
+    /// The hardlink target first, then the files linked to it.
+    file_list: Vec<FileId>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VddType {
+    Primary,
+    Joliet,
+    Enhanced,
+}
+
+#[derive(Default)]
+struct PathTable {
+    first: Option<EntId>,
+    last: Option<EntId>,
+    sorted: Vec<EntId>,
+    cnt: i32,
+}
+
+/// Which of the two trees.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Which {
+    Primary,
+    Joliet,
+}
+
+/// Used for making the Path Table Record.
+struct Vdd {
+    /// The root of entry tree. Joliet's is set when the tree is cloned.
+    rootent: EntId,
+    vdd_type: VddType,
+    pathtbl: Vec<PathTable>,
+    max_depth: i32,
+    path_table_block: i32,
+    path_table_size: i32,
+    location_type_l_path_table: i32,
+    location_type_m_path_table: i32,
+    total_dir_block: i32,
+}
+
+impl Vdd {
+    fn new(vdd_type: VddType) -> Self {
+        Vdd {
+            rootent: 0,
+            vdd_type,
+            pathtbl: Vec::new(),
+            max_depth: 0,
+            path_table_block: 0,
+            path_table_size: 0,
+            location_type_l_path_table: 0,
+            location_type_m_path_table: 0,
+            total_dir_block: 0,
         }
     }
 }
-#[derive(Default)]
-struct DirLayout {
-    location: u32,
-    blocks: u32,
-    extra_blocks: u32,
+
+/// Used for making zisofs.
+struct Zisofs {
+    detect_magic: bool,
+    making: bool,
+    allzero: bool,
+    magic_buffer: [u8; 64],
+    magic_cnt: i32,
+
+    /// The block pointers, little-endian, in a buffer that only grows.
+    block_pointers: Vec<u8>,
+    block_pointers_cnt: i32,
+    block_pointers_idx: i32,
+    total_size: i64,
+    block_offset: i64,
+
+    /// The deflate stream once `stream_valid`, and its `total_in`.
+    stream: Option<deflate::Deflate>,
+    total_in: u64,
+    remaining: i64,
+    compression_level: i32,
 }
-struct Tree {
-    directories: Vec<usize>,
-    order: Vec<usize>,
-    numbers: HashMap<usize, u16>,
-    layout: HashMap<usize, DirLayout>,
-    path_size: u32,
-    path_blocks: u32,
-    path_l: u32,
-    path_m: u32,
+
+/// 'El Torito' boot data.
+struct ElTorito {
+    // boot catalog file
+    catalog_filename: Vec<u8>,
+    catalog: Option<EntId>,
+    // boot image file
+    boot_filename: Vec<u8>,
+    boot: Option<EntId>,
+
+    platform_id: u8,
+    id: Vec<u8>,
+    media_type: u8,
+    system_type: u8,
+    boot_load_seg: u16,
+    boot_load_size: u16,
 }
-pub struct Iso9660 {
-    nodes: Vec<Node>,
-    names: HashMap<Vec<u8>, usize>,
-    spool: Option<File>,
-    spool_size: u64,
-    data_order: Vec<usize>,
-    current: Option<usize>,
-    remaining: u64,
-    level: u8,
+
+const BOOT_PLATFORM_X86: u8 = 0;
+const BOOT_MEDIA_NO_EMULATION: u8 = 0;
+const BOOT_MEDIA_1_2M_DISKETTE: u8 = 1;
+const BOOT_MEDIA_1_44M_DISKETTE: u8 = 2;
+const BOOT_MEDIA_2_88M_DISKETTE: u8 = 3;
+const BOOT_MEDIA_HARD_DISK: u8 = 4;
+const BOOT_LOAD_SIZE: u16 = 4;
+
+/// ISO writer options. Each flag says whether the option was given; the
+/// values live with what they configure.
+struct IsoOption {
+    abstract_file: bool,
+    application_id: bool,
+    allow_vernum: bool,
+    biblio_file: bool,
+    boot: bool,
+    boot_catalog: bool,
+    boot_info_table: bool,
+    boot_load_seg: bool,
+    boot_load_size: bool,
+    boot_type: u8,
+    compression_level: bool,
+    copyright_file: bool,
+    iso_level: u8,
     joliet: u8,
-    rr: u8,
-    pad: bool,
     limit_depth: bool,
     limit_dirs: bool,
-    allow_vernum: bool,
+    pad: bool,
+    publisher: bool,
+    rr: u8,
+    volume_id: bool,
     zisofs: bool,
-    compression: u8,
-    strings: HashMap<Vec<u8>, Vec<u8>>,
-    boot: Boot,
-    boot_enabled: bool,
-    boot_floppy: bool,
-    boot_auto: bool,
-    birth: i64,
-    er_location: u32,
-    primary_children: HashMap<usize, Vec<usize>>,
-    primary_parent: HashMap<usize, usize>,
-    too_deep: Option<usize>,
-    info_options: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
+
+const ABSTRACT_FILE_SIZE: usize = 37;
+const APPLICATION_IDENTIFIER_SIZE: usize = 128;
+const BIBLIO_FILE_SIZE: usize = 37;
+const COPYRIGHT_FILE_SIZE: usize = 37;
+const PUBLISHER_IDENTIFIER_SIZE: usize = 128;
+const VOLUME_IDENTIFIER_SIZE: usize = 32;
+
+const OPT_BOOT_TYPE_AUTO: u8 = 0; // auto detect
+const OPT_BOOT_TYPE_NO_EMU: u8 = 1; // ``no emulation'' image
+const OPT_BOOT_TYPE_FD: u8 = 2; // floppy disk image
+const OPT_BOOT_TYPE_HARD_DISK: u8 = 3; // hard disk image
+
+const OPT_JOLIET_DISABLE: u8 = 0; // Not generate Joliet Records.
+const OPT_JOLIET_ENABLE: u8 = 1; // Generate Joliet Records.
+const OPT_JOLIET_LONGNAME: u8 = 2; // Use long joliet filenames.
+
+const OPT_RR_DISABLED: u8 = 0;
+const OPT_RR_STRICT: u8 = 1;
+const OPT_RR_USEFUL: u8 = 2;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WbType {
+    ToStream,
+    ToTemp,
+}
+
+pub struct Iso9660 {
+    /// The creation time of ISO image.
+    birth_time: i64,
+    /// A temporary file, which file contents save to until ISO image can
+    /// be created.
+    temp: Option<File>,
+
+    cur_file: Option<FileId>,
+    cur_dirent: EntId,
+    cur_dirstr: Vec<u8>,
+    bytes_remaining: u64,
+    need_multi_extent: bool,
+
+    // Temporary string buffers for the Joliet extension.
+    utf16be: Vec<u8>,
+    mbs: Vec<u8>,
+
+    sconv_to_utf16be: Option<Arc<StringConv>>,
+    sconv_from_utf16be: Option<Arc<StringConv>>,
+    /// The archive's string conversions, for entries made here
+    /// (`archive_entry_new2`) and for the UTF-16BE converters.
+    conv: Option<Cache>,
+
+    /// All isofiles, in creation order (`all_file_list` and the files
+    /// upstream frees right away).
+    files: Vec<IsoFile>,
+    /// All isoents of both trees.
+    ents: Vec<IsoEnt>,
+    /// Files which have contents and are not a directory, a hardlinked
+    /// file or a symlink file.
+    data_file_list: Vec<FileId>,
+    /// Used for managing to find hardlinking files.
+    hardlinks: BTreeMap<Vec<u8>, Hardlink>,
+
+    primary: Vdd,
+    joliet: Vdd,
+
+    // Used for making a Volume Descriptor.
+    volume_space_size: i32,
+    volume_sequence_number: i32,
+    total_file_block: i32,
+    volume_identifier: Vec<u8>,
+    publisher_identifier: Vec<u8>,
+    data_preparer_identifier: Vec<u8>,
+    application_identifier: Vec<u8>,
+    copyright_file_identifier: Vec<u8>,
+    abstract_file_identifier: Vec<u8>,
+    bibliographic_file_identifier: Vec<u8>,
+
+    /// Used for making rockridge extensions.
+    location_rrip_er: i32,
+
+    zisofs: Zisofs,
+
+    directories_too_deep: Option<EntId>,
+    dircnt_max: i32,
+
+    // Write buffer.
+    wbuff: Vec<u8>,
+    wbuff_remaining: usize,
+    wbuff_type: WbType,
+    wbuff_offset: i64,
+    wbuff_written: i64,
+    wbuff_tail: i64,
+
+    el_torito: ElTorito,
+    opt: IsoOption,
+}
+
+fn misc(msg: impl Into<Vec<u8>>) -> Error {
+    Error::fatal(ARCHIVE_ERRNO_MISC, msg)
+}
+
+/// A pathname for a message, as printf shows a NULL `%s`.
+fn shown(path: Option<&CStr>) -> Vec<u8> {
+    path.map_or(b"(null)".to_vec(), |p| p.to_bytes().to_vec())
+}
+
+/// `strlen` of a NUL-terminated buffer, bounded by the buffer.
+fn strlen(s: &[u8]) -> usize {
+    s.iter().position(|&b| b == 0).unwrap_or(s.len())
+}
+
+fn temp_error(e: &std::io::Error) -> c_int {
+    e.raw_os_error().unwrap_or(libc::EIO)
+}
+
+/// `write(2)` all of `b` to the temporary file.
+fn write_to_temp(temp: &mut Option<File>, b: &[u8]) -> Result<(), Error> {
+    if b.is_empty() {
+        return Ok(());
+    }
+    let Some(f) = temp.as_mut() else {
+        return Err(Error::fatal(libc::EBADF, "Can't write to temporary file"));
+    };
+    f.write_all(b)
+        .map_err(|e| Error::fatal(temp_error(&e), "Can't write to temporary file"))
+}
+
+/// `lseek(2)`, whose failure upstream ignores.
+fn temp_seek(temp: &mut Option<File>, off: i64) {
+    if let (Some(f), Ok(off)) = (temp.as_mut(), u64::try_from(off)) {
+        let _ = f.seek(SeekFrom::Start(off));
+    }
+}
+
+/// `read(2)` from the temporary file: the count, or -1 and the errno.
+fn temp_read(temp: &mut Option<File>, buf: &mut [u8]) -> Result<usize, (i64, c_int)> {
+    let Some(f) = temp.as_mut() else {
+        return Err((-1, libc::EBADF));
+    };
+    loop {
+        match f.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err((-1, temp_error(&e))),
+        }
+    }
+}
+
+/// "Can't read temporary file(%jd)" for a read that returned `rs`.
+fn read_error(rs: i64, errno: c_int) -> Error {
+    Error::fatal(errno, format!("Can't read temporary file({rs})"))
+}
+
 impl Default for Iso9660 {
+    /// `archive_write_set_format_iso9660`.
     fn default() -> Self {
-        let mut root = Entry::new(None);
-        root.set_mode(0o40555);
-        root.set_nlink(2);
-        let mut names = HashMap::new();
-        names.insert(Vec::new(), 0);
-        let mut strings = HashMap::new();
-        strings.insert(b"volume-id".to_vec(), b"CDROM".to_vec());
-        strings.insert(b"application-id".to_vec(), b"libarchive 3.9.0dev".to_vec());
-        Self {
-            nodes: vec![Node::new(root, Vec::new(), 0, true)],
-            names,
-            spool: None,
-            spool_size: 0,
-            data_order: Vec::new(),
-            current: None,
-            remaining: 0,
-            level: 1,
-            joliet: 1,
-            rr: 2,
-            pad: true,
-            limit_depth: true,
-            limit_dirs: true,
-            allow_vernum: true,
-            zisofs: false,
-            compression: 9,
-            strings,
-            boot: Boot {
-                filename: Vec::new(),
-                catalog: b"boot.catalog".to_vec(),
-                info_table: false,
-                load_segment: 0,
-                load_size: 4,
-                media: Media::NoEmulation,
-                system_type: 0,
-                platform_id: 0,
-                identifier: Vec::new(),
+        let mut iso9660 = Iso9660 {
+            birth_time: 0,
+            temp: None,
+            cur_file: None,
+            cur_dirent: 0,
+            cur_dirstr: Vec::new(),
+            bytes_remaining: 0,
+            need_multi_extent: false,
+            utf16be: Vec::new(),
+            mbs: Vec::new(),
+            sconv_to_utf16be: None,
+            sconv_from_utf16be: None,
+            conv: None,
+            files: Vec::new(),
+            ents: Vec::new(),
+            data_file_list: Vec::new(),
+            hardlinks: BTreeMap::new(),
+            primary: Vdd::new(VddType::Primary),
+            joliet: Vdd::new(VddType::Joliet),
+            volume_space_size: 0,
+            volume_sequence_number: 0,
+            total_file_block: 0,
+            // Init Identifiers used for PVD and SVD.
+            volume_identifier: b"CDROM".to_vec(),
+            publisher_identifier: Vec::new(),
+            data_preparer_identifier: Vec::new(),
+            application_identifier: crate::util::VERSION_STRING.to_bytes().to_vec(),
+            copyright_file_identifier: Vec::new(),
+            abstract_file_identifier: Vec::new(),
+            bibliographic_file_identifier: Vec::new(),
+            location_rrip_er: 0,
+            zisofs: Zisofs {
+                detect_magic: false,
+                making: false,
+                allzero: false,
+                magic_buffer: [0; 64],
+                magic_cnt: 0,
+                block_pointers: Vec::new(),
+                block_pointers_cnt: 0,
+                block_pointers_idx: 0,
+                total_size: 0,
+                block_offset: 0,
+                stream: None,
+                total_in: 0,
+                remaining: 0,
+                compression_level: 9,
             },
-            boot_enabled: false,
-            boot_floppy: false,
-            boot_auto: true,
-            birth: 0,
-            er_location: 0,
-            primary_children: HashMap::new(),
-            primary_parent: HashMap::new(),
-            too_deep: None,
-            info_options: Vec::new(),
+            directories_too_deep: None,
+            dircnt_max: 1,
+            wbuff: vec![0; WB_BUFFMAX],
+            wbuff_remaining: WB_BUFFMAX,
+            wbuff_type: WbType::ToTemp,
+            wbuff_offset: 0,
+            wbuff_written: 0,
+            wbuff_tail: 0,
+            // Init El Torito bootable CD variables.
+            el_torito: ElTorito {
+                // Set default file name of boot catalog
+                catalog_filename: b"boot.catalog".to_vec(),
+                catalog: None,
+                boot_filename: Vec::new(),
+                boot: None,
+                platform_id: BOOT_PLATFORM_X86,
+                id: Vec::new(),
+                media_type: 0,
+                system_type: 0,
+                boot_load_seg: 0,
+                boot_load_size: BOOT_LOAD_SIZE,
+            },
+            // Set default value of iso9660 options.
+            opt: IsoOption {
+                abstract_file: false,
+                application_id: false,
+                allow_vernum: true,
+                biblio_file: false,
+                boot: false,
+                boot_catalog: false,
+                boot_info_table: false,
+                boot_load_seg: false,
+                boot_load_size: false,
+                boot_type: OPT_BOOT_TYPE_AUTO,
+                compression_level: false,
+                copyright_file: false,
+                iso_level: 1,
+                joliet: OPT_JOLIET_ENABLE,
+                limit_depth: true,
+                limit_dirs: true,
+                pad: true,
+                publisher: false,
+                rr: OPT_RR_USEFUL,
+                volume_id: false,
+                zisofs: false,
+            },
+        };
+        // Create the root directory. Its pathname is empty, so making it
+        // cannot fail.
+        if let Ok(root) = iso9660.isoent_create_virtual_dir(b"") {
+            iso9660.ents[root].parent = root;
+            iso9660.primary.rootent = root;
+            iso9660.cur_dirent = root;
         }
+        iso9660
     }
 }
-fn io_error(e: std::io::Error) -> Error {
-    Error::fatal(e.raw_os_error().unwrap_or(libc::EIO), e.to_string())
-}
-fn bad(key: &[u8]) -> Error {
-    Error::new(
-        ARCHIVE_FAILED,
-        -1,
-        [b"Invalid value for option ``".as_slice(), key, b"''"].concat(),
-    )
-}
-fn normalize(path: &[u8]) -> Vec<u8> {
-    let mut components = Vec::new();
-    for part in path.split(|&b| b == b'/') {
-        match part {
-            b"" | b"." => {}
-            b".." => {
-                components.pop();
-            }
-            _ => components.push(part),
-        }
-    }
-    let mut out = Vec::new();
-    for p in components {
-        if !out.is_empty() {
-            out.push(b'/')
-        }
-        out.extend_from_slice(p);
-    }
-    out
-}
-/// isofile_gen_utility_names()'s UTF-16BE basename: the last component of
-/// the converted pathname, without trailing slashes. Upstream converts the
-/// pathname as given, so `dir/.` is named `.` in the Joliet tree.
-fn joliet_basename(entry: &mut Entry, conv: &crate::string::StringConv) -> (Vec<u8>, bool) {
-    let (u16, converted) = entry.pathname_l(Some(conv));
-    let u16 = u16.unwrap_or_default();
-    let mut units: Vec<&[u8]> = u16.chunks_exact(2).collect();
-    while units.last() == Some(&&[0, b'/'][..]) {
-        units.pop();
-    }
-    let start = units
-        .iter()
-        .rposition(|&u| u == [0, b'/'])
-        .map_or(0, |i| i + 1);
-    (units[start..].concat(), converted)
-}
-fn both32(n: u32) -> [u8; 8] {
-    let mut b = [0; 8];
-    b[..4].copy_from_slice(&n.to_le_bytes());
-    b[4..].copy_from_slice(&n.to_be_bytes());
-    b
-}
-fn both16(n: u16) -> [u8; 4] {
-    let mut b = [0; 4];
-    b[..2].copy_from_slice(&n.to_le_bytes());
-    b[2..].copy_from_slice(&n.to_be_bytes());
-    b
-}
-fn date(secs: i64) -> [u8; 7] {
-    let Some(t) = crate::ffi::sys::localtime(secs) else {
-        return [0; 7];
+
+/// get_str_opt(): a string option of at most `maxsize` bytes.
+fn get_str_opt(
+    s: &mut Vec<u8>,
+    maxsize: usize,
+    key: &[u8],
+    value: Option<&[u8]>,
+) -> Result<(), Error> {
+    // Upstream's strlen() of a value the option parser left NULL (a
+    // "!key") dereferences NULL; refuse it like an empty number.
+    let Some(value) = value else {
+        return Err(misc(
+            [b"Invalid value(empty) for option ``", key, b"''"].concat(),
+        ));
     };
-    let local = crate::time::days_from_civil(
-        i64::from(t.year) + 1900,
-        i64::from(t.mon) + 1,
-        i64::from(t.mday),
-    )
-    .saturating_mul(86400)
-    .saturating_add(i64::from(t.hour) * 3600 + i64::from(t.min) * 60 + i64::from(t.sec));
-    let offset = (local.saturating_sub(secs) / 900).clamp(-48, 52) as i8;
-    [
-        t.year as u8,
-        (t.mon + 1) as u8,
-        t.mday as u8,
-        t.hour as u8,
-        t.min as u8,
-        t.sec as u8,
-        offset as u8,
-    ]
-}
-fn volume_date(secs: i64) -> [u8; 17] {
-    let mut out = [b'0'; 17];
-    if let Some(t) = crate::ffi::sys::localtime(secs) {
-        let s = format!(
-            "{:04}{:02}{:02}{:02}{:02}{:02}00",
-            t.year + 1900,
-            t.mon + 1,
-            t.mday,
-            t.hour,
-            t.min,
-            t.sec
-        );
-        if s.len() == 16 {
-            out[..16].copy_from_slice(s.as_bytes())
-        }
+    if value.len() > maxsize {
+        let mut msg =
+            format!("Value is longer than {maxsize} characters for option ``").into_bytes();
+        msg.extend_from_slice(key);
+        msg.extend_from_slice(b"''");
+        return Err(misc(msg));
     }
-    out[16] = date(secs)[6];
-    out
+    *s = value.to_vec();
+    Ok(())
 }
-fn rr_field(sig: &[u8; 2], data: &[u8]) -> Vec<u8> {
-    let mut out = vec![sig[0], sig[1], (data.len() + 4) as u8, 1];
-    out.extend_from_slice(data);
-    out
-}
-fn continuation(block: u32, offset: u32, len: u32) -> Vec<u8> {
-    let mut data = Vec::new();
-    data.extend_from_slice(&both32(block));
-    data.extend_from_slice(&both32(offset));
-    data.extend_from_slice(&both32(len));
-    rr_field(b"CE", &data)
-}
-fn ascii_identifier(
-    name: &[u8],
-    directory: bool,
-    level: u8,
-    rr: bool,
-    allow_vernum: bool,
-) -> Vec<u8> {
-    let max = if level == 1 {
-        8
-    } else if level <= 3 {
-        31
-    } else if rr {
-        193
-    } else {
-        207
+
+/// get_num_opt(): a decimal option between `low` and `high`.
+fn get_num_opt(high: i32, low: i32, key: &[u8], value: Option<&[u8]>) -> Result<i32, Error> {
+    let fail = |text: &str| {
+        let (head, tail) = text.split_once("%s").unwrap_or((text, ""));
+        misc([head.as_bytes(), key, tail.as_bytes()].concat())
     };
-    if level == 4 {
-        let mut id: Vec<u8> = name
-            .iter()
-            .copied()
-            .map(|b| if b == b'/' || b == 0 { b'_' } else { b })
-            .take(max)
-            .collect();
-        while id.last() == Some(&b'.') {
-            id.pop();
-        }
-        if id.is_empty() {
-            id.push(b'_');
-        }
-        return id;
+    let Some(mut p) = value else {
+        return Err(fail("Invalid value(empty) for option ``%s''"));
+    };
+    let mut data: i32 = 0;
+    let mut neg = false;
+    if p.first() == Some(&b'-') {
+        neg = true;
+        p = &p[1..];
     }
-    let mut mapped: Vec<_> = name
-        .iter()
-        .copied()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b == b'_' || b == b'.' {
-                b.to_ascii_uppercase()
-            } else {
-                b'_'
-            }
-        })
-        .collect();
-    if directory {
-        for b in &mut mapped {
-            if *b == b'.' {
-                *b = b'_'
-            }
+    for &c in p {
+        if c.is_ascii_digit() {
+            data = data * 10 + i32::from(c - b'0');
+        } else {
+            return Err(fail("Invalid value for option ``%s''"));
         }
-        mapped.truncate(max);
-        return mapped;
-    }
-    if !allow_vernum {
-        for b in &mut mapped {
-            if *b == b';' {
-                *b = b'_'
-            }
+        if data > high {
+            return Err(fail(&format!(
+                "Invalid value(over {high}) for option ``%s''"
+            )));
+        }
+        if data < low {
+            return Err(fail(&format!(
+                "Invalid value(under {low}) for option ``%s''"
+            )));
         }
     }
-    let dot = mapped.iter().rposition(|&b| b == b'.');
-    let (stem, ext) = dot.map_or((mapped.as_slice(), &[][..]), |i| {
-        (&mapped[..i], &mapped[i + 1..])
-    });
-    let mut stem = stem.to_vec();
-    for b in &mut stem {
-        if *b == b'.' {
-            *b = b'_'
-        }
-    }
-    let extmax = if level == 1 { 3 } else { ext.len().min(29) };
-    let ext = &ext[..ext.len().min(extmax)];
-    stem.truncate(if level == 1 { 8 } else { 30 - ext.len() });
-    if stem.is_empty() {
-        stem.push(b'_')
-    }
-    stem.push(b'.');
-    stem.extend_from_slice(ext);
-    if allow_vernum {
-        stem.extend_from_slice(b";1");
-    }
-    stem
+    Ok(if neg { -data } else { data })
 }
+
 impl Iso9660 {
-    fn ensure_spool(&mut self) -> Result<&mut File, Error> {
-        if self.spool.is_none() {
-            self.spool = Some(crate::write::temp_file()?);
-        }
-        self.spool
-            .as_mut()
-            .ok_or_else(|| Error::fatal(-1, "Missing ISO temporary file"))
-    }
-    fn append(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.ensure_spool()?.write_all(data).map_err(io_error)?;
-        self.spool_size = self
-            .spool_size
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| Error::fatal(libc::EOVERFLOW, "ISO image too large"))?;
-        Ok(())
-    }
-    fn directory(&mut self, path: &[u8]) -> Result<usize, Error> {
-        let mut parent = 0;
-        let mut prefix = Vec::new();
-        for component in path.split(|&b| b == b'/').filter(|p| !p.is_empty()) {
-            if !prefix.is_empty() {
-                prefix.push(b'/');
+    /// iso9660_options(). `Ok(ARCHIVE_WARN)` tells the options supervisor
+    /// we didn't handle the option.
+    fn iso9660_options(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<c_int, Error> {
+        let invalid_value = || {
+            Error::new(
+                ARCHIVE_FAILED,
+                ARCHIVE_ERRNO_MISC,
+                [b"Invalid value for option ``", key, b"''"].concat(),
+            )
+        };
+        match key {
+            b"abstract-file" => {
+                let r = get_str_opt(
+                    &mut self.abstract_file_identifier,
+                    ABSTRACT_FILE_SIZE,
+                    key,
+                    value,
+                );
+                self.opt.abstract_file = r.is_ok();
+                r?;
             }
-            prefix.extend_from_slice(component);
-            if let Some(&i) = self.names.get(&prefix) {
-                if !self.nodes[i].directory {
-                    return Err(Error::new(
-                        ARCHIVE_FAILED,
-                        -1,
-                        [b"`".as_slice(), prefix.as_slice(), b"' is not directory"].concat(),
-                    ));
+            b"application-id" => {
+                let r = get_str_opt(
+                    &mut self.application_identifier,
+                    APPLICATION_IDENTIFIER_SIZE,
+                    key,
+                    value,
+                );
+                self.opt.application_id = r.is_ok();
+                r?;
+            }
+            b"allow-vernum" => self.opt.allow_vernum = value.is_some(),
+            b"biblio-file" => {
+                let r = get_str_opt(
+                    &mut self.bibliographic_file_identifier,
+                    BIBLIO_FILE_SIZE,
+                    key,
+                    value,
+                );
+                self.opt.biblio_file = r.is_ok();
+                r?;
+            }
+            b"boot" => match value {
+                None => self.opt.boot = false,
+                Some(v) => {
+                    self.opt.boot = true;
+                    self.el_torito.boot_filename = v.to_vec();
                 }
-                parent = i;
-                continue;
+            },
+            b"boot-catalog" => {
+                let r = get_str_opt(&mut self.el_torito.catalog_filename, 1024, key, value);
+                self.opt.boot_catalog = r.is_ok();
+                r?;
             }
-            let mut entry = Entry::new(None);
-            entry.set_mode(0o40555);
-            entry.set_nlink(2);
-            entry.set_pathname(&prefix);
-            let i = self.nodes.len();
-            self.nodes
-                .try_reserve(1)
-                .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate data"))?;
-            self.nodes
-                .push(Node::new(entry, prefix.clone(), parent, true));
-            self.nodes[parent].children.push(i);
-            self.names.insert(prefix.clone(), i);
-            parent = i;
-        }
-        Ok(parent)
-    }
-    fn identifiers(&mut self) -> Result<(), Error> {
-        let conv = crate::string::conversion_to_charset(None, b"UTF-16BE", true)
-            .map_err(|e| Error::fatal(e.errno, e.message))?;
-        for i in 1..self.nodes.len() {
-            let node = &mut self.nodes[i];
-            node.ident[0] = ascii_identifier(
-                &node.name,
-                node.directory,
-                self.level,
-                self.rr != 0,
-                self.allow_vernum,
-            );
-            if self.joliet == 0 {
-                continue;
-            }
-            let mut joliet = joliet_basename(&mut node.entry, &conv).0;
-            let max = if self.joliet == 2 { 206 } else { 128 };
-            let truncated = joliet.len() > max;
-            joliet.truncate(max);
-            for unit in joliet.chunks_exact_mut(2) {
-                let ch = u16::from_be_bytes([unit[0], unit[1]]);
-                if ch < 32 || b"*/:;?\\".contains(&(ch as u8)) && ch < 128 {
-                    unit.copy_from_slice(&[0, b'_']);
+            b"boot-info-table" => self.opt.boot_info_table = value.is_some(),
+            b"boot-load-seg" => {
+                self.opt.boot_load_seg = false;
+                let Some(mut p) = value else {
+                    return Err(invalid_value());
+                };
+                let mut seg: u32 = 0;
+                if p.len() >= 2 && p[0] == b'0' && (p[1] == b'x' || p[1] == b'X') {
+                    p = &p[2..];
                 }
-            }
-            // The multibyte length of the name, which upstream checks
-            // against Joliet's 240-byte path limit.
-            node.mb_len = if truncated {
-                let units: Vec<u16> = joliet
-                    .chunks_exact(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                    .collect();
-                String::from_utf16_lossy(&units).len()
-            } else {
-                node.name.len()
-            };
-            node.ident[1] = joliet;
-        }
-        for parent in 0..self.nodes.len() {
-            for tree in 0..2 {
-                let children = self.children(parent, tree);
-                let mut used = HashSet::new();
-                for &i in &children {
-                    let base = self.nodes[i].ident[tree].clone();
-                    let mut name = base.clone();
-                    let mut counter = 0;
-                    while used.contains(&name) {
-                        let suffix = format!("{counter:03}");
-                        counter += 1;
-                        if counter > 1000 {
-                            return Err(Error::fatal(-1, "Too many duplicate ISO identifiers"));
-                        }
-                        if tree == 0 {
-                            let ext = base.iter().rposition(|&b| b == b'.').unwrap_or(base.len());
-                            let capacity: usize = if self.level == 1 {
-                                8
-                            } else if self.level <= 3 {
-                                31usize.saturating_sub((base.len() - ext).saturating_sub(
-                                    if self.nodes[i].directory || !self.allow_vernum {
-                                        0
-                                    } else {
-                                        2
-                                    },
-                                ))
-                            } else {
-                                let max = if self.rr != 0 { 193usize } else { 207usize };
-                                max.saturating_sub(base.len() - ext)
-                            };
-                            let stem = &base[..ext.min(capacity.saturating_sub(3))];
-                            name = stem.to_vec();
-                            name.extend_from_slice(suffix.as_bytes());
-                            name.extend_from_slice(&base[ext..]);
-                        } else {
-                            let max = if self.joliet == 2 { 206 } else { 128 };
-                            name = base[..base.len().min(max - 6)].to_vec();
-                            for b in suffix.bytes() {
-                                name.extend_from_slice(&[0, b]);
-                            }
-                        }
+                for &c in p {
+                    if seg != 0 {
+                        seg <<= 4;
                     }
-                    used.insert(name.clone());
-                    self.nodes[i].ident[tree] = name;
-                }
-            }
-        }
-        if self.joliet != 0 {
-            // isoent_traverse_tree() visits directories depth first, each
-            // one's children in order; a full pathname over 240 bytes violates
-            // the Joliet extensions.
-            let mut stack = vec![(0, 1usize)];
-            while let Some((parent, parent_len)) = stack.pop() {
-                let children = self.children(parent, 1);
-                for &child in &children {
-                    let mb_len = self.nodes[child].mb_len;
-                    if parent_len > 240 || mb_len > 240 || parent_len + mb_len > 240 {
-                        let path = self.nodes[child]
-                            .entry
-                            .pathname()
-                            .map_or(&b""[..], |p| p.to_bytes());
-                        return Err(Error::fatal(
-                            -1,
-                            [
-                                b"The regulation of Joliet extensions; A length of a full-pathname of `".as_slice(),
-                                path,
-                                format!(
-                                    "' is longer than 240 bytes, (p={parent_len}, b={mb_len})"
-                                )
-                                .as_bytes(),
-                            ]
-                            .concat(),
+                    seg += match c {
+                        b'A'..=b'F' => u32::from(c - b'A') + 0x0a,
+                        b'a'..=b'f' => u32::from(c - b'a') + 0x0a,
+                        b'0'..=b'9' => u32::from(c - b'0'),
+                        _ => return Err(invalid_value()),
+                    };
+                    if seg > 0xffff {
+                        return Err(misc(
+                            [b"Invalid value(over 0xffff) for option ``", key, b"''"].concat(),
                         ));
                     }
                 }
-                for &child in children.iter().rev() {
-                    if self.is_dir(child, 1) {
-                        stack.push((child, parent_len + self.nodes[child].mb_len + 1));
-                    }
+                self.el_torito.boot_load_seg = seg as u16;
+                self.opt.boot_load_seg = true;
+            }
+            b"boot-load-size" => {
+                let r = get_num_opt(0xffff, 1, key, value);
+                self.opt.boot_load_size = r.is_ok();
+                self.el_torito.boot_load_size = r? as u16;
+            }
+            b"boot-type" => {
+                self.opt.boot_type = match value {
+                    Some(b"no-emulation") => OPT_BOOT_TYPE_NO_EMU,
+                    Some(b"fd") => OPT_BOOT_TYPE_FD,
+                    Some(b"hard-disk") => OPT_BOOT_TYPE_HARD_DISK,
+                    _ => return Err(invalid_value()),
                 }
             }
-        }
-        Ok(())
-    }
-    fn children(&self, index: usize, kind: usize) -> Vec<usize> {
-        if kind == 0 {
-            self.primary_children
-                .get(&index)
-                .unwrap_or(&self.nodes[index].children)
-                .clone()
-        } else {
-            self.nodes[index]
-                .children
-                .iter()
-                .copied()
-                .filter(|&i| !self.nodes[i].joliet_hidden)
-                .collect()
-        }
-    }
-    fn parent(&self, index: usize, kind: usize) -> usize {
-        if kind == 0 {
-            self.primary_parent
-                .get(&index)
-                .copied()
-                .unwrap_or(self.nodes[index].parent)
-        } else {
-            self.nodes[index].parent
-        }
-    }
-    fn is_dir(&self, index: usize, kind: usize) -> bool {
-        if kind == 0 {
-            self.nodes[index].directory
-        } else {
-            self.nodes[index].entry.filetype() == 0o40000
-        }
-    }
-    fn relocate(&mut self) -> Result<(), Error> {
-        if !self.limit_depth || self.level >= 4 {
-            return Ok(());
-        }
-        if self.rr == 0 {
-            let mut queue = VecDeque::from([(0, 0usize)]);
-            while let Some((parent, depth)) = queue.pop_front() {
-                let children = self.children(parent, 0);
-                if depth >= 7 && !children.is_empty() {
-                    self.too_deep = Some(parent);
-                    self.primary_children.insert(parent, Vec::new());
-                    continue;
+            b"compression-level" => match value {
+                Some(&[c]) if c.is_ascii_digit() => {
+                    self.zisofs.compression_level = i32::from(c - b'0');
+                    self.opt.compression_level = true;
                 }
-                for child in children {
-                    if self.nodes[child].directory {
-                        queue.push_back((child, depth + 1));
-                    }
-                }
-            }
-            return Ok(());
-        }
-        let mut moved = None;
-        let mut queue = VecDeque::from([(0, 0usize)]);
-        while let Some((parent, depth)) = queue.pop_front() {
-            for child in self.children(parent, 0) {
-                if !self.nodes[child].directory {
-                    continue;
-                }
-                if depth < 7 {
-                    queue.push_back((child, depth + 1));
-                    continue;
-                }
-                let target = if let Some(i) = moved {
-                    i
-                } else {
-                    let existed = self.names.contains_key(b"rr_moved".as_slice());
-                    let i = self.directory(b"rr_moved")?;
-                    if !existed {
-                        self.nodes[i].joliet_hidden = true;
-                    }
-                    moved = Some(i);
-                    i
-                };
-                if self
-                    .children(target, 0)
-                    .iter()
-                    .any(|&i| self.nodes[i].name == self.nodes[child].name)
-                {
-                    return Err(Error::fatal(-1, "Duplicate relocated directory name"));
-                }
-                let mut node = Node::new(
-                    self.nodes[child].entry.clone_entry(),
-                    self.nodes[child].path.clone(),
-                    target,
-                    false,
-                );
-                node.children = self.nodes[child].children.clone();
-                node.rr_parent = Some(parent);
-                node.joliet_hidden = true;
-                let relocated = self.nodes.len();
-                self.nodes.push(node);
-                self.nodes[child].rr_child = Some(relocated);
-                self.nodes[child].directory = false;
-                self.primary_children.insert(child, Vec::new());
-                for &i in &self.nodes[relocated].children {
-                    self.primary_parent.insert(i, relocated);
-                }
-                let mut children = self.children(target, 0);
-                children.push(relocated);
-                self.primary_children.insert(target, children);
-                queue.push_back((relocated, 2));
-            }
-        }
-        Ok(())
-    }
-    fn tree(&self, kind: usize) -> Result<Tree, Error> {
-        let mut directories = Vec::new();
-        let mut queue = VecDeque::from([0]);
-        while let Some(i) = queue.pop_front() {
-            directories.push(i);
-            let mut children: Vec<_> = self
-                .children(i, kind)
-                .into_iter()
-                .filter(|&c| self.is_dir(c, kind))
-                .collect();
-            children.sort_by(|&a, &b| self.nodes[a].ident[kind].cmp(&self.nodes[b].ident[kind]));
-            queue.extend(children);
-        }
-        if self.limit_dirs && directories.len() > u16::MAX as usize {
-            return Err(Error::fatal(-1, "Too many directories"));
-        }
-        let numbers = directories
-            .iter()
-            .enumerate()
-            .map(|(n, &i)| (i, (n + 1) as u16))
-            .collect();
-        let size = directories
-            .iter()
-            .try_fold(0usize, |size, &i| {
-                let n = if i == 0 {
-                    1
-                } else {
-                    self.nodes[i].ident[kind].len()
-                };
-                size.checked_add(8 + n + n % 2)
-            })
-            .ok_or_else(|| Error::fatal(libc::EOVERFLOW, "ISO path table too large"))?;
-        let path_size = u32::try_from(size)
-            .map_err(|_| Error::fatal(libc::EOVERFLOW, "ISO path table too large"))?;
-        let mut order = Vec::new();
-        let mut stack = vec![0];
-        while let Some(i) = stack.pop() {
-            order.push(i);
-            let mut children: Vec<_> = self
-                .children(i, kind)
-                .into_iter()
-                .filter(|&c| self.is_dir(c, kind))
-                .collect();
-            children.sort_by(|&a, &b| self.nodes[b].ident[kind].cmp(&self.nodes[a].ident[kind]));
-            if kind == 0 {
-                children.sort_by_key(|&i| self.nodes[i].name == b"rr_moved");
-            }
-            stack.extend(children);
-        }
-        Ok(Tree {
-            directories,
-            order,
-            numbers,
-            layout: HashMap::new(),
-            path_size,
-            path_blocks: (path_size as usize).div_ceil(4096) as u32 * 2,
-            path_l: 0,
-            path_m: 0,
-        })
-    }
-    fn rr(&self, index: usize, kind: u8) -> Vec<Vec<u8>> {
-        let original = &self.nodes[index];
-        let node = if kind == 4 {
-            &self.nodes[original.rr_parent.unwrap_or(index)]
-        } else {
-            original
-        };
-        let e = &node.entry;
-        let mut out = Vec::new();
-        if index == 0 && kind == 0 {
-            out.push(rr_field(b"SP", &[0xbe, 0xef, 0]));
-        }
-        let mut flags = 0x81;
-        if kind == 2 {
-            flags |= 8;
-            if e.filetype() == 0o120000 {
-                flags |= 4
-            }
-            if matches!(e.filetype(), 0o20000 | 0o60000) {
-                flags |= 2
-            }
-        }
-        if kind == 2 && node.rr_child.is_some() {
-            flags |= 0x10;
-        }
-        if kind == 2 && node.rr_parent.is_some() {
-            flags |= 0x40;
-        }
-        if kind == 4 {
-            flags |= 0x20;
-        }
-        out.push(rr_field(b"RR", &[flags]));
-        if kind == 2 {
-            if let Some(i) = node.rr_child {
-                out.push(rr_field(b"CL", &both32(self.nodes[i].extent)));
-            }
-            if node.rr_parent.is_some() {
-                out.push(rr_field(b"RE", &[]));
-            }
-        }
-        if kind == 4 {
-            out.push(rr_field(b"PL", &both32(node.extent)));
-        }
-        if kind == 2 {
-            let count = node.name.len().div_ceil(250);
-            for (n, name) in node.name.chunks(250).enumerate() {
-                let mut data = vec![u8::from(n + 1 < count)];
-                data.extend_from_slice(name);
-                out.push(rr_field(b"NM", &data));
-            }
-        }
-        let mut mode = u32::from(e.mode());
-        if self.rr == 2 {
-            mode |= 0o444;
-            if mode & 0o111 != 0 {
-                mode |= 0o111
-            }
-            mode &= !0o7222;
-        }
-        let mut px = Vec::new();
-        let serial = if node.directory {
-            node.extent
-        } else if let Some(i) = node.hardlink {
-            self.nodes[i].extent
-        } else {
-            node.extent
-        };
-        for n in [mode, e.nlink(), e.uid() as u32, e.gid() as u32, serial] {
-            px.extend_from_slice(&both32(n));
-        }
-        out.push(rr_field(b"PX", &px));
-        if kind == 2 && e.filetype() == 0o120000 {
-            let sym = node.symlink.as_slice();
-            let mut components = Vec::new();
-            if sym.starts_with(b"/") {
-                components.push(vec![8, 0]);
-            }
-            for component in sym.split(|&b| b == b'/').filter(|p| !p.is_empty()) {
-                match component {
-                    b"." => components.push(vec![2, 0]),
-                    b".." => components.push(vec![4, 0]),
-                    _ => {
-                        let count = component.len().div_ceil(245);
-                        for (n, c) in component.chunks(245).enumerate() {
-                            let mut p = vec![u8::from(n + 1 < count), c.len() as u8];
-                            p.extend_from_slice(c);
-                            components.push(p);
-                        }
-                    }
-                }
-            }
-            let mut data = vec![0];
-            for component in components {
-                if data.len() + component.len() > 251 {
-                    data[0] = 1;
-                    out.push(rr_field(b"SL", &data));
-                    data = vec![0];
-                }
-                data.extend(component);
-            }
-            out.push(rr_field(b"SL", &data));
-        }
-        if kind == 2 && matches!(e.filetype(), 0o20000 | 0o60000) {
-            let mut data = Vec::new();
-            data.extend_from_slice(&both32(e.rdevmajor() as u32));
-            data.extend_from_slice(&both32(e.rdevminor() as u32));
-            out.push(rr_field(b"PN", &data));
-        }
-        let times = [
-            (
-                e.birthtime_is_set() != 0 && e.birthtime() <= e.mtime(),
-                e.birthtime(),
-                1,
-            ),
-            (e.mtime_is_set() != 0, e.mtime(), 2),
-            (e.atime_is_set() != 0, e.atime(), 4),
-            (e.ctime_is_set() != 0, e.ctime(), 8),
-        ];
-        let mut data = vec![0];
-        for (set, seconds, flag) in times {
-            if set {
-                data[0] |= flag;
-                data.extend_from_slice(&date(seconds));
-            }
-        }
-        out.push(rr_field(b"TF", &data));
-        if kind == 2
-            && let Some((size, header, log)) = node.zisofs
-        {
-            let mut data = vec![b'p', b'z', header, log];
-            data.extend_from_slice(&both32(size));
-            out.push(rr_field(b"ZF", &data));
-        }
-        if index == 0 && kind == 0 {
-            out.push(continuation(self.er_location, 0, ER.len() as u32));
-        }
-        out
-    }
-    fn record(
-        &self,
-        index: usize,
-        id: &[u8],
-        kind: u8,
-        tree: &Tree,
-        placement: (usize, u32, Option<(u32, u32, bool)>),
-        extra: &mut Vec<u8>,
-    ) -> Result<Vec<u8>, Error> {
-        let (tree_kind, extra_base, segment) = placement;
-        let actual = if kind == 4 {
-            self.nodes[index].rr_parent.unwrap_or(index)
-        } else {
-            index
-        };
-        let node = &self.nodes[actual];
-        let data_node = node.hardlink.map_or(node, |n| &self.nodes[n]);
-        let mut out = vec![0; 33 + id.len() + usize::from(id.len().is_multiple_of(2))];
-        if out.len() > 254 {
-            return Err(Error::fatal(-1, "ISO identifier too long"));
-        }
-        let (extent, len) = if self.is_dir(actual, tree_kind) {
-            let l = tree.layout.get(&actual);
-            (
-                l.map_or(0, |l| l.location),
-                l.map_or(2048, |l| l.blocks * BLOCK as u32),
-            )
-        } else {
-            (
-                data_node.extent,
-                if segment.is_some() {
-                    0
-                } else {
-                    u32::try_from(data_node.size)
-                        .map_err(|_| Error::fatal(-1, "ISO extent too large"))?
-                },
-            )
-        };
-        let (extent, len, multi) = segment.unwrap_or((extent, len, false));
-        out[2..10].copy_from_slice(&both32(extent));
-        out[10..18].copy_from_slice(&both32(len));
-        out[18..25].copy_from_slice(&date(node.entry.mtime()));
-        out[25] = if self.is_dir(actual, tree_kind) { 2 } else { 0 };
-        if multi {
-            out[25] |= 0x80;
-        }
-        out[28..32].copy_from_slice(&both16(1));
-        out[32] = id.len() as u8;
-        out[33..33 + id.len()].copy_from_slice(id);
-        if tree_kind == 0 && self.rr != 0 && kind != 3 {
-            let fields = self.rr(index, kind);
-            let full = fields.iter().map(Vec::len).sum::<usize>();
-            if out.len() + full <= 254 {
-                for field in fields {
-                    out.extend(field);
-                }
-            } else {
-                let mut remaining = Vec::new();
-                let mut overflow = false;
-                for field in fields {
-                    if !overflow && out.len() + field.len() + 28 <= 254 {
-                        out.extend(field);
-                    } else {
-                        overflow = true;
-                        remaining.extend(field);
-                    }
-                }
-                let offset = extra.len() % BLOCK;
-                if offset + remaining.len() > BLOCK {
-                    extra.resize(extra.len() + BLOCK - offset, 0);
-                }
-                let at = extra.len();
-                extra.extend_from_slice(&remaining);
-                out.extend(continuation(
-                    extra_base + (at / BLOCK) as u32,
-                    (at % BLOCK) as u32,
-                    u32::try_from(remaining.len()).map_err(|_| {
-                        Error::fatal(libc::EOVERFLOW, "Rock Ridge continuation too large")
-                    })?,
-                ));
-            }
-            // extra_close_record() pads the record to an even length.
-            if !out.len().is_multiple_of(2) {
-                out.push(0);
-            }
-        }
-        out[0] = out.len() as u8;
-        Ok(out)
-    }
-    fn directory_bytes(
-        &self,
-        index: usize,
-        kind: usize,
-        tree: &Tree,
-        extra_base: u32,
-    ) -> Result<(Vec<u8>, Vec<u8>), Error> {
-        let mut out = Vec::new();
-        let mut extra = Vec::new();
-        let parent_record = if kind == 0 && self.nodes[index].rr_parent.is_some() {
-            (index, vec![1], 4)
-        } else {
-            (self.parent(index, kind), vec![1], 1)
-        };
-        let mut records = vec![(index, vec![0], 0), parent_record];
-        let mut children = self.children(index, kind);
-        children.sort_by(|&a, &b| self.nodes[a].ident[kind].cmp(&self.nodes[b].ident[kind]));
-        for i in children {
-            records.push((i, self.nodes[i].ident[kind].clone(), 2));
-        }
-        for (i, id, record_kind) in records {
-            let node = self.nodes[i]
-                .hardlink
-                .map_or(&self.nodes[i], |n| &self.nodes[n]);
-            let mut remaining = if record_kind == 2 && !self.is_dir(i, kind) {
-                node.size
-            } else {
-                0
-            };
-            let mut extent = node.extent;
-            loop {
-                let segment = if remaining > u32::MAX as u64 {
-                    Some((extent, 0xfffff800, true))
-                } else if remaining > 0 && extent != node.extent {
-                    Some((extent, remaining as u32, false))
-                } else {
-                    None
-                };
-                let record = self.record(
-                    i,
-                    &id,
-                    record_kind,
-                    tree,
-                    (kind, extra_base, segment),
-                    &mut extra,
-                )?;
-                let offset = out.len() % BLOCK;
-                if offset + record.len() > BLOCK {
-                    out.resize(out.len() + BLOCK - offset, 0);
-                }
-                out.extend(record);
-                if let Some((_, size, true)) = segment {
-                    remaining -= size as u64;
-                    extent = extent
-                        .checked_add(size / BLOCK as u32)
-                        .ok_or_else(|| Error::fatal(libc::EOVERFLOW, "ISO extent too large"))?;
-                } else {
-                    break;
-                }
-            }
-        }
-        out.resize(out.len().div_ceil(BLOCK) * BLOCK, 0);
-        extra.resize(extra.len().div_ceil(BLOCK) * BLOCK, 0);
-        Ok((out, extra))
-    }
-    fn layout(&self, tree: &mut Tree, kind: usize, mut block: u32) -> Result<u32, Error> {
-        for &i in &tree.order {
-            let (data, extra) = self.directory_bytes(i, kind, tree, 0)?;
-            let blocks = u32::try_from(data.len() / BLOCK)
-                .map_err(|_| Error::fatal(libc::EOVERFLOW, "ISO directory too large"))?;
-            let extra_blocks = u32::try_from(extra.len() / BLOCK)
-                .map_err(|_| Error::fatal(libc::EOVERFLOW, "ISO directory too large"))?;
-            tree.layout.insert(
-                i,
-                DirLayout {
-                    location: block,
-                    blocks,
-                    extra_blocks,
-                },
-            );
-            block = block
-                .checked_add(blocks)
-                .and_then(|n| n.checked_add(extra_blocks))
-                .ok_or_else(|| Error::fatal(libc::EOVERFLOW, "ISO directory too large"))?;
-        }
-        Ok(block)
-    }
-    fn path_table(&self, tree: &Tree, kind: usize, big: bool) -> Vec<u8> {
-        let mut out = Vec::new();
-        for &i in &tree.directories {
-            let id = if i == 0 {
-                vec![0]
-            } else {
-                self.nodes[i].ident[kind].clone()
-            };
-            let location = tree.layout.get(&i).map_or(0, |l| l.location);
-            let parent = tree
-                .numbers
-                .get(&self.parent(i, kind))
-                .copied()
-                .unwrap_or(1);
-            out.extend_from_slice(&[id.len() as u8, 0]);
-            out.extend_from_slice(&if big {
-                location.to_be_bytes()
-            } else {
-                location.to_le_bytes()
-            });
-            out.extend_from_slice(&if big {
-                parent.to_be_bytes()
-            } else {
-                parent.to_le_bytes()
-            });
-            out.extend_from_slice(&id);
-            if id.len() % 2 != 0 {
-                out.push(0)
-            }
-        }
-        out.resize(tree.path_blocks as usize * BLOCK, 0);
-        out
-    }
-}
-impl Iso9660 {
-    fn descriptor(
-        &self,
-        tree: &Tree,
-        kind: usize,
-        enhanced: bool,
-        total: u32,
-    ) -> Result<Vec<u8>, Error> {
-        let mut out = vec![0; BLOCK];
-        out[0] = if kind == 0 && !enhanced { 1 } else { 2 };
-        out[1..6].copy_from_slice(b"CD001");
-        out[6] = if enhanced { 2 } else { 1 };
-        let conv = if kind == 1 {
-            Some(
-                crate::string::conversion_to_charset(None, b"UTF-16BE", true)
-                    .map_err(|e| Error::fatal(e.errno, e.message))?,
-            )
-        } else {
-            None
-        };
-        let text = |out: &mut [u8], raw: &[u8]| -> Result<(), Error> {
-            if let Some(conv) = &conv {
-                for unit in out.chunks_exact_mut(2) {
-                    unit.copy_from_slice(&[0, b' ']);
-                }
-                let mut encoded = Vec::new();
-                crate::string::strncpy_l(&mut encoded, raw, Some(conv))
-                    .map_err(|_| Error::fatal(-1, "Can't convert volume identifier to UTF-16BE"))?;
-                let n = out.len().min(encoded.len()) & !1;
-                out[..n].copy_from_slice(&encoded[..n]);
-            } else {
-                out.fill(b' ');
-                for (d, &s) in out.iter_mut().zip(raw) {
-                    *d = if enhanced { s } else { s.to_ascii_uppercase() };
-                }
-            }
-            Ok(())
-        };
-        text(
-            &mut out[8..40],
-            if cfg!(target_os = "macos") {
-                b"Darwin"
-            } else {
-                b"Linux"
+                _ => return Err(invalid_value()),
             },
-        )?;
-        text(
-            &mut out[40..72],
-            self.strings
-                .get(b"volume-id".as_slice())
-                .map_or(b"CDROM".as_slice(), Vec::as_slice),
-        )?;
-        out[80..88].copy_from_slice(&both32(total));
-        if kind == 1 {
-            out[88..91].copy_from_slice(b"%/E")
-        }
-        out[120..124].copy_from_slice(&both16(1));
-        out[124..128].copy_from_slice(&both16(1));
-        out[128..132].copy_from_slice(&both16(2048));
-        out[132..140].copy_from_slice(&both32(tree.path_size));
-        out[140..144].copy_from_slice(&tree.path_l.to_le_bytes());
-        out[148..152].copy_from_slice(&tree.path_m.to_be_bytes());
-        let root = self.record(0, &[0], 3, tree, (kind, 0, None), &mut Vec::new())?;
-        out[156..190].copy_from_slice(&root);
-        for (range, key) in [
-            (190..318, b"".as_slice()),
-            (318..446, b"publisher"),
-            (446..574, b"data-preparer"),
-            (574..702, b"application-id"),
-            (702..739, b"copyright-file"),
-            (739..776, b"abstract-file"),
-            (776..813, b"biblio-file"),
-        ] {
-            text(
-                &mut out[range],
-                self.strings.get(key).map_or(&[][..], Vec::as_slice),
-            )?;
-        }
-        out[813..830].copy_from_slice(&volume_date(self.birth));
-        out[830..847].copy_from_slice(&volume_date(self.birth));
-        out[847..863].fill(b'0');
-        out[864..881].copy_from_slice(&volume_date(self.birth));
-        out[881] = if enhanced { 2 } else { 1 };
-        out[883..1395].fill(b' ');
-        Ok(out)
-    }
-    fn compress_zisofs(&mut self, index: usize) -> Result<(), Error> {
-        let size = self.nodes[index].size;
-        if !self.zisofs || self.rr == 0 || !(24..1 << 32).contains(&size) {
-            return Ok(());
-        }
-        let offset = self.nodes[index].offset;
-        let mut header = [0; 64];
-        let spool_end = self.spool_size;
-        {
-            let file = self.ensure_spool()?;
-            file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
-            file.read_exact(&mut header[..size.min(64) as usize])
-                .map_err(io_error)?;
-            file.seek(SeekFrom::Start(spool_end)).map_err(io_error)?;
-        }
-        let magic = b"\x37\xe4\x53\x96\xc9\xdb\xd6\x07";
-        if header[..8] == *magic {
-            let original = u32::from_le_bytes(header[8..12].try_into().unwrap_or_default());
-            let log = header[13];
-            if original >= 24 && header[12] == 4 && (7..=30).contains(&log) {
-                let count = (u64::from(original) + (1u64 << log) - 1) >> log;
-                let table_size = 16 + (count + 1) * 4;
-                if table_size <= size {
-                    let mut pointer = table_size as u32;
-                    let mut valid = true;
-                    for pair in header[16..size.min(64) as usize].windows(8).step_by(4) {
-                        let begin = u32::from_le_bytes(pair[..4].try_into().unwrap_or_default());
-                        let end = u32::from_le_bytes(pair[4..].try_into().unwrap_or_default());
-                        if begin != pointer || end < begin || u64::from(end) > size {
-                            valid = false;
-                            break;
-                        }
-                        pointer = end;
-                    }
-                    if valid {
-                        self.nodes[index].zisofs = Some((original, 4, log));
-                        return Ok(());
-                    }
+            b"copyright-file" => {
+                let r = get_str_opt(
+                    &mut self.copyright_file_identifier,
+                    COPYRIGHT_FILE_SIZE,
+                    key,
+                    value,
+                );
+                self.opt.copyright_file = r.is_ok();
+                r?;
+            }
+            b"iso-level" => match value {
+                Some(&[c @ b'1'..=b'4']) => self.opt.iso_level = c - b'0',
+                _ => return Err(invalid_value()),
+            },
+            b"joliet" => {
+                self.opt.joliet = match value {
+                    None => OPT_JOLIET_DISABLE,
+                    Some(b"1") => OPT_JOLIET_ENABLE,
+                    Some(b"long") => OPT_JOLIET_LONGNAME,
+                    _ => return Err(invalid_value()),
                 }
             }
+            b"limit-depth" => self.opt.limit_depth = value.is_some(),
+            b"limit-dirs" => self.opt.limit_dirs = value.is_some(),
+            b"pad" => self.opt.pad = value.is_some(),
+            b"publisher" => {
+                let r = get_str_opt(
+                    &mut self.publisher_identifier,
+                    PUBLISHER_IDENTIFIER_SIZE,
+                    key,
+                    value,
+                );
+                self.opt.publisher = r.is_ok();
+                r?;
+            }
+            // Upstream also tests for "Rockridge", but under its switch on
+            // the first letter, 'r', so that key is never recognized.
+            b"rockridge" => {
+                self.opt.rr = match value {
+                    None => OPT_RR_DISABLED,
+                    Some(b"1") | Some(b"useful") => OPT_RR_USEFUL,
+                    Some(b"strict") => OPT_RR_STRICT,
+                    _ => return Err(invalid_value()),
+                }
+            }
+            b"volume-id" => {
+                let r = get_str_opt(
+                    &mut self.volume_identifier,
+                    VOLUME_IDENTIFIER_SIZE,
+                    key,
+                    value,
+                );
+                self.opt.volume_id = r.is_ok();
+                r?;
+            }
+            b"zisofs" => self.opt.zisofs = value.is_some(),
+            // Note: The "warn" return is just to inform the options
+            // supervisor that we didn't handle it. It will generate a
+            // suitable error if no one used this option.
+            _ => return Ok(ARCHIVE_WARN),
         }
-        if size <= BLOCK as u64 {
+        Ok(ARCHIVE_OK)
+    }
+
+    /// iso9660_write_header().
+    fn iso9660_write_header(
+        &mut self,
+        a: &Base,
+        entry: &Entry,
+        out: &mut dyn Sink,
+    ) -> Result<c_int, Error> {
+        let mut ret = ARCHIVE_OK;
+
+        self.cur_file = None;
+        self.bytes_remaining = 0;
+        self.need_multi_extent = false;
+        if entry.filetype() == AE_IFLNK && self.opt.rr == OPT_RR_DISABLED {
+            a.set_error(ARCHIVE_ERRNO_MISC, Some(b"Ignore symlink file"));
+            return Ok(ARCHIVE_WARN);
+        }
+        if entry.filetype() == AE_IFREG && entry.size() >= MULTI_EXTENT_SIZE {
+            if self.opt.iso_level < 3 {
+                let msg =
+                    format!("Ignore over {MULTI_EXTENT_SIZE} bytes file. This file too large");
+                a.set_error(ARCHIVE_ERRNO_MISC, Some(msg.as_bytes()));
+                return Ok(ARCHIVE_WARN);
+            }
+            self.need_multi_extent = true;
+        }
+
+        let file = self.isofile_new(Some(entry));
+        let r = self.isofile_gen_utility_names(Some(a), file)?;
+        ret = ret.min(r);
+
+        // Ignore a path which looks like the top of directory name since we
+        // have already made the root directory of an ISO image.
+        if self.files[file].parentdir.is_empty() && self.files[file].basename.is_empty() {
+            return Ok(r);
+        }
+
+        let mut isoent = self.isoent_new(file);
+        if self.files[file].dircnt > self.dircnt_max {
+            self.dircnt_max = self.files[file].dircnt;
+        }
+
+        // Add the current file into tree
+        isoent = self.isoent_tree(isoent)?;
+
+        // If there is the same file in tree and the current file is older
+        // than the file in tree. So we don't need the current file data
+        // anymore.
+        if self.ents[isoent].file != file {
+            return Ok(ARCHIVE_OK);
+        }
+
+        // Non regular files contents are unneeded to be saved to temporary
+        // files.
+        if self.files[file].entry.filetype() != AE_IFREG {
+            return Ok(ret);
+        }
+
+        // Set the current file to cur_file to read its contents.
+        self.cur_file = Some(file);
+
+        if self.files[file].entry.nlink() > 1 {
+            self.isofile_register_hardlink(file);
+        }
+
+        // Prepare to save the contents of the file.
+        if self.temp.is_none() {
+            self.temp = Some(
+                crate::write::temp_file()
+                    .map_err(|e| Error::fatal(e.errno, "Couldn't create temporary file"))?,
+            );
+        }
+
+        // Save an offset of current file in temporary file.
+        let offset = self.wb_offset();
+        let f = &mut self.files[file];
+        f.content[0].offset_of_temp = offset;
+        f.cur_content = Some(0);
+        self.zisofs_init(out, file)?;
+        self.bytes_remaining = self.files[file].entry.size() as u64;
+
+        Ok(ret)
+    }
+
+    /// The current file and its current extent.
+    fn cur_content(&mut self) -> Result<&mut Content, Error> {
+        self.cur_file
+            .and_then(|f| {
+                let file = self.files.get_mut(f)?;
+                file.content.get_mut(file.cur_content?)
+            })
+            .ok_or_else(|| misc("No current file content"))
+    }
+
+    fn write_iso9660_data(&mut self, out: &mut dyn Sink, mut buff: &[u8]) -> Result<usize, Error> {
+        let s = buff.len();
+        if self.temp.is_none() {
+            return Err(misc("Couldn't create temporary file"));
+        }
+
+        let mut ws = s as i64;
+        let size = self.cur_content()?.size;
+        if self.need_multi_extent && size + ws >= MULTI_EXTENT_SIZE - LOGICAL_BLOCK_SIZE as i64 {
+            let ts = (MULTI_EXTENT_SIZE - LOGICAL_BLOCK_SIZE as i64 - size) as usize;
+            let head = buff.get(..ts).ok_or_else(|| misc("Invalid extent size"))?;
+
+            if self.zisofs.detect_magic {
+                self.zisofs_detect_magic(head);
+            }
+
+            if self.zisofs.making {
+                self.zisofs_write_to_temp(out, head)?;
+            } else {
+                self.wb_write_to_temp(out, head)?;
+                self.cur_content()?.size += ts as i64;
+            }
+
+            // Write padding.
+            let size = self.cur_content()?.size;
+            self.wb_write_padding_to_temp(out, size)?;
+
+            // Compute the logical block number.
+            let c = self.cur_content()?;
+            c.blocks = ((c.size + LOGICAL_BLOCK_SIZE as i64 - 1) >> LOGICAL_BLOCK_BITS) as i32;
+
+            // Make next extent.
+            ws -= ts as i64;
+            buff = &buff[ts..];
+            // Make a content for next extent.
+            let con = Content {
+                offset_of_temp: self.wb_offset(),
+                ..Content::default()
+            };
+            if let Some(f) = self.cur_file {
+                let file = &mut self.files[f];
+                file.content.push(con);
+                file.cur_content = Some(file.content.len() - 1);
+            }
+            self.zisofs.block_offset = 0;
+        }
+
+        if self.zisofs.detect_magic {
+            self.zisofs_detect_magic(buff);
+        }
+
+        if self.zisofs.making {
+            self.zisofs_write_to_temp(out, buff)?;
+        } else {
+            self.wb_write_to_temp(out, buff)?;
+            self.cur_content()?.size += ws;
+        }
+
+        Ok(s)
+    }
+
+    fn iso9660_write_data(&mut self, out: &mut dyn Sink, buff: &[u8]) -> Result<usize, Error> {
+        let Some(f) = self.cur_file else {
+            return Ok(0);
+        };
+        if self.files[f].entry.filetype() != AE_IFREG {
+            return Ok(0);
+        }
+        let s = (buff.len() as u64).min(self.bytes_remaining) as usize;
+        if s == 0 {
+            return Ok(0);
+        }
+
+        let r = self.write_iso9660_data(out, &buff[..s])?;
+        self.bytes_remaining -= r as u64;
+        Ok(r)
+    }
+
+    fn iso9660_finish_entry(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
+        let Some(f) = self.cur_file else {
+            return Ok(());
+        };
+        if self.files[f].entry.filetype() != AE_IFREG {
             return Ok(());
         }
-        let count = size.div_ceil(32768);
-        let table_size = 16 + (count + 1) * 4;
-        let mut temporary = crate::write::temp_file()?;
-        let mut metadata = Vec::new();
-        let table_size_usize = usize::try_from(table_size)
-            .map_err(|_| Error::fatal(libc::ENOMEM, "Zisofs pointer table too large"))?;
-        metadata
-            .try_reserve_exact(table_size_usize)
-            .map_err(|_| Error::fatal(libc::ENOMEM, "Zisofs pointer table too large"))?;
-        metadata.resize(table_size_usize, 0);
-        metadata[..8].copy_from_slice(magic);
-        metadata[8..12].copy_from_slice(&(size as u32).to_le_bytes());
-        metadata[12] = 4;
-        metadata[13] = 15;
-        temporary.write_all(&metadata).map_err(io_error)?;
-        let mut total = table_size;
-        let mut remaining = size;
-        let mut input = [0; 32768];
-        let mut zlib =
-            deflate::Deflate::new(i32::from(self.compression), 15, 8).ok_or_else(|| {
-                Error::fatal(
-                    -1,
-                    "Internal error initializing compression library: invalid setup parameter",
-                )
-            })?;
-        let mut compressed = Vec::new();
-        for block in 0..count {
-            let n = remaining.min(input.len() as u64) as usize;
-            {
-                let file = self.ensure_spool()?;
-                file.seek(SeekFrom::Start(offset + size - remaining))
-                    .map_err(io_error)?;
-                file.read_exact(&mut input[..n]).map_err(io_error)?;
-            }
-            let at = 16 + block as usize * 4;
-            metadata[at..at + 4].copy_from_slice(&(total as u32).to_le_bytes());
-            if n != 32768 || input[..n].iter().any(|&b| b != 0) {
-                compressed.clear();
-                zlib.reset();
-                zlib.compress(&input[..n], &mut compressed).map_err(|e| {
-                    Error::fatal(
-                        -1,
-                        format!(
-                            "Compression failed: deflate() call returned status {}",
-                            e.code()
-                        ),
-                    )
-                })?;
-                temporary.write_all(&compressed).map_err(io_error)?;
-                total = total
-                    .checked_add(compressed.len() as u64)
-                    .filter(|&s| s <= u32::MAX.into())
-                    .ok_or_else(|| Error::fatal(libc::EOVERFLOW, "Zisofs file too large"))?;
-            }
-            remaining -= n as u64;
+        if self.files[f].content[0].size == 0 {
+            return Ok(());
         }
-        let at = 16 + count as usize * 4;
-        metadata[at..at + 4].copy_from_slice(&(total as u32).to_le_bytes());
-        temporary.seek(SeekFrom::Start(0)).map_err(io_error)?;
-        temporary.write_all(&metadata).map_err(io_error)?;
-        temporary.seek(SeekFrom::Start(0)).map_err(io_error)?;
-        self.nodes[index].offset = self.spool_size;
-        let end = self.spool_size;
-        self.ensure_spool()?
-            .seek(SeekFrom::Start(end))
-            .map_err(io_error)?;
-        let mut buffer = [0; 65536];
-        loop {
-            let n = temporary.read(&mut buffer).map_err(io_error)?;
-            if n == 0 {
-                break;
-            }
-            self.append(&buffer[..n])?;
+
+        // If there are unwritten data, write null data instead.
+        while self.bytes_remaining > 0 {
+            let s = self.bytes_remaining.min(NULLS.len() as u64) as usize;
+            self.write_iso9660_data(out, &NULLS[..s])?;
+            self.bytes_remaining -= s as u64;
         }
-        self.nodes[index].size = total;
-        self.nodes[index].zisofs = Some((size as u32, 4, 15));
+
+        if self.zisofs.making {
+            self.zisofs_finish_entry(out)?;
+        }
+
+        // Write padding.
+        let size = self.cur_content()?.size;
+        self.wb_write_padding_to_temp(out, size)?;
+
+        // Compute the logical block number.
+        let c = self.cur_content()?;
+        c.blocks = ((c.size + LOGICAL_BLOCK_SIZE as i64 - 1) >> LOGICAL_BLOCK_BITS) as i32;
+
+        // Add the current file to data file list.
+        self.data_file_list.push(f);
+
+        Ok(())
+    }
+
+    fn iso9660_close(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
+        // Write remaining data out to the temporary file.
+        if self.wbuff_remaining > 0 {
+            self.wb_write_out(out)?;
+        }
+
+        // Preparations...
+        self.birth_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+
+        // Prepare a bootable ISO image.
+        if self.opt.boot {
+            // Find out the boot file entry.
+            self.isoent_find_out_boot_file()?;
+            // Reconvert the boot file from zisofs'ed form to plain form.
+            self.zisofs_rewind_boot_file(out)?;
+            // Write remaining data out to the temporary file.
+            if self.wbuff_remaining > 0 {
+                self.wb_write_out(out)?;
+            }
+            // Create the boot catalog.
+            self.isoent_create_boot_catalog()?;
+        }
+
+        // Prepare joliet extensions.
+        if self.opt.joliet != 0 {
+            // Make a new tree for joliet.
+            self.joliet.rootent = self.isoent_clone_tree(self.primary.rootent);
+            // Make sure we have UTF-16BE converters. if there is no file
+            // entry, converters are still uninitialized.
+            self.make_utf16be_converters()?;
+        }
+
+        // Make Path Tables.
+        self.isoent_make_path_table()?;
+
+        // Calculate a total volume size and setup all locations of contents
+        // of an iso9660 image.
+        let mut blocks = SYSTEM_AREA_BLOCK
+            + PRIMARY_VOLUME_DESCRIPTOR_BLOCK
+            + VOLUME_DESCRIPTOR_SET_TERMINATOR_BLOCK
+            + NON_ISO_FILE_SYSTEM_INFORMATION_BLOCK;
+        if self.opt.boot {
+            blocks += BOOT_RECORD_DESCRIPTOR_BLOCK;
+        }
+        if self.opt.joliet != 0 {
+            blocks += SUPPLEMENTARY_VOLUME_DESCRIPTOR_BLOCK;
+        }
+        if self.opt.iso_level == 4 {
+            blocks += SUPPLEMENTARY_VOLUME_DESCRIPTOR_BLOCK;
+        }
+
+        // Setup the locations of Path Table.
+        self.primary.location_type_l_path_table = blocks;
+        blocks = blocks.wrapping_add(self.primary.path_table_block);
+        self.primary.location_type_m_path_table = blocks;
+        blocks = blocks.wrapping_add(self.primary.path_table_block);
+        if self.opt.joliet != 0 {
+            self.joliet.location_type_l_path_table = blocks;
+            blocks = blocks.wrapping_add(self.joliet.path_table_block);
+            self.joliet.location_type_m_path_table = blocks;
+            blocks = blocks.wrapping_add(self.joliet.path_table_block);
+        }
+
+        // Setup the locations of directories.
+        self.isoent_setup_directory_location(blocks, Which::Primary)?;
+        blocks = blocks.wrapping_add(self.primary.total_dir_block);
+        if self.opt.joliet != 0 {
+            self.isoent_setup_directory_location(blocks, Which::Joliet)?;
+            blocks = blocks.wrapping_add(self.joliet.total_dir_block);
+        }
+
+        if self.opt.rr != 0 {
+            self.location_rrip_er = blocks;
+            blocks = blocks.wrapping_add(RRIP_ER_BLOCK);
+        }
+
+        // Setup the locations of all file contents.
+        self.isoent_setup_file_location(blocks)?;
+        blocks = blocks.wrapping_add(self.total_file_block);
+        if self.opt.boot && self.opt.boot_info_table {
+            self.setup_boot_information()?;
+        }
+
+        // Now we have a total volume size.
+        self.volume_space_size = blocks;
+        if self.opt.pad {
+            self.volume_space_size = self.volume_space_size.wrapping_add(PADDING_BLOCK);
+        }
+        self.volume_sequence_number = 1;
+
+        // Write an ISO 9660 image.
+        self.write_image(out)
+    }
+
+    fn make_utf16be_converters(&mut self) -> Result<(), Error> {
+        if self.sconv_to_utf16be.is_some() {
+            return Ok(());
+        }
+        let conv = self.conv.clone();
+        let mut guard = conv
+            .as_ref()
+            .map(|c| c.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let to = crate::string::conversion_to_charset(guard.as_deref_mut(), b"UTF-16BE", true)
+            .map_err(|e| Error::fatal(e.errno, e.message))?;
+        let from = crate::string::conversion_from_charset(guard.as_deref_mut(), b"UTF-16BE", true)
+            .map_err(|e| Error::fatal(e.errno, e.message))?;
+        self.sconv_to_utf16be = Some(to);
+        self.sconv_from_utf16be = Some(from);
+        Ok(())
+    }
+
+    // Manage to write ISO-image data with wbuff to reduce calling
+    // __archive_write_output() for performance.
+
+    /// wb_buffptr(): where the next byte goes in `wbuff`.
+    fn wb_buffptr(&self) -> usize {
+        WB_BUFFMAX - self.wbuff_remaining
+    }
+
+    fn wb_offset(&self) -> i64 {
+        self.wbuff_offset + (WB_BUFFMAX - self.wbuff_remaining) as i64
+    }
+
+    fn wb_write_out(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
+        let wsize = WB_BUFFMAX - self.wbuff_remaining;
+        let nw = wsize % LOGICAL_BLOCK_SIZE;
+        let r = if self.wbuff_type == WbType::ToStream {
+            out.write(&self.wbuff[..wsize - nw])
+        } else {
+            write_to_temp(&mut self.temp, &self.wbuff[..wsize - nw])
+        };
+        // Increase the offset.
+        self.wbuff_offset += (wsize - nw) as i64;
+        if self.wbuff_offset > self.wbuff_written {
+            self.wbuff_written = self.wbuff_offset;
+        }
+        self.wbuff_remaining = WB_BUFFMAX;
+        if nw != 0 {
+            self.wbuff_remaining -= nw;
+            self.wbuff.copy_within(wsize - nw..wsize, 0);
+        }
+        r
+    }
+
+    fn wb_consume(&mut self, out: &mut dyn Sink, size: usize) -> Result<(), Error> {
+        if size > self.wbuff_remaining || self.wbuff_remaining == 0 {
+            return Err(misc(format!(
+                "Internal Programming error: iso9660:wb_consume() size={size}, wbuff_remaining={}",
+                self.wbuff_remaining
+            )));
+        }
+        self.wbuff_remaining -= size;
+        if self.wbuff_remaining < LOGICAL_BLOCK_SIZE {
+            return self.wb_write_out(out);
+        }
+        Ok(())
+    }
+
+    fn wb_set_offset(&mut self, out: &mut dyn Sink, off: i64) -> Result<(), Error> {
+        if self.wbuff_type != WbType::ToTemp {
+            return Err(misc("Internal Programming error: iso9660:wb_set_offset()"));
+        }
+
+        let mut used = WB_BUFFMAX - self.wbuff_remaining;
+        if self.wbuff_offset + used as i64 > self.wbuff_tail {
+            self.wbuff_tail = self.wbuff_offset + used as i64;
+        }
+        if self.wbuff_offset < self.wbuff_written {
+            write_to_temp(&mut self.temp, &self.wbuff[..used])?;
+            self.wbuff_offset = self.wbuff_written;
+            temp_seek(&mut self.temp, self.wbuff_offset);
+            self.wbuff_remaining = WB_BUFFMAX;
+            used = 0;
+        }
+        if off < self.wbuff_offset {
+            // Write out waiting data.
+            if used > 0 {
+                self.wb_write_out(out)?;
+            }
+            temp_seek(&mut self.temp, off);
+            self.wbuff_offset = off;
+            self.wbuff_remaining = WB_BUFFMAX;
+        } else if off <= self.wbuff_tail {
+            // Upstream's remaining count wraps when `off` is past the
+            // buffer, and its buffer pointer leaves the buffer.
+            self.wbuff_remaining = usize::try_from(off - self.wbuff_offset)
+                .ok()
+                .and_then(|d| WB_BUFFMAX.checked_sub(d))
+                .ok_or_else(|| misc("Internal Programming error: iso9660:wb_set_offset()"))?;
+        } else {
+            let mut ext_bytes = off - self.wbuff_tail;
+            self.wbuff_remaining = usize::try_from(self.wbuff_tail - self.wbuff_offset)
+                .ok()
+                .and_then(|d| WB_BUFFMAX.checked_sub(d))
+                .ok_or_else(|| misc("Internal Programming error: iso9660:wb_set_offset()"))?;
+            while ext_bytes >= self.wbuff_remaining as i64 {
+                let n = self.wbuff_remaining;
+                self.write_null(out, n)?;
+                ext_bytes -= n as i64;
+            }
+            if ext_bytes > 0 {
+                self.write_null(out, ext_bytes as usize)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_null(&mut self, out: &mut dyn Sink, mut size: usize) -> Result<(), Error> {
+        let remaining = self.wbuff_remaining;
+        let p = self.wb_buffptr();
+        if size <= remaining {
+            self.wbuff[p..p + size].fill(0);
+            return self.wb_consume(out, size);
+        }
+        self.wbuff[p..].fill(0);
+        self.wb_consume(out, remaining)?;
+        size -= remaining;
+        let old = p;
+        let p = self.wb_buffptr();
+        if old > p {
+            self.wbuff[p..old].fill(0);
+        }
+        let remaining = self.wbuff_remaining;
+        while size > 0 {
+            let wsize = size.min(remaining);
+            self.wb_consume(out, wsize)?;
+            size -= wsize;
+        }
+        Ok(())
+    }
+
+    fn wb_write_to_temp(&mut self, out: &mut dyn Sink, buff: &[u8]) -> Result<(), Error> {
+        let s = buff.len();
+        let mut xp = 0;
+        let mut xs = s;
+
+        // If a written data size is big enough to use system-call and there
+        // is no waiting data, this calls write_to_temp() in order to reduce
+        // a extra memory copy.
+        if self.wbuff_remaining == WB_BUFFMAX && s > 1024 * 16 {
+            xs = s % LOGICAL_BLOCK_SIZE;
+            self.wbuff_offset += (s - xs) as i64;
+            write_to_temp(&mut self.temp, &buff[..s - xs])?;
+            if xs == 0 {
+                return Ok(());
+            }
+            xp += s - xs;
+        }
+
+        while xs > 0 {
+            let size = xs.min(self.wbuff_remaining);
+            let p = self.wb_buffptr();
+            self.wbuff[p..p + size].copy_from_slice(&buff[xp..xp + size]);
+            self.wb_consume(out, size)?;
+            xs -= size;
+            xp += size;
+        }
+        Ok(())
+    }
+
+    fn wb_write_padding_to_temp(&mut self, out: &mut dyn Sink, csize: i64) -> Result<(), Error> {
+        let ns = csize.rem_euclid(LOGICAL_BLOCK_SIZE as i64) as usize;
+        if ns != 0 {
+            return self.write_null(out, LOGICAL_BLOCK_SIZE - ns);
+        }
         Ok(())
     }
 }
+
 impl Format for Iso9660 {
     fn code(&self) -> c_int {
         0x40000
@@ -1288,889 +1292,22 @@ impl Format for Iso9660 {
         b"iso9660"
     }
     fn options(&mut self, _: &Base, key: &[u8], value: Option<&[u8]>) -> Result<c_int, Error> {
-        match key {
-            b"iso-level" => {
-                self.level = match value {
-                    Some([b'1'..=b'4']) => {
-                        value.and_then(|v| v.first()).copied().unwrap_or(b'1') - b'0'
-                    }
-                    _ => return Err(bad(key)),
-                }
-            }
-            b"joliet" => {
-                self.joliet = match value {
-                    None => 0,
-                    Some(b"1") => 1,
-                    Some(b"long") => 2,
-                    _ => return Err(bad(key)),
-                }
-            }
-            b"rockridge" | b"Rockridge" => {
-                self.rr = match value {
-                    None => 0,
-                    Some(b"1") | Some(b"useful") => 2,
-                    Some(b"strict") => 1,
-                    _ => return Err(bad(key)),
-                }
-            }
-            b"pad" => self.pad = value.is_some(),
-            b"limit-depth" => self.limit_depth = value.is_some(),
-            b"limit-dirs" => self.limit_dirs = value.is_some(),
-            b"allow-vernum" => self.allow_vernum = value.is_some(),
-            b"zisofs" => self.zisofs = value.is_some(),
-            b"compression-level" => {
-                self.compression = match value {
-                    Some([b'0'..=b'9']) => {
-                        value.and_then(|v| v.first()).copied().unwrap_or(b'6') - b'0'
-                    }
-                    _ => return Err(bad(key)),
-                }
-            }
-            b"abstract-file" | b"application-id" | b"biblio-file" | b"copyright-file"
-            | b"publisher" | b"volume-id" => {
-                let value = value.ok_or_else(|| bad(key))?;
-                let max = match key {
-                    b"application-id" | b"publisher" => 128,
-                    b"volume-id" => 32,
-                    _ => 37,
-                };
-                if value.len() > max {
-                    return Err(Error::fatal(
-                        -1,
-                        format!(
-                            "Value is longer than {max} characters for option ``{}''",
-                            String::from_utf8_lossy(key)
-                        ),
-                    ));
-                }
-                self.strings.insert(key.to_vec(), value.to_vec());
-            }
-            b"boot" => {
-                self.boot_enabled = value.is_some();
-                self.boot.filename = value.unwrap_or_default().to_vec();
-            }
-            b"boot-catalog" => {
-                let name = value.ok_or_else(|| bad(key))?;
-                if name.len() > 1024 {
-                    return Err(Error::fatal(
-                        -1,
-                        "Value is longer than 1024 characters for option ``boot-catalog''",
-                    ));
-                }
-                self.boot.catalog = name.to_vec();
-            }
-            b"boot-info-table" => self.boot.info_table = value.is_some(),
-            b"boot-load-seg" => {
-                let value = value
-                    .and_then(|v| std::str::from_utf8(v).ok())
-                    .ok_or_else(|| bad(key))?;
-                let value = value
-                    .strip_prefix("0x")
-                    .or_else(|| value.strip_prefix("0X"))
-                    .unwrap_or(value);
-                self.boot.load_segment = u16::from_str_radix(value, 16).map_err(|_| bad(key))?;
-            }
-            b"boot-load-size" => {
-                let value = value
-                    .and_then(|v| std::str::from_utf8(v).ok())
-                    .and_then(|v| v.parse::<u16>().ok())
-                    .filter(|n| *n > 0)
-                    .ok_or_else(|| bad(key))?;
-                self.boot.load_size = value;
-            }
-            b"boot-type" => {
-                self.boot_auto = false;
-                match value {
-                    Some(b"no-emulation") => {
-                        self.boot.media = Media::NoEmulation;
-                        self.boot_floppy = false;
-                    }
-                    Some(b"fd") => self.boot_floppy = true,
-                    Some(b"hard-disk") => {
-                        self.boot.media = Media::HardDisk;
-                        self.boot_floppy = false;
-                    }
-                    _ => return Err(bad(key)),
-                }
-            }
-            _ => return Ok(ARCHIVE_WARN),
-        }
-        let key = if key == b"Rockridge" {
-            b"rockridge".as_slice()
-        } else {
-            key
-        };
-        self.info_options.retain(|(k, _)| k != key);
-        let changed = match key {
-            b"allow-vernum" | b"pad" | b"limit-depth" | b"limit-dirs" => value.is_none(),
-            b"joliet" => self.joliet != 1,
-            b"rockridge" => self.rr != 2,
-            b"zisofs" | b"boot-info-table" | b"boot" => value.is_some(),
-            b"iso-level" => self.level != 1,
-            _ => true,
-        };
-        if changed {
-            let value = match key {
-                b"boot-load-seg" => Some(format!("{:x}", self.boot.load_segment).into_bytes()),
-                b"boot-load-size" => Some(self.boot.load_size.to_string().into_bytes()),
-                _ => value.map(<[u8]>::to_vec),
-            };
-            self.info_options.push((key.to_vec(), value));
-        }
-        Ok(ARCHIVE_OK)
+        self.iso9660_options(key, value)
     }
-    fn header(&mut self, a: &Base, e: &mut Entry, _: &mut dyn Sink) -> Result<c_int, Error> {
-        self.current = None;
-        self.remaining = 0;
-        if e.filetype() == 0o120000 && self.rr == 0 {
-            a.set_error(-1, Some(b"Ignore symlink file"));
-            return Ok(ARCHIVE_WARN);
-        }
-        if e.filetype() == 0o100000 && e.size() >= 1i64 << 32 && self.level < 3 {
-            a.set_error(
-                -1,
-                Some(b"Ignore over 4294967296 bytes file. This file too large"),
-            );
-            return Ok(ARCHIVE_WARN);
-        }
-        let mut ret = ARCHIVE_OK;
-        if self.joliet != 0 && e.pathname().is_some_and(|p| !p.is_empty()) {
-            let conv = {
-                let mut cache = a
-                    .conv
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                crate::string::conversion_to_charset(Some(&mut *cache), b"UTF-16BE", true)
-                    .map_err(|err| Error::fatal(err.errno, err.message))?
-            };
-            if !joliet_basename(e, &conv).1 {
-                a.set_error(
-                    -1,
-                    Some(b"A filename cannot be converted to UTF-16BE;You should disable making Joliet extension"),
-                );
-                ret = ARCHIVE_WARN;
-            }
-        }
-        let path = normalize(
-            e.pathname()
-                .ok_or_else(|| Error::new(ARCHIVE_FAILED, -1, "Missing pathname"))?
-                .to_bytes(),
-        );
-        if path.is_empty() {
-            return Ok(ret);
-        }
-        let parentpath = path
-            .iter()
-            .rposition(|&b| b == b'/')
-            .map_or(&[][..], |p| &path[..p]);
-        if parentpath.split(|&b| b == b'/').any(|p| p.len() > 255) {
-            return Err(Error::fatal(-1, "A name buffer is too small"));
-        }
-        let parent = self.directory(parentpath)?;
-        let index = if let Some(&i) = self.names.get(&path) {
-            if self.nodes[i].entry.filetype() != e.filetype() {
-                return Err(Error::new(
-                    ARCHIVE_FAILED,
-                    -1,
-                    [
-                        b"Found duplicate entries `".as_slice(),
-                        &path,
-                        b"' and its file type is different",
-                    ]
-                    .concat(),
-                ));
-            }
-            let children = std::mem::take(&mut self.nodes[i].children);
-            self.nodes[i] = Node::new(e.clone_entry(), path.clone(), parent, false);
-            self.nodes[i].children = children;
-            i
-        } else {
-            let i = self.nodes.len();
-            self.nodes
-                .try_reserve(1)
-                .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate data"))?;
-            self.nodes
-                .push(Node::new(e.clone_entry(), path.clone(), parent, false));
-            self.nodes[parent].children.push(i);
-            self.names.insert(path, i);
-            i
-        };
-        if e.filetype() == 0o100000 && e.hardlink().is_none() {
-            let size = u64::try_from(e.size())
-                .map_err(|_| Error::new(ARCHIVE_FAILED, -1, "Invalid entry size"))?;
-            self.ensure_spool()?;
-            self.nodes[index].offset = self.spool_size;
-            self.nodes[index].size = size;
-            self.current = Some(index);
-            self.remaining = size;
-        }
-        Ok(ret)
+    fn header(&mut self, a: &Base, entry: &mut Entry, out: &mut dyn Sink) -> Result<c_int, Error> {
+        self.conv.get_or_insert_with(|| a.conv.clone());
+        self.iso9660_write_header(a, entry, out)
     }
-    fn data(&mut self, data: &[u8], _: &mut dyn Sink) -> Result<usize, Error> {
-        let n = data
-            .len()
-            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
-        self.append(&data[..n])?;
-        self.remaining -= n as u64;
-        Ok(n)
+    fn data(&mut self, data: &[u8], out: &mut dyn Sink) -> Result<usize, Error> {
+        self.iso9660_write_data(out, data)
     }
-    fn finish_entry(&mut self, _: &mut dyn Sink) -> Result<(), Error> {
-        let Some(index) = self.current.take() else {
-            return Ok(());
-        };
-        if self.remaining != 0 && self.remaining == self.nodes[index].size {
-            if !self.boot_enabled || self.nodes[index].path != normalize(&self.boot.filename) {
-                self.nodes[index].size = 0;
-            }
-            return Ok(());
-        }
-        let zero = [0; 65536];
-        while self.remaining > 0 {
-            let n = self.remaining.min(zero.len() as u64) as usize;
-            self.append(&zero[..n])?;
-            self.remaining -= n as u64;
-        }
-        if self.nodes[index].size > 0 {
-            self.compress_zisofs(index)?;
-            let pad = (BLOCK as u64 - self.nodes[index].size % BLOCK as u64) % BLOCK as u64;
-            self.append(&zero[..pad as usize])?;
-            self.data_order.push(index);
-        }
-        Ok(())
+    fn finish_entry(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
+        self.iso9660_finish_entry(out)
     }
-    fn close(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
-        self.close_image(sink)
-    }
-}
-impl Iso9660 {
-    fn restore_zisofs(&mut self, index: usize) -> Result<(), Error> {
-        let Some((size, _, log)) = self.nodes[index].zisofs else {
-            return Ok(());
-        };
-        if log > 28 {
-            return Err(Error::fatal(
-                libc::ENOMEM,
-                "Zisofs block exceeds memory limit",
-            ));
-        }
-        let count = u64::from(size).div_ceil(1 << log);
-        let offset = self.nodes[index].offset;
-        let table_size = (count + 1) * 4;
-        let mut pointers = Vec::new();
-        pointers
-            .try_reserve_exact(table_size as usize)
-            .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for zisofs pointer table"))?;
-        pointers.resize(table_size as usize, 0);
-        {
-            let file = self.ensure_spool()?;
-            file.seek(SeekFrom::Start(offset + 16)).map_err(io_error)?;
-            file.read_exact(&mut pointers).map_err(io_error)?;
-        }
-        let mut restored = crate::write::temp_file()?;
-        let mut remaining = u64::from(size);
-        for pair in pointers.windows(8).step_by(4) {
-            let begin = u32::from_le_bytes(pair[..4].try_into().unwrap_or_default());
-            let end = u32::from_le_bytes(pair[4..].try_into().unwrap_or_default());
-            if end < begin || u64::from(end) > self.nodes[index].size {
-                return Err(Error::fatal(-1, "Invalid zisofs block pointer"));
-            }
-            let amount = remaining.min(1 << log) as usize;
-            if begin == end {
-                let zero = [0; 65536];
-                let mut n = amount;
-                while n > 0 {
-                    let take = n.min(zero.len());
-                    restored.write_all(&zero[..take]).map_err(io_error)?;
-                    n -= take;
-                }
-            } else {
-                if end - begin > 256 * 1024 * 1024 {
-                    return Err(Error::fatal(
-                        libc::ENOMEM,
-                        "Zisofs compressed block exceeds memory limit",
-                    ));
-                }
-                let mut compressed = Vec::new();
-                compressed
-                    .try_reserve_exact((end - begin) as usize)
-                    .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for zisofs block"))?;
-                compressed.resize((end - begin) as usize, 0);
-                {
-                    let file = self.ensure_spool()?;
-                    file.seek(SeekFrom::Start(offset + u64::from(begin)))
-                        .map_err(io_error)?;
-                    file.read_exact(&mut compressed).map_err(io_error)?;
-                }
-                let data =
-                    miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&compressed, amount)
-                        .map_err(|_| Error::fatal(-1, "Invalid zisofs compressed block"))?;
-                if data.len() != amount {
-                    return Err(Error::fatal(-1, "Invalid zisofs decompressed size"));
-                }
-                restored.write_all(&data).map_err(io_error)?;
-            }
-            remaining -= amount as u64;
-        }
-        let end = self.spool_size;
-        self.ensure_spool()?
-            .seek(SeekFrom::Start(end))
-            .map_err(io_error)?;
-        restored.seek(SeekFrom::Start(0)).map_err(io_error)?;
-        self.nodes[index].offset = end;
-        let mut buffer = [0; 65536];
-        loop {
-            let n = restored.read(&mut buffer).map_err(io_error)?;
-            if n == 0 {
-                break;
-            }
-            self.append(&buffer[..n])?;
-        }
-        self.nodes[index].size = size.into();
-        self.nodes[index].entry.set_size(size.into());
-        self.nodes[index].zisofs = None;
-        let padding = (BLOCK as u64 - u64::from(size) % BLOCK as u64) % BLOCK as u64;
-        self.append(
-            &buffer[..padding as usize]
-                .iter()
-                .map(|_| 0)
-                .collect::<Vec<_>>(),
-        )?;
-        Ok(())
-    }
-    fn close_image(&mut self, sink: &mut dyn Sink) -> Result<(), Error> {
-        self.birth = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .min(i64::MAX as u64) as i64;
-        let mut boot_index = None;
-        let mut catalog_index = None;
-        let mut boot_allocation = 0;
-        if self.boot_enabled {
-            let filename = normalize(&self.boot.filename);
-            let index = self.names.get(&filename).copied().ok_or_else(|| {
-                Error::fatal(
-                    -1,
-                    [
-                        b"Can't find the boot image file ``".as_slice(),
-                        &self.boot.filename,
-                        b"''",
-                    ]
-                    .concat(),
-                )
-            })?;
-            self.restore_zisofs(index)?;
-            let size = self.nodes[index].size;
-            if self.boot_floppy {
-                self.boot.media = if size <= 1200 * 1024 {
-                    Media::Floppy1200
-                } else if size <= 1440 * 1024 {
-                    Media::Floppy1440
-                } else if size <= 2880 * 1024 {
-                    Media::Floppy2880
-                } else {
-                    return Err(Error::fatal(
-                        -1,
-                        "Boot image file size is too big for fd type",
-                    ));
-                };
-            } else if self.boot_auto {
-                self.boot.media = match size {
-                    1228800 => Media::Floppy1200,
-                    1474560 => Media::Floppy1440,
-                    2949120 => Media::Floppy2880,
-                    _ => Media::NoEmulation,
-                };
-            }
-            boot_allocation = match self.boot.media {
-                Media::Floppy1200 => 1200 * 1024,
-                Media::Floppy1440 => 1440 * 1024,
-                Media::Floppy2880 => 2880 * 1024,
-                _ => size,
-            };
-            self.boot.identifier = self
-                .strings
-                .get(b"publisher".as_slice())
-                .cloned()
-                .unwrap_or_default();
-            let catalog_name = normalize(&self.boot.catalog);
-            let parentpath = catalog_name
-                .iter()
-                .rposition(|&b| b == b'/')
-                .map_or(&[][..], |p| &catalog_name[..p]);
-            let parent = self.directory(parentpath)?;
-            let mut entry = Entry::new(None);
-            entry.set_pathname(&catalog_name);
-            entry.set_mode(0o100444);
-            entry.set_size(2048);
-            entry.set_nlink(1);
-            entry.set_mtime(self.birth, 0);
-            entry.set_atime(self.birth, 0);
-            entry.set_ctime(self.birth, 0);
-            let catalog = self.nodes.len();
-            let mut node = Node::new(entry, catalog_name.clone(), parent, false);
-            node.size = 2048;
-            self.nodes.push(node);
-            self.nodes[parent].children.push(catalog);
-            self.names.insert(catalog_name, catalog);
-            boot_index = Some(index);
-            catalog_index = Some(catalog);
-        }
-        let identities = {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = self.ensure_spool()?.metadata().map_err(io_error)?;
-            (metadata.uid(), metadata.gid())
-        };
-        for node in &mut self.nodes {
-            if node.virtual_dir {
-                node.entry.set_mtime(self.birth, 0);
-                node.entry.set_atime(self.birth, 0);
-                node.entry.set_ctime(self.birth, 0);
-                node.entry.set_uid(identities.0.into());
-                node.entry.set_gid(identities.1.into());
-            }
-        }
-        for i in 1..self.nodes.len() {
-            if let Some(target) = self.nodes[i]
-                .entry
-                .hardlink()
-                .map(|s| normalize(s.to_bytes()))
-                && let Some(&target) = self.names.get(&target)
-                && target != i
-            {
-                self.nodes[i].hardlink = Some(target);
-                self.nodes[i].size = 0;
-            }
-        }
-        let mut links = vec![1u32; self.nodes.len()];
-        for node in &self.nodes {
-            if let Some(i) = node.hardlink {
-                links[i] = links[i].saturating_add(1);
-            }
-        }
-        for (i, node) in self.nodes.iter_mut().enumerate().skip(1) {
-            let count = links[node.hardlink.unwrap_or(i)];
-            if count > 1 {
-                node.entry.set_nlink(count);
-            }
-        }
-        let deep = self
-            .nodes
-            .iter()
-            .any(|n| n.path.iter().filter(|&&b| b == b'/').count() >= 7 && n.directory);
-        if self.rr != 0
-            && self.limit_depth
-            && self.level < 4
-            && deep
-            && let Some(&i) = self.names.get(b"rr_moved".as_slice())
-            && !self.nodes[i].directory
-        {
-            return Err(Error::fatal(
-                -1,
-                "Unable to relocate directories into rr_moved: the existing entry is not a directory",
-            ));
-        }
-        self.relocate()?;
-        for node in &mut self.nodes {
-            if node.virtual_dir {
-                node.entry.set_mtime(self.birth, 0);
-                node.entry.set_atime(self.birth, 0);
-                node.entry.set_ctime(self.birth, 0);
-                node.entry.set_uid(identities.0.into());
-                node.entry.set_gid(identities.1.into());
-            }
-        }
-        self.identifiers()?;
-        let mut primary = self.tree(0)?;
-        let mut joliet = if self.joliet != 0 {
-            Some(self.tree(1)?)
-        } else {
-            None
-        };
-        let mut block = 20 + u32::from(self.boot_enabled) + u32::from(self.level == 4)
-            - u32::from(self.joliet == 0);
-        primary.path_l = block;
-        block = block
-            .checked_add(primary.path_blocks)
-            .ok_or_else(|| Error::fatal(libc::EOVERFLOW, "ISO image too large"))?;
-        primary.path_m = block;
-        block += primary.path_blocks;
-        if let Some(tree) = &mut joliet {
-            tree.path_l = block;
-            block += tree.path_blocks;
-            tree.path_m = block;
-            block += tree.path_blocks;
-        }
-        block = self.layout(&mut primary, 0, block)?;
-        if let Some(tree) = &mut joliet {
-            block = self.layout(tree, 1, block)?;
-        }
-        if self.rr != 0 {
-            self.er_location = block;
-            block += 1;
-        }
-        for (&index, layout) in &primary.layout {
-            self.nodes[index].extent = layout.location;
-        }
-        let mut empty_extent = u32::MAX - 15;
-        for node in &mut self.nodes {
-            if !node.directory && node.size == 0 && node.hardlink.is_none() {
-                node.extent = empty_extent;
-                empty_extent = empty_extent.wrapping_sub(1);
-            }
-        }
-        if let Some(catalog) = catalog_index {
-            self.nodes[catalog].extent = block;
-            block += 1;
-        }
-        if let Some(index) = boot_index {
-            self.nodes[index].extent = block;
-            block = block
-                .checked_add(
-                    u32::try_from(boot_allocation.div_ceil(BLOCK as u64))
-                        .map_err(|_| Error::fatal(libc::EOVERFLOW, "Boot image is too large"))?,
-                )
-                .ok_or_else(|| Error::fatal(libc::EOVERFLOW, "Boot image is too large"))?;
-            if self.boot.info_table {
-                let offset = self.nodes[index].offset;
-                let extent = self.nodes[index].extent;
-                let size = self.nodes[index].size;
-                boot::patch_info_table(
-                    self.ensure_spool()?,
-                    offset,
-                    extent,
-                    size,
-                    boot_allocation,
-                )?;
-            }
-        }
-        let mut emitted = HashSet::new();
-        for &index in &self.data_order {
-            if Some(index) == boot_index
-                || self.nodes[index].hardlink.is_some()
-                || self.nodes[index].size == 0
-                || !emitted.insert(index)
-            {
-                continue;
-            }
-            self.nodes[index].extent = block;
-            block = block
-                .checked_add(
-                    u32::try_from(self.nodes[index].size.div_ceil(BLOCK as u64))
-                        .map_err(|_| Error::fatal(libc::EOVERFLOW, "ISO file too large"))?,
-                )
-                .ok_or_else(|| Error::fatal(libc::EOVERFLOW, "ISO image too large"))?;
-        }
-        let total = block
-            .checked_add(if self.pad { 150 } else { 0 })
-            .ok_or_else(|| Error::fatal(libc::EOVERFLOW, "ISO image too large"))?;
-        zeros(sink, (16 * BLOCK) as u64)?;
-        sink.write(&self.descriptor(&primary, 0, false, total)?)?;
-        if let Some(catalog) = catalog_index {
-            let mut descriptor = vec![0; BLOCK];
-            descriptor[1..6].copy_from_slice(b"CD001");
-            descriptor[6] = 1;
-            descriptor[7..30].copy_from_slice(b"EL TORITO SPECIFICATION");
-            descriptor[71..75].copy_from_slice(&self.nodes[catalog].extent.to_le_bytes());
-            sink.write(&descriptor)?;
-        }
-        if self.level == 4 {
-            sink.write(&self.descriptor(&primary, 0, true, total)?)?;
-        }
-        if let Some(tree) = &joliet {
-            sink.write(&self.descriptor(tree, 1, false, total)?)?;
-        }
-        let mut terminator = vec![0; BLOCK];
-        terminator[0] = 255;
-        terminator[1..6].copy_from_slice(b"CD001");
-        terminator[6] = 1;
-        sink.write(&terminator)?;
-        sink.write(&info::block(self.birth, &self.info_options)?)?;
-        for (kind, tree) in [(0, Some(&primary)), (1, joliet.as_ref())] {
-            if let Some(tree) = tree {
-                sink.write(&self.path_table(tree, kind, false))?;
-                sink.write(&self.path_table(tree, kind, true))?;
-            }
-        }
-        for (kind, tree) in [(0, Some(&primary)), (1, joliet.as_ref())] {
-            if let Some(tree) = tree {
-                for &index in &tree.order {
-                    let layout = tree
-                        .layout
-                        .get(&index)
-                        .ok_or_else(|| Error::fatal(-1, "Missing ISO directory layout"))?;
-                    let (data, extra) =
-                        self.directory_bytes(index, kind, tree, layout.location + layout.blocks)?;
-                    if data.len() / BLOCK != layout.blocks as usize
-                        || extra.len() / BLOCK != layout.extra_blocks as usize
-                    {
-                        return Err(Error::fatal(-1, "ISO directory layout changed"));
-                    }
-                    sink.write(&data)?;
-                    sink.write(&extra)?;
-                }
-            }
-        }
-        if self.rr != 0 {
-            let mut er = vec![0; BLOCK];
-            er[..ER.len()].copy_from_slice(ER);
-            sink.write(&er)?;
-        }
-        if let Some(index) = boot_index {
-            sink.write(&boot::catalog(
-                self.nodes[index].extent,
-                self.nodes[index].size,
-                &self.boot,
-            )?)?;
-            self.copy_data(index, sink)?;
-            zeros(
-                sink,
-                boot_allocation.div_ceil(BLOCK as u64) * BLOCK as u64 - self.nodes[index].size,
-            )?;
-        }
-        for index in self.data_order.clone() {
-            if Some(index) == boot_index || !emitted.remove(&index) {
-                continue;
-            }
-            self.copy_data(index, sink)?;
-            let pad = (BLOCK as u64 - self.nodes[index].size % BLOCK as u64) % BLOCK as u64;
-            zeros(sink, pad)?;
-        }
-        if self.pad {
-            zeros(sink, (150 * BLOCK) as u64)?;
-        }
-        if let Some(index) = self.too_deep {
-            return Err(Error::new(
-                ARCHIVE_WARN,
-                -1,
-                [self.nodes[index].path.as_slice(), b": Directories too deep"].concat(),
-            ));
-        }
-        Ok(())
-    }
-    fn copy_data(&mut self, index: usize, sink: &mut dyn Sink) -> Result<(), Error> {
-        let offset = self.nodes[index].offset;
-        let mut left = self.nodes[index].size;
-        let file = self.ensure_spool()?;
-        file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
-        let mut buffer = [0; 65536];
-        while left > 0 {
-            let n = left.min(buffer.len() as u64) as usize;
-            file.read_exact(&mut buffer[..n]).map_err(io_error)?;
-            sink.write(&buffer[..n])?;
-            left -= n as u64;
-        }
-        Ok(())
+    fn close(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
+        self.iso9660_close(out)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    struct Discard;
-    impl Sink for Discard {
-        fn write(&mut self, _: &[u8]) -> Result<(), Error> {
-            Ok(())
-        }
-    }
-    #[test]
-    fn root_entry_is_ignored_and_version_option_is_preserved() {
-        let mut iso = Iso9660::default();
-        let base = Base::new(crate::archive::WRITE_MAGIC);
-        let mut root = Entry::new(None);
-        root.set_pathname(b".");
-        root.set_mode(0o40700);
-        root.set_uid(123);
-        root.set_mtime(456, 0);
-        iso.header(&base, &mut root, &mut Discard).unwrap();
-        assert_eq!(iso.nodes[0].entry.uid(), 0);
-        assert_eq!(iso.nodes[0].entry.mtime(), 0);
-        assert!(iso.nodes[0].virtual_dir);
-        iso.options(&base, b"allow-vernum", None).unwrap();
-        iso.directory(&[b'a'; 40]).unwrap();
-        iso.directory(&[b'A'; 40]).unwrap();
-        let mut e = Entry::new(None);
-        e.set_mode(0o100444);
-        e.set_pathname(b"file");
-        e.set_size(0);
-        iso.header(&base, &mut e, &mut Discard).unwrap();
-        iso.identifiers().unwrap();
-        let i = iso.names[b"file".as_slice()];
-        assert_eq!(iso.nodes[i].ident[0], b"FILE.");
-        assert_eq!(iso.info_options, vec![(b"allow-vernum".to_vec(), None)]);
-    }
-    #[test]
-    fn joliet_rejects_path_longer_than_240_bytes() {
-        let base = Base::new(crate::archive::WRITE_MAGIC);
-        let dirs = [[b'a'; 64]; 3].join(&b'/');
-        // Upstream counts a leading separator: a 239-byte path is the limit.
-        for (leaf, fails) in [(44, false), (45, true)] {
-            let mut iso = Iso9660::default();
-            let mut e = Entry::new(None);
-            e.set_pathname(&[dirs.as_slice(), b"/", &vec![b'b'; leaf]].concat());
-            e.set_mode(0o100444);
-            assert_eq!(iso.header(&base, &mut e, &mut Discard).unwrap(), ARCHIVE_OK);
-            let r = iso.identifiers();
-            assert_eq!(r.is_err(), fails);
-            if let Err(err) = r {
-                assert_eq!(
-                    err.msg,
-                    [
-                        b"The regulation of Joliet extensions; A length of a full-pathname of `".as_slice(),
-                        &dirs,
-                        b"/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' is longer than 240 bytes, (p=196, b=45)",
-                    ]
-                    .concat()
-                );
-            }
-        }
-    }
-    #[test]
-    fn rock_ridge_directory_records_have_even_length() {
-        struct Image(Vec<u8>);
-        impl Sink for Image {
-            fn write(&mut self, data: &[u8]) -> Result<(), Error> {
-                self.0.extend_from_slice(data);
-                Ok(())
-            }
-        }
-        let base = Base::new(crate::archive::WRITE_MAGIC);
-        let mut iso = Iso9660::default();
-        let mut image = Image(Vec::new());
-        let mut d = Entry::new(None);
-        d.set_pathname(b"d");
-        d.set_mode(0o40755);
-        iso.header(&base, &mut d, &mut image).unwrap();
-        iso.close(&mut image).unwrap();
-        let pvd = &image.0[16 * BLOCK..17 * BLOCK];
-        let root = u32::from_le_bytes(pvd[158..162].try_into().unwrap()) as usize;
-        let mut lengths = Vec::new();
-        let mut at = root * BLOCK;
-        while image.0[at] != 0 {
-            lengths.push(image.0[at]);
-            at += image.0[at] as usize;
-        }
-        assert_eq!(lengths.len(), 3);
-        assert!(lengths.iter().all(|n| n.is_multiple_of(2)), "{lengths:?}");
-    }
-    #[test]
-    fn joliet_name_comes_from_the_pathname_as_given() {
-        // isofile_gen_utility_names() warns on a failed UTF-16BE conversion,
-        // keeps the best-effort name, and takes the basename before the
-        // multibyte path is cleaned up: `d/.` is named `.`.
-        let _locale = crate::ffi::charset::lock_locale();
-        let base = Base::new(crate::archive::WRITE_MAGIC);
-        let mut iso = Iso9660::default();
-        let mut e = Entry::new(None);
-        e.set_pathname(b"bad\xff");
-        e.set_mode(0o100444);
-        assert_eq!(
-            iso.header(&base, &mut e, &mut Discard).unwrap(),
-            ARCHIVE_WARN
-        );
-        assert_eq!(
-            &*base.error.borrow(),
-            b"A filename cannot be converted to UTF-16BE;You should disable making Joliet extension\0"
-        );
-        let mut d = Entry::new(None);
-        d.set_pathname(b"d/.");
-        d.set_mode(0o40755);
-        assert_eq!(iso.header(&base, &mut d, &mut Discard).unwrap(), ARCHIVE_OK);
-        iso.identifiers().unwrap();
-        assert_eq!(
-            iso.nodes[iso.names[b"bad\xff".as_slice()]].ident[1],
-            b"\0b\0a\0d\xff\xfd"
-        );
-        assert_eq!(iso.nodes[iso.names[b"d".as_slice()]].ident[1], b"\0.");
-    }
-
-    #[test]
-    fn unwritten_regular_file_is_empty_without_spooling_zeroes() {
-        let mut iso = Iso9660::default();
-        let base = Base::new(crate::archive::WRITE_MAGIC);
-        let mut e = Entry::new(None);
-        e.set_pathname(b"empty");
-        e.set_mode(0o100444);
-        e.set_size(1 << 30);
-        iso.header(&base, &mut e, &mut Discard).unwrap();
-        iso.finish_entry(&mut Discard).unwrap();
-        let i = iso.names[b"empty".as_slice()];
-        assert_eq!(iso.nodes[i].size, 0);
-        assert_eq!(iso.spool_size, 0);
-        assert!(iso.data_order.is_empty());
-    }
-    #[test]
-    fn truncated_directory_names_are_unique() {
-        let mut iso = Iso9660 {
-            level: 2,
-            ..Default::default()
-        };
-        iso.directory(&[b'a'; 40]).unwrap();
-        iso.directory(&[b'A'; 40]).unwrap();
-        iso.identifiers().unwrap();
-        assert_ne!(iso.nodes[1].ident[0], iso.nodes[2].ident[0]);
-        assert!(iso.nodes[2].ident[0].len() <= 31);
-    }
-    #[test]
-    fn large_file_directory_records_are_block_aligned_multiextents() {
-        let mut iso = Iso9660 {
-            level: 3,
-            ..Default::default()
-        };
-        let mut e = Entry::new(None);
-        e.set_mode(0o100444);
-        let mut node = Node::new(e, b"large".to_vec(), 0, false);
-        node.size = u32::MAX as u64 + 123;
-        node.extent = 100;
-        iso.nodes.push(node);
-        iso.nodes[0].children.push(1);
-        iso.identifiers().unwrap();
-        let tree = iso.tree(0).unwrap();
-        let (bytes, _) = iso.directory_bytes(0, 0, &tree, 0).unwrap();
-        let mut at = 0;
-        let mut segments = Vec::new();
-        while bytes[at] != 0 {
-            let len = bytes[at] as usize;
-            let record = &bytes[at..at + len];
-            if record[32] > 1 {
-                segments.push((
-                    u32::from_le_bytes(record[2..6].try_into().unwrap()),
-                    u32::from_le_bytes(record[10..14].try_into().unwrap()),
-                    record[25],
-                ));
-            }
-            at += len;
-        }
-        assert_eq!(
-            segments,
-            vec![(100, 0xfffff800, 0x80), (100 + 0xfffff800 / 2048, 2170, 0)]
-        );
-    }
-    #[test]
-    fn primary_relocation_preserves_joliet_tree() {
-        let mut iso = Iso9660::default();
-        let leaf = iso.directory(b"a/b/c/d/e/f/g/h/i").unwrap();
-        iso.relocate().unwrap();
-        iso.identifiers().unwrap();
-        let h = iso.names[b"a/b/c/d/e/f/g/h".as_slice()];
-        let relocated = iso.nodes[h].rr_child.unwrap();
-        assert!(!iso.is_dir(h, 0));
-        assert!(iso.is_dir(h, 1));
-        assert_eq!(iso.parent(leaf, 0), relocated);
-        assert_eq!(iso.parent(leaf, 1), h);
-        assert!(iso.tree(0).unwrap().directories.contains(&relocated));
-        assert!(!iso.tree(1).unwrap().directories.contains(&relocated));
-    }
-    #[test]
-    fn disabling_joliet_accepts_nonunicode_filename() {
-        let mut iso = Iso9660 {
-            joliet: 0,
-            ..Default::default()
-        };
-        let mut e = Entry::new(None);
-        e.set_mode(0o100444);
-        iso.nodes.push(Node::new(e, vec![0xff], 0, false));
-        iso.nodes[0].children.push(1);
-        assert!(iso.identifiers().is_ok());
-    }
-}
+mod tests;

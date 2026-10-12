@@ -246,6 +246,67 @@ pub fn gmtime(secs: i64) -> Option<Tm> {
     date_clock(secs, true).map(|v| v.0)
 }
 
+/// `localtime_r` and the `tm_gmtoff` it reports, or `None` if it fails.
+pub fn localtime_gmtoff(secs: i64) -> Option<(Tm, i64)> {
+    let secs = libc::time_t::try_from(secs).ok()?;
+    // SAFETY: `secs` and `t` are valid for the call; localtime_r writes
+    // only to `t`, and on success `t` is fully initialized.
+    let t = unsafe {
+        let mut t = std::mem::zeroed::<libc::tm>();
+        if libc::localtime_r(&secs, &mut t).is_null() {
+            return None;
+        }
+        t
+    };
+    Some((
+        Tm {
+            year: t.tm_year,
+            mon: t.tm_mon,
+            mday: t.tm_mday,
+            hour: t.tm_hour,
+            min: t.tm_min,
+            sec: t.tm_sec,
+        },
+        t.tm_gmtoff as i64,
+    ))
+}
+
+/// `ctime_r`: the local time as "Thu Jan  1 00:00:00 1970\n", or `None`
+/// if it fails.
+pub fn ctime(secs: i64) -> Option<Vec<u8>> {
+    let secs = libc::time_t::try_from(secs).ok()?;
+    let mut buf = [0 as libc::c_char; 128];
+    // SAFETY: ctime_r writes at most 26 bytes, NUL included, to `buf`,
+    // which has room for 128; on success it returns `buf`.
+    let p = unsafe { libc::ctime_r(&secs, buf.as_mut_ptr()) };
+    if p.is_null() {
+        return None;
+    }
+    let text = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8);
+    Some(text.collect())
+}
+
+/// `getuid()` and `getgid()`.
+pub fn user_ids() -> (u32, u32) {
+    // SAFETY: getuid and getgid take no arguments and cannot fail.
+    unsafe { (libc::getuid() as u32, libc::getgid() as u32) }
+}
+
+/// The `sysname` `uname(2)` reports, or `None` if it fails.
+pub fn uname_sysname() -> Option<Vec<u8>> {
+    // SAFETY: an all-zero `struct utsname` is valid, and uname writes only
+    // to the struct we own; its fields are NUL-terminated on success.
+    let u = unsafe {
+        let mut u = std::mem::zeroed::<libc::utsname>();
+        if libc::uname(&mut u) != 0 {
+            return None;
+        }
+        u
+    };
+    let name = u.sysname.iter().take_while(|&&c| c != 0).map(|&c| c as u8);
+    Some(name.collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -35,6 +35,7 @@ mod pathmatch;
 mod ppmd;
 mod ppmd7;
 mod ppmd8;
+mod rb;
 mod read;
 mod read_add_passphrase;
 mod read_append_filter;

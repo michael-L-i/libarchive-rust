@@ -49,8 +49,26 @@ Libarchive: 764 passed / upstream baseline 829 / 934 total.
 | other | 96 | 96 | 139 |
 
 Remaining stubs (`src/ffi/stubs.rs`): 0
-`unsafe` in `src/` (excluding stubs.rs): 248; in the tools: 39, all in
+`unsafe` in `src/` (excluding stubs.rs): 256; in the tools: 39, all in
 `tools/libarchive_fe/src/sys.rs`
+
+## ISO9660 writer port checkpoint
+
+The ISO9660 writer, until now a reimplementation, is a function-by-function
+port of upstream's (`src/write/format/iso9660/`, with `src/rb.rs` for the
+identifier resolver's red-black tree and a port of macOS's `qsort` for the
+path tables). The round-twelve writer sweep is 64 of 68 identical (the four
+others are mtree's RIPEMD-160). `../diagnostics/round14-iso9660` compares
+C and Rust bsdtar on 3,493 cases: 3,459 identical images, messages and exit
+codes; on the other 34 upstream dereferences null and this fails cleanly
+(NOTES.md, "ISO9660 writer"). On Linux, against upstream built with glibc
+2.41, 3,457 are identical and upstream crashes on the other 36; path tables
+sort as each platform's `qsort` does. Creating a 204 MB, 3,000-file image takes
+0.90x C's time, 0.91x with zisofs. Byte identity includes upstream's zisofs
+bugs, which corrupt some compressed files that the reimplementation wrote
+correctly. Write options without a module now combine the format's and the
+filters' answers as upstream does, and a failed format close leaves the
+archive closed.
 
 ## Phase 5 checkpoint
 

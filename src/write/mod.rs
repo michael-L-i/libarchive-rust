@@ -465,11 +465,72 @@ impl Write {
                 r = r.min(a.raise(e));
             }
         }
-        if a.state.get() != state::FATAL {
-            a.state.set(state::CLOSED);
-        }
+        // Upstream calls the format's finish_entry and close directly, so
+        // their failures leave the state alone and the archive ends closed.
+        a.state.set(state::CLOSED);
         r
     }
+    /// `archive_set_format_option`.
+    fn format_option(
+        format: &mut Option<Box<dyn Format>>,
+        a: &Base,
+        module: Option<&[u8]>,
+        key: &[u8],
+        value: Option<&[u8]>,
+    ) -> c_int {
+        let Some(f) = format.as_mut() else {
+            return if module.is_none() {
+                ARCHIVE_FAILED
+            } else {
+                crate::options::UNKNOWN_MODULE
+            };
+        };
+        // If the format name didn't match, return a special code.
+        if module.is_some_and(|m| m != f.module()) {
+            return crate::options::UNKNOWN_MODULE;
+        }
+        match f.options(a, key, value) {
+            Ok(r) => r,
+            Err(e) => report(a, e),
+        }
+    }
+
+    /// `archive_set_filter_option`.
+    fn filter_option(
+        filters: &mut [Box<dyn Filter>],
+        a: &Base,
+        module: Option<&[u8]>,
+        key: &[u8],
+        value: Option<&[u8]>,
+    ) -> c_int {
+        let mut rv = ARCHIVE_WARN;
+        for f in filters {
+            if module.is_some_and(|m| m != f.name().to_bytes()) {
+                continue;
+            }
+            let r = match f.options(key, value) {
+                Ok(r) => r,
+                Err(e) => a.raise(e),
+            };
+            if r == ARCHIVE_FATAL {
+                return ARCHIVE_FATAL;
+            }
+            if module.is_some() {
+                return r;
+            }
+            if r == ARCHIVE_OK {
+                rv = ARCHIVE_OK;
+            }
+        }
+        // If the filter name didn't match, return a special code.
+        if rv == ARCHIVE_WARN && module.is_some() {
+            rv = crate::options::UNKNOWN_MODULE;
+        }
+        rv
+    }
+
+    /// One option for the format, the filters, or both as
+    /// `_archive_set_either_option` combines them.
     pub fn option(
         &mut self,
         a: &Base,
@@ -479,39 +540,17 @@ impl Write {
         formats: bool,
         filters: bool,
     ) -> c_int {
-        let mut matched = module.is_none();
-        let mut result = ARCHIVE_WARN;
-        if formats
-            && let Some(f) = self.format.as_mut()
-            && module.is_none_or(|m| m == f.module())
-        {
-            matched = true;
-            result = match f.options(a, key, value) {
-                Ok(r) => r,
-                Err(e) => report(a, e),
-            };
-        }
-        if filters {
-            for f in &mut self.filters {
-                if module.is_none_or(|m| m == f.name().to_bytes()) {
-                    matched = true;
-                    let r = match f.options(key, value) {
-                        Ok(r) => r,
-                        Err(e) => a.raise(e),
-                    };
-                    if r < ARCHIVE_WARN {
-                        return r;
-                    }
-                    if r == ARCHIVE_OK {
-                        result = ARCHIVE_OK;
-                    }
-                }
-            }
-        }
-        if matched {
-            result
-        } else {
-            crate::options::UNKNOWN_MODULE
+        let (format, filter) = (&mut self.format, &mut self.filters);
+        match (formats, filters) {
+            (true, false) => Self::format_option(format, a, module, key, value),
+            (false, true) => Self::filter_option(filter, a, module, key, value),
+            _ => crate::options::set_either_option(
+                module,
+                key,
+                value,
+                &mut |m, o, v| Self::format_option(format, a, m, o, v),
+                &mut |m, o, v| Self::filter_option(filter, a, m, o, v),
+            ),
         }
     }
     pub fn free(&mut self, a: &Base) -> c_int {
@@ -709,6 +748,61 @@ mod tests {
             base.error_string().as_deref(),
             Some(b"Entry remaining bytes larger than 0".as_slice())
         );
+    }
+
+    #[test]
+    fn options_combine_format_and_filter_answers() {
+        let base = Base::new(WRITE_MAGIC);
+        let mut writer = Write::default();
+        writer.set_format(&base, Box::new(format::iso9660::Iso9660::default()));
+        // Without a module, the format's failure loses to the filters' "not
+        // mine", so the option counts as undefined.
+        assert_eq!(
+            writer.option(&base, None, b"iso-level", Some(b"9"), true, true),
+            ARCHIVE_WARN
+        );
+        assert_eq!(
+            writer.option(
+                &base,
+                Some(b"iso9660"),
+                b"iso-level",
+                Some(b"9"),
+                true,
+                true
+            ),
+            ARCHIVE_FAILED
+        );
+        assert_eq!(
+            writer.option(&base, Some(b"zip"), b"iso-level", Some(b"2"), true, true),
+            crate::options::UNKNOWN_MODULE
+        );
+        assert_eq!(
+            writer.option(&base, None, b"iso-level", Some(b"2"), true, false),
+            ARCHIVE_OK
+        );
+        let mut empty = Write::default();
+        assert_eq!(
+            empty.option(&base, None, b"x", None, true, false),
+            ARCHIVE_FAILED
+        );
+    }
+
+    #[test]
+    fn a_failed_format_close_still_closes() {
+        let base = Base::new(WRITE_MAGIC);
+        let mut writer = Write::default();
+        writer.set_format(&base, Box::new(format::iso9660::Iso9660::default()));
+        assert_eq!(
+            writer.option(&base, None, b"boot", Some(b"missing"), true, true),
+            ARCHIVE_OK
+        );
+        let out = Rc::new(RefCell::new(Vec::new()));
+        assert_eq!(writer.open(&base, Box::new(Collect(out))), ARCHIVE_OK);
+        assert_eq!(writer.header(&base, &mut file(1)), ARCHIVE_OK);
+        assert_eq!(writer.data(&base, b"x"), 1);
+        assert_eq!(writer.close(&base), ARCHIVE_FATAL);
+        assert_eq!(base.state.get(), state::CLOSED);
+        assert_eq!(writer.close(&base), ARCHIVE_OK);
     }
 
     #[test]
