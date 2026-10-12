@@ -317,14 +317,11 @@ impl Iso9660 {
         Ok(())
     }
 
-    pub(super) fn zisofs_finish_entry(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
+    pub(super) fn zisofs_finish_entry(&mut self, _out: &mut dyn Sink) -> Result<(), Error> {
         let f = self.cur_file.ok_or_else(|| misc("No current file"))?;
 
         // Direct temp file stream to zisofs temp file stream.
         self.files[f].entry.set_size(self.zisofs.total_size);
-
-        // Save a file pointer which points the end of current zisofs data.
-        let tail = self.wb_offset();
 
         // Make a header.
         //
@@ -359,25 +356,53 @@ impl Iso9660 {
         buff[13] = file.zisofs.log2_bs;
         // Reserved: 14 and 15
 
-        // Upstream ignores seek failures; propagate them before using a
-        // buffer position rejected by our bounds guard.
-        self.wb_set_offset(out, file.content[0].offset_of_temp)?;
-
-        // Write the header.
-        self.wb_write_to_temp(out, &buff)?;
-
-        // Write zisofs Block Pointers.
-        let s = self.zisofs.block_pointers_cnt as usize * 4;
-        let block_pointers = std::mem::take(&mut self.zisofs.block_pointers);
-        let r = match block_pointers.get(..s) {
-            Some(p) => self.wb_write_to_temp(out, p),
-            None => Err(misc("Too many zisofs blocks")),
+        // Patch bytes already flushed in the temporary file, and bytes
+        // still buffered in place. Seeking the write buffer backwards
+        // would discard the compressed tail.
+        let mut offset = file.content[0].offset_of_temp;
+        let buffer_offset = self.wbuff_offset;
+        let used = self.wb_buffptr();
+        let mut patch = |mut bytes: &[u8]| -> Result<(), Error> {
+            if offset < buffer_offset {
+                let n = bytes.len().min((buffer_offset - offset) as usize);
+                let temp = self
+                    .temp
+                    .as_mut()
+                    .ok_or_else(|| misc("Couldn't create temporary file"))?;
+                let pos =
+                    u64::try_from(offset).map_err(|_| misc("Invalid zisofs header offset"))?;
+                temp.seek(SeekFrom::Start(pos))
+                    .map_err(|e| misc(e.to_string()))?;
+                temp.write_all(&bytes[..n])
+                    .map_err(|e| misc(e.to_string()))?;
+                temp.seek(SeekFrom::Start(buffer_offset as u64))
+                    .map_err(|e| misc(e.to_string()))?;
+                offset += n as i64;
+                bytes = &bytes[n..];
+            }
+            if !bytes.is_empty() {
+                let at = usize::try_from(offset - buffer_offset)
+                    .map_err(|_| misc("Invalid zisofs header offset"))?;
+                let end = at
+                    .checked_add(bytes.len())
+                    .filter(|&end| end <= used)
+                    .ok_or_else(|| misc("Invalid zisofs header offset"))?;
+                self.wbuff
+                    .get_mut(at..end)
+                    .ok_or_else(|| misc("Invalid zisofs header offset"))?
+                    .copy_from_slice(bytes);
+                offset += bytes.len() as i64;
+            }
+            Ok(())
         };
-        self.zisofs.block_pointers = block_pointers;
-        r?;
-
-        // Set a file pointer back to the end of the temporary file.
-        self.wb_set_offset(out, tail)?;
+        patch(&buff)?;
+        let s = self.zisofs.block_pointers_cnt as usize * 4;
+        let pointers = self
+            .zisofs
+            .block_pointers
+            .get(..s)
+            .ok_or_else(|| misc("Too many zisofs blocks"))?;
+        patch(pointers)?;
 
         Ok(())
     }
