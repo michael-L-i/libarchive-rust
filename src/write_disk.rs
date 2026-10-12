@@ -30,7 +30,9 @@
 #[cfg(target_vendor = "apple")]
 mod hfs;
 
-use crate::archive::{ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN, Base, state};
+use crate::archive::{
+    ARCHIVE_ERRNO_MISC, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN, Base, state,
+};
 use crate::entry::Entry;
 use crate::ffi::disk_sys::{PrepareError, Target};
 use crate::util::Error;
@@ -38,7 +40,7 @@ use std::ffi::c_int;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 pub const OWNER: c_int = 1;
 pub const PERM: c_int = 2;
@@ -77,6 +79,35 @@ pub struct WriteDisk {
     new_directory: bool,
 }
 
+/// Upstream's cleanup_pathname_fsobj: drops empty and `.` elements and a
+/// trailing `/`, keeping `..`, and refuses what the SECURE flags forbid.
+fn cleanup_pathname(path: &[u8], options: c_int) -> Result<Vec<u8>, &'static str> {
+    if path.is_empty() {
+        return Err("Invalid empty pathname");
+    }
+    let absolute = path.starts_with(b"/");
+    if absolute && options & SECURE_NOABSOLUTEPATHS != 0 {
+        return Err("Path is absolute");
+    }
+    let mut clean = Vec::with_capacity(path.len());
+    for element in path.split(|&b| b == b'/') {
+        if element.is_empty() || element == b"." {
+            continue;
+        }
+        if element == b".." && options & SECURE_NODOTDOT != 0 {
+            return Err("Path contains '..'");
+        }
+        if absolute || !clean.is_empty() {
+            clean.push(b'/');
+        }
+        clean.extend_from_slice(element);
+    }
+    if clean.is_empty() {
+        clean.push(if absolute { b'/' } else { b'.' });
+    }
+    Ok(clean)
+}
+
 fn failure(a: &Base, err: std::io::Error, action: &str, path: &Path) -> c_int {
     a.raise(Error::new(
         ARCHIVE_FAILED,
@@ -96,37 +127,14 @@ impl WriteDisk {
         self.permissions_created = false;
         self.new_directory = false;
         let mut entry = entry.clone_entry();
-        let Some(name) = entry.pathname().map(|p| p.to_bytes().to_vec()) else {
-            return a.raise(Error::new(
-                ARCHIVE_FAILED,
-                libc::EINVAL,
-                "Invalid empty pathname",
-            ));
+        let raw = entry
+            .pathname()
+            .map_or(Vec::new(), |p| p.to_bytes().to_vec());
+        let name = match cleanup_pathname(&raw, self.options) {
+            Ok(name) => name,
+            Err(msg) => return a.raise(Error::new(ARCHIVE_FAILED, ARCHIVE_ERRNO_MISC, msg)),
         };
         let path = PathBuf::from(std::ffi::OsStr::from_bytes(&name));
-        if name.is_empty() {
-            return a.raise(Error::new(
-                ARCHIVE_FAILED,
-                libc::EINVAL,
-                "Invalid empty pathname",
-            ));
-        }
-        if self.options & SECURE_NOABSOLUTEPATHS != 0 && path.is_absolute() {
-            return a.raise(Error::new(
-                ARCHIVE_FAILED,
-                crate::archive::ARCHIVE_ERRNO_MISC,
-                "Path is absolute",
-            ));
-        }
-        if self.options & SECURE_NODOTDOT != 0
-            && path.components().any(|c| c == Component::ParentDir)
-        {
-            return a.raise(Error::new(
-                ARCHIVE_FAILED,
-                crate::archive::ARCHIVE_ERRNO_MISC,
-                "Path contains '..'",
-            ));
-        }
         let hardlink = entry
             .hardlink()
             .map(|p| PathBuf::from(std::ffi::OsStr::from_bytes(p.to_bytes())));
@@ -134,35 +142,12 @@ impl WriteDisk {
             .symlink()
             .map(|p| PathBuf::from(std::ffi::OsStr::from_bytes(p.to_bytes())));
         if let Some(target) = &hardlink {
-            // Upstream compares the cleaned-up pathname with the link as given.
-            let name: PathBuf = path
-                .components()
-                .filter(|c| *c != Component::CurDir)
-                .collect();
-            if name.as_os_str() == target.as_os_str() {
-                let msg = [
-                    b"Skipping hardlink pointing to itself: ",
-                    name.as_os_str().as_bytes(),
-                ];
-                return a
-                    .warn(crate::archive::ARCHIVE_ERRNO_MISC, msg.concat())
-                    .code();
+            if name == target.as_os_str().as_bytes() {
+                let msg = [b"Skipping hardlink pointing to itself: ", name.as_slice()];
+                return a.warn(ARCHIVE_ERRNO_MISC, msg.concat()).code();
             }
-            if self.options & SECURE_NOABSOLUTEPATHS != 0 && target.is_absolute() {
-                return a.raise(Error::new(
-                    ARCHIVE_FAILED,
-                    crate::archive::ARCHIVE_ERRNO_MISC,
-                    "Path is absolute",
-                ));
-            }
-            if self.options & SECURE_NODOTDOT != 0
-                && target.components().any(|c| c == Component::ParentDir)
-            {
-                return a.raise(Error::new(
-                    ARCHIVE_FAILED,
-                    crate::archive::ARCHIVE_ERRNO_MISC,
-                    "Path contains '..'",
-                ));
+            if let Err(msg) = cleanup_pathname(target.as_os_str().as_bytes(), self.options) {
+                return a.raise(Error::new(ARCHIVE_FAILED, ARCHIVE_ERRNO_MISC, msg));
             }
         }
         let secure = self.options & SECURE_SYMLINKS != 0;
@@ -949,6 +934,34 @@ mod tests {
         let dir = locked.join("dir");
         let expected = [b"Failed to create dir '", dir.as_os_str().as_bytes(), b"'"].concat();
         assert_eq!(*base.error_string().unwrap(), *expected);
+    }
+
+    #[test]
+    fn pathnames_are_cleaned_up_as_upstream_does() {
+        for (path, clean) in [
+            (&b"./a//b/."[..], &b"a/b"[..]),
+            (b"/", b"/"),
+            (b"./", b"."),
+            (b"//a/", b"/a"),
+            (b"a/../..x", b"a/../..x"),
+        ] {
+            assert_eq!(cleanup_pathname(path, 0).as_deref(), Ok(clean));
+        }
+        assert_eq!(
+            cleanup_pathname(b"a/..", SECURE_NODOTDOT),
+            Err("Path contains '..'")
+        );
+        assert_eq!(
+            cleanup_pathname(b"/a", SECURE_NOABSOLUTEPATHS),
+            Err("Path is absolute")
+        );
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        let mut entry = Entry::new(None);
+        entry.set_mode(libc::S_IFREG | 0o644);
+        assert_eq!(disk.header(&base, &entry), ARCHIVE_FAILED);
+        assert_eq!(base.errno.get(), ARCHIVE_ERRNO_MISC);
+        assert_eq!(*base.error_string().unwrap(), *b"Invalid empty pathname");
     }
 
     #[test]
