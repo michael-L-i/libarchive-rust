@@ -32,7 +32,7 @@ mod hfs;
 
 use crate::archive::{ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN, Base, state};
 use crate::entry::Entry;
-use crate::ffi::disk_sys::Target;
+use crate::ffi::disk_sys::{PrepareError, Target};
 use crate::util::Error;
 use std::ffi::c_int;
 use std::fs::File;
@@ -159,7 +159,10 @@ impl WriteDisk {
             self.options & NO_AUTODIR == 0,
         ) {
             Ok(t) => t,
-            Err(e) => return failure(a, e, "Can't create parent directory", &path),
+            Err(PrepareError::Mkdir(dir, e)) => return failure(a, e, "Failed to create dir", &dir),
+            Err(PrepareError::Other(e)) => {
+                return failure(a, e, "Can't create parent directory", &path);
+            }
         };
         if !secure
             && self.options & UNLINK == 0
@@ -172,7 +175,7 @@ impl WriteDisk {
         {
             match Target::prepare(&real, false, false, false) {
                 Ok(t) => target = t,
-                Err(e) => return failure(a, e, "Can't follow directory", &path),
+                Err(e) => return failure(a, e.into(), "Can't follow directory", &path),
             }
         }
         // SAFE_WRITES extracts a regular file to a temporary and renames it over
@@ -245,6 +248,7 @@ impl WriteDisk {
                 Ok(())
             } else if let Some(source) = hardlink {
                 Target::prepare(&source, secure, false, false)
+                    .map_err(std::io::Error::from)
                     .and_then(|source| target.hardlink(&source, secure))
             } else if let Some(link) = link {
                 self.limit = Some(0);
@@ -908,6 +912,24 @@ mod tests {
         assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
         let metadata = std::fs::metadata(output.path()).unwrap();
         assert_eq!((metadata.len(), metadata.mtime()), (0, 1_000_000_000));
+    }
+
+    #[test]
+    fn failed_parent_mkdir_names_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let output = Output::new();
+        let locked = output.0.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        let mut entry = Entry::new(None);
+        entry.set_pathname(locked.join("dir/file").as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFREG | 0o644);
+        assert_eq!(disk.header(&base, &entry), ARCHIVE_FAILED);
+        let dir = locked.join("dir");
+        let expected = [b"Failed to create dir '", dir.as_os_str().as_bytes(), b"'"].concat();
+        assert_eq!(*base.error_string().unwrap(), *expected);
     }
 
     #[test]

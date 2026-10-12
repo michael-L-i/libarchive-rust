@@ -3,7 +3,7 @@
 use crate::entry::Entry;
 use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn path_c(path: &Path) -> std::io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
@@ -268,6 +268,26 @@ fn supports_nofollow_any() -> bool {
     })
 }
 
+/// Why `Target::prepare` failed: creating a missing parent directory, or
+/// anything else.
+#[derive(Debug)]
+pub enum PrepareError {
+    Mkdir(PathBuf, std::io::Error),
+    Other(std::io::Error),
+}
+impl From<std::io::Error> for PrepareError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Other(e)
+    }
+}
+impl From<PrepareError> for std::io::Error {
+    fn from(e: PrepareError) -> Self {
+        match e {
+            PrepareError::Mkdir(_, e) | PrepareError::Other(e) => e,
+        }
+    }
+}
+
 /// Holds the destination directory open so renames cannot redirect extraction.
 pub struct Target {
     parent: File,
@@ -298,7 +318,7 @@ impl Target {
         secure: bool,
         unlink: bool,
         autodir: bool,
-    ) -> std::io::Result<Self> {
+    ) -> Result<Self, PrepareError> {
         let mut components = path.components();
         let last = components
             .next_back()
@@ -339,12 +359,17 @@ impl Target {
             )
         };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::last_os_error().into());
         }
         // SAFETY: fd is a successfully opened, uniquely owned descriptor.
         let mut parent = unsafe { File::from_raw_fd(fd) };
+        let mut prefix = PathBuf::new();
         for component in components {
-            if component == Component::RootDir || component == Component::CurDir {
+            if component == Component::CurDir {
+                continue;
+            }
+            prefix.push(component);
+            if component == Component::RootDir {
                 continue;
             }
             let part = CString::new(component.as_os_str().as_bytes())
@@ -373,24 +398,25 @@ impl Target {
                         // SAFETY: unlinkat uses the live parent and component.
                         result(unsafe { libc::unlinkat(parent.as_raw_fd(), part.as_ptr(), 0) })?;
                     } else if error.raw_os_error() != Some(libc::ENOENT) {
-                        return Err(error);
+                        return Err(error.into());
                     }
                 } else if error.raw_os_error() != Some(libc::ENOENT) {
-                    return Err(error);
+                    return Err(error.into());
                 }
                 if !autodir {
-                    return Err(error);
+                    return Err(error.into());
                 }
                 // SAFETY: mkdirat uses a valid parent descriptor and path.
-                let code = unsafe { libc::mkdirat(parent.as_raw_fd(), part.as_ptr(), 0o777) };
-                if code != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
-                {
-                    return Err(std::io::Error::last_os_error());
+                if unsafe { libc::mkdirat(parent.as_raw_fd(), part.as_ptr(), 0o777) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(PrepareError::Mkdir(prefix, error));
+                    }
                 }
                 // SAFETY: retry opens the newly created directory, never a symlink when secure.
                 fd = unsafe { libc::openat(parent.as_raw_fd(), part.as_ptr(), flags) };
                 if fd < 0 {
-                    return Err(std::io::Error::last_os_error());
+                    return Err(std::io::Error::last_os_error().into());
                 }
             }
             // SAFETY: the new descriptor is uniquely owned by this File.
