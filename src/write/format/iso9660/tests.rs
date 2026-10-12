@@ -297,3 +297,241 @@ fn an_unwritten_file_is_not_padded() {
     assert_eq!(&image[pvd + 80..pvd + 84], &184u32.to_le_bytes());
     assert!(image.windows(100).any(|w| w == [7; 100]));
 }
+
+#[test]
+fn information_block_records_options_and_zero_padding() {
+    let mut iso = Iso::new(&[
+        ("iso-level", Some("3")),
+        ("joliet", Some("long")),
+        ("pad", None),
+    ]);
+    assert_eq!(iso.close().0, ARCHIVE_OK);
+    let image = iso.out.borrow();
+    let info = &image[19 * LOGICAL_BLOCK_SIZE..20 * LOGICAL_BLOCK_SIZE];
+    assert!(info.starts_with(b"INFO "));
+    assert!(
+        info.windows(crate::util::VERSION_STRING.to_bytes().len())
+            .any(|w| w == crate::util::VERSION_STRING.to_bytes())
+    );
+    let end = info.iter().position(|&b| b == 0).unwrap();
+    assert!(info[..end].ends_with(b" iso-level=3,joliet=long,!pad"));
+    assert!(info[end..].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn option_validation_keeps_upstreams_boundaries_and_messages() {
+    let base = Base::new(WRITE_MAGIC);
+    let mut format = Iso9660::default();
+    for (key, value, message) in [
+        (
+            "boot-load-seg",
+            "10000",
+            "Invalid value(over 0xffff) for option ``boot-load-seg''",
+        ),
+        (
+            "boot-load-seg",
+            "0xg",
+            "Invalid value for option ``boot-load-seg''",
+        ),
+        (
+            "boot-load-size",
+            "0",
+            "Invalid value(under 1) for option ``boot-load-size''",
+        ),
+        (
+            "boot-load-size",
+            "65536",
+            "Invalid value(over 65535) for option ``boot-load-size''",
+        ),
+        (
+            "compression-level",
+            "10",
+            "Invalid value for option ``compression-level''",
+        ),
+        (
+            "compression-level",
+            "-1",
+            "Invalid value for option ``compression-level''",
+        ),
+        ("joliet", "0", "Invalid value for option ``joliet''"),
+        ("rockridge", "0", "Invalid value for option ``rockridge''"),
+    ] {
+        let error = format
+            .options(&base, key.as_bytes(), Some(value.as_bytes()))
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            if message.contains("value for") {
+                ARCHIVE_FAILED
+            } else {
+                ARCHIVE_FATAL
+            },
+            "{key}={value}"
+        );
+        assert_eq!(error.msg.as_slice(), message.as_bytes(), "{key}={value}");
+    }
+    for (key, value) in [
+        ("boot-load-seg", "0xFfFf"),
+        ("boot-load-seg", ""),
+        ("boot-load-size", "65535"),
+        ("boot-load-size", "1"),
+        ("compression-level", "0"),
+        ("compression-level", "9"),
+        ("joliet", "long"),
+        ("joliet", "1"),
+        ("rockridge", "strict"),
+        ("rockridge", "useful"),
+        ("rockridge", "1"),
+    ] {
+        assert_eq!(
+            format
+                .options(&base, key.as_bytes(), Some(value.as_bytes()))
+                .unwrap(),
+            ARCHIVE_OK
+        );
+    }
+    for key in [b"joliet".as_slice(), b"rockridge"] {
+        assert_eq!(format.options(&base, key, None).unwrap(), ARCHIVE_OK);
+    }
+    for (key, limit) in [
+        ("volume-id", 32),
+        ("publisher", 128),
+        ("application-id", 128),
+        ("boot-catalog", 1024),
+    ] {
+        assert_eq!(
+            format
+                .options(&base, key.as_bytes(), Some(&vec![b'x'; limit]))
+                .unwrap(),
+            ARCHIVE_OK
+        );
+        let error = format
+            .options(&base, key.as_bytes(), Some(&vec![b'x'; limit + 1]))
+            .unwrap_err();
+        assert_eq!(
+            error.msg.as_slice(),
+            format!("Value is longer than {limit} characters for option ``{key}''").as_bytes()
+        );
+    }
+}
+
+#[test]
+fn joliet_rejects_paths_over_240_bytes() {
+    let parent = "x".repeat(80);
+    let name = "y".repeat(80);
+    let mut iso = Iso::new(&[("joliet", Some("long"))]);
+    let path = format!("{parent}/{parent}/{name}");
+    assert_eq!(iso.add(&path, file(), b"f"), ARCHIVE_OK);
+    assert_eq!(iso.close(), (ARCHIVE_FATAL,
+        format!("The regulation of Joliet extensions; A length of a full-pathname of `{path}' is longer than 240 bytes, (p=163, b=80)").into_bytes()));
+}
+
+#[test]
+fn directories_too_deep_warns_after_writing_a_truncated_image() {
+    let mut iso = Iso::new(&[("rockridge", None), ("joliet", None)]);
+    chain(&mut iso, "d", 9);
+    let (status, message) = iso.close();
+    assert_eq!(status, ARCHIVE_WARN);
+    assert!(message.ends_with(b": Directories too deep"));
+    let image = iso.out.borrow();
+    assert!(image.len() >= WB_BUFFMAX);
+    assert_eq!(image.len() % WB_BUFFMAX, 0);
+    let blocks = u32::from_le_bytes(
+        image[16 * LOGICAL_BLOCK_SIZE + 80..16 * LOGICAL_BLOCK_SIZE + 84]
+            .try_into()
+            .unwrap(),
+    );
+    assert!(image.len() < blocks as usize * LOGICAL_BLOCK_SIZE);
+}
+
+#[test]
+fn joliet_keeps_original_tree_after_rockridge_relocation() {
+    let mut iso = Iso::new(&[]);
+    chain(&mut iso, "d", 9);
+    assert_eq!(iso.close().0, ARCHIVE_OK);
+    let image = iso.out.borrow().clone();
+    assert!(image.windows(8).any(|w| w == b"RR_MOVED"));
+    let mut reader = crate::ArchiveRead::new();
+    assert_eq!(reader.support_format_all(), crate::Status::Ok);
+    assert_eq!(
+        reader.set_option(Some(b"iso9660"), Some(b"rockridge"), None),
+        crate::Status::Ok
+    );
+    assert_eq!(reader.open_memory(image), crate::Status::Ok);
+    let mut paths = Vec::new();
+    while reader.next_header() == crate::Status::Ok {
+        paths.push(reader.entry().pathname().unwrap().to_vec());
+    }
+    assert!(paths.iter().any(|p| p == b"d/l1/l2/l3/l4/l5/l6/l7/l8/l9/f"));
+    assert!(!paths.iter().any(|p| p.windows(8).any(|s| s == b"rr_moved")));
+}
+
+#[test]
+fn unconvertible_names_warn_with_the_utf16be_message() {
+    let mut iso = Iso::new(&[]);
+    let mut entry = Entry::new(None);
+    entry.set_pathname_utf8(b"invalid\xff");
+    entry.set_mode(file() as _);
+    entry.set_size(0);
+    assert_eq!(iso.writer.header(&iso.base, &mut entry), ARCHIVE_WARN);
+    assert_eq!(iso.base.error_string().as_deref(), Some(b"A filename cannot be converted to UTF-16BE;You should disable making Joliet extension".as_slice()));
+}
+
+#[test]
+#[ignore = "writes a 4 GiB temporary file; run alongside the sparse ISO harness"]
+fn level_three_writes_multi_extent_records_from_a_declared_size() {
+    struct Prefix(Rc<RefCell<Vec<u8>>>);
+    impl Sink for Prefix {
+        fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+            let mut prefix = self.0.borrow_mut();
+            let n = data.len().min(65536usize.saturating_sub(prefix.len()));
+            prefix.extend_from_slice(&data[..n]);
+            Ok(())
+        }
+    }
+    let base = Base::new(WRITE_MAGIC);
+    let mut writer = Write::default();
+    writer.set_format(&base, Box::new(Iso9660::default()));
+    for (key, value) in [
+        (b"iso-level".as_slice(), Some(b"3".as_slice())),
+        (b"joliet", None),
+        (b"rockridge", None),
+    ] {
+        assert_eq!(
+            writer.option(&base, Some(b"iso9660"), key, value, true, false),
+            ARCHIVE_OK
+        );
+    }
+    let prefix = Rc::new(RefCell::new(Vec::new()));
+    assert_eq!(
+        writer.open(&base, Box::new(Prefix(prefix.clone()))),
+        ARCHIVE_OK
+    );
+    let mut entry = Entry::new(None);
+    entry.set_pathname(b"huge");
+    entry.set_mode(file() as _);
+    entry.set_size(MULTI_EXTENT_SIZE + 4096);
+    assert_eq!(writer.header(&base, &mut entry), ARCHIVE_OK);
+    assert_eq!(writer.data(&base, b"x"), 1);
+    assert_eq!(writer.close(&base), ARCHIVE_OK);
+    let image = prefix.borrow();
+    let le = |bytes: &[u8]| u32::from_le_bytes(bytes.try_into().unwrap());
+    let root = le(&image[16 * LOGICAL_BLOCK_SIZE + 158..16 * LOGICAL_BLOCK_SIZE + 162]) as usize
+        * LOGICAL_BLOCK_SIZE;
+    let mut at = root;
+    let mut records = Vec::new();
+    while image[at] != 0 {
+        let len = image[at] as usize;
+        let record = &image[at..at + len];
+        if &record[33..33 + record[32] as usize] == b"HUGE;1" {
+            records.push((le(&record[2..6]), le(&record[10..14]), record[25]));
+        }
+        at += len;
+    }
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].1, 0xfffff800);
+    assert_eq!(records[0].2, 0x80);
+    assert_eq!(records[1].1, 6144);
+    assert_eq!(records[1].2, 0);
+    assert_eq!(records[1].0 - records[0].0, 2097151);
+}
