@@ -1308,3 +1308,6 @@ impl Format for Iso9660 {
         self.iso9660_close(out)
     }
 }
+
+#[cfg(test)]
+mod tests;
