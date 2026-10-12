@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Opt-in: isolated Linux flag/trusted-xattr oracle checks. No host mounts.
+# LA_PRIVILEGED_IMAGE can reuse an image with Rust and the Dockerfile packages.
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+pin=8bb3bbdc7b117a1e22086a2260f2087aafa90687
+test "$(git -C "$root/upstream/libarchive" rev-parse HEAD)" = "$pin"
+image="${LA_PRIVILEGED_IMAGE:-libarchive-privileged-tests:local}"
+name="${LA_PRIVILEGED_CONTAINER:-la-improve-privileged-$$}"
+out="${1:-$root/build/linux-privileged}"
+mkdir -p "$out"
+out="$(cd "$out" && pwd)"
+tmp="$(mktemp -d)"
+created=false
+cleanup() {
+  if $created; then
+    docker exec "$name" python3 /suite/tests/linux-privileged/check.py --cleanup /scratch >/dev/null 2>&1 || true
+    docker rm -f "$name" >/dev/null || true
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+python3 "$root/tests/linux-privileged/snapshot.py" "$root" "$tmp/source.tar"
+git -C "$root/upstream/libarchive" archive "$pin" >"$tmp/upstream.tar"
+if [ -z "${LA_PRIVILEGED_IMAGE:-}" ]; then
+  docker build -t "$image" -f "$root/tests/linux-privileged/Dockerfile" "$tmp" \
+    >"$out/image-build.log" 2>&1 || { tail -n 40 "$out/image-build.log" >&2; exit 1; }
+fi
+docker create --name "$name" --network none --cap-drop ALL \
+  --cap-add SYS_ADMIN --cap-add LINUX_IMMUTABLE --cap-add DAC_OVERRIDE \
+  --cap-add CHOWN --cap-add FOWNER --cap-add SETUID --cap-add SETGID \
+  --cap-add SETPCAP "$image" sleep infinity >/dev/null
+created=true
+docker start "$name" >/dev/null
+docker exec "$name" mkdir -p /suite/upstream/libarchive /scratch /results
+docker cp "$tmp/source.tar" "$name:/source.tar"
+docker cp "$tmp/upstream.tar" "$name:/upstream.tar"
+docker exec "$name" tar -xf /source.tar -C /suite
+docker exec "$name" tar -xf /upstream.tar -C /suite/upstream/libarchive
+# The image caches dependencies; the runtime container has no network.
+docker exec -w /suite -e CARGO_TARGET_DIR=/privileged-build/target "$name" \
+  cargo build --offline --locked --release -p libarchive-capi \
+  >"$out/port-build.log" 2>&1 || { tail -n 40 "$out/port-build.log" >&2; exit 1; }
+docker exec -w /suite "$name" scripts/build-oracle \
+  >"$out/oracle-build.log" 2>&1 || { tail -n 40 "$out/oracle-build.log" >&2; exit 1; }
+status=0
+docker exec "$name" python3 /suite/tests/linux-privileged/check.py \
+  --oracle /suite/build/oracle/libarchive/libarchive.so \
+  --port /privileged-build/target/release/libarchive.so \
+  --root /scratch --output /results/report.json >"$out/check.log" 2>&1 || status=$?
+cat "$out/check.log"
+docker cp "$name:/results/report.json" "$out/report.json" || true
+printf 'Privileged report: %s/report.json\n' "$out"
+exit "$status"
