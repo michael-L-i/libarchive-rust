@@ -23,8 +23,9 @@ C programs (bsdtar, package managers) link it in place of `libarchive.so`.
   that restate the code.
 - **Faithful.** Match upstream at the pinned commit: return codes, errno values,
   error strings, entry metadata and output bytes. Port behavior that looks wrong
-  as-is and record it in `NOTES.md`. The one intended difference: input that
-  makes upstream read or write out of bounds fails cleanly here.
+  as-is and record it in `NOTES.md`, except bugs that corrupt output data:
+  fix those and document the behavior difference and regression evidence.
+  Input that makes upstream read or write out of bounds fails cleanly here.
 - **Safe Rust dependencies.** No C, and prefer crates with no or minimal
   `unsafe`. When a backend can't be both memory-safe and byte-identical to
   upstream, safe wins: use the safe crate and record how its behavior differs

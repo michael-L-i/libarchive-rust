@@ -4,7 +4,7 @@
 use super::descriptor::num_731;
 use super::*;
 use crate::read::ARCHIVE_ERRNO_FILE_FORMAT;
-use deflate::Flush;
+use deflate::{Flush, Status as DeflateStatus};
 use miniz_oxide::inflate::stream::{InflateState, inflate};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 
@@ -244,10 +244,10 @@ impl Iso9660 {
 
             // If current data block are all zero, we do not use compressed
             // data.
-            if flush == Flush::Finish
+            let hole = flush == Flush::Finish
                 && self.zisofs.allzero
-                && avail as u64 + self.zisofs.total_in == ZF_BLOCK_SIZE
-            {
+                && avail as u64 + self.zisofs.total_in == ZF_BLOCK_SIZE;
+            if hole {
                 let c = *self.cur_content()?;
                 if self.zisofs.block_offset != c.size {
                     self.wb_set_offset(out, c.offset_of_temp + self.zisofs.block_offset)?;
@@ -259,7 +259,8 @@ impl Iso9660 {
             }
 
             // Compress file data.
-            while avail_in > 0 {
+            let mut stream_end = false;
+            while avail_in > 0 || (flush == Flush::Finish && !hole && !stream_end) {
                 let (z, wbuff) = (&mut self.zisofs, &mut self.wbuff);
                 let stream = z
                     .stream
@@ -271,7 +272,11 @@ impl Iso9660 {
                     flush,
                 );
                 match r {
-                    Ok((_, used, csize)) => {
+                    Ok((status, used, csize)) => {
+                        stream_end = status == DeflateStatus::StreamEnd;
+                        if used == 0 && csize == 0 && !stream_end {
+                            return Err(misc("Compression failed: deflate() made no progress"));
+                        }
                         next_in += used;
                         avail_in -= used;
                         z.total_in += used as u64;
