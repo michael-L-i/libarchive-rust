@@ -1981,7 +1981,11 @@ Still different:
   option, every level, Joliet and Rock Ridge variants, zisofs, El Torito,
   deep trees, 3,000 random archives and an API probe): 3,459 on macOS, and
   3,457 on Linux (glibc 2.41, aarch64) against upstream built there. The
-  others are inputs upstream crashes on, listed below.
+  others are inputs upstream crashes on, listed below. After the review
+  follow-ups and before fixing corrupt output, the fixed/API subsets
+  remained identical: macOS 460 matches and 31 upstream crashes across
+  491 cases; Linux 436 matches and 33 crashes across 469 cases (without
+  the round-twelve inputs).
 - The identifier resolver keeps upstream's red-black tree (`src/rb.rs`,
   insertion and lookup from `archive_rb.c`). Its comparison is not a total
   order: `FOO` and `FOO.` each sort before the other, so the tree's shape
@@ -2056,7 +2060,9 @@ Output-corruption bugs fixed with the user's approval (deliberate deviations):
 `tests.rs` covers these transitions and exact decoded contents, including
 short prefixes. `scripts/test-iso-zisofs` drives whole and split public-API
 writes and verifies eight deterministic images using the independently
-built upstream reader. These images now extract their original bytes;
+built upstream reader. All eight fail against the macOS upstream writer
+and pass against the corrected writer. These images now extract their
+original bytes;
 affected images intentionally differ from upstream's corrupt output.
 
 Other upstream edge cases retained:
