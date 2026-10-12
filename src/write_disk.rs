@@ -172,8 +172,13 @@ impl WriteDisk {
         }
         // SAFE_WRITES extracts a regular file to a temporary and renames it over
         // whatever non-directory is in the way; anything else in the way is removed.
-        let regular =
-            hardlink.is_none() && link.is_none() && matches!(entry.filetype(), 0 | libc::S_IFREG);
+        // Any other type is created as a regular file, as POSIX requires.
+        let regular = hardlink.is_none()
+            && link.is_none()
+            && !matches!(
+                entry.filetype(),
+                libc::S_IFDIR | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFIFO
+            );
         let safe_write = regular && self.options & SAFE_WRITES != 0;
         // A successful exclusive create cannot replace an existing inode. Fall back
         // to the original checks on any error, including a racing creation.
@@ -256,7 +261,7 @@ impl WriteDisk {
                     }
                     result => result,
                 }
-            } else if entry.filetype() == libc::S_IFREG || entry.filetype() == 0 {
+            } else if regular {
                 if safe_write {
                     match target.atomic_file(entry.mode() as u32 & 0o777) {
                         Ok((tmp, file)) => {
@@ -710,6 +715,25 @@ mod tests {
             assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
             assert_eq!(std::fs::read(output.path()).unwrap(), b"new");
             assert_ne!(std::fs::metadata(output.path()).unwrap().ino(), inode);
+        }
+    }
+
+    #[test]
+    fn link_without_target_and_socket_entries_become_regular_files() {
+        for kind in [libc::S_IFLNK, libc::S_IFSOCK] {
+            let output = Output::new();
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = WriteDisk::default();
+            let mut entry = Entry::new(None);
+            entry.set_pathname(output.path().as_os_str().as_bytes());
+            entry.set_mode(kind | 0o644);
+            entry.set_size(1);
+            assert_eq!(disk.header(&base, &entry), ARCHIVE_OK);
+            assert_eq!(disk.data(&base, b"x"), 1);
+            assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+            let metadata = std::fs::symlink_metadata(output.path()).unwrap();
+            assert!(metadata.is_file());
+            assert_eq!(std::fs::read(output.path()).unwrap(), b"x");
         }
     }
 
