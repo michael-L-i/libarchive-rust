@@ -24,6 +24,7 @@ mod stubs;
 pub(crate) mod charset;
 pub(crate) mod filter_fork;
 pub(crate) mod sys;
+pub(crate) mod util;
 
 macro_rules! opaque {
     ($($name:ident),*) => {$(

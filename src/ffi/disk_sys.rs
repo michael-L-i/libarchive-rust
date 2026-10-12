@@ -755,7 +755,7 @@ unsafe extern "C" {
 }
 #[cfg(target_vendor = "apple")]
 fn temporary() -> std::io::Result<File> {
-    let mut name = std::env::temp_dir()
+    let mut name = crate::ffi::util::get_tempdir()
         .join("libarchive-metadata.XXXXXX")
         .as_os_str()
         .as_bytes()

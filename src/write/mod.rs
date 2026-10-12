@@ -613,8 +613,9 @@ pub(crate) fn temp_file() -> Result<std::fs::File, Error> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    let directory = crate::ffi::util::get_tempdir();
     for _ in 0..32 {
-        let path = std::env::temp_dir().join(format!(
+        let path = directory.join(format!(
             "libarchive-rust-{}-{stamp:x}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
