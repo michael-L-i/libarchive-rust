@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# CI setup for the unprivileged Ubuntu runner. Builds and tests never use sudo.
+# Matches diagnostics/round14-linux-env/{run,setup-user}.sh, plus libattr.
+set -euo pipefail
+
+test "$(id -u)" -ne 0
+sudo apt-get update -qq
+sudo apt-get install -y cmake pkg-config python3 locales \
+  zlib1g-dev libbz2-dev liblzma-dev libzstd-dev liblz4-dev \
+  libb2-dev libxml2-dev libssl-dev libacl1-dev libattr1-dev libext2fs-dev
+
+# SHIFT_JIS emits an ASCII compatibility warning despite being usable.
+while read -r name charset; do
+  sudo localedef --no-warnings=ascii -i "${name%%.*}" -f "$charset" "$name"
+done <<'LOCALES'
+en_US.UTF-8 UTF-8
+en_US.ISO8859-1 ISO-8859-1
+ru_RU.KOI8-R KOI8-R
+ru_RU.CP1251 CP1251
+ru_RU.CP866 CP866
+ja_JP.eucJP EUC-JP
+ja_JP.SJIS SHIFT_JIS
+LOCALES
