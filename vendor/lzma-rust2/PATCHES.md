@@ -122,8 +122,13 @@ instructions retired, not time, judge these).
   to liblzma, before the two skip changes and after: text 1.228 ->
   0.677, source 1.076 -> 0.956, mixed 0.822 -> 0.750, records
   0.968 -> 0.988, compiled 0.920 -> 0.924, documents 0.769 -> 0.712,
-  many-files 1.021 -> 0.963, random 0.655 -> 0.657. Instructions fall
-  on every input but random (+0.2%).
+  many-files 1.021 -> 0.963, random 0.655 -> 0.657; records and
+  compiled are within noise. Instructions fall on six inputs, records
+  is unchanged and random rises 0.2%. In the bsdtar benchmark
+  (`diagnostics/round13-lzma-text`, seven rotated runs, medians relative
+  to C bsdtar), text creation goes from 1.250 to 0.707 for tar.xz and
+  from 1.341 to 0.762 for 7-Zip LZMA2; the other datasets' creation
+  stays within 2% or improves, and all 16 archives are unchanged.
 
 ## LZMA2 decoder resident dictionary pages
 
