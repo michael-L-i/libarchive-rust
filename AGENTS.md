@@ -26,6 +26,9 @@ C programs (bsdtar, package managers) link it in place of `libarchive.so`.
   as-is and record it in `NOTES.md`, except bugs that corrupt output data:
   fix those and document the behavior difference and regression evidence.
   Input that makes upstream read or write out of bounds fails cleanly here.
+  Reviewed descriptor-based disk hardening may retain an observed inode,
+  fail on replacement or refuse unanchored metadata fallbacks; document its
+  errors and remaining race limitations in `NOTES.md`.
 - **Safe Rust dependencies.** No C, and prefer crates with no or minimal
   `unsafe`. When a backend can't be both memory-safe and byte-identical to
   upstream, safe wins: use the safe crate and record how its behavior differs
@@ -36,6 +39,19 @@ C programs (bsdtar, package managers) link it in place of `libarchive.so`.
   varargs and calls into Rust, because stable Rust can't define C variadic
   functions. Only the C library (`capi/`) compiles it; the Rust crate and
   everything built on it contain no C.
+
+## Processing limits
+
+Default reads retain upstream behavior and existing hard safety caps.
+`ReadLimits` and `limits:*` read options are opt-in extensions configured
+before open; configure decoder memory before explicitly appending filters.
+New covered decoder output, entry-table records and retained metadata must
+share the handle's processing budget, including hidden work and skips.
+Keep allocation checks before covered retained allocations. Work limits
+are not CPU deadlines or total heap/RSS limits: producer blocks, callback
+work, external programs and unsupported decoder allocations need external
+resource controls. Preserve uncapped compatibility and document actual
+coverage and error behavior in `src/read/limits.rs` and `NOTES.md`.
 
 ## Layout
 
@@ -128,9 +144,10 @@ per fixture and tags each with the filter it exercises, so a filter agent can fi
 1. **Upstream test suite.** `libarchive/test/` holds 934 tests and 491 `.uu`
    fixtures, compiled unchanged and linked against our library. This is the
    primary oracle; its pass count is the headline number in `STATUS.md`.
-   Upstream itself passes 829 here (the rest skip for platform reasons), so 829
-   is the target. A test in `tests/passing.txt` that fails is a regression and
-   blocks the commit. Newly passing tests go into `passing.txt` in the same
+   Use the current per-platform counts in `STATUS.md` and the oracle
+   baselines, including platform and internal-test skips. A recorded pass
+   that fails or skips is a regression and blocks the commit. Newly passing
+   tests go into the selected platform baseline in the same
    commit as the code that fixed them. 17 files (73 tests) call libarchive
    internals and can't link against the public ABI; `build-port` detects them
    with `nm` and turns them into skips, and their checks are ported as Rust
@@ -143,15 +160,18 @@ per fixture and tags each with the filter it exercises, so a filter agent can fi
 2. **Differential runs.** Build upstream `bsdtar` against upstream libarchive
    and against ours. Diff `bsdtar -tvf` output, extracted trees and exit codes
    over the corpus: upstream's `*.uu` test archives plus oss-fuzz corpora.
-3. **Fuzzing.** One `cargo fuzz` target per reader. A crash, panic, hang or
-   unbounded allocation is a bug. `fuzz/` is a nightly-only crate outside the
-   workspace: `format_*` per format, `filter_*` per filter (paired with the
-   raw format), and `all`. Each opens the input from memory, reads every
-   entry and aborts on panic (exports otherwise turn panics into
-   `ARCHIVE_FATAL`).
+3. **Fuzzing.** The nightly-only `fuzz/` crate stays outside the workspace.
+   Its 39 targets cover formats/filters/all, a deeper reader, seven writer
+   formats plus `writer_roundtrip`, and `read_limits`. Reader targets apply
+   opt-in budgets before open, touch entry metadata and abort on swallowed
+   ABI panics. Valid writer properties compare exact recovered contents and
+   partial-read/skip behavior through bounded owned memory output. A crash,
+   panic, hang or uncontrolled allocation in these bounded harnesses is a
+   bug; processing limits do not replace libFuzzer timeout/RSS controls.
 
    ```
-   scripts/fuzz-seeds                  # decode upstream .uu fixtures into fuzz/corpus/<target>/
+   scripts/fuzz-seeds                  # upstream .uu reader fixtures
+   scripts/fuzz-writer-seeds           # valid writer and deeper-reader seeds
    cd fuzz
    cargo +nightly fuzz run format_zip -- -timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=1024 -max_total_time=300
    cargo +nightly fuzz build && for t in $(cargo +nightly fuzz list); do   # all targets, 30 s each

@@ -37,7 +37,7 @@ Suspected upstream bugs ported as-is, and deliberate divergences, per unit.
 - `archive_write_data` and `archive_write_data_block` reject a size above
   `isize::MAX`, or a NULL buffer with a non-zero size, with `ARCHIVE_FATAL`
   (no message) instead of reading out of bounds.
-- `archive_set_error` (`src/ffi/variadic.c`) formats with libc `vsnprintf`,
+- `archive_set_error` (`capi/variadic.c`) formats with libc `vsnprintf`,
   not upstream's `archive_string_vsprintf`. Upstream supports only `%%`, `%c`,
   `%s`, `%d`, `%o`, `%u`, `%x`, `%X` and `%S`, with the length modifiers `l`,
   `ll`, `j` and `z`; anything else (including width, precision, flags, `%i`
@@ -1454,9 +1454,9 @@ and the filters. The PPMd model is `ppmd7`, reached through `Ppmd7` and
 - The sparse list is a `VecDeque`, and the 1.0 map's lines are read one at a
   time (at most 100 bytes each, as upstream limits them) instead of through
   the shared `line` buffer.
-- No allocation is bounded beyond upstream's limits: names and values are
-  copied from bytes the archive holds, so memory use is at most the size of the
-  input, as upstream's is. An attribute name can be as long as the buffered
+- With optional processing limits disabled, allocation follows upstream's
+  limits: names and values are copied from bytes the archive holds, so memory
+  use is at most the size of the input, as upstream's is. An attribute name can be as long as the buffered
   part of its line (up to 100 million characters).
 - A failed `read_ahead` (not only a short archive) is reported with the
   "Truncated ..." message of the call site, as upstream does for its `NULL`.
@@ -1694,6 +1694,48 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   with data but no folder, a pack stream index outside the table), the
   reader fails with "Damaged 7-Zip archive".
 
+## Optional reader processing limits (`src/read/limits.rs`)
+
+`ArchiveRead::set_limits(ReadLimits)` and the read-options module `limits`
+are extensions to upstream. Configure them before opening the archive. All
+fields default to `None`, retaining existing C behavior and hard safety caps;
+`Some(0)` allows no charged work in that category. C callers can use options
+such as `limits:decoded-bytes=8388608`; `unlimited` or an unset value removes
+that optional limit. Configuration survives format/filter selection.
+
+- `decoded_bytes` charges newly produced source blocks, outer-filter output
+  and instrumented internal format-decoder output, including intermediate
+  layers, headers, skips and rereads. Optimized source skips and materialized
+  sparse holes count too; buffer copies do not. This is aggregate processing
+  work, not just bytes returned to the caller.
+- `entries` bounds returned entries and eagerly parsed entry-table records,
+  including hidden and duplicate records. `metadata_bytes` charges consumed
+  bidding/header syntax and instrumented decoded or retained metadata, with
+  checks before covered retained allocations. Parsing overhead can count,
+  so this is not an exact size of the resulting entry objects.
+- `filter_depth` bounds outer filters in addition to the source; the existing
+  hard maximum of 25 automatically detected filters remains.
+- `decoder_memory` caps each supported decoder's dictionary/window or PPMd
+  model, with existing hard caps retained. Coverage is XZ/LZMA/lzip/Zstd outer
+  filters; LZMA/XZ/Zstd/PPMd in ZIP; LZMA/LZMA2/Zstd/PPMd in 7-Zip; XZ/LZMA
+  in XAR; RAR windows/PPMd models; and RAR5 windows. It excludes other codecs
+  and decoder overhead and is not a sum across decoders.
+
+Changing `decoder_memory` after explicitly appending a filter, or setting a
+filter-depth cap below the already appended count, returns `Failed`/`EINVAL`.
+Configure the memory cap first: appended decoders are already initialized.
+Exceeded work/count/depth budgets return persistent `Fatal`/`EFBIG` errors
+beginning `Archive resource limit exceeded:` until close. Decoder-memory
+rejection retains the codec's existing error (`ENOMEM` where available),
+which can also describe malformed compressed input.
+
+A producer may finish one bounded output block before detecting exhaustion.
+Source-owned input buffers, decoder overhead, callbacks and external-program
+work remain outside these guarantees. Limits do not impose a CPU deadline,
+process RSS ceiling or bound every allocation; use process isolation and
+external time/memory limits when those guarantees are required. Default
+uncapped operation can still expand decompression bombs as upstream does.
+
 ## Matching (`src/matching.rs`, `pathmatch.rs`, `parse_date.rs`)
 
 - Inclusion patterns are anchored and optionally recursive; exclusions match
@@ -1782,6 +1824,37 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 
 ## Disk traversal and extraction (`src/read_disk.rs`, `src/write_disk.rs`)
 
+- Read-side directory enumeration uses `fdopendir`, with children looked up
+  through `openat`/`fstatat` relative to pinned parents. Descent and time
+  restoration retain the directory selected before a callback or rename;
+  delayed data opens verify device, inode and file type. Replaced leaves
+  can fail with `ESTALE` or a no-follow open error rather than reading the
+  replacement. Physical, hybrid and logical symlink policies are retained;
+  this is not a content snapshot or a root-directory sandbox.
+- Linux pins non-symlink metadata with `O_PATH` and `/proc/self/fd`; macOS
+  uses opened metadata descriptors where available. Symlink text is pinned
+  with Linux `O_PATH` or macOS `O_SYMLINK`/`freadlink`. Linux symlink xattrs
+  still require anchored name lookups bracketed by identity checks: replacing
+  a name and restoring it during the xattr call (ABA) can evade those checks.
+  Other POSIX targets use bracketed `readlinkat` for symlink text and retain
+  path-based metadata fallbacks, with less race coverage than Linux/macOS.
+  macOS anchored reads without a usable metadata descriptor return
+  `ARCHIVE_WARN`/`EACCES` ("Couldn't open metadata descriptor") when requested
+  metadata needs it, rather than falling back to the mutable display path.
+  Other POSIX hosts do the same for regular-file sparse discovery.
+- Pinned directories can increase descriptor use with descent depth and
+  pending directories, so traversal can fail under the process descriptor
+  limit. Device/inode/type checks do not freeze contents or attributes changed
+  on the same inode, nor distinguish inode reuse with the same identity.
+  Synchronized Rust tests cover parent replacement, leaf replacement, symlink
+  text and restoration after renames on macOS and Linux.
+- `scripts/test-linux-privileged` passed on isolated Docker overlayfs with
+  successful immutable/append-only flags and trusted xattrs, including
+  clearing/enforcement, mode-000 metadata and secure links. The fresh run
+  matched 28 root and 23 capability-cleared uid-65534 operation records
+  exactly against upstream. The runtime container has no host mounts or
+  network, and requests only its listed capabilities. This verifies that
+  filesystem/kernel combination; other Linux filesystems need separate runs.
 - Standard read-side uid/gid names use upstream's bounded 127-slot cache,
   including missing names; custom lookup callbacks remain uncached. Filesystem
   remote/synthetic flags are cached by the existing device ID, as upstream's
@@ -1928,8 +2001,10 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - Upstream opens a descriptor for the flags of a regular file or directory
   and reads its ACLs, extended attributes and sparse map through it; so does
   this port. For other entries upstream's archive_read_disk_entry_setup_path
-  also opens one (a FIFO, a device) just to read ACLs; here they are read by
-  path, with the same result, so a device is never opened.
+  also opens one (a FIFO, a device) just to read ACLs. Linux traversal here
+  pins these with `O_PATH` and reads metadata through `/proc/self/fd`, without
+  opening device contents; unanchored entry-from-file calls retain the
+  path-based fallbacks.
 - Where upstream writes metadata by path (a FIFO's or device's attributes
   and access ACL), the path here goes through the parent directory held
   open for the entry, `/proc/self/fd/N/name`, so it needs /proc. A
@@ -2222,6 +2297,11 @@ Other upstream edge cases retained:
 
 ## Rust API and front-ends (`src/api/`, `tools/`)
 
+- `ArchiveWrite::open_memory` retains owned output in a shared
+  `Rc<RefCell<Vec<u8>>>`, up to the caller's maximum size. The sink grows
+  geometrically within that bound; it does not cap format/filter working
+  memory. Exhaustion is `Fatal`/`ENOMEM`, a conflicting borrow is
+  `Fatal`/`EBUSY`, and callers must check close before using completed output.
 - bsdcat restores `SIGPIPE`'s default action first thing: Rust's runtime
   starts every program with it ignored, so `bsdcat big.gz | head` would
   otherwise report "Write error" instead of dying of the signal as C bsdcat
@@ -2257,9 +2337,21 @@ Other upstream edge cases retained:
   parser had read ahead, liblzma's encoder position lags the stream by the
   read-ahead bytes. Every position context was just reset, so the lag only
   relabels them and decoders are unaffected; the bytes match upstream.
-- Archives of directory trees can still differ from upstream: Rust
-  `read_disk` visits a directory's entries in a different order than C, so
-  the encoder sees different input (the many-files benchmark).
+- The vendored encoder reserves the same preset history, hash and chain/tree
+  capacities, but initializes only history and nodes reachable by supplied
+  input before matching. Hash tables stay fully initialized. High-water marks,
+  dictionary wraps, moves, pending sync-flush data and preset dictionaries
+  retain their original semantics. This avoids touching reused dirty pages
+  for a short second coder, such as a 7-Zip encoded header; it does not shrink
+  dictionary capacity or the logical memory estimate.
+- Five rotated macOS creation runs per dataset measured records/documents
+  peak RSS at 96.55 -> 56.03 MiB and many-files at 97.56 -> 57.03 MiB, about
+  42% lower. Text/source peak RSS stayed approximately unchanged; long inputs
+  eventually initialize the full ring. All 25 baseline/candidate archive
+  hashes match, and C extracts the same contents. Another 1,360 preset/form
+  and 145 fragmented/preset-dictionary streams match liblzma byte for byte.
+  These are measured corpus results, not a general memory cap. Evidence is
+  `../diagnostics/round14-codec-memory/REPORT.md` and its raw records.
 
 ## Zstd writer encoder (`src/write/filter/zstd.rs`, vendored ruzstd)
 
@@ -2293,11 +2385,21 @@ single-hash matcher. Levels and options keep libarchive's meaning.
 
 ## Fuzzing (`fuzz/`)
 
-- Decompression bombs are unbounded, as upstream. A 293-byte gzip found by
-  `filter_gzip` stores gzip headers whose content is again such a gzip, so
-  each of the (up to 25) nested filter layers multiplies the output; upstream
-  `bsdcat` writes gigabytes from it too. The harness stops reading entry data
-  after 1 MiB per input instead of the library imposing a limit.
+- There are 39 nightly targets: 29 format/filter/all reader targets, a deeper
+  reader, seven format writer properties, `writer_roundtrip`, and
+  `read_limits`. Reader targets abort on swallowed ABI panics and apply
+  processing limits before open. Ordinary readers stop at 1 MiB of entry
+  data; `all_deep` reads up to 16 MiB with larger budgets, including header
+  work. External timeout/RSS limits remain necessary.
+- Writer properties generate bounded valid archives in owned memory and
+  compare recovered names/content with buffered and block reads, then check
+  partial-read/skip traversal. They cover tar variants, ZIP, cpio, ar, 7-Zip,
+  XAR and ISO9660; they do not exhaust options or filesystem behavior.
+- A 293-byte nested gzip previously found by `filter_gzip` can expand to
+  gigabytes under default uncapped reads, as upstream's `bsdcat` does. The
+  opted-in fuzz budgets bound charged decoder work rather than every CPU
+  instruction or process allocation. Short campaigns validate the harness
+  and exercise seeds; they do not establish the absence of bugs.
 
 ## bsdunzip (`tools/unzip/`)
 

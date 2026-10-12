@@ -59,8 +59,47 @@ that cannot link through the public ABI; 73 such tests are excluded in total.
 | other | 96 | 96 | 139 |
 
 Remaining stubs (`src/ffi/stubs.rs`): 0
-`unsafe` in `src/` (excluding stubs.rs): 283; in the tools: 40, all in
+`unsafe` in `src/` (excluding stubs.rs): 301; in the tools: 40, all in
 `tools/libarchive_fe/src/sys.rs`
+
+## Round 15: processing limits, filesystem races and archive properties
+
+Five improvements landed in separate branches and passed fresh independent
+reviews. Readers now accept opt-in aggregate processing limits through
+`ReadLimits` or existing `limits:*` read options; defaults preserve upstream
+behavior. Metadata/table checks run before covered allocations, hidden decoder
+work counts, and dictionary/model limits use actual allocation sizes.
+These are processing checks, not whole-process heap or CPU quotas.
+
+Disk traversal pins parent directories, metadata and symlink text where the
+platform supports it, and verifies identity on delayed data opens. Synchronized
+replacement tests cover both platforms. Remaining ABA and platform limitations
+are documented in NOTES.md. An isolated, host-unmounted overlayfs container
+matches C for 28 privileged and 23 unprivileged operation results, requiring
+successful immutable/append flags and trusted xattrs as well as rejection paths.
+
+The LZMA encoder initializes reachable history/tree nodes while retaining
+the preset capacities and matching semantics. Scoped five-rotation checks
+reduce small 7-Zip creation RSS about 42%, with unchanged large-stream RSS;
+25 archive pairs and 1,505 backend streams remain byte-identical.
+
+Fuzzing now has 39 targets. Seven writer formats, a format-selector target,
+reader-limit properties and deeper reads supplement the original 29 targets.
+The bounded memory writer API grows geometrically within its output-length
+cap. Two deterministic archive-property tests pass. All targets build under
+nightly; short ASan campaigns ran 85,116 inputs across the ten new targets
+and 657,138 across the original 29, with zero failures. Short campaigns do
+not establish exhaustive coverage. Hosted CI has not run before publication.
+
+Integrated verification: macOS dev/release workspace tests 630/629 passes;
+Linux 627/626, with zero failures and five ignored tests per run. Formatting,
+strict all-target Clippy, nine Python harness checks and all 454 public exports
+pass. The full upstream/tool counts above remain unchanged, with zero
+ratchet regressions, crashes or timeouts. Eight corrected zisofs images
+pass independent C-reader checks in both profiles on both platforms.
+
+Work is local; nothing was pushed. Detailed validation evidence is retained
+in sibling `diagnostics/round15-validation/`.
 
 ## Round 14 continuation: Linux and ISO correctness
 
@@ -109,12 +148,12 @@ Generated compiler caches in vendored crates are no longer tracked, and
 all target directories are ignored. Their old blobs remain in existing
 history; merged history was preserved. Work is local, with no remotes or
 pushes. Older benchmark results below predate these correctness changes;
-the fresh comparison follows. The Linux container
-lacks successful privileged immutable/append flags and trusted.* coverage;
+the round-14 comparison follows. At that checkpoint the Linux container
+lacked successful privileged immutable/append flags and trusted.* coverage;
 failure/retry paths and unprivileged metadata were checked. Windows was not
 built or validated in this continuation.
 
-## Current 96-case benchmark (2026-10-12)
+## Round 14 96-case benchmark (2026-10-12, historical)
 
 The integrated release tools, including the disk and ISO fixes, were measured
 against the original frozen C executable on the same eight frozen datasets.

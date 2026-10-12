@@ -27,7 +27,7 @@ from the unprivileged `tester` runs in
 `diagnostics/round14-linux-disk/suite/after-{port,oracle}.tsv` in the local
 parent project. The port's 70 additional skips are upstream internal tests
 that cannot link through the public C ABI. Those results used the Linux
-disk fixes; the baseline must be merged with those fixes.
+disk fixes, which are now integrated.
 
 The required Ubuntu CI jobs run Rust checks and both full upstream suites.
 Both jobs use `scripts/setup-linux-tests` to install the development packages from
@@ -49,3 +49,38 @@ skip regressions and baseline updates without building the C test programs:
 ```
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
+
+The optional privileged Linux checks require Docker and successful native
+operations, rather than treating missing capabilities as passes:
+
+```
+scripts/test-linux-privileged build/linux-privileged
+```
+
+The script snapshots source into an isolated container with no host mounts,
+no runtime network and only its listed capabilities. It compares the two
+public ABIs as root and uid 65534 with cleared capabilities: immutable and
+append-only enforcement/clearing, trusted and user xattrs, mode-000 metadata,
+and secure link behavior. It requires real immutable, append and trusted.*
+operations and writes `report.json` plus logs before removing the container.
+The final October 12 run passed on Docker overlayfs with exact oracle/port
+records for both users. This establishes overlayfs coverage; other Linux
+filesystems and kernels still need their own runs. GitHub CI has not run it.
+
+Synchronized Rust disk tests replace parents or leaves across callbacks and
+verify inode identity, symlink text, data reads and directory time restoration.
+Read-limit tests cover header work, hidden decoder output, eager records,
+metadata allocations, sparse holes, sticky failure and configuration ordering.
+These remain separate from uncapped upstream compatibility tests:
+
+```
+cargo test --release -p libarchive-rust read_disk::tests
+cargo test --release -p libarchive-rust limits
+cargo test --manifest-path fuzz/Cargo.toml --lib
+```
+
+`ReadLimits` measures charged processing and selected per-decoder storage,
+not a process memory or CPU ceiling. Its precise accounting, defaults and
+ordering restrictions are documented in `src/read/limits.rs` and `NOTES.md`.
+The owned writer-memory tests also check exhaustion, borrow conflicts, close
+errors and bounded geometric growth; their sink does not cap codec workspaces.

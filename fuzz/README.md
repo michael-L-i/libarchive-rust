@@ -1,17 +1,27 @@
 # Archive property fuzzing
 
+The crate contains 39 targets: 29 original format/filter/all readers,
+`all_deep`, seven format writers, `writer_roundtrip`, and `read_limits`.
+
 The reader/filter targets exercise the C ABI, abort on swallowed Rust panics,
 and use per-handle processing limits before opening input. Their usual data
-loop stops after 1 MiB; `all_deep` reads up to 16 MiB with larger processing
-budgets. These limits also cover header work. They do not bound every CPU
-instruction, callback, external process or total resident memory; libFuzzer's
-timeout and RSS limits remain necessary.
+loop stops after 1 MiB, with 8 MiB decoded-work and 2 MiB metadata budgets,
+16,384 entries, depth 25 and a 256 MiB per-decoder cap. `all_deep` reads up
+to 16 MiB, with 64 MiB decoded-work, 8 MiB metadata and 65,536-entry budgets;
+its depth and decoder caps are unchanged. These limits also cover header
+work. They do not bound every CPU instruction, callback, external process
+or total resident memory; libFuzzer's
+timeout and RSS limits remain necessary. A bounded producer block may finish
+before a processing limit is detected. Normal library reads are uncapped by
+these optional budgets unless the caller configures them; decoder memory
+must be configured before explicitly appending filters.
 
-The seven `writer_*` format targets generate one to five regular files with
+The seven format-specific writer targets generate one to five regular files
+with
 ordinary names and at most 8 KiB each. They write into a safe, bounded memory
-sink, verify exact recovered file contents using buffered or block reads,
-then check partial-read/skip traversal. `writer_roundtrip` selects a format
-from its first input byte. It covers ustar/pax/gnutar, ZIP, newc cpio, BSD ar,
+sink with geometric growth, verify exact recovered file contents using
+buffered or block reads, then check partial-read/skip traversal.
+`writer_roundtrip` selects a format from its first input byte. It covers ustar/pax/gnutar, ZIP, newc cpio, BSD ar,
 LZMA2 7-Zip, XAR and ISO9660 with Rock Ridge/Joliet names. These are bounded
 valid-archive properties, not exhaustive writer option or filesystem tests.
 
@@ -35,3 +45,8 @@ seeds cover empty and binary members, each tar variant, small chunks and
 maximum generated file sizes. The deeper reader seeds include a valid 3 MiB
 tar member and its gzip wrapper. A short campaign checks that targets run;
 it does not establish the absence of bugs.
+
+The ten new targets completed short ASan campaigns of ten seconds each with
+no reported failures, using the commands' 1,024 MiB RSS limit and default ASan
+quarantine. Observed peaks ranged from 154 to 491 MiB. These are campaign
+measurements, not library memory bounds or exhaustive security results.
