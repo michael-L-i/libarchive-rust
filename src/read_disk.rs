@@ -899,7 +899,14 @@ fn setup_sparse(
     let mut ret = ARCHIVE_OK;
     let mut check_fully_sparse = false;
     let mut off_s = 0;
+    let mut scanned = 0;
     while off_s < size {
+        if scanned == MAX_EXTENTS {
+            ret = failed(libc::ENOMEM, b"Can't read sparse data");
+            break;
+        }
+        scanned += 1;
+        let requested = off_s;
         off_s = match disk_sys::seek(fd, off_s, SEEK_DATA) {
             Ok(off) => off,
             Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
@@ -912,6 +919,10 @@ fn setup_sparse(
                 break;
             }
         };
+        if off_s < requested {
+            ret = failed(libc::EIO, b"Can't read sparse data");
+            break;
+        }
         let off_e = match disk_sys::seek(fd, off_s, SEEK_HOLE) {
             Ok(off) => off,
             Err(e) => {
@@ -928,6 +939,10 @@ fn setup_sparse(
         };
         if off_s == 0 && off_e == size {
             break; // This is not sparse.
+        }
+        if off_e <= off_s {
+            ret = failed(libc::EIO, b"Can't read sparse data");
+            break;
         }
         if entry.sparse.len() >= MAX_EXTENTS {
             ret = failed(libc::ENOMEM, b"Can't read sparse data");
@@ -954,6 +969,7 @@ fn setup_sparse(
 fn setup_sparse_fiemap(a: &Base, entry: &mut Entry, fd: c_int) -> c_int {
     let size = entry.size();
     let mut map = disk_sys::Fiemap::new();
+    let mut mapped = 0;
     for iter in 0.. {
         if map.map(fd).is_err() {
             break;
@@ -966,16 +982,28 @@ fn setup_sparse_fiemap(a: &Base, entry: &mut Entry, fd: c_int) -> c_int {
             }
             break;
         };
+        // Unwritten extents consume the scan budget too.
+        if extents.len() > MAX_EXTENTS - mapped {
+            return a.raise(Error::new(
+                ARCHIVE_FAILED,
+                libc::ENOMEM,
+                "Can't read sparse data",
+            ));
+        }
+        mapped += extents.len();
         let mut more = true;
         for fe in extents {
+            let Some(end) = fe.fe_logical.checked_add(fe.fe_length) else {
+                return a.raise(Error::new(
+                    ARCHIVE_FAILED,
+                    libc::EIO,
+                    "Can't read sparse data",
+                ));
+            };
             if fe.fe_flags & disk_sys::FIEMAP_EXTENT_UNWRITTEN == 0 {
                 // The fe_length of the last block does not adjust itself
                 // to its size files.
-                let mut length = fe.fe_length as i64;
-                let end = fe.fe_logical.wrapping_add(length as u64);
-                if end > size as u64 {
-                    length = (length as u64).wrapping_sub(end.wrapping_sub(size as u64)) as i64;
-                }
+                let length = end.min(size as u64).saturating_sub(fe.fe_logical) as i64;
                 if fe.fe_logical == 0 && length == size {
                     // This is not sparse.
                     more = false;
@@ -993,7 +1021,13 @@ fn setup_sparse_fiemap(a: &Base, entry: &mut Entry, fd: c_int) -> c_int {
                 more = false;
             }
         }
-        let start = last.fe_logical.wrapping_add(last.fe_length);
+        let Some(start) = last.fe_logical.checked_add(last.fe_length) else {
+            return a.raise(Error::new(
+                ARCHIVE_FAILED,
+                libc::EIO,
+                "Can't read sparse data",
+            ));
+        };
         // A map that doesn't move on would be asked for forever.
         if !more || start <= map.fm_start {
             break;

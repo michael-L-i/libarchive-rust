@@ -361,10 +361,10 @@ pub struct FiemapExtent {
 #[repr(C)]
 pub struct Fiemap {
     pub fm_start: u64,
-    pub fm_length: u64,
-    pub fm_flags: u32,
-    pub fm_mapped_extents: u32,
-    pub fm_extent_count: u32,
+    fm_length: u64,
+    fm_flags: u32,
+    fm_mapped_extents: u32,
+    fm_extent_count: u32,
     fm_reserved: u32,
     fm_extents: [FiemapExtent; FIEMAP_EXTENTS],
 }
@@ -385,6 +385,8 @@ impl Fiemap {
     /// FS_IOC_FIEMAP on `fd` (struct fiemap is 32 bytes before its extents).
     pub fn map(&mut self, fd: libc::c_int) -> std::io::Result<()> {
         const FS_IOC_FIEMAP: libc::Ioctl = libc::_IOWR::<[u64; 4]>(b'f' as u32, 11);
+        self.fm_extent_count = FIEMAP_EXTENTS as u32;
+        self.fm_mapped_extents = 0;
         // SAFETY: `self` is a struct fiemap whose fm_extent_count is the
         // length of its extent array, which bounds what the kernel writes.
         result(unsafe { libc::ioctl(fd, FS_IOC_FIEMAP, self as *mut Self) })
