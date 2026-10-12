@@ -321,7 +321,7 @@ fn set_acl(
             .fold(0, |perm, (_, l)| perm | l);
         add(&mut aces, tag, perm, id);
     }
-    match target.acl(name, &encode(&aces)) {
+    match target.xattr(name, &encode(&aces)) {
         Ok(()) => ARCHIVE_OK,
         // Filesystem doesn't support ACLs.
         Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => ARCHIVE_OK,

@@ -1934,7 +1934,10 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   and access ACL), the path here goes through the parent directory held
   open for the entry, `/proc/self/fd/N/name`, so it needs /proc. A
   directory's default ACL is set through the descriptor held for it, where
-  libacl's acl_set_file goes by name; the result is the same.
+  libacl's acl_set_file goes by name; the result is the same. Kept,
+  stricter than upstream: acl_set_file follows a symlink in the entry's
+  place, which only one swapped in after the entry was made could be; an
+  ACL here goes on the entry's name itself, as its attributes do.
 - Ported as-is: a directory's ACLs wait for close, where upstream hands
   archive_write_disk_set_acls the fixup's mode, which is set only if the
   directory's mode, times or file flags waited too. Otherwise it is 0, and

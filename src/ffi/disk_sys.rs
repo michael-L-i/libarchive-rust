@@ -1090,17 +1090,11 @@ impl Target {
 impl Target {
     /// Sets an extended attribute through the entry's descriptor, or else
     /// by its name without following a symlink there, as upstream's
-    /// fsetxattr and lsetxattr.
+    /// fsetxattr and lsetxattr. An ACL's attribute too, which libacl's
+    /// acl_set_file sets following one: only a symlink swapped in after
+    /// the entry was made could be followed, and the kernel keeps no ACLs
+    /// on symlinks.
     pub fn xattr(&self, name: &CStr, value: &[u8]) -> std::io::Result<()> {
-        self.set_xattr(name, value, false)
-    }
-    /// Sets an ACL's attribute through the entry's descriptor, or else by
-    /// its name following a symlink there, as libacl's acl_set_fd and
-    /// acl_set_file.
-    pub fn acl(&self, name: &CStr, value: &[u8]) -> std::io::Result<()> {
-        self.set_xattr(name, value, true)
-    }
-    fn set_xattr(&self, name: &CStr, value: &[u8], follow: bool) -> std::io::Result<()> {
         if let Some(file) = &self.live {
             // SAFETY: live descriptor, terminated name, and a value
             // readable for its length; the kernel copies it.
@@ -1120,15 +1114,10 @@ impl Target {
         path.extend_from_slice(self.name.as_bytes());
         let path =
             CString::new(path).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-        let set = if follow {
-            libc::setxattr
-        } else {
-            libc::lsetxattr
-        };
         // SAFETY: terminated path and name, and a value readable for its
         // length; the kernel copies it.
         result(unsafe {
-            set(
+            libc::lsetxattr(
                 path.as_ptr(),
                 name.as_ptr(),
                 value.as_ptr().cast(),
