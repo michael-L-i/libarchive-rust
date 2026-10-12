@@ -212,11 +212,6 @@ impl Iso9660 {
         out: &mut dyn Sink,
         buff: &[u8],
     ) -> Result<(), Error> {
-        // Where deflate() writes. Upstream sets these only here and after
-        // each deflate() call, so they are stale after an all-zero block
-        // moves the write position.
-        let mut next_out = self.wb_buffptr();
-        let mut avail_out = self.wbuff_remaining;
         let mut b = 0;
         let mut s = buff.len();
         loop {
@@ -261,6 +256,9 @@ impl Iso9660 {
             // Compress file data.
             let mut stream_end = false;
             while avail_in > 0 || (flush == Flush::Finish && !hole && !stream_end) {
+                // An all-zero block may have moved the write position.
+                let next_out = self.wb_buffptr();
+                let avail_out = self.wbuff_remaining;
                 let (z, wbuff) = (&mut self.zisofs, &mut self.wbuff);
                 let stream = z
                     .stream
@@ -283,8 +281,6 @@ impl Iso9660 {
                         self.wb_consume(out, csize)?;
                         self.zisofs.total_size += csize as i64;
                         self.cur_content()?.size += csize as i64;
-                        next_out = self.wb_buffptr();
-                        avail_out = self.wbuff_remaining;
                     }
                     Err(e) => {
                         return Err(misc(format!(
