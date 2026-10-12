@@ -489,6 +489,10 @@ impl Target {
     pub fn retain_file(&mut self, file: File) {
         self.live = Some(file);
     }
+    /// Whether metadata goes through a descriptor kept open for it.
+    pub fn is_open(&self) -> bool {
+        self.live.is_some()
+    }
     pub fn directory_file(&self) -> std::io::Result<File> {
         // SAFETY: live parent/name; directory-only open never follows a final symlink.
         let fd = unsafe {
@@ -671,36 +675,12 @@ impl Target {
             )
         })
     }
-    pub fn times(&self, entry: &Entry) -> std::io::Result<()> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let times = [
-            libc::timespec {
-                tv_sec: if entry.atime_is_set() != 0 {
-                    entry.atime()
-                } else {
-                    now.as_secs() as _
-                },
-                tv_nsec: if entry.atime_is_set() != 0 {
-                    entry.atime_nsec() as _
-                } else {
-                    now.subsec_nanos() as _
-                },
-            },
-            libc::timespec {
-                tv_sec: if entry.mtime_is_set() != 0 {
-                    entry.mtime()
-                } else {
-                    now.as_secs() as _
-                },
-                tv_nsec: if entry.mtime_is_set() != 0 {
-                    entry.mtime_nsec() as _
-                } else {
-                    now.subsec_nanos() as _
-                },
-            },
-        ];
+    /// Sets the access and modification times, each (seconds, nanoseconds).
+    pub fn times(&self, atime: (i64, i64), mtime: (i64, i64)) -> std::io::Result<()> {
+        let times = [atime, mtime].map(|(tv_sec, tv_nsec)| libc::timespec {
+            tv_sec: tv_sec as _,
+            tv_nsec: tv_nsec as _,
+        });
         // SAFETY: two writable-by-value timespecs, live descriptor and name.
         result(unsafe {
             libc::utimensat(
@@ -722,6 +702,11 @@ impl Target {
             )
         })
     }
+}
+
+pub fn euid() -> u32 {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 pub fn umask() -> u32 {
@@ -873,9 +858,13 @@ impl Target {
             return Ok(());
         }
         let file = self.metadata_file()?;
-        let st = self.stat()?;
+        let mut flags = (self.stat()?.st_flags & !clear) | set;
+        // Only the super-user may change SF_* flags.
+        if euid() != 0 {
+            flags &= !(libc::SF_APPEND | libc::SF_ARCHIVED | libc::SF_IMMUTABLE | 0x0010_0000);
+        }
         // SAFETY: live file descriptor; fchflags does not access borrowed memory.
-        result(unsafe { libc::fchflags(file.as_raw_fd(), (st.st_flags | set) & !clear) })
+        result(unsafe { libc::fchflags(file.as_raw_fd(), flags) })
     }
     #[cfg(not(target_vendor = "apple"))]
     pub fn flags(&self, _set: u32, _clear: u32) -> std::io::Result<()> {
@@ -948,14 +937,22 @@ impl Target {
 }
 
 impl Target {
-    pub fn write_xattrs(&self, entry: &Entry) -> std::io::Result<()> {
+    /// Sets every extended attribute it can and returns the ones it couldn't.
+    pub fn write_xattrs<'a>(&self, entry: &'a Entry) -> Vec<(&'a CStr, std::io::Error)> {
         #[cfg(target_vendor = "apple")]
-        for attr in &entry.xattrs {
-            self.xattr(&attr.name, &attr.value)?;
-        }
+        return entry
+            .xattrs
+            .iter()
+            .filter_map(|attr| {
+                let e = self.xattr(&attr.name, &attr.value).err()?;
+                Some((attr.name.as_c_str(), e))
+            })
+            .collect();
         #[cfg(not(target_vendor = "apple"))]
-        let _ = entry;
-        Ok(())
+        {
+            let _ = entry;
+            Vec::new()
+        }
     }
 }
 impl Target {

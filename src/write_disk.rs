@@ -30,11 +30,9 @@
 #[cfg(target_vendor = "apple")]
 mod hfs;
 
-use crate::archive::{
-    ARCHIVE_ERRNO_MISC, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN, Base, state,
-};
+use crate::archive::{ARCHIVE_ERRNO_MISC, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, Base, state};
 use crate::entry::Entry;
-use crate::ffi::disk_sys::{DirError, Target, check_symlinks, create_dir, umask};
+use crate::ffi::disk_sys::{DirError, Target, check_symlinks, create_dir, euid, umask};
 use crate::util::Error;
 use std::ffi::c_int;
 use std::fs::File;
@@ -58,6 +56,13 @@ pub const MAC_METADATA: c_int = 0x2000;
 pub const SECURE_NOABSOLUTEPATHS: c_int = 0x10000;
 pub const SAFE_WRITES: c_int = 0x40000;
 
+/// File flags that would get in the way of the rest of the extraction.
+#[cfg(target_vendor = "apple")]
+const CRITICAL_FLAGS: std::ffi::c_ulong =
+    (libc::SF_IMMUTABLE | libc::UF_IMMUTABLE | libc::SF_APPEND | libc::UF_APPEND) as _;
+#[cfg(not(target_vendor = "apple"))]
+const CRITICAL_FLAGS: std::ffi::c_ulong = 0;
+
 #[derive(Default)]
 pub struct WriteDisk {
     pub options: c_int,
@@ -67,7 +72,10 @@ pub struct WriteDisk {
     pub group: crate::ffi::disk::IdLookup,
     file: Option<File>,
     current: Option<(PathBuf, Entry, Target, c_int)>,
-    directories: Vec<(Entry, Target, c_int, bool)>,
+    /// What close restores: name, entry, target, ARCHIVE_EXTRACT_* bits and
+    /// whether to set the mode.
+    fixups: Vec<(Vec<u8>, Entry, Target, c_int, bool)>,
+    start_time: i64,
     offset: u64,
     max_offset: u64,
     file_offset: Option<u64>,
@@ -124,6 +132,11 @@ impl WriteDisk {
         }
         a.clear_error();
         a.state.set(state::HEADER);
+        if self.start_time == 0 {
+            self.start_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+        }
         self.skipped = false;
         self.permissions_created = false;
         self.new_directory = false;
@@ -318,16 +331,6 @@ impl WriteDisk {
         }
     }
 
-    /// The permissions an entry ends up with: without PERM, no set-id or
-    /// sticky bits and the umask applied.
-    fn final_mode(&self, entry: &Entry) -> u32 {
-        if self.options & PERM != 0 {
-            entry.mode() as u32 & 0o7777
-        } else {
-            entry.mode() as u32 & 0o777 & !umask()
-        }
-    }
-
     /// The mode upstream creates a file with: the final permissions with
     /// the umask applied, and no set-id bits.
     fn creation_mode(&self, entry: &Entry) -> u32 {
@@ -388,7 +391,7 @@ impl WriteDisk {
                     self.limit = Some(0);
                     // Upstream's limits keep a new directory usable and
                     // private to its group until close sets its mode.
-                    let final_mode = self.final_mode(entry);
+                    let final_mode = final_mode(entry, options);
                     let mode = ((final_mode & 0o777 & !umask()) | 0o700) & 0o775;
                     let created = target.mkdir(mode);
                     self.new_directory = created.is_ok();
@@ -502,6 +505,7 @@ impl WriteDisk {
         let Some((path, entry, mut target, options)) = self.current.take() else {
             return ARCHIVE_OK;
         };
+        a.clear_error();
         a.state.set(state::HEADER);
         let permissions_created = std::mem::take(&mut self.permissions_created);
         if !self.skipped {
@@ -542,13 +546,17 @@ impl WriteDisk {
             if let Some(destination) = self.atomic.take() {
                 if let Err(e) = target.rename_to(&destination) {
                     let _ = target.remove(false);
-                    return failure(a, e, "Can't rename temporary file", &path);
+                    let errno = e.raw_os_error().unwrap_or(libc::EIO);
+                    let msg = "Failed to rename temporary file";
+                    return a.raise(Error::new(ARCHIVE_FAILED, errno, msg));
                 }
                 target = destination;
             }
             if let Some(file) = file {
                 target.retain_file(file);
             }
+            let mut ret = ARCHIVE_OK;
+            // An AppleDouble file "._name" is merged into "name" and removed.
             #[cfg(target_vendor = "apple")]
             if let Some(name) = path
                 .file_name()
@@ -561,189 +569,253 @@ impl WriteDisk {
                 })
             {
                 use std::io::Read;
-                if let Ok(mut file) = target.read_file() {
-                    let mut magic = [0; 8];
-                    if file.read_exact(&mut magic).is_ok() && magic == [0, 5, 22, 7, 0, 2, 0, 0] {
-                        let size = file.metadata().map_or(0, |m| m.len());
-                        if size > 16 * 1024 * 1024 {
-                            return a
-                                .warn(libc::ENOMEM, "AppleDouble metadata is too large")
-                                .code();
+                let merged = target
+                    .read_file()
+                    .map_err(|e| (e, "Failed to open a restoring file"))
+                    .and_then(|mut file| {
+                        let mut magic = [0; 8];
+                        match file.read_exact(&mut magic) {
+                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                return Ok(false);
+                            }
+                            Err(e) => return Err((e, "Failed to read a restoring file")),
+                            Ok(()) if magic != [0, 5, 22, 7, 0, 2, 0, 0] => return Ok(false),
+                            Ok(()) => {}
+                        }
+                        if file.metadata().map_or(0, |m| m.len()) > 16 * 1024 * 1024 {
+                            let e = std::io::Error::from_raw_os_error(libc::ENOMEM);
+                            return Err((e, "AppleDouble metadata is too large"));
                         }
                         let mut bytes = Vec::from(magic);
-                        if let Err(e) = file.read_to_end(&mut bytes) {
-                            return failure(a, e, "Can't read metadata", &path);
-                        }
-                        if let Err(e) = dest.unpack_mac_metadata(&bytes) {
-                            return a
-                                .warn(
-                                    e.raw_os_error().unwrap_or(libc::EIO),
-                                    "Failed to restore metadata",
-                                )
-                                .code();
-                        }
-                        if let Err(e) = target.remove(false) {
-                            return failure(a, e, "Can't remove AppleDouble", &path);
-                        }
+                        file.read_to_end(&mut bytes)
+                            .and_then(|_| dest.unpack_mac_metadata(&bytes))
+                            .map_err(|e| (e, "Failed to restore metadata"))?;
+                        let _ = target.remove(false);
+                        Ok(true)
+                    });
+                match merged {
+                    Ok(true) => {
                         a.state.set(state::HEADER);
                         return ARCHIVE_OK;
                     }
+                    Ok(false) => {}
+                    Err((e, msg)) => {
+                        ret = a.warn(e.raw_os_error().unwrap_or(libc::EIO), msg).code();
+                    }
                 }
             }
-            if entry.filetype() == libc::S_IFDIR {
-                // A directory's mode, ACLs and Mac metadata wait for close, and
-                // so do its times if this entry created it. Its mode changes if
-                // mkdir couldn't set it, and for PERM. The rest is restored now.
-                let mode = if self.new_directory {
-                    std::mem::take(&mut self.directory_mode)
-                } else {
-                    options & PERM != 0 && target.stat().is_ok_and(|st| st.st_mode != entry.mode())
-                };
-                let mut deferred = ACL | MAC_METADATA;
-                if self.new_directory {
-                    deferred |= TIME;
-                }
-                let ret = self.restore(a, &entry, &mut target, options & !deferred, false);
-                if ret < 0 {
-                    return ret;
-                }
-                let deferred = options & (deferred | PERM);
-                self.directories.push((entry, target, deferred, mode));
+            // A hardlink without data says nothing about the file's metadata.
+            let link_only =
+                entry.hardlink_is_set() != 0 && (entry.size_is_set() == 0 || entry.size() <= 0);
+            let todo = if link_only { 0 } else { options };
+            // Flags that forbid changes wait for close, after any hardlinks.
+            let mut deferred = if entry.fflags().0 & CRITICAL_FLAGS != 0 {
+                FFLAGS
             } else {
-                let ret = self.restore(a, &entry, &mut target, options, !permissions_created);
-                if ret < 0 {
-                    return ret;
-                }
+                0
+            };
+            let directory = entry.filetype() == libc::S_IFDIR;
+            let mode = if !directory {
+                !permissions_created
+            } else if self.new_directory {
+                // Its times wait too, and its mode if mkdir couldn't set it.
+                deferred |= TIME | ACL | MAC_METADATA;
+                std::mem::take(&mut self.directory_mode)
+            } else {
+                // One already there keeps its mode, unless PERM changes it.
+                deferred |= ACL | MAC_METADATA;
+                options & PERM != 0 && target.stat().is_ok_and(|st| st.st_mode != entry.mode())
+            };
+            let name = path.as_os_str().as_bytes();
+            let mode = mode && !link_only;
+            let now = todo & !deferred;
+            ret = ret.min(self.restore(a, name, &entry, &mut target, now, mode && !directory));
+            if todo & deferred != 0 || (directory && mode) {
+                let todo = todo & (deferred | PERM);
+                self.fixups
+                    .push((name.to_vec(), entry, target, todo, directory && mode));
             }
+            a.state.set(state::HEADER);
+            return ret;
         }
         a.state.set(state::HEADER);
         ARCHIVE_OK
     }
 
+    /// Upstream's metadata restoration in finish_entry, in its order.
     fn restore(
         &mut self,
         a: &Base,
+        name: &[u8],
         entry: &Entry,
         target: &mut Target,
-        options: c_int,
+        todo: c_int,
         mode: bool,
     ) -> c_int {
-        if entry.hardlink_is_set() != 0 && (entry.size_is_set() == 0 || entry.size() == 0) {
-            return ARCHIVE_OK;
-        }
         if entry.filetype() == libc::S_IFDIR
             && let Ok(file) = target.directory_file()
         {
             target.retain_file(file);
         }
+        let errno = |e: std::io::Error| e.raw_os_error().unwrap_or(libc::EIO);
         let mut ret = ARCHIVE_OK;
+        let warn =
+            |ret: &mut c_int, errno, msg: Vec<u8>| *ret = (*ret).min(a.warn(errno, msg).code());
         // Upstream compresses as the data is written, before any metadata.
         #[cfg(target_vendor = "apple")]
         if entry.filetype() == libc::S_IFREG
-            && options & 0x4000 == 0
-            && (options & 0x8000 != 0
+            && todo & 0x4000 == 0
+            && (todo & 0x8000 != 0
                 || entry.fflags().0 & libc::UF_COMPRESSED as std::ffi::c_ulong != 0)
             && let Err(e) = hfs::compress(target, entry.size().max(0) as u64)
         {
-            ret = a
-                .warn(
-                    e.raw_os_error().unwrap_or(libc::EIO),
-                    "Failed to compress file",
-                )
-                .code();
+            warn(&mut ret, errno(e), b"Failed to compress file".to_vec());
         }
-        if options & OWNER != 0 {
+        let euid = euid();
+        let mut final_mode = final_mode(entry, todo);
+        let (uid, gid) = if todo & OWNER != 0 || (mode && final_mode & 0o6000 != 0) {
             let mut names = entry.clone_entry();
             let uid = self.user.lookup(names.uname(), entry.uid(), false);
-            let gid = self.group.lookup(names.gname(), entry.gid(), true);
-            if let Err(e) = target.owner(uid, gid) {
-                let _ = a
-                    .warn(
-                        e.raw_os_error().unwrap_or(libc::EPERM),
-                        "Can't restore owner",
-                    )
-                    .code();
-                ret = ARCHIVE_WARN;
+            (uid, self.group.lookup(names.gname(), entry.gid(), true))
+        } else {
+            (euid.into(), 0)
+        };
+        let mut owned = false;
+        if todo & OWNER != 0 {
+            // Elsewhere than on Linux, only root may give a file away.
+            if cfg!(not(target_os = "linux")) && euid != 0 && i64::from(euid) != uid {
+                warn(
+                    &mut ret,
+                    libc::EPERM,
+                    format!("Can't set UID={uid}").into_bytes(),
+                );
+            } else if let Err(e) = target.owner(uid, gid) {
+                let msg = format!("Can't set user={uid}/group={gid} for ");
+                warn(&mut ret, errno(e), [msg.as_bytes(), name].concat());
+            } else {
+                owned = true;
             }
         }
-        if mode {
-            let mut mode = if options & PERM != 0 {
-                entry.mode() as u32 & 0o7777
-            } else {
-                entry.mode() as u32 & 0o777 & !umask()
-            };
-            if mode & 0o6000 != 0
-                && let Ok(st) = target.stat()
-            {
-                if st.st_uid as i64 != entry.uid() {
-                    mode &= !0o4000;
+        // Not being root, set attributes before the mode can forbid it.
+        if euid != 0 && todo & XATTR != 0 {
+            ret = ret.min(set_xattrs(a, entry, target));
+        }
+        if mode && entry.filetype() != libc::S_IFDIR {
+            let mut chmod = true;
+            // The set-id bits stay only on a file with the archive's owner.
+            if !owned && final_mode & 0o2000 != 0 {
+                match target.stat() {
+                    Err(e) => {
+                        warn(&mut ret, errno(e), b"Couldn't stat file".to_vec());
+                        chmod = false;
+                    }
+                    Ok(st) => {
+                        if i64::from(st.st_gid) != gid {
+                            final_mode &= !0o2000;
+                            if todo & OWNER != 0 {
+                                warn(
+                                    &mut ret,
+                                    ARCHIVE_ERRNO_MISC,
+                                    b"Can't restore SGID bit".to_vec(),
+                                );
+                            }
+                        }
+                        if i64::from(st.st_uid) != uid && final_mode & 0o4000 != 0 {
+                            final_mode &= !0o4000;
+                            if todo & OWNER != 0 {
+                                warn(
+                                    &mut ret,
+                                    ARCHIVE_ERRNO_MISC,
+                                    b"Can't restore SUID bit".to_vec(),
+                                );
+                            }
+                        }
+                    }
                 }
-                if st.st_gid as i64 != entry.gid() {
-                    mode &= !0o2000;
+            } else if !owned && final_mode & 0o4000 != 0 && i64::from(euid) != uid {
+                final_mode &= !0o4000;
+                if todo & OWNER != 0 {
+                    warn(
+                        &mut ret,
+                        ARCHIVE_ERRNO_MISC,
+                        b"Can't make file SUID".to_vec(),
+                    );
                 }
             }
             // A symlink's mode is set with lchmod, whose lack is no error.
-            if let Err(e) = target.chmod(mode)
+            if chmod
+                && let Err(e) = target.chmod(final_mode)
                 && !(entry.filetype() == libc::S_IFLNK
                     && e.raw_os_error().is_some_and(|errno| {
                         [libc::ENOTSUP, libc::ENOSYS, libc::EOPNOTSUPP].contains(&errno)
                     }))
             {
-                let _ = a.warn(
-                    e.raw_os_error().unwrap_or(libc::EPERM),
-                    format!("Can't set permissions to 0{mode:o}"),
+                warn(
+                    &mut ret,
+                    errno(e),
+                    format!("Can't set permissions to 0{final_mode:o}").into_bytes(),
                 );
-                ret = ARCHIVE_WARN;
             }
         }
-        if options & TIME != 0
-            && let Err(e) = target.times(entry)
-        {
-            a.warn(e.raw_os_error().unwrap_or(libc::EIO), "Can't restore times")
-                .code();
-            ret = ARCHIVE_WARN;
+        // Security attributes go last: other changes remove them.
+        if euid == 0 && todo & XATTR != 0 {
+            ret = ret.min(set_xattrs(a, entry, target));
         }
-        if options & XATTR != 0
-            && let Err(e) = target.write_xattrs(entry)
-        {
-            a.warn(
-                e.raw_os_error().unwrap_or(libc::EIO),
-                "Can't restore extended attributes",
-            )
-            .code();
-            ret = ARCHIVE_WARN;
-        }
-        #[cfg(target_vendor = "apple")]
-        if options & ACL != 0
-            && let Err(e) = target.metadata_file().and_then(|file| {
-                crate::ffi::disk_acl::write(&file, entry, &mut self.user, &mut self.group)
-            })
-        {
-            ret = a
-                .warn(e.raw_os_error().unwrap_or(libc::EIO), "Can't restore ACL")
-                .code();
-        }
-        if options & MAC_METADATA != 0
-            && let Some(metadata) = entry.mac_metadata()
-            && let Err(e) = target.unpack_mac_metadata(metadata)
-        {
-            let _ = a.warn(
-                e.raw_os_error().unwrap_or(libc::EIO),
-                "Failed to restore metadata",
-            );
-            ret = ARCHIVE_WARN;
-        }
-        if options & FFLAGS != 0 {
+        if todo & FFLAGS != 0 {
             let (set, clear) = entry.fflags();
             if let Err(e) = target.flags(set as u32, clear as u32) {
-                let _ = a.warn(
-                    e.raw_os_error().unwrap_or(libc::EIO),
-                    "Can't restore file flags",
-                );
-                ret = ARCHIVE_WARN;
+                warn(&mut ret, errno(e), b"Failed to set file flags".to_vec());
             }
         }
+        if todo & TIME != 0 {
+            let start = (self.start_time, 0);
+            let time = |set, sec, nsec| if set != 0 { (sec, nsec) } else { start };
+            let atime = time(entry.atime_is_set(), entry.atime(), entry.atime_nsec());
+            let mtime = time(entry.mtime_is_set(), entry.mtime(), entry.mtime_nsec());
+            let birthtime = time(
+                entry.birthtime_is_set(),
+                entry.birthtime(),
+                entry.birthtime_nsec(),
+            );
+            let birthtime_set = cfg!(target_vendor = "apple") && entry.birthtime_is_set() != 0;
+            if (entry.atime_is_set() != 0 || birthtime_set || entry.mtime_is_set() != 0)
+                && let Err(e) = set_times(target, atime, birthtime, mtime)
+            {
+                warn(&mut ret, errno(e), b"Can't restore time".to_vec());
+            }
+        }
+        // Mac metadata includes ACLs, which go after the times they can forbid.
+        if todo & MAC_METADATA != 0
+            && let Some(metadata) = entry.mac_metadata().filter(|m| !m.is_empty())
+            && let Err(e) = target.unpack_mac_metadata(metadata)
+        {
+            warn(&mut ret, errno(e), b"Failed to restore metadata".to_vec());
+        }
+        #[cfg(target_vendor = "apple")]
+        if todo & ACL != 0 {
+            ret = ret.min(self.set_acls(a, entry, target));
+        }
         ret
+    }
+
+    /// Upstream's archive_write_disk_set_acls on Darwin.
+    #[cfg(target_vendor = "apple")]
+    fn set_acls(&mut self, a: &Base, entry: &Entry, target: &Target) -> c_int {
+        let set = target.metadata_file().and_then(|file| {
+            crate::ffi::disk_acl::write(&file, entry, &mut self.user, &mut self.group)
+        });
+        match set {
+            // The filesystem doesn't support ACLs.
+            Err(e) if e.raw_os_error() != Some(libc::EOPNOTSUPP) => {
+                let msg = if target.is_open() {
+                    "Failed to set acl on fd: nfs4"
+                } else {
+                    "Failed to set acl: nfs4"
+                };
+                a.warn(e.raw_os_error().unwrap_or(libc::EIO), msg).code()
+            }
+            _ => ARCHIVE_OK,
+        }
     }
 
     pub fn close(&mut self, a: &Base) -> c_int {
@@ -751,18 +823,113 @@ impl WriteDisk {
             return ARCHIVE_FATAL;
         }
         let ret = self.finish_entry(a);
-        // Upstream fixes up only what is still a directory, and ignores failures.
-        while let Some((entry, mut target, options, mode)) = self.directories.pop() {
-            if target
+        // Deepest first, so a directory's mode can't lock out its contents.
+        let mut fixups = std::mem::take(&mut self.fixups);
+        fixups.sort_by(|x, y| y.0.cmp(&x.0));
+        // Upstream fixes up only what still has the entry's type, and its
+        // failures leave a message but don't change the result.
+        for (_, entry, mut target, todo, mode) in fixups {
+            if !target
                 .stat()
-                .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+                .is_ok_and(|st| st.st_mode & libc::S_IFMT == entry.filetype())
             {
-                let _ = self.restore(a, &entry, &mut target, options, mode);
+                continue;
+            }
+            if entry.filetype() == libc::S_IFDIR
+                && let Ok(file) = target.directory_file()
+            {
+                target.retain_file(file);
+            }
+            if todo & TIME != 0 && (entry.mtime_is_set() != 0 || entry.atime_is_set() != 0) {
+                let start = (self.start_time, 0);
+                let time = |set, sec, nsec| if set != 0 { (sec, nsec) } else { start };
+                let atime = time(entry.atime_is_set(), entry.atime(), entry.atime_nsec());
+                let mtime = time(entry.mtime_is_set(), entry.mtime(), entry.mtime_nsec());
+                let birthtime = match entry.birthtime_is_set() {
+                    0 => mtime,
+                    _ => (entry.birthtime(), entry.birthtime_nsec()),
+                };
+                if let Err(e) = set_times(&target, atime, birthtime, mtime) {
+                    let _ = a.warn(e.raw_os_error().unwrap_or(libc::EIO), "Can't restore time");
+                }
+            }
+            if mode {
+                let _ = target.chmod(final_mode(&entry, todo));
+            }
+            #[cfg(target_vendor = "apple")]
+            if todo & ACL != 0 {
+                let _ = self.set_acls(a, &entry, &target);
+            }
+            if todo & FFLAGS != 0
+                && let Err(e) = target.flags(entry.fflags().0 as u32, 0)
+            {
+                let _ = a.warn(
+                    e.raw_os_error().unwrap_or(libc::EIO),
+                    "Failed to set file flags",
+                );
+            }
+            if todo & MAC_METADATA != 0
+                && let Some(metadata) = entry.mac_metadata().filter(|m| !m.is_empty())
+                && let Err(e) = target.unpack_mac_metadata(metadata)
+            {
+                let _ = a.warn(
+                    e.raw_os_error().unwrap_or(libc::EIO),
+                    "Failed to restore metadata",
+                );
             }
         }
         a.state.set(state::CLOSED);
         ret
     }
+}
+
+/// The permissions an entry ends up with: without PERM, no set-id or
+/// sticky bits and the umask applied.
+fn final_mode(entry: &Entry, options: c_int) -> u32 {
+    if options & PERM != 0 {
+        entry.mode() as u32 & 0o7777
+    } else {
+        entry.mode() as u32 & 0o777 & !umask()
+    }
+}
+
+/// Upstream's set_times. Where files have a birthtime, setting an earlier
+/// mtime moves it back, so the birthtime goes first.
+fn set_times(
+    target: &Target,
+    atime: (i64, i64),
+    birthtime: (i64, i64),
+    mtime: (i64, i64),
+) -> std::io::Result<()> {
+    let first = if cfg!(target_vendor = "apple") && birthtime < mtime {
+        target.times(atime, birthtime)
+    } else {
+        Ok(())
+    };
+    let second = target.times(atime, mtime);
+    second.and(first)
+}
+
+/// Upstream's set_xattrs: sets every attribute it can, and names the ones
+/// it couldn't unless the filesystem has no extended attributes.
+fn set_xattrs(a: &Base, entry: &Entry, target: &Target) -> c_int {
+    let failed = target.write_xattrs(entry);
+    if failed.is_empty() {
+        return ARCHIVE_OK;
+    }
+    let unsupported =
+        |e: &std::io::Error| [Some(libc::ENOTSUP), Some(libc::ENOSYS)].contains(&e.raw_os_error());
+    let msg = if failed.iter().all(|(_, e)| unsupported(e)) {
+        b"Cannot restore extended attributes on this file system".to_vec()
+    } else {
+        let names: Vec<&[u8]> = failed.iter().map(|(name, _)| name.to_bytes()).collect();
+        [
+            b"Cannot restore extended attributes: ",
+            &names.join(&b' ')[..],
+        ]
+        .concat()
+    };
+    a.warn(ARCHIVE_ERRNO_MISC, msg).code()
 }
 
 impl Drop for WriteDisk {
@@ -778,6 +945,7 @@ impl Drop for WriteDisk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::ARCHIVE_WARN;
     use crate::archive::WRITE_DISK_MAGIC;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1172,10 +1340,10 @@ mod tests {
             // Only the metadata is restored, and it is no AppleDouble file.
             assert_eq!(restored, ARCHIVE_WARN);
             let message = base.error_string().unwrap().to_vec();
-            let expected: &[u8] = if with_metadata {
-                b"Failed to restore metadata"
+            let expected = if with_metadata {
+                b"Failed to restore metadata".to_vec()
             } else {
-                b"Can't restore extended attributes"
+                [&b"Cannot restore extended attributes: "[..], &[b'x'; 200]].concat()
             };
             assert_eq!(message, expected);
         }
@@ -1212,6 +1380,117 @@ mod tests {
         let metadata = std::fs::metadata(output.path()).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0);
         std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn metadata_failures_are_reported_as_upstream_does() {
+        let output = Output::new();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        disk.options = OWNER | XATTR | TIME;
+        let mut entry = Entry::new(None);
+        entry.set_pathname(output.path().as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFREG | 0o644);
+        entry.set_uid(i64::from(euid()) + 1);
+        entry.set_gid(0);
+        entry.set_mtime(1_000_000_000, 0);
+        let long = std::ffi::CString::new([b'x'; 200]).unwrap();
+        entry.xattr_add(c"user.first", b"v");
+        entry.xattr_add(&long, b"v");
+        entry.xattr_add(c"user.last", b"v");
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_WARN);
+        // The last failure's message stays.
+        let message = base.error_string().unwrap().to_vec();
+        if euid() == 0 {
+            assert!(message.starts_with(b"Cannot restore extended attributes: "));
+        } else if cfg!(target_vendor = "apple") {
+            let expected = [&b"Cannot restore extended attributes: "[..], &[b'x'; 200]].concat();
+            assert_eq!(message, expected);
+            assert_eq!(base.errno.get(), ARCHIVE_ERRNO_MISC);
+        }
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(output.path()).unwrap().mtime(),
+            1_000_000_000
+        );
+        #[cfg(target_vendor = "apple")]
+        if euid() != 0 {
+            let mut read = Entry::new(None);
+            crate::ffi::disk_sys::read_xattrs(&output.path(), &mut read, false).unwrap();
+            assert_eq!(read.xattrs.len(), 2);
+            // Without root, giving the file away isn't tried.
+            disk.options = OWNER;
+            assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+            assert_eq!(disk.finish_entry(&base), ARCHIVE_WARN);
+            let expected = format!("Can't set UID={}", i64::from(euid()) + 1);
+            assert_eq!(*base.error_string().unwrap(), *expected.as_bytes());
+            entry.set_uid(euid().into());
+            assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+            assert_eq!(disk.finish_entry(&base), ARCHIVE_WARN);
+            let name = output.path();
+            let expected = format!("Can't set user={}/group=0 for {}", euid(), name.display());
+            assert_eq!(*base.error_string().unwrap(), *expected.as_bytes());
+            assert_eq!(base.errno.get(), libc::EPERM);
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn flags_that_forbid_changes_wait_for_close() {
+        use std::os::macos::fs::MetadataExt;
+        let output = Output::new();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        disk.options = FFLAGS | TIME;
+        let mut entry = Entry::new(None);
+        entry.set_pathname(output.path().as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFREG | 0o644);
+        entry.set_mtime(1_000_000_000, 0);
+        let flags = libc::UF_IMMUTABLE | libc::UF_HIDDEN;
+        entry.set_fflags(
+            flags as std::ffi::c_ulong,
+            libc::UF_HIDDEN as std::ffi::c_ulong,
+        );
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+        assert_eq!(std::fs::metadata(output.path()).unwrap().st_flags(), 0);
+        // A hardlink to it can still be made.
+        let mut link = Entry::new(None);
+        link.set_pathname(output.0.join("link").as_os_str().as_bytes());
+        link.set_hardlink(output.path().as_os_str().as_bytes());
+        link.set_mode(libc::S_IFREG | 0o644);
+        assert_eq!(disk.header(&base, &mut link), ARCHIVE_OK);
+        assert_eq!(disk.close(&base), ARCHIVE_OK);
+        let metadata = std::fs::metadata(output.path()).unwrap();
+        // A flag both set and cleared stays set, as upstream sets it.
+        assert_eq!(metadata.st_flags(), flags);
+        assert_eq!(metadata.st_mtime(), 1_000_000_000);
+        // Clear them so that the directory can be removed.
+        let target = Target::prepare(&output.path(), false).unwrap();
+        target.flags(0, flags).unwrap();
+    }
+
+    #[test]
+    fn hardlink_without_data_leaves_the_file_metadata_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let output = Output::new();
+        std::fs::write(output.path(), b"data").unwrap();
+        std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o751)).unwrap();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        disk.options = PERM | TIME;
+        let mut entry = Entry::new(None);
+        entry.set_pathname(output.0.join("link").as_os_str().as_bytes());
+        entry.set_hardlink(output.path().as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFREG | 0o642);
+        entry.set_mtime(1_000_000_000, 0);
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+        assert_eq!(disk.close(&base), ARCHIVE_OK);
+        let metadata = std::fs::metadata(output.path()).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o751);
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(metadata.mtime(), 1_000_000_000);
     }
 
     #[test]
