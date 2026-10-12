@@ -48,17 +48,34 @@ C libraries (Apple zlib, liblzma 5.8.4, libzstd 1.5.7):
 
 | | Wins | Ties | Losses |
 |---|---:|---:|---:|
+| Current, after disk and ISO fixes (Oct 12) | 57 | 37 | 2 |
 | Round 13 (two runs) | 59–61 | 32–34 | 3 |
 | Round 13, with `scripts/build-pgo` | 63 | 31 | 2 |
 | Previous version | 24 | 22 | 50 |
 
-Across all 96 cases the geometric mean of Rust/C time is 0.90. Close cases
-move by a few percent between runs. The remaining losses are Zstandard
-creation of two datasets (1.05–1.08x) and one 7-Zip extraction
-(1.06–1.09x). `scripts/build-pgo` trains on data other than the
-benchmark's; it changes no output byte.
+The current run uses the same frozen inputs and C executable as round 13.
+Across all 96 cases the geometric mean of Rust/C time is 0.899, about 10%
+less elapsed time. All 192 cross-reader checks pass with no run failures.
+Close cases move by a few percent between runs. The remaining losses are
+Zstandard creation of the records dataset (1.055x C's time) and 7-Zip
+extraction of the compiled dataset (1.081x). Several small 7-Zip creation
+cases use about 97 MiB peak RSS versus 55 MiB for C; memory use is a further
+optimization target. These results measure regular-file contents with
+metadata disabled, not the ISO or privileged metadata paths.
 
-The subsequent disk and ISO correctness fixes have not been rebenchmarked.
+The PGO result is historical; the current fixes have not been rebuilt with
+PGO. `scripts/build-pgo` trains on data other than the benchmark's; it
+changes no output byte.
+
+## Security limits
+
+Passing tests and safe Rust do not establish resistance to resource
+exhaustion. As documented in `NOTES.md`, decompression output is unbounded;
+the mtree reader also loads all entries before returning its first header.
+Some decoder dictionaries have memory caps, but there is no archive-wide
+output or metadata budget. The fuzz harness stops entry data after 1 MiB
+and currently exercises readers and filters, leaving writer fuzzing and
+aggregate resource limits as improvement areas.
 
 ## What is Rust
 

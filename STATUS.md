@@ -108,11 +108,35 @@ the independent zisofs reader checks; hosted CI has not run before publication.
 Generated compiler caches in vendored crates are no longer tracked, and
 all target directories are ignored. Their old blobs remain in existing
 history; merged history was preserved. Work is local, with no remotes or
-pushes. Benchmark results below predate these correctness changes; the
-remaining Zstandard/7-Zip losses have not been remeasured. The Linux container
+pushes. Older benchmark results below predate these correctness changes;
+the fresh comparison follows. The Linux container
 lacks successful privileged immutable/append flags and trusted.* coverage;
 failure/retry paths and unprivileged metadata were checked. Windows was not
 built or validated in this continuation.
+
+## Current 96-case benchmark (2026-10-12)
+
+The integrated release tools, including the disk and ISO fixes, were measured
+against the original frozen C executable on the same eight frozen datasets.
+Five rotating repeats, warm cache, Apple M5 Pro/macOS 26.6.2; metadata disabled.
+Input digests and the C executable hash match the round-13 report.
+
+| Operation | Rust wins | Ties | Losses | Geometric Rust/C time |
+|---|---:|---:|---:|---:|
+| Create | 32 | 15 | 1 | 0.871 |
+| Extract | 25 | 22 | 1 | 0.927 |
+| Total | 57 | 37 | 2 | 0.899 |
+
+All 192 cross-reader checks pass; no run failures. A win/loss is more than
+5% below/above C's median time. The remaining losses are records/tar.zst
+creation (1.055x) and compiled/7zip extraction (1.081x). Several small
+7zip creation cases peak around 97 MiB versus 55 MiB for C. Close timing
+outcomes are sensitive to background load; these are ordinary desktop runs.
+PGO was not rebuilt. This matrix does not measure ISO or metadata behavior.
+
+Local detailed results: `../diagnostics/results/round14/round14-current.{md,json}`.
+Measured Rust executable SHA-256:
+`6418be2145ef430671682801e44c68aeb3d5bf197b01b343b38f411e8e1d52a4`.
 
 ## Initial ISO9660 writer port (historical)
 
