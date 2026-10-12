@@ -145,7 +145,7 @@ impl Mf {
         };
 
         let mut mf = Self {
-            buffer: vec![0; (size + MEMCMPLEN_EXTRA) as usize],
+            buffer: Vec::with_capacity((size + MEMCMPLEN_EXTRA) as usize),
             size,
             keep_size_before,
             keep_size_after,
@@ -161,7 +161,7 @@ impl Mf {
             hash2: vec![0; HASH_2_SIZE],
             hash3: vec![0; if hash_bytes > 3 { HASH_3_SIZE } else { 0 }],
             hash: vec![0; hs as usize + 1],
-            son: vec![0; cyclic_size as usize * if is_bt { 2 } else { 1 }],
+            son: Vec::with_capacity(cyclic_size as usize * if is_bt { 2 } else { 1 }),
             hash4_hint: None,
             run: Run::default(),
             cyclic_pos: 0,
@@ -177,6 +177,7 @@ impl Mf {
             // If the preset dictionary is bigger than the actual
             // dictionary, use only the tail.
             let len = dict.len().min(size as usize);
+            mf.initialize(len, len);
             mf.buffer[..len].copy_from_slice(&dict[dict.len() - len..]);
             mf.write_pos = len as u32;
             mf.action = Action::SyncFlush;
@@ -184,6 +185,21 @@ impl Mf {
         }
         mf.action = Action::Run;
         mf
+    }
+
+    /// Initialize only the history and nodes this input can reach. Hashes
+    /// still cover the full configured dictionary; untouched nodes cannot
+    /// be referenced until their positions have passed the match finder.
+    fn initialize(&mut self, end: usize, positions: usize) {
+        let needed = end + MEMCMPLEN_EXTRA as usize;
+        if needed > self.buffer.len() {
+            self.buffer.resize(needed, 0);
+        }
+        let nodes = (self.cyclic_pos as usize + positions).min(self.cyclic_size as usize)
+            * if self.kind == MfType::Bt4 { 2 } else { 1 };
+        if nodes > self.son.len() {
+            self.son.resize(nodes, 0);
+        }
     }
 
     /// Number of bytes that haven't been ran through the match finder yet.
@@ -240,6 +256,10 @@ impl Mf {
 
         let write_pos = self.write_pos as usize;
         let len = input.len().min(self.size as usize - write_pos);
+        self.initialize(
+            write_pos + len,
+            (self.write_pos - self.read_pos + self.pending) as usize + len,
+        );
         self.buffer[write_pos..write_pos + len].copy_from_slice(&input[..len]);
         self.write_pos += len as u32;
         let end = self.write_pos as usize;
