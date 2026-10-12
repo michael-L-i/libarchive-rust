@@ -1819,10 +1819,11 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   permissions, links and deferred directories retain their previous handling.
   Actual Opus 5.5 design/final review, C ABI mode/status checks and five-rotation
   six-format extraction results are retained in `../diagnostics/round8-system`.
-- Kept: with NO_OVERWRITE (or NO_OVERWRITE_NEWER) on an existing
-  non-directory, upstream still restores the entry's metadata onto the file it
-  kept, by path: its chmod follows a symlink there (without SECURE_SYMLINKS,
-  which removes one). Here the kept file's metadata is left alone. Data writes
+- Kept: when NO_OVERWRITE (or NO_OVERWRITE_NEWER) keeps what is in the way
+  of a non-directory entry, upstream still restores the entry's metadata onto
+  it by path, a directory included, and its chmod follows a symlink there
+  (without SECURE_SYMLINKS, which removes one). Here what was kept is left
+  alone. Data writes
   to it fail with "Attempt to write to an empty file" as upstream's do.
 - Kept: where upstream restores a non-directory's metadata by path, its
   chmod() follows a symlink in the entry's place, e.g. for a hardlink entry
