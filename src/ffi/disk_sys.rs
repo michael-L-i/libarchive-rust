@@ -5,7 +5,7 @@ use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-fn path_c(path: &Path) -> std::io::Result<CString> {
+pub fn path_c(path: &Path) -> std::io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
 }
@@ -32,46 +32,26 @@ pub fn stat(path: &Path, fd: libc::c_int, follow: bool) -> std::io::Result<libc:
     result(code)?;
     Ok(st)
 }
-pub fn restore_times(path: &Path, entry: &Entry) -> std::io::Result<()> {
+/// Opens `path` for reading, following symlinks, with `flags` added.
+pub fn open_read(path: &Path, flags: libc::c_int) -> std::io::Result<File> {
     let path = path_c(path)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let times = [
-        libc::timespec {
-            tv_sec: if entry.atime_is_set() != 0 {
-                entry.atime()
-            } else {
-                now.as_secs() as i64
-            },
-            tv_nsec: if entry.atime_is_set() != 0 {
-                entry.atime_nsec() as _
-            } else {
-                now.subsec_nanos() as _
-            },
-        },
-        libc::timespec {
-            tv_sec: if entry.mtime_is_set() != 0 {
-                entry.mtime()
-            } else {
-                now.as_secs() as i64
-            },
-            tv_nsec: if entry.mtime_is_set() != 0 {
-                entry.mtime_nsec() as _
-            } else {
-                now.subsec_nanos() as _
-            },
-        },
-    ];
-    // SAFETY: the pathname and two timespec values are live, properly sized.
-    result(unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            times.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    })
+    // SAFETY: the path is terminated; a successful open returns a new descriptor.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: nothing else owns the descriptor open just returned.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+/// Upstream's close_and_restore_time: puts back the access and
+/// modification times, each (seconds, nanoseconds), of what `file` is.
+pub fn restore_times(file: &File, atime: (i64, i64), mtime: (i64, i64)) -> std::io::Result<()> {
+    let times = [atime, mtime].map(|(tv_sec, tv_nsec)| libc::timespec {
+        tv_sec: tv_sec as _,
+        tv_nsec: tv_nsec as _,
+    });
+    // SAFETY: live descriptor and two timespecs that outlive the call.
+    result(unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) })
 }
 pub fn name(id: i64, group: bool) -> Option<CString> {
     let mut buffer = vec![0u8; 16384];
@@ -230,13 +210,192 @@ pub fn read_xattrs(
     }
     Ok(())
 }
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 pub fn read_xattrs(
     _path: &Path,
     _entry: &mut Entry,
     _follow: bool,
 ) -> Result<(), (std::io::Error, &'static str)> {
     Ok(())
+}
+
+/// Linux inode flags (`<linux/fs.h>`) that upstream names.
+#[cfg(target_os = "linux")]
+pub const FS_IMMUTABLE_FL: u32 = 0x10;
+#[cfg(target_os = "linux")]
+pub const FS_APPEND_FL: u32 = 0x20;
+#[cfg(target_os = "linux")]
+pub const FS_NODUMP_FL: u32 = 0x40;
+#[cfg(target_os = "linux")]
+pub const FS_JOURNAL_DATA_FL: u32 = 0x4000;
+
+/// FS_IOC_GETFLAGS: the inode flags of the regular file or directory
+/// `fd` is open on. Anything else that a race put under a name opened for
+/// its flags gets no ioctl, which a device's driver would take, and fails
+/// with ENOTTY, as a file without flags does.
+#[cfg(target_os = "linux")]
+pub fn get_flags(fd: libc::c_int) -> std::io::Result<u32> {
+    let mut st = super::entry::zeroed_stat();
+    // SAFETY: writable stat; a descriptor that isn't open only fails.
+    result(unsafe { libc::fstat(fd, &mut st) })?;
+    if ![libc::S_IFREG, libc::S_IFDIR].contains(&(st.st_mode & libc::S_IFMT)) {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTTY));
+    }
+    let mut flags: libc::c_int = 0;
+    // SAFETY: the ioctl writes one int, to `flags`, which outlives the
+    // call; a descriptor that isn't open only fails.
+    result(unsafe { libc::ioctl(fd, libc::FS_IOC_GETFLAGS, &mut flags) })?;
+    Ok(flags as u32)
+}
+#[cfg(target_os = "linux")]
+fn set_flags(fd: libc::c_int, flags: u32) -> std::io::Result<()> {
+    let flags = flags as libc::c_int;
+    // SAFETY: the ioctl reads one int, from `flags`, which outlives the
+    // call; a descriptor that isn't open only fails.
+    result(unsafe { libc::ioctl(fd, libc::FS_IOC_SETFLAGS, &flags) })
+}
+
+/// What Linux extended attributes are read from: a descriptor, or a path
+/// and whether to follow a symlink there.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub enum Source<'a> {
+    Fd(libc::c_int),
+    Path(&'a CStr, bool),
+}
+#[cfg(target_os = "linux")]
+fn xattr_size(n: isize) -> std::io::Result<usize> {
+    usize::try_from(n).map_err(|_| std::io::Error::last_os_error())
+}
+#[cfg(target_os = "linux")]
+impl Source<'_> {
+    /// flistxattr, listxattr or llistxattr: the names into `buf`, or with
+    /// an empty `buf` the size they need.
+    pub fn list(self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let ptr = if buf.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            buf.as_mut_ptr().cast()
+        };
+        // SAFETY: `ptr` is NULL with a length of 0, or `buf`, writable for
+        // its length; the path is terminated.
+        xattr_size(unsafe {
+            match self {
+                Source::Fd(fd) => libc::flistxattr(fd, ptr, buf.len()),
+                Source::Path(p, true) => libc::listxattr(p.as_ptr(), ptr, buf.len()),
+                Source::Path(p, false) => libc::llistxattr(p.as_ptr(), ptr, buf.len()),
+            }
+        })
+    }
+    /// fgetxattr, getxattr or lgetxattr: the value of `name` into `buf`,
+    /// or with an empty `buf` its size.
+    pub fn get(self, name: &CStr, buf: &mut [u8]) -> std::io::Result<usize> {
+        let ptr = if buf.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            buf.as_mut_ptr().cast()
+        };
+        let name = name.as_ptr();
+        // SAFETY: `ptr` is NULL with a length of 0, or `buf`, writable for
+        // its length; the name and path are terminated.
+        xattr_size(unsafe {
+            match self {
+                Source::Fd(fd) => libc::fgetxattr(fd, name, ptr, buf.len()),
+                Source::Path(p, true) => libc::getxattr(p.as_ptr(), name, ptr, buf.len()),
+                Source::Path(p, false) => libc::lgetxattr(p.as_ptr(), name, ptr, buf.len()),
+            }
+        })
+    }
+    /// fstat, stat or lstat.
+    pub fn stat(self) -> std::io::Result<libc::stat> {
+        let mut st = super::entry::zeroed_stat();
+        // SAFETY: the path is terminated and `st` writable.
+        result(unsafe {
+            match self {
+                Source::Fd(fd) => libc::fstat(fd, &mut st),
+                Source::Path(p, true) => libc::stat(p.as_ptr(), &mut st),
+                Source::Path(p, false) => libc::lstat(p.as_ptr(), &mut st),
+            }
+        })?;
+        Ok(st)
+    }
+}
+
+/// lseek on a descriptor.
+#[cfg(target_os = "linux")]
+pub fn seek(fd: libc::c_int, offset: i64, whence: libc::c_int) -> std::io::Result<i64> {
+    // SAFETY: lseek takes no pointers; a descriptor that isn't open fails.
+    let at = unsafe { libc::lseek(fd, offset, whence) };
+    if at < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(at)
+}
+
+/// The extents one FS_IOC_FIEMAP call returns: as many as fit in
+/// upstream's 4096-byte buffer.
+#[cfg(target_os = "linux")]
+const FIEMAP_EXTENTS: usize = (4096 - 32) / 56;
+#[cfg(target_os = "linux")]
+pub const FIEMAP_FLAG_SYNC: u32 = 0x1;
+#[cfg(target_os = "linux")]
+pub const FIEMAP_EXTENT_LAST: u32 = 0x1;
+#[cfg(target_os = "linux")]
+pub const FIEMAP_EXTENT_UNWRITTEN: u32 = 0x800;
+
+/// `<linux/fiemap.h>`'s struct fiemap_extent.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FiemapExtent {
+    pub fe_logical: u64,
+    pub fe_physical: u64,
+    pub fe_length: u64,
+    fe_reserved64: [u64; 2],
+    pub fe_flags: u32,
+    fe_reserved: [u32; 3],
+}
+
+/// `<linux/fiemap.h>`'s struct fiemap, with room for its extents.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+pub struct Fiemap {
+    pub fm_start: u64,
+    fm_length: u64,
+    fm_flags: u32,
+    fm_mapped_extents: u32,
+    fm_extent_count: u32,
+    fm_reserved: u32,
+    fm_extents: [FiemapExtent; FIEMAP_EXTENTS],
+}
+#[cfg(target_os = "linux")]
+impl Fiemap {
+    /// Upstream's request: every extent from the start, synced first.
+    pub fn new() -> Self {
+        Fiemap {
+            fm_start: 0,
+            fm_length: !0,
+            fm_flags: FIEMAP_FLAG_SYNC,
+            fm_mapped_extents: 0,
+            fm_extent_count: FIEMAP_EXTENTS as u32,
+            fm_reserved: 0,
+            fm_extents: [FiemapExtent::default(); FIEMAP_EXTENTS],
+        }
+    }
+    /// FS_IOC_FIEMAP on `fd` (struct fiemap is 32 bytes before its extents).
+    pub fn map(&mut self, fd: libc::c_int) -> std::io::Result<()> {
+        const FS_IOC_FIEMAP: libc::Ioctl = libc::_IOWR::<[u64; 4]>(b'f' as u32, 11);
+        self.fm_extent_count = FIEMAP_EXTENTS as u32;
+        self.fm_mapped_extents = 0;
+        // SAFETY: `self` is a struct fiemap whose fm_extent_count is the
+        // length of its extent array, which bounds what the kernel writes.
+        result(unsafe { libc::ioctl(fd, FS_IOC_FIEMAP, self as *mut Self) })
+    }
+    /// The extents the last call mapped.
+    pub fn extents(&self) -> &[FiemapExtent] {
+        let n = (self.fm_mapped_extents as usize).min(FIEMAP_EXTENTS);
+        self.fm_extents.get(..n).unwrap_or_default()
+    }
 }
 
 use std::fs::File;
@@ -499,7 +658,6 @@ impl Target {
         self.live = Some(file);
     }
     /// Whether metadata goes through a descriptor kept open for it.
-    #[cfg(target_vendor = "apple")]
     pub fn is_open(&self) -> bool {
         self.live.is_some()
     }
@@ -729,7 +887,23 @@ pub fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Upstream's __archive_get_umask. Linux reports it in /proc/self/status
+/// (since 4.7), which upstream reads rather than set the umask while other
+/// threads may be creating files.
 pub fn umask() -> u32 {
+    #[cfg(target_os = "linux")]
+    if let Ok(status) = std::fs::read("/proc/self/status")
+        && let Some(mask) = status.split(|&b| b == b'\n').find_map(|line| {
+            let digits = line.strip_prefix(b"Umask:")?.trim_ascii_start();
+            let end = digits
+                .iter()
+                .position(|b| !(b'0'..=b'7').contains(b))
+                .unwrap_or(digits.len());
+            u32::from_str_radix(std::str::from_utf8(digits.get(..end)?).ok()?, 8).ok()
+        })
+    {
+        return mask;
+    }
     // SAFETY: umask has no pointer arguments; restore immediately, as upstream does.
     unsafe {
         let mask = libc::umask(0);
@@ -886,9 +1060,82 @@ impl Target {
         // SAFETY: live file descriptor; fchflags does not access borrowed memory.
         result(unsafe { libc::fchflags(file.as_raw_fd(), flags) })
     }
-    #[cfg(not(target_vendor = "apple"))]
+    /// Upstream's Linux set_fflags_platform, past its file type check:
+    /// changes the flags through the entry's descriptor or one opened here
+    /// (if that fails there is nothing to do), keeping the flags only root
+    /// may change as they are if setting them is refused.
+    #[cfg(target_os = "linux")]
+    pub fn flags(&self, set: u32, clear: u32) -> std::io::Result<()> {
+        const SF_MASK: u32 = FS_IMMUTABLE_FL | FS_APPEND_FL | FS_JOURNAL_DATA_FL;
+        if set | clear == 0 {
+            return Ok(());
+        }
+        let opened;
+        let fd = match &self.live {
+            Some(file) => file.as_raw_fd(),
+            None => match self.fixup_file(false) {
+                Ok(file) => {
+                    opened = file;
+                    opened.as_raw_fd()
+                }
+                Err(_) => return Ok(()),
+            },
+        };
+        let old = get_flags(fd)?;
+        let new = (old & !clear) | set;
+        match set_flags(fd, new) {
+            // If we couldn't set all the flags, try again with a subset.
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                set_flags(fd, (new & !SF_MASK) | (old & SF_MASK))
+            }
+            r => r,
+        }
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     pub fn flags(&self, _set: u32, _clear: u32) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Target {
+    /// Sets an extended attribute through the entry's descriptor, or else
+    /// by its name without following a symlink there, as upstream's
+    /// fsetxattr and lsetxattr. An ACL's attribute too, which libacl's
+    /// acl_set_file sets following one: only a symlink swapped in after
+    /// the entry was made could be followed, and the kernel keeps no ACLs
+    /// on symlinks.
+    pub fn xattr(&self, name: &CStr, value: &[u8]) -> std::io::Result<()> {
+        if let Some(file) = &self.live {
+            // SAFETY: live descriptor, terminated name, and a value
+            // readable for its length; the kernel copies it.
+            return result(unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            });
+        }
+        // The calls that take only a path reach the entry through the
+        // parent held open for it.
+        let mut path = format!("/proc/self/fd/{}/", self.parent.as_raw_fd()).into_bytes();
+        path.extend_from_slice(self.name.as_bytes());
+        let path =
+            CString::new(path).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        // SAFETY: terminated path and name, and a value readable for its
+        // length; the kernel copies it.
+        result(unsafe {
+            libc::lsetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        })
     }
 }
 
@@ -957,23 +1204,10 @@ impl Target {
     }
 }
 
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 impl Target {
-    /// Sets every extended attribute it can and returns the ones it couldn't.
-    pub fn write_xattrs<'a>(&self, entry: &'a Entry) -> Vec<(&'a CStr, std::io::Error)> {
-        #[cfg(target_vendor = "apple")]
-        return entry
-            .xattrs
-            .iter()
-            .filter_map(|attr| {
-                let e = self.xattr(&attr.name, &attr.value).err()?;
-                Some((attr.name.as_c_str(), e))
-            })
-            .collect();
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            let _ = entry;
-            Vec::new()
-        }
+    pub fn xattr(&self, _name: &CStr, _value: &[u8]) -> std::io::Result<()> {
+        Ok(())
     }
 }
 impl Target {
@@ -1037,8 +1271,19 @@ impl Target {
     }
 }
 
+/// What upstream's setup_current_filesystem learns of a file system:
+/// whether it is remote and synthetic (1, 0, or -1 for unknown), whether
+/// it is mounted noatime, and the size of the blocks its files are read in.
+#[derive(Clone, Copy)]
+pub struct Filesystem {
+    pub remote: libc::c_int,
+    pub synthetic: libc::c_int,
+    pub noatime: bool,
+    pub block_size: usize,
+}
+
 #[cfg(target_vendor = "apple")]
-pub fn filesystem(path: &Path, follow: bool) -> std::io::Result<(libc::c_int, libc::c_int)> {
+pub fn filesystem(path: &Path, follow: bool) -> Result<Filesystem, (std::io::Error, &'static str)> {
     let inspect =
         if follow || std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink()) {
             path
@@ -1047,21 +1292,153 @@ pub fn filesystem(path: &Path, follow: bool) -> std::io::Result<(libc::c_int, li
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new("."))
         };
-    let path = path_c(inspect)?;
+    let failed = |e| (e, "statfs failed");
+    let path = path_c(inspect).map_err(failed)?;
     // SAFETY: statfs is a plain C struct with integer and byte-array fields.
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: live pathname and writable statfs destination.
-    result(unsafe { libc::statfs(path.as_ptr(), &mut st) })?;
-    Ok((
-        libc::c_int::from(st.f_flags & libc::MNT_LOCAL as u32 == 0),
-        -1,
-    ))
-}
-#[cfg(not(target_vendor = "apple"))]
-pub fn filesystem(_path: &Path, _follow: bool) -> std::io::Result<(libc::c_int, libc::c_int)> {
-    Ok((-1, -1))
+    result(unsafe { libc::statfs(path.as_ptr(), &mut st) }).map_err(failed)?;
+    Ok(Filesystem {
+        remote: libc::c_int::from(st.f_flags & libc::MNT_LOCAL as u32 == 0),
+        synthetic: -1,
+        noatime: st.f_flags & libc::MNT_NOATIME as u32 != 0,
+        block_size: 64 * 1024,
+    })
 }
 
+/// Upstream's Linux setup_current_filesystem for `path`: the directory
+/// being read, or with `target` a symlink's target on another file
+/// system, which upstream opens (with O_NONBLOCK here, so that a FIFO
+/// can't hang the walk).
+#[cfg(target_os = "linux")]
+pub fn filesystem(path: &Path, target: bool) -> Result<Filesystem, (std::io::Error, &'static str)> {
+    const AFS_SUPER_MAGIC: u32 = 0x5346_414f;
+    const CIFS_SUPER_MAGIC: u32 = 0xff53_4d42;
+    const CODA_SUPER_MAGIC: u32 = 0x7375_7245;
+    const NCP_SUPER_MAGIC: u32 = 0x564c;
+    const NFS_SUPER_MAGIC: u32 = 0x6969;
+    const SMB_SUPER_MAGIC: u32 = 0x517b;
+    const DEVFS_SUPER_MAGIC: u32 = 0x1373;
+    const PROC_SUPER_MAGIC: u32 = 0x9fa0;
+    const USBDEVICE_SUPER_MAGIC: u32 = 0x9fa2;
+    let failed = |e| (e, "statfs failed");
+    let file = if target {
+        Some(open_read(path, libc::O_NONBLOCK).map_err(|e| (e, "openat failed"))?)
+    } else {
+        None
+    };
+    let fd = file.as_ref().map(AsRawFd::as_raw_fd);
+    let path = path_c(path).map_err(failed)?;
+    // SAFETY: statvfs and statfs are plain C structs of integers.
+    let (mut vfs, mut sfs): (libc::statvfs, libc::statfs) = unsafe { std::mem::zeroed() };
+    // SAFETY: live descriptor or terminated path, and writable structs.
+    let vr = result(unsafe {
+        match fd {
+            Some(fd) => libc::fstatvfs(fd, &mut vfs),
+            None => libc::statvfs(path.as_ptr(), &mut vfs),
+        }
+    });
+    // SAFETY: as above.
+    result(unsafe {
+        match fd {
+            Some(fd) => libc::fstatfs(fd, &mut sfs),
+            None => libc::statfs(path.as_ptr(), &mut sfs),
+        }
+    })
+    .map_err(failed)?;
+    // Upstream's get_xfer_size. errno is cleared first: a name the file
+    // system has no value for gives -1 and leaves it alone.
+    // SAFETY: errno is this thread's own.
+    unsafe { *libc::__errno_location() = 0 };
+    let sizes = [
+        libc::_PC_REC_INCR_XFER_SIZE,
+        libc::_PC_REC_MAX_XFER_SIZE,
+        libc::_PC_REC_MIN_XFER_SIZE,
+        libc::_PC_REC_XFER_ALIGN,
+    ]
+    .map(|name| {
+        // SAFETY: live descriptor or terminated path; no pointer is kept.
+        unsafe {
+            match fd {
+                Some(fd) => libc::fpathconf(fd, name),
+                None => libc::pathconf(path.as_ptr(), name),
+            }
+        }
+    });
+    let errno = std::io::Error::last_os_error();
+    vr.map_err(failed)?;
+    let [incr, max, min, align] = match sizes {
+        [.., -1] if errno.raw_os_error() == Some(libc::EINVAL) => {
+            // pathconf(_PC_REC_*) operations are not supported.
+            let size = |n: libc::c_ulong| if n > 0 { n as libc::c_long } else { -1 };
+            [size(vfs.f_bsize), -1, size(vfs.f_bsize), size(vfs.f_frsize)]
+        }
+        [.., -1] => return Err(failed(errno)),
+        sizes => sizes,
+    };
+    let (remote, synthetic) = match sfs.f_type as u32 {
+        AFS_SUPER_MAGIC | CIFS_SUPER_MAGIC | CODA_SUPER_MAGIC | NCP_SUPER_MAGIC
+        | NFS_SUPER_MAGIC | SMB_SUPER_MAGIC => (1, 0),
+        DEVFS_SUPER_MAGIC | PROC_SUPER_MAGIC | USBDEVICE_SUPER_MAGIC => (0, 1),
+        _ => (0, 0),
+    };
+    Ok(Filesystem {
+        remote,
+        synthetic,
+        noatime: vfs.f_flag & libc::ST_NOATIME != 0,
+        block_size: read_block_size(incr, max, min, align),
+    })
+}
+
+/// The size of upstream's read buffer for a file system with these
+/// transfer sizes (setup_suitable_read_buffer): the maximum, or else the
+/// minimum grown by the increment to at least 64 KiB. Where upstream would
+/// grow it forever or read nothing, it is 64 KiB; it is at most 16 MiB.
+#[cfg(target_os = "linux")]
+fn read_block_size(
+    incr: libc::c_long,
+    max: libc::c_long,
+    min: libc::c_long,
+    align: libc::c_long,
+) -> usize {
+    const MIN: libc::c_long = 64 * 1024;
+    let align = if align == -1 { 4096 } else { align };
+    let size = if max != -1 {
+        max
+    } else {
+        let (mut size, incr) = if min < 0 {
+            (align, align)
+        } else {
+            (min, if incr < 0 { min } else { incr })
+        };
+        if size < MIN && incr <= 0 {
+            return MIN as usize;
+        }
+        while size < MIN {
+            size = size.saturating_add(incr);
+        }
+        size
+    };
+    match usize::try_from(size) {
+        Ok(0) | Err(_) => MIN as usize,
+        Ok(size) => size.min(16 * 1024 * 1024),
+    }
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+pub fn filesystem(
+    _path: &Path,
+    _follow: bool,
+) -> Result<Filesystem, (std::io::Error, &'static str)> {
+    Ok(Filesystem {
+        remote: -1,
+        synthetic: -1,
+        noatime: false,
+        block_size: 64 * 1024,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn sparse(path: &Path, follow: bool, size: i64) -> std::io::Result<Vec<(i64, i64)>> {
     if size <= 0 {
         return Ok(Vec::new());

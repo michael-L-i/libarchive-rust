@@ -2,7 +2,7 @@
 
 use super::{Archive, ArchiveEntry, ArchiveMatch, Status};
 use crate::archive::READ_DISK_MAGIC;
-use crate::archive::{ARCHIVE_EOF, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, Base, Handle, Kind};
+use crate::archive::{ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, Base, Handle, Kind};
 use crate::entry::Entry;
 use crate::ffi::disk::NameLookup;
 use crate::ffi::matching::MatchingHandle;
@@ -142,7 +142,9 @@ impl Handle {
                 };
                 entry.copy_stat(&stat);
             }
-            d.fill_metadata(a, entry, &path, d.symlinks != 0)
+            let access = path.as_os_str().as_bytes();
+            let fd = (fd >= 0).then_some(fd);
+            d.fill_metadata(a, entry, &path, d.symlinks != 0, fd, access)
         })
     }
 
@@ -169,16 +171,6 @@ pub(crate) fn new() -> Handle {
     Handle {
         base: Base::new(READ_DISK_MAGIC),
         kind: Kind::ReadDisk(RefCell::new(ReadDisk::new())),
-    }
-}
-
-/// `archive_read_data_block`'s code for what `ReadDisk::data_block` gave:
-/// an empty block is the end of the file's data.
-pub(crate) fn block_code(block: &Result<(&[u8], i64), c_int>) -> c_int {
-    match block {
-        Ok(([], _)) => ARCHIVE_EOF,
-        Ok(_) => ARCHIVE_OK,
-        Err(code) => *code,
     }
 }
 
@@ -243,9 +235,10 @@ impl ArchiveReadDisk {
         let Kind::ReadDisk(d) = &mut h.kind else {
             return (Status::Fatal, &[], 0);
         };
-        let block = d.get_mut().data_block(&h.base);
-        let code = Status::from_code(block_code(&block));
-        block.map_or((code, &[], 0), |(data, offset)| (code, data, offset))
+        match d.get_mut().data_block(&h.base) {
+            Ok((code, data, offset)) => (Status::from_code(code), data, offset),
+            Err(code) => (Status::from_code(code), &[], 0),
+        }
     }
 
     /// `archive_read_disk_descend`: walks into the directory just read.

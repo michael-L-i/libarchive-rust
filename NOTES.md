@@ -1785,7 +1785,7 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
 - Standard read-side uid/gid names use upstream's bounded 127-slot cache,
   including missing names; custom lookup callbacks remain uncached. Filesystem
   remote/synthetic flags are cached by the existing device ID, as upstream's
-  filesystem table does. A failed filesystem probe is retried on later entries.
+  filesystem table does. A failed filesystem probe is fatal, as upstream's.
   Numeric filesystem IDs, symlink handling and write-side owner lookup fallback
   behavior are unchanged. Real Opus 5.5 design/review and byte-identical
   six-format many-file measurements are retained in `../diagnostics/round8-system`.
@@ -1831,7 +1831,8 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   as all its other calls do. A directory's extended attributes, Mac metadata
   and ACLs are set by the entry's own pathname, so a trailing slash makes them
   follow a symlink to a directory in its place (`d/` over `d -> ../outside`);
-  here they go on the link itself.
+  here they go on the link itself, where Linux refuses user attributes
+  ("Cannot restore extended attributes: ...").
 - Kept: an AppleDouble entry `._name` that is a symlink with data (cpio keeps
   the target as data) is opened by upstream through the link, to merge
   whatever it points to; here it isn't followed, so the merge fails with
@@ -1853,10 +1854,10 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   finish_entry saw is skipped, where upstream fixes up whatever has its name. Kept: upstream's close-time
   flags fixup starts from the flags of the last entry's path (its stat cache
   is filled from `a->name`), and skips the fixup if that path is gone; here
-  each file's own flags are used. "Can't set UID=%jd" carries whatever errno
-  upstream last saw, which isn't meaningful; here it is EPERM. A SAFE_WRITES
-  temporary file is renamed into place before its metadata is restored rather
-  than after; the result is the same. A failure to build an ACL warns "Failed
+  each file's own flags are used, as upstream's Linux code reads them.
+  "Can't set UID=%jd" carries whatever errno upstream last saw, which isn't
+  meaningful; here it is EPERM. A SAFE_WRITES temporary file is renamed into
+  place before its metadata is restored rather than after; the result is the same. A failure to build an ACL warns "Failed
   to set acl..." rather than with upstream's ARCHIVE_FAILED messages for
   acl_create_entry and the like, which only fail on ENOMEM.
 - Ported as-is: upstream makes a missing parent directory with mode
@@ -1885,10 +1886,101 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   resource buffer. Failure to enable compression restores the data fork.
 - `SAFE_WRITES` creates a fresh sibling with `O_EXCL` and renames it on entry
   completion. A failed/abandoned write removes only its owned temporary.
-  Sparse metadata is discovered through `SEEK_DATA`/`SEEK_HOLE`; block reads
-  skip holes, while ordinary reads preserve zero bytes. Sparse maps are
-  bounded to one million extents. Remote filesystem detection uses native
-  `statfs`; synthetic status is unknown (-1) on macOS, as upstream's build.
+  Sparse metadata is discovered through `SEEK_DATA`/`SEEK_HOLE` (on Linux
+  falling back to FIEMAP, as upstream); block reads skip holes, while
+  ordinary reads preserve zero bytes. Sparse maps are bounded to one
+  million extents. Remote filesystem detection uses native `statfs`;
+  synthetic status is unknown (-1) on macOS, as upstream's build.
+- Data blocks follow upstream's _archive_read_data_block: the file is opened
+  at the first read ("Couldn't open %s"), each region of the sparse list is
+  read in turn, and an empty region (a file that is all hole, or the end
+  after a trailing hole) gives an empty ARCHIVE_OK block. Writers rely on
+  that block: bsdtar's write of it is what makes the pax writer emit the
+  sparse map of a file that is all hole. Seek and read
+  errors are upstream's fatal "Seek error" and "Read error". Access times
+  are put back as upstream does: a file's when its data descriptor closes,
+  a directory's when the walk leaves it (before the end of the walk, not
+  at close); closing early leaves the directories not yet left alone. A
+  warning from the metadata (ACLs, extended attributes) is returned by
+  archive_read_next_header, as upstream's is.
+- Extended attributes are restored in the order upstream's list holds them
+  (the last added first), which the names of a failure follow.
+  ARCHIVE_EXTRACT_CLEAR_NOCHANGE_FFLAGS clears the immutable and
+  append-only flags of what is in the way, as upstream's
+  clear_nochange_fflags.
+
+### Linux
+
+- POSIX.1e ACLs (`src/ffi/disk_acl_linux.rs`) are the
+  `system.posix_acl_access` and `system.posix_acl_default` extended
+  attributes, read and written with libacl's semantics rather than through
+  libacl: a file without an access ACL has the one its mode makes, a
+  directory without a default ACL an empty one, a value libacl rejects
+  (another version, a partial entry, an unknown tag) is no ACL, entries are
+  read back sorted by tag and qualifier (stably, as glibc's qsort), and an
+  ACL being built keeps libacl's order, a named entry whose qualifier is
+  ACL_UNDEFINED_ID staying where it was added. The kernel validates and
+  applies them (the mask to the mode, SGID). Differential runs against the
+  oracle's libacl compare the attribute bytes
+  (`../diagnostics/round14-linux-disk`). RichACLs are not ported: they need
+  librichacl and a kernel patch that never reached mainline, and the
+  oracle is built without them, like upstream's usual Linux build.
+- Upstream opens a descriptor for the flags of a regular file or directory
+  and reads its ACLs, extended attributes and sparse map through it; so does
+  this port. For other entries upstream's archive_read_disk_entry_setup_path
+  also opens one (a FIFO, a device) just to read ACLs; here they are read by
+  path, with the same result, so a device is never opened.
+- Where upstream writes metadata by path (a FIFO's or device's attributes
+  and access ACL), the path here goes through the parent directory held
+  open for the entry, `/proc/self/fd/N/name`, so it needs /proc. A
+  directory's default ACL is set through the descriptor held for it, where
+  libacl's acl_set_file goes by name; the result is the same. Kept,
+  stricter than upstream: acl_set_file follows a symlink in the entry's
+  place, which only one swapped in after the entry was made could be; an
+  ACL here goes on the entry's name itself, as its attributes do.
+- Ported as-is: a directory's ACLs wait for close, where upstream hands
+  archive_write_disk_set_acls the fixup's mode, which is set only if the
+  directory's mode, times or file flags waited too. Otherwise it is 0, and
+  the default ACL is refused ("Cannot set default ACL on non-directory",
+  left on the handle): `bsdtar -x --acls -m` without `-p` restores no
+  default ACLs where the directory's mode is already final.
+- Ported as-is: set_xattrs refuses an attribute in the obsolete xfsroot
+  namespace, but that alone doesn't make it warn: such attributes are
+  dropped silently unless another attribute fails, when they are named too.
+- Ported as-is: with access times to be restored, a file's data is opened
+  with O_NOATIME, which fails with EPERM for another user's file unless
+  privileged. Upstream means to retry without it but only clears the flag,
+  so reading the data fails with "Couldn't open %s".
+- Ported as-is: upstream's Linux setup_current_filesystem statfs's the
+  directory being read (the working directory for the walk's root), not
+  the entry, unless the entry is a symlink followed to another file
+  system. A mount point therefore gets its parent's properties, which the
+  entries below it share: /proc reached from / is not synthetic, nor is
+  /proc/sys walked from a working directory elsewhere. The read block
+  size follows that file system's transfer sizes too (1 MiB blocks on a
+  file system with 1 MiB blocks, 64 KiB on most). Sizes that would make
+  upstream grow its buffer forever or read nothing give 64 KiB, and blocks
+  are at most 16 MiB. Upstream opens a symlink's target to statfs it; here
+  with O_NONBLOCK, so that a FIFO there can't hang the walk. On macOS the
+  port still asks about the entry itself, where upstream's code there
+  asks about the directory too.
+- FIEMAP extents are read until the last one, as upstream; a map that
+  doesn't move on stops rather than repeat forever. The scan accepts at
+  most 1,048,576 extents, including unwritten ones, and rejects overflowing
+  extent ends. SEEK_DATA/SEEK_HOLE scans have the same limit, even when
+  adjacent ranges merge; results that go backwards or don't advance fail.
+- With `-P`, upstream can keep a symlink in place of an archived directory
+  and write the directory's xattrs on its target. The port keeps metadata
+  on the symlink and warns when Linux refuses the xattr, so extraction can
+  exit 1 where upstream exits 0. Explicit `-P` still permits extracting
+  child paths through the symlink.
+- Kept, stricter than upstream: FS_IOC_GETFLAGS (and so FS_IOC_SETFLAGS)
+  goes only to a descriptor fstat shows is a regular file or directory.
+  Upstream opens a name it stat'ed as one, and a device swapped in between
+  would get the ioctl in its driver; here that fails with ENOTTY.
+- The umask is read from /proc/self/status, as upstream's
+  __archive_get_umask does in a threaded process, rather than set and
+  restored, which other threads creating files could see.
 
 ## Archive writers
 
