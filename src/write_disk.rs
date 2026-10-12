@@ -150,17 +150,10 @@ impl WriteDisk {
             Err(msg) => return a.raise(Error::new(ARCHIVE_FAILED, ARCHIVE_ERRNO_MISC, msg)),
         };
         let path = PathBuf::from(std::ffi::OsStr::from_bytes(&name));
-        let hardlink = entry
-            .hardlink()
-            .map(|p| PathBuf::from(std::ffi::OsStr::from_bytes(p.to_bytes())));
-        if let Some(target) = &hardlink {
-            if name == target.as_os_str().as_bytes() {
-                let msg = [b"Skipping hardlink pointing to itself: ", name.as_slice()];
-                return a.warn(ARCHIVE_ERRNO_MISC, msg.concat()).code();
-            }
-            if let Err(msg) = cleanup_pathname(target.as_os_str().as_bytes(), self.options) {
-                return a.raise(Error::new(ARCHIVE_FAILED, ARCHIVE_ERRNO_MISC, msg));
-            }
+        // Upstream compares the cleaned-up pathname with the link as given.
+        if entry.hardlink().is_some_and(|link| link.to_bytes() == name) {
+            let msg = [b"Skipping hardlink pointing to itself: ", name.as_slice()];
+            return a.warn(ARCHIVE_ERRNO_MISC, msg.concat()).code();
         }
         let mut options = self.options;
         // On Apple, Mac metadata holds the ACLs and extended attributes too:
@@ -1491,6 +1484,25 @@ mod tests {
         assert_eq!(metadata.permissions().mode() & 0o7777, 0o751);
         use std::os::unix::fs::MetadataExt;
         assert_ne!(metadata.mtime(), 1_000_000_000);
+    }
+
+    #[test]
+    fn hardlink_target_is_checked_after_unlink() {
+        for options in [SECURE_NODOTDOT, SECURE_NODOTDOT | UNLINK] {
+            let output = Output::new();
+            std::fs::write(output.path(), b"old").unwrap();
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = WriteDisk::default();
+            disk.options = options;
+            let mut entry = Entry::new(None);
+            entry.set_pathname(output.path().as_os_str().as_bytes());
+            entry.set_hardlink(b"dir/../other");
+            entry.set_mode(libc::S_IFREG | 0o644);
+            assert_eq!(disk.header(&base, &mut entry), ARCHIVE_FAILED);
+            assert_eq!(*base.error_string().unwrap(), *b"Path contains '..'");
+            // Upstream unlinks what is in the way before it looks at the link.
+            assert_eq!(output.path().exists(), options & UNLINK == 0);
+        }
     }
 
     #[test]
