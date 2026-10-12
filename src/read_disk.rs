@@ -324,15 +324,18 @@ impl ReadDisk {
             // Following symlinks, archive the target unless the link is
             // broken or loops back to a parent; then the link itself.
             let follow = self.symlinks == 1 || (self.symlinks == 2 && root);
-            let (st, followed) = match access_path.stat(true) {
-                Ok(st)
-                    if follow
-                        && !(st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            let (st, followed) = if follow {
+                match access_path.stat(true) {
+                    Ok(st)
+                        if !(st.st_mode & libc::S_IFMT == libc::S_IFDIR
                             && self.ancestors.contains(&(st.st_dev as u64, st.st_ino))) =>
-                {
-                    (st, true)
+                    {
+                        (st, true)
+                    }
+                    _ => (lst, false),
                 }
-                _ => (lst, false),
+            } else {
+                (lst, false)
             };
             #[cfg(target_os = "linux")]
             if let Err(e) = access_path.pin_metadata(&st, followed) {
@@ -346,14 +349,35 @@ impl ReadDisk {
             } else {
                 None
             };
-            let metadata_file =
-                if matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR) {
-                    access_path.open(libc::O_NONBLOCK, followed, &st).ok()
-                } else {
-                    None
-                };
+            let fsid = st.st_dev as u64;
+            let filesystem = match self.filesystems.iter().position(|&(id, _)| id == fsid) {
+                Some(n) => n,
+                None => {
+                    self.filesystems.push((fsid, None));
+                    self.filesystems.len() - 1
+                }
+            };
+            self.filesystem = filesystem as c_int;
+            a.disk_filesystem.set(self.filesystem);
+            // Only filesystem probing and nodump need a readable file before
+            // callbacks; normal metadata opens freshly after callbacks.
+            let metadata_early = self.filesystems[filesystem].1.is_none();
+            #[cfg(target_os = "linux")]
+            let metadata_early = metadata_early || self.behavior & 2 != 0;
+            let metadata_file = if metadata_early
+                && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
+            {
+                access_path.open(libc::O_NONBLOCK, followed, &st).ok()
+            } else {
+                None
+            };
             #[cfg(target_vendor = "apple")]
             let metadata_file = metadata_file.or_else(|| {
+                if !metadata_early
+                    && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
+                {
+                    return None;
+                }
                 if st.st_mode & libc::S_IFMT == libc::S_IFLNK
                     && let Some(link) = access_path.link_file()
                 {
@@ -373,16 +397,6 @@ impl ReadDisk {
             if self.behavior & 0x40 == 0 {
                 entry.set_fflags(st.st_flags.into(), 0);
             }
-            let fsid = st.st_dev as u64;
-            let filesystem = match self.filesystems.iter().position(|&(id, _)| id == fsid) {
-                Some(n) => n,
-                None => {
-                    self.filesystems.push((fsid, None));
-                    self.filesystems.len() - 1
-                }
-            };
-            self.filesystem = filesystem as c_int;
-            a.disk_filesystem.set(self.filesystem);
             let probe = &mut self.filesystems[filesystem].1;
             let fs = match *probe {
                 Some(fs) => fs,
@@ -476,18 +490,21 @@ impl ReadDisk {
                 .filter(|_| !root)
                 .unwrap_or(path.as_os_str());
             // Open metadata after callbacks, but verify the inode selected by stat.
-            let metadata_file = if matches!(entry.filetype(), libc::S_IFREG | libc::S_IFDIR) {
-                access_path
-                    .open(libc::O_NONBLOCK, followed, &st)
-                    .ok()
-                    .or_else(|| {
-                        self.current_dir
-                            .as_ref()
-                            .and_then(|dir| dir.try_clone().ok())
-                    })
-            } else {
-                metadata_file
-            };
+            let metadata_file =
+                if matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
+                    || matches!(entry.filetype(), libc::S_IFREG | libc::S_IFDIR)
+                {
+                    access_path
+                        .open(libc::O_NONBLOCK, followed, &st)
+                        .ok()
+                        .or_else(|| {
+                            self.current_dir
+                                .as_ref()
+                                .and_then(|dir| dir.try_clone().ok())
+                        })
+                } else {
+                    metadata_file
+                };
             let ret = self.fill_metadata_at(
                 a,
                 entry,
@@ -1455,6 +1472,104 @@ mod tests {
             }
         }
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn cached_filesystem_metadata_honors_permission_granted_by_callback() {
+        use std::os::unix::fs::PermissionsExt;
+        if disk_sys::euid() == 0 {
+            return;
+        }
+        let root = Directory::new("cached-permissions");
+        let path = root.0.join("file");
+        fs::write(&path, b"data").unwrap();
+        disk_sys::Target::prepare(&path, false)
+            .unwrap()
+            .xattr(c"user.libarchive-permissions", b"granted")
+            .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
+        let a = Base::new(READ_DISK_MAGIC);
+        let mut disk = ReadDisk::new();
+        disk.behavior = 0xe0;
+        disk.metadata_filter = Some(Box::new(move |_, entry| {
+            if entry.filetype() == libc::S_IFREG {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            true
+        }));
+        let mut entry = Entry::new(None);
+        assert_eq!(disk.open(&a, root.0.as_os_str().as_bytes()), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        assert_eq!(disk.descend(&a), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        assert!(
+            entry
+                .xattrs
+                .iter()
+                .any(|x| { x.name == c"user.libarchive-permissions" && x.value == b"granted" })
+        );
+        assert_eq!(disk.data_block(&a).unwrap(), (ARCHIVE_OK, &b"data"[..], 0));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn cached_filesystem_metadata_keeps_callback_type_changes_and_rechecks_access() {
+        use std::os::unix::fs::PermissionsExt;
+        if disk_sys::euid() == 0 {
+            return;
+        }
+        for behavior in [0xe0, 4] {
+            for action in ["unchanged", "revoke", "replace"] {
+                let root = Directory::new("mutated-type");
+                let path = root.0.join("file");
+                fs::write(&path, b"original").unwrap();
+                disk_sys::Target::prepare(&path, false)
+                    .unwrap()
+                    .xattr(c"user.libarchive-mutated", b"original")
+                    .unwrap();
+                let a = Base::new(READ_DISK_MAGIC);
+                let mut disk = ReadDisk::new();
+                disk.behavior = behavior;
+                let moved = root.0.join("moved");
+                disk.metadata_filter = Some(Box::new(move |_, entry| {
+                    if entry.filetype() == libc::S_IFREG {
+                        entry.set_filetype(libc::S_IFIFO as u32);
+                        if action == "revoke" {
+                            fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
+                        } else if action == "replace" {
+                            fs::rename(&path, &moved).unwrap();
+                            fs::write(&path, b"replacement").unwrap();
+                            disk_sys::Target::prepare(&path, false)
+                                .unwrap()
+                                .xattr(c"user.libarchive-mutated", b"replacement")
+                                .unwrap();
+                        }
+                    }
+                    true
+                }));
+                let mut entry = Entry::new(None);
+                assert_eq!(disk.open(&a, root.0.as_os_str().as_bytes()), ARCHIVE_OK);
+                assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+                assert_eq!(disk.descend(&a), ARCHIVE_OK);
+                let ret = disk.next_header2(&a, &mut entry);
+                assert_eq!(entry.filetype(), libc::S_IFIFO);
+                if action == "unchanged" {
+                    assert_eq!(ret, ARCHIVE_OK);
+                    assert!(entry.xattrs.iter().any(|x| {
+                        x.name == c"user.libarchive-mutated" && x.value == b"original"
+                    }));
+                } else {
+                    assert_eq!(ret, ARCHIVE_WARN);
+                    assert_eq!(a.errno.get(), libc::EACCES);
+                    assert_eq!(
+                        a.error.borrow().strip_suffix(b"\0").unwrap(),
+                        b"Couldn't open metadata descriptor"
+                    );
+                    assert!(entry.xattrs.is_empty());
+                }
+                assert_eq!(disk.data_block(&a).unwrap().0, ARCHIVE_EOF);
+            }
+        }
     }
 
     #[test]
