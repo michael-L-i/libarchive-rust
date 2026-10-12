@@ -427,3 +427,106 @@ impl<W: Write> AutoFinish for Lzma2Writer<W> {
         let _ = self.finish();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eager<W: Write>(writer: &mut Lzma2Writer<W>) {
+        writer.mf.buffer.resize(writer.mf.buffer.capacity(), 0);
+        writer.mf.son.resize(writer.mf.son.capacity(), 0);
+    }
+
+    #[test]
+    fn empty_writes_and_flushes_do_not_initialize_nodes() {
+        for preset in [0, 2, 6] {
+            let mut options = Lzma2Options::with_preset(preset);
+            options.lzma_options.dict_size = 4096;
+            let mut writer = Lzma2Writer::new(Vec::new(), options);
+            assert_eq!(writer.write(&[]).unwrap(), 0);
+            writer.flush().unwrap();
+            writer.flush().unwrap();
+            assert!(writer.mf.son.is_empty());
+            assert_eq!(writer.mf.buffer.len(), 8);
+            assert_eq!(writer.finish().unwrap(), [0]);
+        }
+    }
+
+    #[test]
+    fn partial_match_finder_initialization_preserves_streams() {
+        let mut seed = 0x82f6_eab9u32;
+        let data: Vec<u8> = (0..160_003)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                if i % 997 < 800 {
+                    (i % 251) as u8
+                } else {
+                    seed as u8
+                }
+            })
+            .collect();
+        for preset in [0, 2, 6] {
+            for dict_size in [4096, 65536, 1 << 23] {
+                for part_size in [1, 31, 65536] {
+                    for preset_dict in [None, Some(data[..10_007].to_vec())] {
+                        let mut options = Lzma2Options::with_preset(preset);
+                        options.lzma_options.dict_size = dict_size;
+                        options.lzma_options.preset_dict = preset_dict;
+                        let mut lazy = Lzma2Writer::new(Vec::new(), options.clone());
+                        let mut full = Lzma2Writer::new(Vec::new(), options);
+                        eager(&mut full);
+                        for (i, part) in data.chunks(part_size).enumerate() {
+                            lazy.write_all(part).unwrap();
+                            full.write_all(part).unwrap();
+                            if i % 211 == 210 {
+                                lazy.flush().unwrap();
+                                full.flush().unwrap();
+                            }
+                            assert!(lazy.mf.buffer.len() <= full.mf.buffer.len());
+                            assert!(lazy.mf.son.len() <= full.mf.son.len());
+                        }
+                        assert_eq!(lazy.finish().unwrap(), full.finish().unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_initialization_survives_independent_dictionary_resets() {
+        let data: Vec<u8> = (0..160_003).map(|i| (i % 251) as u8).collect();
+        for preset in [0, 2, 6] {
+            let mut options = Lzma2Options::with_preset(preset);
+            options.lzma_options.dict_size = 4096;
+            options.chunk_size = NonZeroU64::new(4096);
+            let mut lazy = Lzma2Writer::new(Vec::new(), options.clone());
+            let mut full = Lzma2Writer::new(Vec::new(), options);
+            eager(&mut full);
+            for part in data.chunks(4096) {
+                lazy.write_all(part).unwrap();
+                full.write_all(part).unwrap();
+                eager(&mut full);
+            }
+            assert_eq!(lazy.finish().unwrap(), full.finish().unwrap());
+        }
+    }
+
+    #[test]
+    fn short_input_leaves_unused_window_and_nodes_uninitialized() {
+        let mut writer = Lzma2Writer::new(Vec::new(), Lzma2Options::with_preset(6));
+        assert!(writer.mf.buffer.is_empty());
+        assert!(writer.mf.son.is_empty());
+        let buffer_capacity = writer.mf.buffer.capacity();
+        let son_capacity = writer.mf.son.capacity();
+        writer.write_all(&[0; 4096]).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.mf.buffer.capacity(), buffer_capacity);
+        assert_eq!(writer.mf.son.capacity(), son_capacity);
+        assert!(writer.mf.buffer.len() < 8192);
+        assert!(writer.mf.son.len() < 16384);
+        assert_eq!(writer.mf.hash.len(), writer.mf.hash_mask as usize + 1);
+        writer.finish().unwrap();
+    }
+}
