@@ -44,7 +44,7 @@ upstream's own test suite.
 
 ## Performance
 
-Round 14 used `bench/compare.py` to time C and Rust `bsdtar`
+The final round used `bench/compare.py` to time C and Rust `bsdtar`
 on 8 datasets and 6 formats for creation and extraction: 96 cases,
 whole-process time including startup,
 warm cache, 5 rotating repeats. A win is a median more than 5% below C. On
@@ -53,21 +53,28 @@ C libraries (Apple zlib, liblzma 5.8.4, libzstd 1.5.7):
 
 | | Wins | Ties | Losses |
 |---|---:|---:|---:|
+| Current, after reviewed limits and race hardening (Oct 12) | 56 | 38 | 2 |
+| Previous Rust, measured in the same final run | 54 | 39 | 3 |
 | Round 14, after disk and ISO fixes (Oct 12) | 57 | 37 | 2 |
 | Round 13 (two runs) | 59–61 | 32–34 | 3 |
 | Round 13, with `scripts/build-pgo` | 63 | 31 | 2 |
 | Previous version | 24 | 22 | 50 |
 
-The round-14 run uses the same frozen inputs and C executable as round 13.
-Across all 96 cases the geometric mean of Rust/C time is 0.899, about 10%
-less elapsed time. All 192 cross-reader checks pass with no run failures.
-Close cases move by a few percent between runs. The remaining losses are
-Zstandard creation of the records dataset (1.055x C's time) and 7-Zip
-extraction of the compiled dataset (1.081x). Several small 7-Zip creation
-cases used about 97 MiB peak RSS versus 55 MiB for C. The reviewed encoder
-change described in `NOTES.md` reduces those Rust cases to about 56–57 MiB.
-These results measure regular-file contents with
-metadata disabled, not the ISO or privileged metadata paths.
+The final run uses the same frozen inputs and C executable as round 13.
+Across all 96 cases the geometric mean of Rust/C time is 0.902, about 10%
+less elapsed time. All 336 content/byte checks pass, including identical
+output from all 48 writers against the previous Rust build. There are no
+run failures. Overall time is comparable to previous Rust (1.002x).
+The remaining losses are compiled-data Zstandard creation (1.054x C's
+time) and 7-Zip extraction (1.078x). Close cases move between runs.
+
+Small 7-Zip creation cases now peak at about 56–57 MiB, down from 97 MiB
+and close to C's 55 MiB; large-stream RSS is unchanged. A 15-repeat
+many-file tar confirmation measures 50.0 ms versus previous Rust's 48.2 ms
+and C's 60.7 ms. The extra permission/identity checks retain a small cost
+after redundant calls were removed. These results measure regular-file
+contents with metadata disabled; ISO and privileged metadata have separate
+correctness checks.
 
 The PGO result is historical; the current fixes have not been rebuilt with
 PGO. `scripts/build-pgo` trains on data other than the benchmark's; it

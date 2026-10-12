@@ -91,8 +91,15 @@ nightly; short ASan campaigns ran 85,116 inputs across the ten new targets
 and 657,138 across the original 29, with zero failures. Short campaigns do
 not establish exhaustive coverage. Hosted CI has not run before publication.
 
-Integrated verification: macOS dev/release workspace tests 630/629 passes;
-Linux 627/626, with zero failures and five ignored tests per run. Formatting,
+Final measurement caught a many-file creation regression from redundant
+metadata opens. A separately reviewed follow-up removes four syscalls per
+ordinary cached physical entry, retaining first-filesystem/nodump probes and
+post-callback permission/identity checks. Added tests cover cached permission
+grants and callback type changes with revocation/replacement; the intentional
+anchored-metadata warnings are documented in NOTES.md.
+
+Integrated verification: macOS dev/release workspace tests 632/631 passes;
+Linux 628/627, with zero failures and five ignored tests per run. Formatting,
 strict all-target Clippy, nine Python harness checks and all 454 public exports
 pass. The full upstream/tool counts above remain unchanged, with zero
 ratchet regressions, crashes or timeouts. Eight corrected zisofs images
@@ -100,6 +107,45 @@ pass independent C-reader checks in both profiles on both platforms.
 
 Work is local; nothing was pushed. Detailed validation evidence is retained
 in sibling `diagnostics/round15-validation/`.
+
+## Final 96-case benchmark (2026-10-12)
+
+Integrated source `540ba52`, Apple M5 Pro/macOS 26.6.2, five rotating
+repeats with startup included and warm caches. The same frozen C executable
+and eight input digests match round 14 and round 13; metadata is disabled.
+
+| Operation | Rust wins | Ties | Losses | Geometric Rust/C time |
+|---|---:|---:|---:|---:|
+| Create | 30 | 17 | 1 | 0.874 |
+| Extract | 26 | 21 | 1 | 0.930 |
+| Total | 56 | 38 | 2 | 0.902 |
+
+Previous Rust in the same run scores 54/39/3, geometric Rust/C 0.900.
+Current/previous geometric time is 1.002: overall speed is comparable.
+All 336 content/identity checks pass, with zero run failures and all
+48 Rust writer outputs byte-identical to the previous build. The losses
+are compiled/tar.zst creation (1.054x C) and compiled/7zip extraction
+(1.078x C). Close outcomes remain sensitive to desktop scheduling.
+
+Small 7zip creation RSS: records/documents 96.55 -> 56.22 MiB;
+many-files 97.56 -> 57.23 MiB, about 42% less. C uses approximately
+55 MiB; text/source remain approximately 97 MiB in Rust.
+
+The first post-hardening matrix is retained unchanged as
+`round15-current`: 48/44/4, geometric Rust/C 0.913. Its mixed-XZ slowdown
+disappears in 15 rotations (current 209.5 ms, previous 210.9 ms, C 215.0 ms).
+Its real 31–40% many-file tar/gzip/zstd creation regression prompted the
+reviewed syscall fix. Final plain-tar confirmation in 15 rotations gives
+50.0 ms current, 48.2 ms previous and 60.7 ms C: 3.9% above previous Rust,
+17.6% below C. The five-repeat final matrix's 6.8% plain-tar increase remains
+in the raw report rather than being replaced by the confirmation.
+
+Local reports: `../diagnostics/results/round15/round15-final.{md,json}`;
+scoped confirmations and the initial matrix are alongside them. Frozen
+executable: `../diagnostics/bin/rust-round15-final-bsdtar`, SHA-256
+`449fba1779e937f85fe9e985288b5c9b5233d17eddbfc52d9d83ee58a2f661ea`.
+PGO was not rebuilt. This matrix does not measure ISO or privileged metadata.
+Only main remains checked out; all retired branches and evidence are preserved.
 
 ## Round 14 continuation: Linux and ISO correctness
 

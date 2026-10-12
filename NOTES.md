@@ -1842,6 +1842,18 @@ uncapped operation can still expand decompression bombs as upstream does.
   `ARCHIVE_WARN`/`EACCES` ("Couldn't open metadata descriptor") when requested
   metadata needs it, rather than falling back to the mutable display path.
   Other POSIX hosts do the same for regular-file sparse discovery.
+- Cached physical entries omit an unused follow-stat and early metadata
+  open/fstat/close. Filesystem probing and Linux nodump still open early when
+  needed; metadata and data access recheck identity and permissions after
+  callbacks. Callback changes to the reported file type are preserved.
+  On macOS, changing an observed regular file to a special type while also
+  revoking read access or replacing the leaf returns `ARCHIVE_WARN`/`EACCES`
+  with "Couldn't open metadata descriptor" and no xattrs. C's revocation
+  case has the same status/errno but says "Couldn't list extended attributes";
+  on replacement C reads the replacement's xattrs. The earlier port could
+  retain the original xattrs, or fail on Mac metadata after revocation.
+  This warning preserves fresh permission checks and avoids replacement
+  metadata without retaining the redundant early descriptor.
 - Pinned directories can increase descriptor use with descent depth and
   pending directories, so traversal can fail under the process descriptor
   limit. Device/inode/type checks do not freeze contents or attributes changed
