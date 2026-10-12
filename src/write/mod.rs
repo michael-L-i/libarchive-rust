@@ -63,6 +63,9 @@ pub trait Filter {
     fn close(&mut self, sink: &mut dyn Sink) -> Result<(), Error>;
     fn code(&self) -> c_int;
     fn name(&self) -> &CStr;
+    fn has_options(&self) -> bool {
+        false
+    }
     fn options(&mut self, _key: &[u8], _value: Option<&[u8]>) -> Result<c_int, Error> {
         Ok(ARCHIVE_WARN)
     }
@@ -505,6 +508,9 @@ impl Write {
     ) -> c_int {
         let mut rv = ARCHIVE_WARN;
         for f in filters {
+            if !f.has_options() {
+                continue;
+            }
             if module.is_some_and(|m| m != f.name().to_bytes()) {
                 continue;
             }
@@ -844,5 +850,24 @@ mod tests {
         assert!(writer.filters.is_empty());
         assert_eq!(writer.free(&base), ARCHIVE_OK);
         assert_eq!(events.borrow().len(), 3);
+    }
+    #[test]
+    fn filters_without_option_handlers_are_unknown_modules() {
+        let base = Base::new(WRITE_MAGIC);
+        let mut filters: Vec<Box<dyn Filter>> =
+            vec![filter::by_code(crate::read::filter_code::COMPRESS).unwrap()];
+        assert_eq!(
+            Write::filter_option(&mut filters, &base, Some(b"compress"), b"foo", Some(b"1")),
+            crate::options::UNKNOWN_MODULE
+        );
+        assert_eq!(
+            Write::filter_option(&mut filters, &base, None, b"foo", Some(b"1")),
+            ARCHIVE_WARN
+        );
+        filters.push(filter::by_code(crate::read::filter_code::GZIP).unwrap());
+        assert_eq!(
+            Write::filter_option(&mut filters, &base, Some(b"gzip"), b"foo", Some(b"1")),
+            ARCHIVE_WARN
+        );
     }
 }

@@ -109,6 +109,9 @@ impl Filter for Encode {
             c"uuencode"
         }
     }
+    fn has_options(&self) -> bool {
+        true
+    }
     fn options(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<i32, Error> {
         match key {
             b"mode" => {
