@@ -548,9 +548,12 @@ impl Target {
             } else {
                 path
             };
+            // O_SEARCH: like upstream's paths, this needs only search
+            // permission on the parent.
+            let nofollow = if secure { libc::O_NOFOLLOW_ANY } else { 0 };
             if let Ok(parent) = File::options()
                 .read(true)
-                .custom_flags(libc::O_DIRECTORY | if secure { libc::O_NOFOLLOW_ANY } else { 0 })
+                .custom_flags(libc::O_SEARCH | nofollow)
                 .open(path)
             {
                 return Ok(Self {
@@ -560,35 +563,14 @@ impl Target {
                 });
             }
         }
-        // SAFETY: start is a terminated path, and open returns a new owned fd.
-        let fd = unsafe {
-            libc::open(
-                start.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: fd is a successfully opened, uniquely owned descriptor.
-        let mut parent = unsafe { File::from_raw_fd(fd) };
+        let mut parent = open_dir(libc::AT_FDCWD, start, true)?;
         for component in components {
             if matches!(component, Component::CurDir | Component::RootDir) {
                 continue;
             }
             let part = CString::new(component.as_os_str().as_bytes())
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-            let flags = libc::O_RDONLY
-                | libc::O_DIRECTORY
-                | libc::O_CLOEXEC
-                | if secure { libc::O_NOFOLLOW } else { 0 };
-            // SAFETY: parent fd and component name are live.
-            let fd = unsafe { libc::openat(parent.as_raw_fd(), part.as_ptr(), flags) };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: the new descriptor is uniquely owned by this File.
-            parent = unsafe { File::from_raw_fd(fd) };
+            parent = open_dir(parent.as_raw_fd(), &part, !secure)?;
         }
         Ok(Self {
             parent,
@@ -1199,6 +1181,22 @@ mod tests {
         assert!(!root.0.join("missing").exists());
         create_dir(missing.parent().unwrap(), true, false, umask()).unwrap();
         assert!(Target::prepare(&missing, true).is_ok());
+    }
+
+    #[test]
+    fn target_parent_needs_only_search_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Directory::new();
+        let parent = root.0.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o333)).unwrap();
+        for (secure, name) in [(true, "secure"), (false, "plain")] {
+            let result =
+                Target::prepare(&parent.join(name), secure).and_then(|t| t.open(0o600, true));
+            assert!(result.is_ok(), "{secure}: {result:?}");
+        }
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(parent.join("secure").exists() && parent.join("plain").exists());
     }
 
     #[test]
