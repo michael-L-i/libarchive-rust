@@ -49,7 +49,8 @@ Libarchive: 764 passed / upstream baseline 829 / 934 total.
 | other | 96 | 96 | 139 |
 
 Remaining stubs (`src/ffi/stubs.rs`): 0
-`unsafe` in `src/` (excluding stubs.rs): 260
+`unsafe` in `src/` (excluding stubs.rs): 248; in the tools: 39, all in
+`tools/libarchive_fe/src/sys.rs`
 
 ## Phase 5 checkpoint
 
@@ -546,6 +547,32 @@ remain. All 181 retained evidence fingerprints match; repository connectivity
 checks pass. Original C and pinned upstream remain clean. The workspace and
 diagnostics guides now identify the current checkpoint and reproduction paths.
 No compiler, compatibility test or benchmark was rerun for this cleanup.
+
+## Round 12 checkpoint: an all-Rust distribution
+
+The command-line tools are Rust programs on a new safe Rust API
+(`src/api/`): bsdtar, bsdcpio, bsdcat and bsdunzip, each compared with the
+relinked C tool, and bsdtar with upstream's own, on created archives,
+listings, extracted trees, messages and exit codes. The Rust crate contains
+no C; `capi/` builds the C library with the one varargs shim.
+
+Codecs: DEFLATE compression is a port of zlib 1.2.12 (`deflate/`) and
+LZMA/XZ compression a port of liblzma 5.8.4, both reproducing C's bytes;
+Zstandard compression ports libzstd 1.5.7's level strategies; inflate and
+the Zstandard decoder have new hot loops. Fidelity fixes: the disk walker
+follows upstream's tree order, stat and metadata errors; a writer sweep
+makes 62 of 68 format cases byte-identical to C; restoring a FIFO no longer
+hangs. Tools load no C codec libraries. Fuzzing: 29 targets, one bug fixed.
+
+The 96-case matrix (`bench/compare.py`, five rotations, frozen round-8
+corpus) records 57 wins, 34 ties and 5 losses against C, and 60/32/4 in a
+second run; with `scripts/build-pgo`, 61/31/4. Round 11 in the same run:
+24/22/50. Geometric-mean Rust/C time 0.91 (0.90 with PGO). All 288
+cross-reader checks pass. Raw data: `diagnostics/results/round12/`.
+
+Verification: 926 upstream and front-end tests pass, 184 skip, none fail;
+468 Rust tests pass; strict clippy and formatting pass on macOS and, for
+everything but `capi/`, on Linux, where the tests have not been run.
 
 ## Earlier checkpoints (historical)
 
