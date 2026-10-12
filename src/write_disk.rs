@@ -991,24 +991,53 @@ fn set_times(
     second.and(first)
 }
 
-/// Upstream's set_xattrs: sets every attribute it can, and names the ones
-/// it couldn't unless the filesystem has no extended attributes.
+/// Upstream's set_xattrs: sets every attribute it can, in the order it
+/// lists them, and names the ones it couldn't unless the file system has
+/// no extended attributes. Linux leaves out the attributes that hold
+/// ACLs, and refuses the obsolete xfsroot namespace, which only adds to
+/// the names of a failure (see NOTES.md).
 fn set_xattrs(a: &Base, entry: &Entry, target: &Target) -> c_int {
-    let failed = target.write_xattrs(entry);
-    if failed.is_empty() {
+    let mut failed: Vec<&[u8]> = Vec::new();
+    let mut warn = false;
+    let mut fail = false;
+    for attr in entry.xattrs.iter().rev() {
+        let name = attr.name.to_bytes();
+        #[cfg(target_os = "linux")]
+        {
+            const ACLS: [&[u8]; 4] = [
+                b"system.posix_acl_access",
+                b"system.posix_acl_default",
+                b"trusted.SGI_ACL_DEFAULT",
+                b"trusted.SGI_ACL_FILE",
+            ];
+            if ACLS.contains(&name) {
+                continue;
+            }
+            if name.starts_with(b"xfsroot.") {
+                fail = true;
+                failed.push(name);
+                continue;
+            }
+        }
+        if let Err(e) = target.xattr(&attr.name, &attr.value) {
+            warn = true;
+            failed.push(name);
+            if ![Some(libc::ENOTSUP), Some(libc::ENOSYS)].contains(&e.raw_os_error()) {
+                fail = true;
+            }
+        }
+    }
+    if !warn {
         return ARCHIVE_OK;
     }
-    let unsupported =
-        |e: &std::io::Error| [Some(libc::ENOTSUP), Some(libc::ENOSYS)].contains(&e.raw_os_error());
-    let msg = if failed.iter().all(|(_, e)| unsupported(e)) {
-        b"Cannot restore extended attributes on this file system".to_vec()
-    } else {
-        let names: Vec<&[u8]> = failed.iter().map(|(name, _)| name.to_bytes()).collect();
+    let msg = if fail {
         [
-            b"Cannot restore extended attributes: ",
-            &names.join(&b' ')[..],
+            &b"Cannot restore extended attributes: "[..],
+            &failed.join(&b' ')[..],
         ]
         .concat()
+    } else {
+        b"Cannot restore extended attributes on this file system".to_vec()
     };
     a.warn(ARCHIVE_ERRNO_MISC, msg).code()
 }
@@ -1624,7 +1653,20 @@ mod tests {
             #[cfg(target_vendor = "apple")]
             entry.set_fflags(libc::UF_HIDDEN as std::ffi::c_ulong, 0);
             assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
-            assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+            // Linux has no user attributes on a symlink.
+            let linux_xattr = cfg!(target_os = "linux") && options & XATTR != 0;
+            assert_eq!(
+                disk.finish_entry(&base),
+                if linux_xattr {
+                    ARCHIVE_WARN
+                } else {
+                    ARCHIVE_OK
+                }
+            );
+            if linux_xattr {
+                let expected = b"Cannot restore extended attributes: user.dir";
+                assert_eq!(*base.error_string().unwrap(), *expected);
+            }
             assert_eq!(disk.close(&base), ARCHIVE_OK);
             // Upstream keeps the symlink and touches only the link itself.
             assert!(

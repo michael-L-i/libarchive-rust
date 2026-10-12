@@ -210,7 +210,7 @@ pub fn read_xattrs(
     }
     Ok(())
 }
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 pub fn read_xattrs(
     _path: &Path,
     _entry: &mut Entry,
@@ -244,6 +244,59 @@ fn set_flags(fd: libc::c_int, flags: u32) -> std::io::Result<()> {
     // SAFETY: the ioctl reads one int, from `flags`, which outlives the
     // call; a descriptor that isn't open only fails.
     result(unsafe { libc::ioctl(fd, libc::FS_IOC_SETFLAGS, &flags) })
+}
+
+/// What Linux extended attributes are read from: a descriptor, or a path
+/// and whether to follow a symlink there.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub enum Source<'a> {
+    Fd(libc::c_int),
+    Path(&'a CStr, bool),
+}
+#[cfg(target_os = "linux")]
+fn xattr_size(n: isize) -> std::io::Result<usize> {
+    usize::try_from(n).map_err(|_| std::io::Error::last_os_error())
+}
+#[cfg(target_os = "linux")]
+impl Source<'_> {
+    /// flistxattr, listxattr or llistxattr: the names into `buf`, or with
+    /// an empty `buf` the size they need.
+    pub fn list(self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let ptr = if buf.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            buf.as_mut_ptr().cast()
+        };
+        // SAFETY: `ptr` is NULL with a length of 0, or `buf`, writable for
+        // its length; the path is terminated.
+        xattr_size(unsafe {
+            match self {
+                Source::Fd(fd) => libc::flistxattr(fd, ptr, buf.len()),
+                Source::Path(p, true) => libc::listxattr(p.as_ptr(), ptr, buf.len()),
+                Source::Path(p, false) => libc::llistxattr(p.as_ptr(), ptr, buf.len()),
+            }
+        })
+    }
+    /// fgetxattr, getxattr or lgetxattr: the value of `name` into `buf`,
+    /// or with an empty `buf` its size.
+    pub fn get(self, name: &CStr, buf: &mut [u8]) -> std::io::Result<usize> {
+        let ptr = if buf.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            buf.as_mut_ptr().cast()
+        };
+        let name = name.as_ptr();
+        // SAFETY: `ptr` is NULL with a length of 0, or `buf`, writable for
+        // its length; the name and path are terminated.
+        xattr_size(unsafe {
+            match self {
+                Source::Fd(fd) => libc::fgetxattr(fd, name, ptr, buf.len()),
+                Source::Path(p, true) => libc::getxattr(p.as_ptr(), name, ptr, buf.len()),
+                Source::Path(p, false) => libc::lgetxattr(p.as_ptr(), name, ptr, buf.len()),
+            }
+        })
+    }
 }
 
 use std::fs::File;
@@ -930,6 +983,45 @@ impl Target {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl Target {
+    /// Sets an extended attribute through the entry's descriptor, or else
+    /// by its name without following a symlink there, as upstream's
+    /// fsetxattr and lsetxattr.
+    pub fn xattr(&self, name: &CStr, value: &[u8]) -> std::io::Result<()> {
+        if let Some(file) = &self.live {
+            // SAFETY: live descriptor, terminated name, and a value
+            // readable for its length; the kernel copies it.
+            return result(unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            });
+        }
+        // The calls that take only a path reach the entry through the
+        // parent held open for it.
+        let mut path = format!("/proc/self/fd/{}/", self.parent.as_raw_fd()).into_bytes();
+        path.extend_from_slice(self.name.as_bytes());
+        let path =
+            CString::new(path).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        // SAFETY: terminated path and name, and a value readable for its
+        // length; the kernel copies it.
+        result(unsafe {
+            libc::lsetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        })
+    }
+}
+
 impl Target {
     #[cfg(target_vendor = "apple")]
     pub fn compression_file(&self) -> std::io::Result<File> {
@@ -995,23 +1087,10 @@ impl Target {
     }
 }
 
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 impl Target {
-    /// Sets every extended attribute it can and returns the ones it couldn't.
-    pub fn write_xattrs<'a>(&self, entry: &'a Entry) -> Vec<(&'a CStr, std::io::Error)> {
-        #[cfg(target_vendor = "apple")]
-        return entry
-            .xattrs
-            .iter()
-            .filter_map(|attr| {
-                let e = self.xattr(&attr.name, &attr.value).err()?;
-                Some((attr.name.as_c_str(), e))
-            })
-            .collect();
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            let _ = entry;
-            Vec::new()
-        }
+    pub fn xattr(&self, _name: &CStr, _value: &[u8]) -> std::io::Result<()> {
+        Ok(())
     }
 }
 impl Target {

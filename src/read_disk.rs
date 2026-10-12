@@ -563,10 +563,23 @@ impl ReadDisk {
                 b"Couldn't translate NFSv4 ACLs",
             ));
         }
+        #[cfg(target_os = "linux")]
+        let cpath = disk_sys::path_c(path).ok();
+        #[cfg(not(target_os = "linux"))]
         if self.behavior & 0x10 == 0
             && let Err((e, msg)) = disk_sys::read_xattrs(path, entry, follow)
         {
             ret = ret.min(failure(a, ARCHIVE_WARN, e, msg.as_bytes()));
+        }
+        #[cfg(target_os = "linux")]
+        if self.behavior & 0x10 == 0
+            && let Some(cpath) = &cpath
+        {
+            let source = match fd {
+                Some(fd) => disk_sys::Source::Fd(fd),
+                None => disk_sys::Source::Path(cpath, follow),
+            };
+            ret = ret.min(setup_xattrs(a, entry, source));
         }
         if self.behavior & 4 != 0
             && let Err(e) = disk_sys::pack_mac_metadata(path, entry)
@@ -749,6 +762,72 @@ fn failure(a: &Base, code: c_int, e: std::io::Error, msg: &[u8]) -> c_int {
     } else {
         a.raise(Error::new(code, errno, msg))
     }
+}
+
+/// Upstream's Linux setup_xattrs: adds the extended attributes of `src`,
+/// but those that hold ACLs and the obsolete xfsroot namespace. One that
+/// can't be read is left out, its error left on the handle.
+#[cfg(target_os = "linux")]
+fn setup_xattrs(a: &Base, entry: &mut Entry, src: disk_sys::Source) -> c_int {
+    let errno = |e: std::io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+    let size = match src.list(&mut []) {
+        Ok(0) => return ARCHIVE_OK,
+        Ok(size) if size <= 1024 * 1024 => size,
+        Ok(_) => {
+            return a
+                .warn(libc::ENOMEM, "Couldn't list extended attributes")
+                .code();
+        }
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::ENOSYS)) => {
+            return ARCHIVE_OK;
+        }
+        Err(e) => return a.warn(errno(e), "Couldn't list extended attributes").code(),
+    };
+    let mut list = vec![0; size];
+    match src.list(&mut list) {
+        Ok(len) => list.truncate(len),
+        Err(e) => {
+            return a
+                .warn(errno(e), "Couldn't retrieve extended attributes")
+                .code();
+        }
+    }
+    for name in list.split_inclusive(|&b| b == 0) {
+        let Ok(name) = std::ffi::CStr::from_bytes_until_nul(name) else {
+            continue;
+        };
+        let skip: [&[u8]; 4] = [
+            // POSIX.1e ACLs.
+            b"system.posix_acl_access",
+            b"system.posix_acl_default",
+            b"trusted.SGI_ACL_DEFAULT",
+            b"trusted.SGI_ACL_FILE",
+        ];
+        // The xfsroot namespace is obsolete and unsupported.
+        if skip.contains(&name.to_bytes()) || name.to_bytes().starts_with(b"xfsroot.") {
+            continue;
+        }
+        let value = src
+            .get(name, &mut [])
+            .map_err(|e| (e, "Couldn't query extended attribute"));
+        let value = value.and_then(|size| {
+            if size > 16 * 1024 * 1024 {
+                let e = std::io::Error::from_raw_os_error(libc::ENOMEM);
+                return Err((e, "Out of memory"));
+            }
+            let mut value = vec![0; size];
+            let len = src
+                .get(name, &mut value)
+                .map_err(|e| (e, "Couldn't read extended attribute"))?;
+            value.truncate(len);
+            Ok(value)
+        });
+        match value {
+            Ok(value) => entry.xattr_add(name, &value),
+            Err((e, msg)) => a.set_error(errno(e), Some(msg.as_bytes())),
+        }
+    }
+    ARCHIVE_OK
 }
 
 #[cfg(test)]
