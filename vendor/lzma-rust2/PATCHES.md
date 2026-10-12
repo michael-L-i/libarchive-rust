@@ -115,6 +115,16 @@ instructions retired, not time, judge these).
   64 compared bytes fewer per skipped byte; the source slice
   6.490 -> 6.512 G and records 11.123 -> 11.126 G.
 
+- `bt_skip_func()` is inlined into its two callers, so the skip loop
+  keeps the search parameters in registers instead of passing them
+  through the stack. Median cycles of three interleaved runs of the
+  preset-6 `.xz` harness on the eight 4-16 MiB benchmark tars, relative
+  to liblzma, before the two skip changes and after: text 1.228 ->
+  0.677, source 1.076 -> 0.956, mixed 0.822 -> 0.750, records
+  0.968 -> 0.988, compiled 0.920 -> 0.924, documents 0.769 -> 0.712,
+  many-files 1.021 -> 0.963, random 0.655 -> 0.657. Instructions fall
+  on every input but random (+0.2%).
+
 ## LZMA2 decoder resident dictionary pages
 
 `src/lz/lz_decoder.rs` and `src/lzma2_reader.rs` defer initialization of

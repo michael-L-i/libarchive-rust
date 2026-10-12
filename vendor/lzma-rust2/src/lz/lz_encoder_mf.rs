@@ -235,6 +235,7 @@ fn bt_find_func(
 /// distance and reaches `len_limit`. When it does, the repeat is measured
 /// up to `run_limit` bytes into `run`, and the next positions it covers
 /// take `len_limit` at that node without comparing bytes.
+#[inline(always)]
 fn bt_skip_func(s: &Search, son: &mut [u32], mut cur_match: u32, run: &mut Run, run_limit: u32) {
     let Search {
         len_limit,
