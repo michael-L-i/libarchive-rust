@@ -49,7 +49,6 @@ use std::sync::Arc;
 mod boot;
 mod descriptor;
 mod idr;
-mod qsort;
 mod record;
 mod tree;
 mod zisofs;

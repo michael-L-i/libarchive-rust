@@ -966,10 +966,9 @@ impl Iso9660 {
             return Err(misc("Path table chain is shorter than its count"));
         }
 
-        qsort::qsort(&mut enttbl, &mut |p1, p2| {
+        crate::ffi::qsort::qsort(&mut enttbl, |p1, p2| {
             self.compare_path_table(p1, p2, joliet)
-        })
-        .map_err(|_| Error::fatal(libc::ENOMEM, "Can't allocate memory"))?;
+        })?;
         for &n in &enttbl {
             self.ents[n].dir_number = *dir_number;
             *dir_number = dir_number.wrapping_add(1);
