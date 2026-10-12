@@ -639,7 +639,19 @@ mod tests {
             let path = PathBuf::from(std::ffi::OsStr::from_bytes(
                 entry.pathname().unwrap().to_bytes(),
             ));
-            let fs = super::super::disk_sys::filesystem(&path, false).unwrap();
+            // On Linux, upstream asks about the directory being read.
+            #[cfg(target_os = "linux")]
+            let fs = super::super::disk_sys::filesystem(
+                if path == root {
+                    std::path::Path::new(".")
+                } else {
+                    path.parent().unwrap()
+                },
+                false,
+            );
+            #[cfg(not(target_os = "linux"))]
+            let fs = super::super::disk_sys::filesystem(&path, false);
+            let fs = fs.unwrap();
             assert_eq!(
                 archive_read_disk_current_filesystem_is_remote(disk),
                 fs.remote

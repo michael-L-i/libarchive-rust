@@ -1052,7 +1052,126 @@ pub fn filesystem(path: &Path, follow: bool) -> Result<Filesystem, (std::io::Err
     })
 }
 
-#[cfg(not(target_vendor = "apple"))]
+/// Upstream's Linux setup_current_filesystem for `path`: the directory
+/// being read, or with `target` a symlink's target on another file
+/// system, which upstream opens (with O_NONBLOCK here, so that a FIFO
+/// can't hang the walk).
+#[cfg(target_os = "linux")]
+pub fn filesystem(path: &Path, target: bool) -> Result<Filesystem, (std::io::Error, &'static str)> {
+    const AFS_SUPER_MAGIC: u32 = 0x5346_414f;
+    const CIFS_SUPER_MAGIC: u32 = 0xff53_4d42;
+    const CODA_SUPER_MAGIC: u32 = 0x7375_7245;
+    const NCP_SUPER_MAGIC: u32 = 0x564c;
+    const NFS_SUPER_MAGIC: u32 = 0x6969;
+    const SMB_SUPER_MAGIC: u32 = 0x517b;
+    const DEVFS_SUPER_MAGIC: u32 = 0x1373;
+    const PROC_SUPER_MAGIC: u32 = 0x9fa0;
+    const USBDEVICE_SUPER_MAGIC: u32 = 0x9fa2;
+    let failed = |e| (e, "statfs failed");
+    let file = if target {
+        Some(open_read(path, libc::O_NONBLOCK).map_err(|e| (e, "openat failed"))?)
+    } else {
+        None
+    };
+    let fd = file.as_ref().map(AsRawFd::as_raw_fd);
+    let path = path_c(path).map_err(failed)?;
+    // SAFETY: statvfs and statfs are plain C structs of integers.
+    let (mut vfs, mut sfs): (libc::statvfs, libc::statfs) = unsafe { std::mem::zeroed() };
+    // SAFETY: live descriptor or terminated path, and writable structs.
+    let vr = result(unsafe {
+        match fd {
+            Some(fd) => libc::fstatvfs(fd, &mut vfs),
+            None => libc::statvfs(path.as_ptr(), &mut vfs),
+        }
+    });
+    // SAFETY: as above.
+    result(unsafe {
+        match fd {
+            Some(fd) => libc::fstatfs(fd, &mut sfs),
+            None => libc::statfs(path.as_ptr(), &mut sfs),
+        }
+    })
+    .map_err(failed)?;
+    // Upstream's get_xfer_size. errno is cleared first: a name the file
+    // system has no value for gives -1 and leaves it alone.
+    // SAFETY: errno is this thread's own.
+    unsafe { *libc::__errno_location() = 0 };
+    let sizes = [
+        libc::_PC_REC_INCR_XFER_SIZE,
+        libc::_PC_REC_MAX_XFER_SIZE,
+        libc::_PC_REC_MIN_XFER_SIZE,
+        libc::_PC_REC_XFER_ALIGN,
+    ]
+    .map(|name| {
+        // SAFETY: live descriptor or terminated path; no pointer is kept.
+        unsafe {
+            match fd {
+                Some(fd) => libc::fpathconf(fd, name),
+                None => libc::pathconf(path.as_ptr(), name),
+            }
+        }
+    });
+    let errno = std::io::Error::last_os_error();
+    vr.map_err(failed)?;
+    let [incr, max, min, align] = match sizes {
+        [.., -1] if errno.raw_os_error() == Some(libc::EINVAL) => {
+            // pathconf(_PC_REC_*) operations are not supported.
+            let size = |n: libc::c_ulong| if n > 0 { n as libc::c_long } else { -1 };
+            [size(vfs.f_bsize), -1, size(vfs.f_bsize), size(vfs.f_frsize)]
+        }
+        [.., -1] => return Err(failed(errno)),
+        sizes => sizes,
+    };
+    let (remote, synthetic) = match sfs.f_type as u32 {
+        AFS_SUPER_MAGIC | CIFS_SUPER_MAGIC | CODA_SUPER_MAGIC | NCP_SUPER_MAGIC
+        | NFS_SUPER_MAGIC | SMB_SUPER_MAGIC => (1, 0),
+        DEVFS_SUPER_MAGIC | PROC_SUPER_MAGIC | USBDEVICE_SUPER_MAGIC => (0, 1),
+        _ => (0, 0),
+    };
+    Ok(Filesystem {
+        remote,
+        synthetic,
+        noatime: vfs.f_flag & libc::ST_NOATIME != 0,
+        block_size: read_block_size(incr, max, min, align),
+    })
+}
+
+/// The size of upstream's read buffer for a file system with these
+/// transfer sizes (setup_suitable_read_buffer): the maximum, or else the
+/// minimum grown by the increment to at least 64 KiB. Where upstream would
+/// grow it forever or read nothing, it is 64 KiB; it is at most 16 MiB.
+#[cfg(target_os = "linux")]
+fn read_block_size(
+    incr: libc::c_long,
+    max: libc::c_long,
+    min: libc::c_long,
+    align: libc::c_long,
+) -> usize {
+    const MIN: libc::c_long = 64 * 1024;
+    let align = if align == -1 { 4096 } else { align };
+    let size = if max != -1 {
+        max
+    } else {
+        let (mut size, incr) = if min < 0 {
+            (align, align)
+        } else {
+            (min, if incr < 0 { min } else { incr })
+        };
+        if size < MIN && incr <= 0 {
+            return MIN as usize;
+        }
+        while size < MIN {
+            size = size.saturating_add(incr);
+        }
+        size
+    };
+    match usize::try_from(size) {
+        Ok(0) | Err(_) => MIN as usize,
+        Ok(size) => size.min(16 * 1024 * 1024),
+    }
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 pub fn filesystem(
     _path: &Path,
     _follow: bool,

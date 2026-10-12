@@ -299,6 +299,17 @@ impl ReadDisk {
             let fs = match *probe {
                 Some(fs) => fs,
                 None => {
+                    // Upstream asks about the directory being read (the
+                    // working directory for the root), or a symlink's
+                    // target on another file system.
+                    #[cfg(target_os = "linux")]
+                    let found = if followed && st.st_dev != lst.st_dev {
+                        disk_sys::filesystem(&path, true)
+                    } else {
+                        let dir = path.parent().filter(|_| !root);
+                        disk_sys::filesystem(dir.unwrap_or(Path::new(".")), false)
+                    };
+                    #[cfg(not(target_os = "linux"))]
                     let found =
                         disk_sys::filesystem(&path, follow && entry.filetype() != libc::S_IFLNK);
                     match found {
@@ -425,7 +436,10 @@ impl ReadDisk {
         self.behavior & 1 != 0 && !rt.noatime
     }
     /// Opens the current file's data, as upstream's
-    /// _archive_read_data_block does when first called.
+    /// _archive_read_data_block does when first called. On Linux, if its
+    /// times are to be restored, it is opened with O_NOATIME, so that they
+    /// needn't be; where that fails with EPERM, upstream means to try again
+    /// without it but fails (see NOTES.md).
     fn open_data(&mut self, a: &Base) -> Result<(), c_int> {
         if self.file.is_some() || self.eof {
             return Ok(());
@@ -433,8 +447,17 @@ impl ReadDisk {
         let Some(path) = &self.current else {
             return Ok(());
         };
-        match disk_sys::open_read(path, 0) {
+        #[cfg(target_os = "linux")]
+        let flags = if self.needs_restore(self.restore) {
+            libc::O_NOATIME
+        } else {
+            0
+        };
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+        match disk_sys::open_read(path, flags) {
             Ok(file) => {
+                self.restore.noatime |= flags != 0;
                 self.file = Some(file);
                 Ok(())
             }
