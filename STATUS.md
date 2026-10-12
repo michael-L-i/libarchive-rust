@@ -97,7 +97,7 @@ cross-reader checks passed. No build, test or benchmark process remains running.
 
 ## 7zip and LZMA performance checkpoint
 
-Compared with c06c7a3 under identical Rust compiler settings, 7zip creation is
+Compared with 6dc2f00 under identical Rust compiler settings, 7zip creation is
 3.4–4.0x faster on repetitive text and 1.8x faster on small files. Creation RSS
 falls from about 97 MiB to 24 MiB for 2 MiB text, 27 MiB for random data and
 10 MiB for 256 small files. Listing RSS falls from about 12 MiB to 4 MiB.
@@ -127,7 +127,7 @@ binary hashes. Code is committed locally; no tests or benchmarks remain running.
 
 ## Optimization round 3 checkpoint
 
-Baseline `7139c72` to code `25ac9ea`: Zstandard uses five-byte hashing,
+Baseline `4a7a5de` to code `84a0406`: Zstandard uses five-byte hashing,
 adaptive search skipping and amortized history compaction. XZ/LZMA2 defers
 initialization of unused dictionary pages. Disk extraction omits redundant
 contiguous seeks and final file resizing while retaining sparse/error behavior.
@@ -168,7 +168,7 @@ before/after snapshots preserve both profiles. Work is committed locally.
 
 ## Optimization round 4 checkpoint
 
-Baseline `916ee2b` to final code `497ebb8`. Seven focused units, implemented in
+Baseline `80cfc52` to final code `18d1b64`. Seven focused units, implemented in
 separate worktrees and independently reviewed by Astra: exact rejection of Zstd
 Huffman output that would be discarded, direct FSE encoder state lookup, inline
 FSE decoder state updates, safe doubling of initialized overlapping matches,
@@ -217,7 +217,7 @@ locally. Current `diagnostics/bin/rust-bsdtar` is the verified final release.
 
 ## Optimization round 5 checkpoint
 
-Baseline `c1dc8b7` to code `de50d58`: three reviewed Zstandard optimizations.
+Baseline `c31ba8d` to code `3bc5500`: three reviewed Zstandard optimizations.
 The matcher bounds its hash load once and stores relative `u32` positions,
 rebasing only when retained history compacts. Its table shrinks from 512 to
 256 KiB without changing match decisions. Two hot decoder ring appends replace
@@ -258,7 +258,7 @@ build, test, benchmark or worker process left running.
 
 ## Optimization round 6 checkpoint
 
-Baseline `a0fbedb` to code `d03bfb0`: BT4 skip reuses the proved suffix of
+Baseline `e999b15` to code `d48411c`: BT4 skip reuses the proved suffix of
 earlier same-distance matches, preserving exact tree and match decisions.
 The three-integer cache is invalidated at position normalization. Zstandard
 batches three bounded FSE state fields into one bit write and inlines match
@@ -303,7 +303,7 @@ clean. Work is committed locally; no build, test or benchmark remains running.
 
 ## Optimization round 7 checkpoint
 
-Baseline `fafa7a5` -> final code `afcf794`. Three isolated specialists used
+Baseline `b9b8c7e` -> final code `8df7b41`. Three isolated specialists used
 actual Claude Opus 5.5 for design and fresh independent review. The accepted
 changes mask range updates for normal LZMA literals, share a direct Zstandard
 frame encoder with the existing pull compressor, and predecode Zstandard
@@ -349,7 +349,7 @@ or benchmark remains running.
 
 ## Optimization round 8 checkpoint
 
-Eight reviewed performance changes are committed through `deefb72`: standard
+Eight reviewed performance changes are committed through `980b748`: standard
 name/filesystem caches, runtime bulk CRC32 dispatch, Zstandard sequence decoding,
 AArch64 DEFLATE bulk copies, bounded Zstandard sequence bit output, fresh-file
 metadata work, bounded LZMA skips/distance prices, and exact short DEFLATE copies.
@@ -427,12 +427,12 @@ No speculative writer change was merged.
 Report: `../diagnostics/results/REPORT.md`; raw results:
 `../diagnostics/results/round9-final.json`; validation and confirmation:
 `../diagnostics/round9-integration/`. Frozen binary:
-`../diagnostics/bin/rust-round9-final-bsdtar`. Code checkpoint: b421761.
+`../diagnostics/bin/rust-round9-final-bsdtar`. Code checkpoint: 78fd146.
 Original C and pinned upstream remain clean. No work was pushed.
 
 ## Performance round 10 checkpoint
 
-Five reviewed optimization units are integrated at `57388dd`: bounded BT4
+Five reviewed optimization units are integrated at `1704441`: bounded BT4
 hash-head pipelining, a tagged next-head hint across match-finder calls,
 exact 64/32-byte DEFLATE history copies, stable DEFLATE insertion-array
 borrows, and medium-sized Zstandard literal/match copies. All codec code
@@ -475,7 +475,7 @@ pinned upstream remain clean. No work was pushed.
 
 ## Performance round 11 checkpoint
 
-Four reviewed units are integrated at `a8135f1`: fixed eight-step LZMA
+Four reviewed units are integrated at `a4cd19b`: fixed eight-step LZMA
 literal loops, exact short DEFLATE matches inside the fast decoder,
 sixteen-byte CRC64 checksum steps, and guarded four-stream Huffman literal
 decoding with inline transitions. All codec code remains safe Rust;
@@ -533,7 +533,7 @@ upstream remain clean. No work was pushed.
 ### Workspace cleanup (October 11, 2026)
 
 Retired all 45 experimental worktrees after the round-eleven validation
-checkpoint `1e72899`. Only the main Rust checkout remains. All branches
+checkpoint `e5315b4`. Only the main Rust checkout remains. All branches
 are retained, with a verified all-ref Git bundle, staged/unstaged patches
 and local file backups in sibling
 `diagnostics/archive/worktrees-2026-10-11/`. Six uncommitted experiments

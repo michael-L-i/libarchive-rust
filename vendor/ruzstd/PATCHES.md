@@ -125,7 +125,7 @@ explicit once and exposes one little-endian word load to the optimizer. The
 five-byte hash, probe order, match lengths, compression settings and bytes
 are unchanged. No vendor codec algorithm changes or unsafe code are needed.
 
-- A fresh profile of the accepted c1dc8b7 baseline attributes about 55% of
+- A fresh profile of the accepted c31ba8d baseline attributes about 55% of
   source encoding CPU to matching, including out-of-line hash loads.
 - Nine alternating release-run medians on 16 MiB inputs, in milliseconds:
   random 13.01 -> 11.39, source 68.01 -> 58.71, mixed 40.34 -> 36.97,
@@ -218,14 +218,14 @@ one `u64` carries all three in the original low-bit-first order. This replaces
 three bit-writer buffer/flush checks with one. Extra bits, table construction,
 state transitions, match choices, compression settings and output are unchanged.
 
-- A fresh a0fbedb source profile still identifies sequence encoding and the
+- A fresh e999b15 source profile still identifies sequence encoding and the
   bit writer's cold flush path as substantial costs after matcher improvements.
 - Nine alternating release-run medians on 16 MiB inputs, milliseconds:
   source 55.50 -> 51.77, mixed 34.21 -> 32.56; random, periodic and repeated
   binary are essentially unchanged. A second nine-run confirmation gives
   source 55.11 -> 52.03 and mixed 34.29 -> 32.77 (about 6% and 4.5%).
 - All 545 corpus, alphabet, block-boundary, compaction and RLE-history cases
-  remain byte-identical to the frozen a0fbedb baseline and decode with ruzstd.
+  remain byte-identical to the frozen e999b15 baseline and decode with ruzstd.
   Independent C zstd validates all five 16 MiB streams. All 15 standalone
   FSE/bit-writer tests pass with optimization and debug assertions enabled.
 - Raw profiles and measurements are in sibling `diagnostics/round6-zstd`.
@@ -283,7 +283,7 @@ checksum writes and full-block empty terminators are unchanged.
   were implemented locally. Prompts and raw model responses are retained in
   sibling `diagnostics/round7-zstd`, including an unsuccessful tool-use review
   attempt and the corrected final review.
-- All 545 frozen fafa7a5 baseline corpus/boundary/history comparisons remain
+- All 545 frozen b9b8c7e baseline corpus/boundary/history comparisons remain
   byte-identical for both pull and push, plus 105 push fragmentation cases.
   Thirteen filter tests pass, covering reset/reuse, first-block and checksum
   emit errors, original sink panic payload, custom-matcher Uncompressed output,

@@ -174,7 +174,7 @@ eight-iteration loop. Probability indices, update order, input reads,
 normalization, dictionary writes and errors are unchanged for valid and
 malformed input. No new unsafe code, dependency, allocation or format change.
 
-Validation on Apple Silicon, 2026-10-11, versus `3bd88f0`:
+Validation on Apple Silicon, 2026-10-11, versus `0de3223`:
 
 - Current source/mixed/records profiles identify the main range decoder and
   length decoder as the relevant hot paths. A separate fixed-array tree and

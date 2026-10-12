@@ -520,7 +520,7 @@ Oracle notes:
 - All 5,838 generated truncations and mutations of the 17 upstream lz4 fixtures
   match the oracle: stdout, exit status and stderr. An earlier run showed 553
   stdout differences where the oracle emitted nothing. They came from the uu
-  bidder's search window (fixed on main by `0c8ecb6`), not from this filter.
+  bidder's search window (fixed on main by `62baf89`), not from this filter.
 
 Phase 5 look-ahead: `lz4_flex` (feature `frame`) has a frame writer with
 linked or independent blocks and block and content checksums, which is the
