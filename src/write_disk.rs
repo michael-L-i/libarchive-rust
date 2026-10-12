@@ -487,6 +487,21 @@ impl WriteDisk {
             target.retain_file(file);
         }
         let mut ret = ARCHIVE_OK;
+        // Upstream compresses as the data is written, before any metadata.
+        #[cfg(target_vendor = "apple")]
+        if entry.filetype() == libc::S_IFREG
+            && options & 0x4000 == 0
+            && (options & 0x8000 != 0
+                || entry.fflags().0 & libc::UF_COMPRESSED as std::ffi::c_ulong != 0)
+            && let Err(e) = hfs::compress(target, entry.size().max(0) as u64)
+        {
+            ret = a
+                .warn(
+                    e.raw_os_error().unwrap_or(libc::EIO),
+                    "Failed to compress file",
+                )
+                .code();
+        }
         if options & OWNER != 0 {
             let mut names = entry.clone_entry();
             let uid = self.user.lookup(names.uname(), entry.uid(), false);
@@ -556,20 +571,6 @@ impl WriteDisk {
         {
             ret = a
                 .warn(e.raw_os_error().unwrap_or(libc::EIO), "Can't restore ACL")
-                .code();
-        }
-        #[cfg(target_vendor = "apple")]
-        if entry.filetype() == libc::S_IFREG
-            && options & 0x4000 == 0
-            && (options & 0x8000 != 0
-                || entry.fflags().0 & libc::UF_COMPRESSED as std::ffi::c_ulong != 0)
-            && let Err(e) = hfs::compress(target, entry.size().max(0) as u64)
-        {
-            ret = a
-                .warn(
-                    e.raw_os_error().unwrap_or(libc::EIO),
-                    "Failed to compress file",
-                )
                 .code();
         }
         if options & 0x2000 != 0
@@ -761,6 +762,28 @@ mod tests {
         if cfg!(target_vendor = "apple") {
             assert_eq!(mode & 0o777, 0o640 & !crate::ffi::disk_sys::umask());
         }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn hfs_compression_precedes_times() {
+        use std::os::unix::fs::MetadataExt;
+        let output = Output::new();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        disk.options = TIME;
+        let mut entry = Entry::new(None);
+        entry.set_pathname(output.path().as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFREG | 0o644);
+        entry.set_size(8192);
+        entry.set_mtime(1_000_000_000, 0);
+        entry.set_fflags(libc::UF_COMPRESSED as std::ffi::c_ulong, 0);
+        assert_eq!(disk.header(&base, &entry), ARCHIVE_OK);
+        assert_eq!(disk.data(&base, &[b'a'; 8192]), 8192);
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+        let metadata = std::fs::metadata(output.path()).unwrap();
+        assert_eq!(metadata.mtime(), 1_000_000_000);
+        assert_eq!(std::fs::read(output.path()).unwrap(), [b'a'; 8192]);
     }
 
     #[test]
