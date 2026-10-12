@@ -574,6 +574,27 @@ Verification: 926 upstream and front-end tests pass, 184 skip, none fail;
 468 Rust tests pass; strict clippy and formatting pass on macOS and, for
 everything but `capi/`, on Linux, where the tests have not been run.
 
+## Round 13 checkpoint: fidelity, safety and the last LZMA gap
+
+A differential run of upstream's 562 test archives through our and
+upstream's bsdtar found 20 differences, 19 in the disk writer; all are fixed
+but one (a damaged bzip2 stream, documented). A follow-up ported the
+writer's remaining paths (symlink checks, what is in the way, metadata order
+and messages, deferred fixups). An independent review with a 169-case
+malicious-archive suite stopped it once, for metadata applied through a
+symlink, descriptor exhaustion and a FIFO hang (the last two already on
+main); after the fixes it matches upstream in 154 cases and is stricter in
+the rest. Metadata now goes through the verified descriptor.
+
+The LZMA encoder no longer re-compares long repeats, and its output stays
+byte-identical to liblzma's: text creation is 0.70x C (was 1.22x). Debug-profile
+tests caught a warning raised as a failure in read_disk; CI now tests the
+dev profile.
+
+Benchmark: 61/32/3 and 59/34/3 against C in two runs, 63/31/2 with PGO;
+geometric-mean Rust/C 0.90. All 336 checks pass, and archives are
+byte-identical to round 12's. Raw data: `diagnostics/results/round12/round13-*`.
+
 ## Earlier checkpoints (historical)
 
 ### Phase 2 checkpoint

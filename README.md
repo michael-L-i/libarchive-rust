@@ -21,8 +21,15 @@ upstream's own test suite.
   `bsdtar` writes the same `.tar.gz`, `.zip`, `.tar.xz` and `.7z` archives as
   the C build. Zstandard compression ports libzstd 1.5.7's strategies.
 - **Fidelity:** in a byte-for-byte comparison of every writer against C
-  `bsdtar`, 62 of 68 format and input cases are identical; `NOTES.md`
-  records each remaining difference and every intended one.
+  `bsdtar`, 62 of 68 format and input cases are identical. Listing and
+  extracting upstream's 562 test archives matches upstream's own `bsdtar` on
+  all but one, a damaged bzip2 stream the safe decoder reports differently.
+  `NOTES.md` records each remaining difference and every intended one.
+- **Extraction safety:** the disk writer follows upstream's checks for
+  absolute paths, `..`, symlinks and hardlinks, verified with a 169-case
+  malicious-archive suite against upstream. Where they differ, this port
+  leaves files outside the extraction directory alone where upstream would
+  change them.
 - **Fuzzing:** a `cargo fuzz` target for every reader and filter (`fuzz/`).
 
 ## Performance
@@ -35,16 +42,15 @@ C libraries (Apple zlib, liblzma 5.8.4, libzstd 1.5.7):
 
 | | Wins | Ties | Losses |
 |---|---:|---:|---:|
-| This version (two runs) | 57–60 | 32–34 | 4–5 |
-| This version, with `scripts/build-pgo` | 61 | 31 | 4 |
+| This version (two runs) | 59–61 | 32–34 | 3 |
+| This version, with `scripts/build-pgo` | 63 | 31 | 2 |
 | Previous version | 24 | 22 | 50 |
 
-Across all 96 cases the geometric mean of Rust/C time is 0.91 (0.90 with
-profile-guided optimization). Close cases move by a few percent between
-runs. The remaining losses are XZ and 7-Zip creation of very repetitive text
-(1.1–1.4x; profile-guided optimization narrows it most), Zstandard creation
-of one or two datasets (1.05–1.07x) and one 7-Zip extraction (1.06–1.08x). `scripts/build-pgo` trains on data other
-than the benchmark's; it changes no output byte.
+Across all 96 cases the geometric mean of Rust/C time is 0.90. Close cases
+move by a few percent between runs. The remaining losses are Zstandard
+creation of two datasets (1.05–1.08x) and one 7-Zip extraction
+(1.06–1.09x). `scripts/build-pgo` trains on data other than the
+benchmark's; it changes no output byte.
 
 ## What is Rust
 
