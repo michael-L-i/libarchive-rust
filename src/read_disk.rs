@@ -70,6 +70,7 @@ struct Dir {
     path: PathBuf,
     ancestors: Ancestors,
     restore: RestoreTime,
+    restore_file: Option<File>,
     read: bool,
 }
 
@@ -157,6 +158,7 @@ impl ReadDisk {
             path: path.clone(),
             ancestors: self.ancestors.clone(),
             restore: self.restore,
+            restore_file: None,
             read: false,
         });
         ARCHIVE_OK
@@ -190,13 +192,22 @@ impl ReadDisk {
             if top.read {
                 if let Some(dir) = self.stack.pop()
                     && self.needs_restore(dir.restore)
-                    && let Ok(file) = disk_sys::open_read(&dir.path, libc::O_DIRECTORY)
+                    && let Some(file) = dir.restore_file
                 {
                     let _ = disk_sys::restore_times(&file, dir.restore.atime, dir.restore.mtime);
                 }
                 continue;
             }
             top.read = true;
+            if self.behavior & 1 != 0 && !top.restore.noatime {
+                match disk_sys::open_read(&top.path, libc::O_DIRECTORY) {
+                    Ok(file) => top.restore_file = Some(file),
+                    Err(e) => {
+                        let path = self.stack.pop().map(|dir| dir.path).unwrap_or_default();
+                        return Err(path_failure(a, &path, e, b"Couldn't visit directory"));
+                    }
+                }
+            }
             match fs::read_dir(&top.path) {
                 Ok(dir) => self.reading = Some((dir, top.path.clone(), top.ancestors.clone())),
                 Err(e) => {
@@ -403,7 +414,7 @@ impl ReadDisk {
                 fd.as_ref().map(AsRawFd::as_raw_fd),
                 access.as_bytes(),
             );
-            if ret < 0 {
+            if ret < ARCHIVE_WARN {
                 return ret;
             }
             self.size = if entry.filetype() == libc::S_IFREG {
@@ -1041,6 +1052,79 @@ fn setup_sparse_fiemap(a: &Base, entry: &mut Entry, fd: c_int) -> c_int {
 mod tests {
     use super::*;
     use crate::archive::READ_DISK_MAGIC;
+
+    #[test]
+    fn ascent_restores_the_directory_opened_before_a_rename() {
+        use std::os::unix::fs::MetadataExt;
+        let root =
+            std::env::temp_dir().join(format!("libarchive-restore-dir-{}", std::process::id()));
+        let moved = root.with_extension("moved");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&moved);
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("file"), b"data").unwrap();
+        let times = |seconds| {
+            fs::FileTimes::new()
+                .set_accessed(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+        };
+        File::open(&root)
+            .unwrap()
+            .set_times(times(123456789))
+            .unwrap();
+        let a = Base::new(READ_DISK_MAGIC);
+        let mut disk = ReadDisk::new();
+        disk.behavior = 1;
+        let mut entry = Entry::new(None);
+        assert_eq!(disk.open(&a, root.as_os_str().as_bytes()), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        assert_eq!(disk.descend(&a), ARCHIVE_OK);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        File::open(&root)
+            .unwrap()
+            .set_times(times(987654321))
+            .unwrap();
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_EOF);
+        assert_eq!(fs::metadata(&moved).unwrap().atime(), 123456789);
+        assert_eq!(fs::metadata(&root).unwrap().atime(), 987654321);
+        disk.close(&a);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn metadata_warning_still_initializes_the_entry_data() {
+        let root =
+            std::env::temp_dir().join(format!("libarchive-metadata-warn-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let path = root.join("file");
+        let moved = root.join("moved");
+        fs::write(&path, b"entry data").unwrap();
+        let a = Base::new(READ_DISK_MAGIC);
+        let mut disk = ReadDisk::new();
+        disk.behavior = 0x20 | 0x40 | 0x80; // Only xattrs remain enabled.
+        let (from, to) = (path.clone(), moved.clone());
+        disk.metadata_filter = Some(Box::new(move |_, _| {
+            fs::rename(&from, &to).unwrap();
+            true
+        }));
+        assert_eq!(disk.open(&a, path.as_os_str().as_bytes()), ARCHIVE_OK);
+        let mut entry = Entry::new(None);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_WARN);
+        assert_eq!(a.state.get(), state::DATA);
+        assert_eq!(a.file_count.get(), 1);
+        fs::rename(&moved, &path).unwrap();
+        assert_eq!(
+            disk.data_block(&a).unwrap(),
+            (ARCHIVE_OK, &b"entry data"[..], 0)
+        );
+        assert_eq!(disk.data_block(&a).unwrap().0, ARCHIVE_EOF);
+        disk.close(&a);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     /// Every path the walk yields, descending into every directory, as
     /// bsdtar does.

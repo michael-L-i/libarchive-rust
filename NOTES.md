@@ -1965,7 +1965,15 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   port still asks about the entry itself, where upstream's code there
   asks about the directory too.
 - FIEMAP extents are read until the last one, as upstream; a map that
-  doesn't move on stops rather than repeat forever.
+  doesn't move on stops rather than repeat forever. The scan accepts at
+  most 1,048,576 extents, including unwritten ones, and rejects overflowing
+  extent ends. SEEK_DATA/SEEK_HOLE scans have the same limit, even when
+  adjacent ranges merge; results that go backwards or don't advance fail.
+- With `-P`, upstream can keep a symlink in place of an archived directory
+  and write the directory's xattrs on its target. The port keeps metadata
+  on the symlink and warns when Linux refuses the xattr, so extraction can
+  exit 1 where upstream exits 0. Explicit `-P` still permits extracting
+  child paths through the symlink.
 - Kept, stricter than upstream: FS_IOC_GETFLAGS (and so FS_IOC_SETFLAGS)
   goes only to a descriptor fstat shows is a regular file or directory.
   Upstream opens a name it stat'ed as one, and a device swapped in between
