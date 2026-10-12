@@ -330,7 +330,7 @@ impl ReadDisk {
             a.state.set(state::DATA);
             if !removed.is_empty() {
                 removed.extend_from_slice(b": File removed before we read it");
-                return a.raise(Error::new(ARCHIVE_WARN, libc::ENOENT, removed));
+                return a.warn(libc::ENOENT, removed).code();
             }
             return ARCHIVE_OK;
         }
@@ -402,7 +402,11 @@ impl ReadDisk {
         let mut ret = ARCHIVE_OK;
         let mut worse = |code: c_int, e: std::io::Error, msg: &str| {
             let errno = e.raw_os_error().unwrap_or(libc::EIO);
-            ret = ret.min(a.raise(Error::new(code, errno, msg)));
+            ret = ret.min(if code == ARCHIVE_WARN {
+                a.warn(errno, msg).code()
+            } else {
+                a.raise(Error::new(code, errno, msg))
+            });
         };
         #[cfg(target_vendor = "apple")]
         if self.behavior & 0x20 == 0
