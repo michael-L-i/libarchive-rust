@@ -50,6 +50,7 @@ pub const SECURE_NODOTDOT: c_int = 0x200;
 pub const NO_AUTODIR: c_int = 0x400;
 pub const NO_OVERWRITE_NEWER: c_int = 0x800;
 pub const SECURE_NOABSOLUTEPATHS: c_int = 0x10000;
+pub const SAFE_WRITES: c_int = 0x40000;
 
 #[derive(Default)]
 pub struct WriteDisk {
@@ -169,13 +170,14 @@ impl WriteDisk {
                 Err(e) => return failure(a, e, "Can't follow directory", &path),
             }
         }
+        // SAFE_WRITES extracts a regular file to a temporary and renames it over
+        // whatever non-directory is in the way; anything else in the way is removed.
+        let regular =
+            hardlink.is_none() && link.is_none() && matches!(entry.filetype(), 0 | libc::S_IFREG);
+        let safe_write = regular && self.options & SAFE_WRITES != 0;
         // A successful exclusive create cannot replace an existing inode. Fall back
         // to the original checks on any error, including a racing creation.
-        let created_file = if hardlink.is_none()
-            && link.is_none()
-            && matches!(entry.filetype(), 0 | libc::S_IFREG)
-            && self.options & 0x40000 == 0
-        {
+        let created_file = if regular && !safe_write {
             target.open(entry.mode() as u32 & 0o777, true).ok()
         } else {
             None
@@ -203,16 +205,21 @@ impl WriteDisk {
             {
                 self.skipped = true;
             } else if !(directory && entry.filetype() == libc::S_IFDIR)
-                && (self.options & UNLINK != 0
-                    || existing.st_mode & libc::S_IFMT == libc::S_IFLNK
-                    || directory
-                    || entry.filetype() == libc::S_IFDIR
-                    || hardlink.is_some()
-                    || link.is_some()
-                    || (existing.st_nlink > 1 && self.options & 0x40000 == 0))
+                && !(safe_write && !directory)
                 && let Err(e) = target.remove(directory)
             {
-                return failure(a, e, "Can't unlink", &path);
+                let msg = if self.options & UNLINK != 0 {
+                    "Could not unlink"
+                } else if directory {
+                    "Can't replace existing directory with non-directory"
+                } else {
+                    "Can't unlink already-existing object"
+                };
+                return a.raise(Error::new(
+                    ARCHIVE_FAILED,
+                    e.raw_os_error().unwrap_or(libc::EIO),
+                    msg,
+                ));
             }
         }
         self.offset = 0;
@@ -250,7 +257,7 @@ impl WriteDisk {
                     result => result,
                 }
             } else if entry.filetype() == libc::S_IFREG || entry.filetype() == 0 {
-                if self.options & 0x40000 != 0 {
+                if safe_write {
                     match target.atomic_file(entry.mode() as u32 & 0o777) {
                         Ok((tmp, file)) => {
                             self.atomic = Some(target);
@@ -642,7 +649,7 @@ mod tests {
     #[test]
     fn regular_creation_and_existing_file_modes_preserve_options() {
         use std::os::unix::fs::PermissionsExt;
-        for options in [0, PERM, UNLINK, NO_OVERWRITE, 0x40000] {
+        for options in [0, PERM, UNLINK, NO_OVERWRITE, SAFE_WRITES] {
             for existing in [false, true] {
                 let output = Output::new();
                 if existing {
@@ -682,6 +689,27 @@ mod tests {
                 );
                 assert_eq!(disk.close(&base), ARCHIVE_OK);
             }
+        }
+    }
+
+    #[test]
+    fn existing_file_is_replaced_not_written_into() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for options in [0, SAFE_WRITES] {
+            let output = Output::new();
+            std::fs::write(output.path(), b"old").unwrap();
+            // Unwritable, as a deny-write ACL makes it: upstream unlinks it, never opens it.
+            std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o444))
+                .unwrap();
+            let inode = std::fs::metadata(output.path()).unwrap().ino();
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = WriteDisk::default();
+            disk.options = options;
+            output.header(&mut disk, &base, Some(3));
+            assert_eq!(disk.data(&base, b"new"), 3);
+            assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+            assert_eq!(std::fs::read(output.path()).unwrap(), b"new");
+            assert_ne!(std::fs::metadata(output.path()).unwrap().ino(), inode);
         }
     }
 
