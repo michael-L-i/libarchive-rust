@@ -774,7 +774,9 @@ impl Iso9660 {
                 self.opt.publisher = r.is_ok();
                 r?;
             }
-            b"rockridge" | b"Rockridge" => {
+            // Upstream also tests for "Rockridge", but under its switch on
+            // the first letter, 'r', so that key is never recognized.
+            b"rockridge" => {
                 self.opt.rr = match value {
                     None => OPT_RR_DISABLED,
                     Some(b"1") | Some(b"useful") => OPT_RR_USEFUL,
