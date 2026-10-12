@@ -34,7 +34,7 @@ use crate::archive::{
     ARCHIVE_ERRNO_MISC, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN, Base, state,
 };
 use crate::entry::Entry;
-use crate::ffi::disk_sys::{DirError, Target, check_symlinks, create_dir};
+use crate::ffi::disk_sys::{DirError, Target, check_symlinks, create_dir, umask};
 use crate::util::Error;
 use std::ffi::c_int;
 use std::fs::File;
@@ -77,6 +77,7 @@ pub struct WriteDisk {
     atomic: Option<Target>,
     permissions_created: bool,
     new_directory: bool,
+    directory_mode: bool,
 }
 
 /// Upstream's cleanup_pathname_fsobj: drops empty and `.` elements and a
@@ -317,10 +318,20 @@ impl WriteDisk {
         }
     }
 
+    /// The permissions an entry ends up with: without PERM, no set-id or
+    /// sticky bits and the umask applied.
+    fn final_mode(&self, entry: &Entry) -> u32 {
+        if self.options & PERM != 0 {
+            entry.mode() as u32 & 0o7777
+        } else {
+            entry.mode() as u32 & 0o777 & !umask()
+        }
+    }
+
     /// The mode upstream creates a file with: the final permissions with
     /// the umask applied, and no set-id bits.
     fn creation_mode(&self, entry: &Entry) -> u32 {
-        entry.mode() as u32 & 0o777 & !crate::ffi::disk_sys::umask()
+        entry.mode() as u32 & 0o777 & !umask()
     }
 
     /// Upstream's create_filesystem_object: one attempt to create the entry.
@@ -375,8 +386,13 @@ impl WriteDisk {
             match entry.filetype() {
                 libc::S_IFDIR => {
                     self.limit = Some(0);
-                    let created = target.mkdir(0o777);
+                    // Upstream's limits keep a new directory usable and
+                    // private to its group until close sets its mode.
+                    let final_mode = self.final_mode(entry);
+                    let mode = ((final_mode & 0o777 & !umask()) | 0o700) & 0o775;
+                    let created = target.mkdir(mode);
                     self.new_directory = created.is_ok();
+                    self.directory_mode = mode != final_mode || options & PERM != 0;
                     created
                 }
                 libc::S_IFCHR | libc::S_IFBLK | libc::S_IFIFO => {
@@ -575,26 +591,23 @@ impl WriteDisk {
                 }
             }
             if entry.filetype() == libc::S_IFDIR {
-                // Only a directory this entry created waits for close to get its
-                // times and mode; one already there gets them now, and its mode
-                // changes only for PERM. ACLs and Mac metadata always wait.
-                let mut deferred = options;
-                let mut mode = true;
-                if !self.new_directory {
-                    mode = options & PERM != 0
-                        && target.stat().is_ok_and(|st| st.st_mode != entry.mode());
-                    let ret = self.restore(
-                        a,
-                        &entry,
-                        &mut target,
-                        options & !(ACL | MAC_METADATA),
-                        false,
-                    );
-                    if ret < 0 {
-                        return ret;
-                    }
-                    deferred &= !(OWNER | TIME | XATTR | FFLAGS);
+                // A directory's mode, ACLs and Mac metadata wait for close, and
+                // so do its times if this entry created it. Its mode changes if
+                // mkdir couldn't set it, and for PERM. The rest is restored now.
+                let mode = if self.new_directory {
+                    std::mem::take(&mut self.directory_mode)
+                } else {
+                    options & PERM != 0 && target.stat().is_ok_and(|st| st.st_mode != entry.mode())
+                };
+                let mut deferred = ACL | MAC_METADATA;
+                if self.new_directory {
+                    deferred |= TIME;
                 }
+                let ret = self.restore(a, &entry, &mut target, options & !deferred, false);
+                if ret < 0 {
+                    return ret;
+                }
+                let deferred = options & (deferred | PERM);
                 self.directories.push((entry, target, deferred, mode));
             } else {
                 let ret = self.restore(a, &entry, &mut target, options, !permissions_created);
@@ -657,7 +670,7 @@ impl WriteDisk {
             let mut mode = if options & PERM != 0 {
                 entry.mode() as u32 & 0o7777
             } else {
-                entry.mode() as u32 & 0o777 & !crate::ffi::disk_sys::umask()
+                entry.mode() as u32 & 0o777 & !umask()
             };
             if mode & 0o6000 != 0
                 && let Ok(st) = target.stat()
@@ -833,7 +846,7 @@ mod tests {
                 } else if options == PERM {
                     0o640
                 } else {
-                    0o640 & !crate::ffi::disk_sys::umask()
+                    0o640 & !umask()
                 };
                 assert_eq!(
                     std::fs::metadata(output.path())
@@ -906,7 +919,7 @@ mod tests {
             .mode();
         // Linux has no symlink modes; its lchmod fails with EOPNOTSUPP.
         if cfg!(target_vendor = "apple") {
-            assert_eq!(mode & 0o777, 0o640 & !crate::ffi::disk_sys::umask());
+            assert_eq!(mode & 0o777, 0o640 & !umask());
         }
     }
 
@@ -1166,6 +1179,39 @@ mod tests {
             };
             assert_eq!(message, expected);
         }
+    }
+
+    #[test]
+    fn new_directory_waits_only_for_its_times_mode_and_acls() {
+        use std::os::unix::fs::PermissionsExt;
+        let output = Output::new();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        disk.options = TIME | XATTR | FFLAGS;
+        let mut entry = Entry::new(None);
+        entry.set_pathname(output.path().as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFDIR);
+        entry.set_mtime(1_000_000_000, 0);
+        entry.xattr_add(c"user.dir", b"v");
+        #[cfg(target_vendor = "apple")]
+        entry.set_fflags(libc::UF_HIDDEN as std::ffi::c_ulong, 0);
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+        let metadata = std::fs::metadata(output.path()).unwrap();
+        // Usable by its owner and closed to others until close.
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::macos::fs::MetadataExt;
+            assert_eq!(metadata.st_flags() & libc::UF_HIDDEN, libc::UF_HIDDEN);
+            let mut read = Entry::new(None);
+            crate::ffi::disk_sys::read_xattrs(&output.path(), &mut read, false).unwrap();
+            assert_eq!(read.xattrs.len(), 1);
+        }
+        assert_eq!(disk.close(&base), ARCHIVE_OK);
+        let metadata = std::fs::metadata(output.path()).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0);
+        std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
