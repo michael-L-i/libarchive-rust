@@ -403,7 +403,6 @@ impl SevenZip {
                 e
             })?;
             self.pack_stream_inbytes_remaining -= bytes_in as i64;
-            r.decoded(bytes_out)?;
             if bytes_out as u64 > self.folder_outbytes_remaining as u64 {
                 bytes_out = self.folder_outbytes_remaining as usize;
             }

@@ -539,7 +539,8 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
             ));
         }
 
-        if u64::from(mem << 20) > r.decoder_memory(u64::MAX) {
+        // PPMd8 also reserves four bytes to align the model arena.
+        if u64::from(mem << 20) + 4 > r.decoder_memory(u64::MAX) {
             return Err(Error::fatal(
                 libc::ENOMEM,
                 "PPMd8 stream requires too much memory",

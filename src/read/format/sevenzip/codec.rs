@@ -735,7 +735,8 @@ impl SevenZip {
                 return Err(lzma_options_error());
             }
             let dict_size = u32::from_le_bytes([d0, d1, d2, d3]);
-            if u64::from(dict_size) > mem_limit.min(u64::from(MAX_DECODER_MEMORY)) {
+            let allocation = (u64::from(dict_size).max(4096) + 15) & !15;
+            if u64::from(dict_size) > u64::from(MAX_DECODER_MEMORY) || allocation > mem_limit {
                 return Err(failed("Decompression failed (5)"));
             }
             // The size of the stream is known; a stream with no end marker
@@ -770,7 +771,9 @@ impl SevenZip {
         {
             return Err(malformed());
         }
-        if u64::from(msize) > mem_limit.min(u64::from(MAX_DECODER_MEMORY)) {
+        let allocation =
+            u64::from(msize) + u64::from(4 - (msize & 3)) + u64::from(crate::ppmd::UNIT_SIZE);
+        if msize > MAX_DECODER_MEMORY || allocation > mem_limit {
             return Err(Error::fatal(
                 libc::ENOMEM,
                 "Coludn't allocate memory for PPMd",
@@ -884,6 +887,7 @@ impl SevenZip {
                 self.pack_stream_inbytes_remaining,
             )?
         };
+        r.decoded(step.produced)?;
         let used = step.used;
         let mut outbytes = out_pos + step.produced;
         let eof = step.eof;
@@ -942,6 +946,86 @@ impl SevenZip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limits_lzma_dictionary_uses_the_allocated_size() {
+        for (declared, cap) in [(0u32, 0u64), (4097, 4097)] {
+            let mut reader = SevenZip {
+                codec: CODEC_LZMA,
+                ..SevenZip::default()
+            };
+            let mut properties = vec![0x5d];
+            properties.extend(declared.to_le_bytes());
+            let coder = Coder {
+                codec: CODEC_LZMA,
+                properties,
+                ..Coder::default()
+            };
+            assert!(reader.init_lzma(&coder, None, cap).is_err());
+            assert!(matches!(reader.coders.backend, Backend::None));
+            assert!(reader.init_lzma(&coder, None, 4112).is_ok());
+        }
+    }
+
+    #[test]
+    fn limits_ppmd_model_includes_arena_alignment_and_glue() {
+        let size = PPMD7_MIN_MEM_SIZE;
+        let mut properties = vec![6];
+        properties.extend(size.to_le_bytes());
+        let coder = Coder {
+            codec: CODEC_PPMD,
+            properties,
+            ..Coder::default()
+        };
+        let mut reader = SevenZip::default();
+        assert!(reader.init_ppmd(&coder, u64::from(size)).is_err());
+        assert!(!reader.coders.ppmd.was_allocated());
+        assert!(reader.init_ppmd(&coder, u64::from(size) + 16).is_ok());
+    }
+
+    #[test]
+    fn limits_charge_codec_bytes_before_bcj_withholds_them() {
+        use crate::archive::{ARCHIVE_OK, Base, READ_MAGIC};
+        use crate::read::{Read, ReadLimits};
+        use crate::read_open_memory::Memory;
+        let encoded = miniz_oxide::deflate::compress_to_vec(b"abc", 6);
+        let a = Base::new(READ_MAGIC);
+        let mut read = Read::default();
+        assert_eq!(
+            read.set_limits(
+                &a,
+                ReadLimits {
+                    decoded_bytes: Some(encoded.len() as u64),
+                    ..ReadLimits::default()
+                }
+            ),
+            ARCHIVE_OK
+        );
+        read.open_client(&a, Box::new(Memory::new(encoded.clone(), encoded.len())))
+            .unwrap();
+        let mut coder = SevenZip {
+            folder_outbytes_remaining: 3,
+            pack_stream_inbytes_remaining: encoded.len() as i64,
+            ..SevenZip::default()
+        };
+        coder
+            .init_decompression(
+                &Coder {
+                    codec: CODEC_DEFLATE,
+                    ..Coder::default()
+                },
+                Some(&Coder {
+                    codec: CODEC_X86,
+                    ..Coder::default()
+                }),
+                u64::MAX,
+            )
+            .unwrap();
+        let e = coder
+            .decompress(&mut read.reader(&a), &mut [0; 8], encoded.len())
+            .unwrap_err();
+        assert_eq!(e.errno, libc::EFBIG);
+    }
 
     #[test]
     fn lzma2_dictionary_covers_the_decoded_stream() {
