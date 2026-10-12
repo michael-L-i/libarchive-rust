@@ -876,7 +876,23 @@ pub fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Upstream's __archive_get_umask. Linux reports it in /proc/self/status
+/// (since 4.7), which upstream reads rather than set the umask while other
+/// threads may be creating files.
 pub fn umask() -> u32 {
+    #[cfg(target_os = "linux")]
+    if let Ok(status) = std::fs::read("/proc/self/status")
+        && let Some(mask) = status.split(|&b| b == b'\n').find_map(|line| {
+            let digits = line.strip_prefix(b"Umask:")?.trim_ascii_start();
+            let end = digits
+                .iter()
+                .position(|b| !(b'0'..=b'7').contains(b))
+                .unwrap_or(digits.len());
+            u32::from_str_radix(std::str::from_utf8(digits.get(..end)?).ok()?, 8).ok()
+        })
+    {
+        return mask;
+    }
     // SAFETY: umask has no pointer arguments; restore immediately, as upstream does.
     unsafe {
         let mask = libc::umask(0);
