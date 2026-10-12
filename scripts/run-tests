@@ -5,6 +5,8 @@ Suites: libarchive (upstream's libarchive_test) and the front-end suites cat, ta
 cpio and unzip, whose bsd<name>_test drives build/<mode>/bin/bsd<name> given with -p.
 Port mode (default) runs build/port; --oracle runs build/oracle (upstream).
 Front-end test names are prefixed with the suite: cat/test_expand_gz.
+Linux uses tests/{passing,upstream}-linux.txt; macOS keeps the unsuffixed files.
+Both modes reject failures, crashes, timeouts and previously passing tests that skip.
 See AGENTS.md, "Oracle".
 """
 
@@ -23,8 +25,15 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTDIR = os.path.join(ROOT, "upstream/libarchive/libarchive/test")
-PASSING = os.path.join(ROOT, "tests/passing.txt")
-UPSTREAM = os.path.join(ROOT, "tests/upstream.txt")
+
+
+def baseline_paths(platform):
+    suffix = "-linux" if platform.startswith("linux") else ""
+    return tuple(os.path.join(ROOT, "tests", name + suffix + ".txt")
+                 for name in ("passing", "upstream"))
+
+
+PASSING, UPSTREAM = baseline_paths(sys.platform)
 PASS_HEADER = "# Upstream tests that pass against libarchive-rust. Maintained by scripts/run-tests --update.\n"
 UPSTREAM_HEADER = "# Upstream tests that pass against upstream libarchive on this machine. Maintained by scripts/run-tests --oracle --baseline.\n"
 PASSING_STATES = ("pass",)
@@ -179,7 +188,7 @@ def write_status(label, tests, status, upstream):
     # The headline is libarchive's; the front-end suites appear as rows only.
     lib = {n for n in tests if suite_of(n) == "libarchive"}
     if upstream is None:
-        head = f"**Passing {len(ours & lib)} / {len(lib)} total** (no tests/upstream.txt yet)"
+        head = f"**Passing {len(ours & lib)} / {len(lib)} total** (no {os.path.relpath(UPSTREAM, ROOT)} yet)"
     else:
         head = f"**Passing {len(ours & lib)} / upstream {len(lib & upstream)} / {len(lib)} total**"
     lines = [
@@ -213,9 +222,9 @@ def main():
                     help="libarchive (default), a front-end (cat, tar, cpio, unzip), or all")
     ap.add_argument("--oracle", action="store_true", help="run upstream (build/oracle) instead of the port")
     ap.add_argument("--bin", metavar="PATH", help="libarchive test binary to run (overrides --oracle's default)")
-    ap.add_argument("--update", action="store_true", help="add new passes to tests/passing.txt")
+    ap.add_argument("--update", action="store_true", help=f"add new passes to {os.path.relpath(PASSING, ROOT)}")
     ap.add_argument("--baseline", action="store_true",
-                    help="with --oracle, record the passes of the selected suites in tests/upstream.txt (full run)")
+                    help=f"with --oracle, record the selected suites in {os.path.relpath(UPSTREAM, ROOT)} (full run)")
     ap.add_argument("--status", action="store_true", help="rewrite STATUS.md (full run, --suite all)")
     ap.add_argument("-j", type=int, default=os.cpu_count() or 1, help="parallel jobs (default: CPU count)")
     # Upstream's slowest test takes ~5s alone; leave room for a loaded machine.
@@ -260,16 +269,15 @@ def main():
     if not selected:
         die("no tests match " + " ".join(a.patterns))
 
-    ratchet = not a.oracle
+    baseline = UPSTREAM if a.oracle else PASSING
+    baseline_name = os.path.relpath(baseline, ROOT)
     passing = set()
-    if ratchet:
-        if not os.path.exists(PASSING):
-            write_names(PASSING, [], PASS_HEADER)
-        passing = set(read_names(PASSING))
+    if os.path.exists(baseline):
+        passing = set(read_names(baseline))
         if not a.patterns:
             unknown = sorted(n for n in passing if suite_of(n) in suites and n not in listed)
             if unknown:
-                print(f"warning: {len(unknown)} names in passing.txt are not in the test list: "
+                print(f"warning: {len(unknown)} names in {baseline_name} are not in the test list: "
                       + " ".join(unknown[:5]))
 
     out_dir = os.path.join(ROOT, "build", label)
@@ -292,20 +300,20 @@ def main():
     summary = (f"{label}: {counts['pass']} pass, {counts['fail']} fail, {counts['skip']} skip, "
                f"{counts['crash']} crash, {counts['timeout']} timeout in {wall:.0f}s")
 
-    regressions, new = [], []
-    if ratchet:
-        regressions = [n for n in selected if n in passing and status[n] not in PASSING_STATES]
-        new = [n for n in selected if status[n] in PASSING_STATES and n not in passing]
-        summary += f" | ratchet: {len(regressions)} regressions, {len(new)} new"
-        if a.update and new:
+    regressions = [n for n in selected if n in passing and status[n] not in PASSING_STATES]
+    new = [n for n in selected if status[n] in PASSING_STATES and n not in passing]
+    summary += f" | ratchet ({baseline_name}): {len(regressions)} regressions, {len(new)} new"
+    if a.update and new:
+        header = PASS_HEADER
+        if os.path.exists(PASSING):
             with open(PASSING) as f:
                 header = "".join(l for l in f if l.startswith("#")) or PASS_HEADER
-            write_names(PASSING, passing | set(new), header)
-            summary += " (added to passing.txt)"
+        write_names(PASSING, passing | set(new), header)
+        summary += f" (added to {baseline_name})"
     print(summary)
 
     if regressions:
-        print("REGRESSIONS (in tests/passing.txt, not passing now):")
+        print(f"REGRESSIONS (in {baseline_name}, not passing now):")
         for n in regressions:
             log = "" if status[n] == "skip" else "  " + log_path(out_dir, n)
             print(f"  {n}  {status[n]}{log}")
@@ -329,18 +337,18 @@ def main():
         for line in tail:
             print("    " + line)
 
-    if a.baseline:
+    if a.baseline and not regressions and first is None:
         kept = {n for n in read_names(UPSTREAM) if suite_of(n) not in suites} if os.path.exists(UPSTREAM) else set()
         passes = {n for n in selected if status[n] == "pass"}
         write_names(UPSTREAM, kept | passes, UPSTREAM_HEADER)
-        print(f"wrote tests/upstream.txt ({len(kept | passes)} tests)")
+        print(f"wrote {baseline_name} ({len(kept | passes)} tests)")
 
     if a.status:
         upstream = set(read_names(UPSTREAM)) if os.path.exists(UPSTREAM) else None
         write_status(label, tests, status, upstream)
         print("wrote STATUS.md")
 
-    sys.exit(1 if regressions else 0)
+    sys.exit(1 if regressions or first is not None else 0)
 
 
 if __name__ == "__main__":
