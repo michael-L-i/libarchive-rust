@@ -1982,6 +1982,21 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   __archive_get_umask does in a threaded process, rather than set and
   restored, which other threads creating files could see.
 
+## Temporary files
+
+- Writer spools and macOS metadata files use upstream's intended
+  `__archive_get_tempdir` checks: trust TMPDIR only when the process's
+  credentials have not changed, otherwise use `/tmp`. Empty TMPDIR
+  selects `/`, as upstream's appended slash does; path bytes need not be
+  UTF-8. Selection and file creation are tested in isolated subprocesses.
+- The pinned CMake template omits `HAVE_ISSETUGID` and `HAVE_GETRESUID`,
+  despite probing them. Its oracle therefore compares only effective and
+  real IDs. This port uses the supported platform functions: `issetugid`
+  on macOS and real/effective/saved UID and GID checks on Linux. These
+  stronger checks intentionally reject TMPDIR in cases the CMake build
+  trusts. All six Linux credential differences are tested in root-only
+  child processes; the parent process's credentials remain unchanged.
+
 ## Archive writers
 
 - Writer lifecycle, callback/file/fd/FILE/memory outputs, format/filter options,

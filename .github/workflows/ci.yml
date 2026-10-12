@@ -59,3 +59,5 @@ jobs:
         run: scripts/build-port
       - name: Run upstream's tests against the port
         run: scripts/run-tests --suite all --timeout 120
+      - name: Verify corrected zisofs images with upstream's reader
+        run: scripts/test-iso-zisofs --library target/debug --reader build/oracle/bin/bsdtar
