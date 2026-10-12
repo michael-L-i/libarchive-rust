@@ -488,6 +488,7 @@ impl Iso9660 {
         Ok(())
     }
 
+    /// _isoent_file_location()
     fn isoent_file_location(&mut self, isoent: EntId, symlocation: &mut i32) -> Result<(), Error> {
         let cnt = self.ents[isoent].children.len();
         for n in 0..cnt {
@@ -886,8 +887,8 @@ impl Iso9660 {
         Ok(())
     }
 
-    /// _compare_path_table(): this comparing rule is according to ISO9660
-    /// Standard 6.9.1
+    /// _compare_path_table() and, for Joliet, _compare_path_table_joliet():
+    /// this comparing rule is according to ISO9660 Standard 6.9.1
     fn compare_path_table(&self, p1: EntId, p2: EntId, joliet: bool) -> i32 {
         let (e1, e2) = (&self.ents[p1], &self.ents[p2]);
         // Compare parent directory number

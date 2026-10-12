@@ -87,8 +87,9 @@ pub(super) fn joliet_allowed_char(high: u8, low: u8) -> bool {
     !matches!(utf16, 0x002A | 0x002F | 0x003A | 0x003B | 0x003F | 0x005C)
 }
 
-/// 8-bit unsigned numerical values. ISO9660 Standard 7.1.1 is a plain
-/// byte; these are the wider ones.
+// set_num_7xx(): the wider numbers, as the bytes they occupy; the 8-bit
+// ones of ISO9660 Standard 7.1 are plain bytes.
+
 /// Least significant byte first. ISO9660 Standard 7.2.1
 pub(super) fn num_721(value: u16) -> [u8; 2] {
     value.to_le_bytes()
@@ -255,6 +256,7 @@ impl Iso9660 {
         }
     }
 
+    /// set_str_a_characters_bp() and set_str_d_characters_bp().
     fn set_str_characters_bp(
         &mut self,
         bp: &mut [u8; LOGICAL_BLOCK_SIZE],
@@ -517,6 +519,7 @@ impl Iso9660 {
         info.extend_from_slice(&crate::ffi::sys::ctime(self.birth_time).unwrap_or_default());
         info.extend_from_slice(crate::util::VERSION_STRING.to_bytes());
         let mut opt = false;
+        // set_option_info()
         let mut set_option_info = |key: &str, value: OptValue| {
             info.push(if opt { b',' } else { b' ' });
             match value {
@@ -888,6 +891,7 @@ impl Iso9660 {
         self.wb_consume(out, LOGICAL_BLOCK_SIZE)
     }
 
+    /// _write_directory_descriptors(): the directory blocks of `isoent`.
     fn write_directory_descriptors_one(
         &mut self,
         out: &mut dyn Sink,
