@@ -23,7 +23,8 @@ upstream's own test suite.
 - **Fidelity:** in a byte-for-byte comparison of every writer against C
   `bsdtar`, 64 of 68 format and input cases are identical; the other four
   are mtree digests the macOS C build lacks. The ISO9660 writer also
-  matches C on 3,459 of 3,493 differential cases; C crashes on the rest. Listing and
+  matches C on 3,459 of 3,493 differential cases on macOS and 3,457 on
+  Linux; C crashes on the rest. Listing and
   extracting upstream's 562 test archives matches upstream's own `bsdtar` on
   all but one, a damaged bzip2 stream the safe decoder reports differently.
   `NOTES.md` records each remaining difference and every intended one.

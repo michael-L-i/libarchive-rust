@@ -1977,20 +1977,23 @@ Still different:
   upstream's 64 KiB write buffer and an unlinked temporary file, so where
   upstream misplaces bytes in that buffer, so does this.
 - Images match upstream's byte for byte, with the same messages and exit
-  codes: 3,459 of 3,493 cases of
-  `../diagnostics/round14-iso9660` (every option, every level, Joliet and
-  Rock Ridge variants, zisofs, El Torito, deep trees, 3,000 random
-  archives and an API probe); the other 34 are inputs upstream crashes
-  on, listed below.
+  codes, in the 3,493 cases of `../diagnostics/round14-iso9660` (every
+  option, every level, Joliet and Rock Ridge variants, zisofs, El Torito,
+  deep trees, 3,000 random archives and an API probe): 3,459 on macOS, and
+  3,457 on Linux (glibc 2.41, aarch64) against upstream built there. The
+  others are inputs upstream crashes on, listed below.
 - The identifier resolver keeps upstream's red-black tree (`src/rb.rs`,
   insertion and lookup from `archive_rb.c`). Its comparison is not a total
   order: `FOO` and `FOO.` each sort before the other, so the tree's shape
   decides which names collide and how they sort.
-- Path tables are sorted with macOS's `qsort` (`qsort.rs`, from Apple
-  Libc). Upstream's comparison only looks at the part of a directory name
-  before its last dot, so `A.B` and `A.C` compare equal and their order is
-  whatever libc's unstable sort leaves; an upstream built with glibc can
-  order them differently.
+- Path tables are sorted the way upstream's `qsort` sorts them on each
+  platform. Upstream's comparison only looks at the part of a directory
+  name before its last dot, so `A.B` and `A.C` compare equal and their
+  order is whatever libc leaves: on Apple platforms that of Apple Libc's
+  unstable `qsort`, ported in `qsort.rs`; elsewhere that of a stable merge
+  sort, which glibc's `qsort` is (checked against upstream on glibc 2.41).
+  Other libcs (musl, the BSDs) may order such entries differently and are
+  not matched.
 - Sizes from entries use checked or wrapping arithmetic as upstream's
   types do; the block pointer table (up to 128 MiB for a 4 GiB file with
   128-byte zisofs blocks), path tables and resolver pools allocate

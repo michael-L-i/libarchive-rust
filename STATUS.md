@@ -61,7 +61,9 @@ path tables). The round-twelve writer sweep is 64 of 68 identical (the four
 others are mtree's RIPEMD-160). `../diagnostics/round14-iso9660` compares
 C and Rust bsdtar on 3,493 cases: 3,459 identical images, messages and exit
 codes; on the other 34 upstream dereferences null and this fails cleanly
-(NOTES.md, "ISO9660 writer"). Creating a 204 MB, 3,000-file image takes
+(NOTES.md, "ISO9660 writer"). On Linux, against upstream built with glibc
+2.41, 3,457 are identical and upstream crashes on the other 36; path tables
+sort as each platform's `qsort` does. Creating a 204 MB, 3,000-file image takes
 0.90x C's time, 0.91x with zisofs. Byte identity includes upstream's zisofs
 bugs, which corrupt some compressed files that the reimplementation wrote
 correctly. Write options without a module now combine the format's and the
