@@ -585,18 +585,13 @@ impl Target {
             live: None,
         })
     }
+    /// The stat of the entry: through its descriptor when one is held, as
+    /// upstream's lazy_stat, otherwise of the name without following it.
     pub fn stat(&self) -> std::io::Result<libc::stat> {
-        let mut st = super::entry::zeroed_stat();
-        // SAFETY: output and fd/name remain live throughout call.
-        result(unsafe {
-            libc::fstatat(
-                self.parent.as_raw_fd(),
-                self.name.as_ptr(),
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        })?;
-        Ok(st)
+        if let Some(file) = &self.live {
+            return fstat(file);
+        }
+        stat_at(&self.parent, &self.name, false)
     }
     /// The stat of what a symlink here points to.
     pub fn stat_follow(&self) -> std::io::Result<libc::stat> {
@@ -660,7 +655,14 @@ impl Target {
             )
         })
     }
+    // Mode, owner and times go through the entry's descriptor when one is
+    // held, as upstream's fchmod, fchown and futimens; otherwise they act on
+    // the name without following it, as lchmod, lchown and lutimes.
     pub fn chmod(&self, mode: u32) -> std::io::Result<()> {
+        if let Some(file) = &self.live {
+            // SAFETY: live descriptor; fchmod takes no pointers.
+            return result(unsafe { libc::fchmod(file.as_raw_fd(), mode as _) });
+        }
         // SAFETY: live parent/name, and no follow prevents replacing another target.
         result(unsafe {
             libc::fchmodat(
@@ -672,6 +674,10 @@ impl Target {
         })
     }
     pub fn owner(&self, uid: i64, gid: i64) -> std::io::Result<()> {
+        if let Some(file) = &self.live {
+            // SAFETY: live descriptor; fchown takes no pointers.
+            return result(unsafe { libc::fchown(file.as_raw_fd(), uid as _, gid as _) });
+        }
         // SAFETY: live parent/name with final symlink not followed.
         result(unsafe {
             libc::fchownat(
@@ -689,6 +695,10 @@ impl Target {
             tv_sec: tv_sec as _,
             tv_nsec: tv_nsec as _,
         });
+        if let Some(file) = &self.live {
+            // SAFETY: live descriptor and two timespecs that outlive the call.
+            return result(unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) });
+        }
         // SAFETY: two writable-by-value timespecs, live descriptor and name.
         result(unsafe {
             libc::utimensat(
@@ -1204,6 +1214,37 @@ mod tests {
         }
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(parent.join("secure").exists() && parent.join("plain").exists());
+    }
+
+    #[test]
+    fn held_descriptor_takes_mode_owner_and_times() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = Directory::new();
+        let path = root.0.join("file");
+        std::fs::write(&path, b"original").unwrap();
+        let mut target = Target::prepare(&path, true).unwrap();
+        target.retain_file(target.fixup_file(false).unwrap());
+        // Replaced by name after the descriptor was checked.
+        std::fs::rename(&path, root.0.join("moved")).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        target.chmod(0o600).unwrap();
+        target
+            .times((1_000_000_000, 0), (1_000_000_000, 0))
+            .unwrap();
+        let st = std::fs::metadata(&path).unwrap();
+        target.owner(st.uid().into(), st.gid().into()).unwrap();
+        assert_eq!(
+            target.stat().unwrap().st_ino,
+            std::fs::metadata(root.0.join("moved")).unwrap().ino()
+        );
+        let moved = std::fs::metadata(root.0.join("moved")).unwrap();
+        assert_eq!(
+            (moved.mode() & 0o777, moved.mtime()),
+            (0o600, 1_000_000_000)
+        );
+        assert_eq!(st.mode() & 0o777, 0o644);
+        assert_ne!(st.mtime(), 1_000_000_000);
     }
 
     #[test]
