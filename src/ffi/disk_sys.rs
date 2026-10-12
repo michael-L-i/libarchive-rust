@@ -219,9 +219,15 @@ pub fn read_xattrs(
     Ok(())
 }
 
-/// The Linux inode flag (`<linux/fs.h>`) of files not to dump.
+/// Linux inode flags (`<linux/fs.h>`) that upstream names.
+#[cfg(target_os = "linux")]
+pub const FS_IMMUTABLE_FL: u32 = 0x10;
+#[cfg(target_os = "linux")]
+pub const FS_APPEND_FL: u32 = 0x20;
 #[cfg(target_os = "linux")]
 pub const FS_NODUMP_FL: u32 = 0x40;
+#[cfg(target_os = "linux")]
+pub const FS_JOURNAL_DATA_FL: u32 = 0x4000;
 
 /// FS_IOC_GETFLAGS: the inode flags of what `fd` is open on.
 #[cfg(target_os = "linux")]
@@ -232,6 +238,14 @@ pub fn get_flags(fd: libc::c_int) -> std::io::Result<u32> {
     result(unsafe { libc::ioctl(fd, libc::FS_IOC_GETFLAGS, &mut flags) })?;
     Ok(flags as u32)
 }
+#[cfg(target_os = "linux")]
+fn set_flags(fd: libc::c_int, flags: u32) -> std::io::Result<()> {
+    let flags = flags as libc::c_int;
+    // SAFETY: the ioctl reads one int, from `flags`, which outlives the
+    // call; a descriptor that isn't open only fails.
+    result(unsafe { libc::ioctl(fd, libc::FS_IOC_SETFLAGS, &flags) })
+}
+
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Component;
@@ -879,7 +893,38 @@ impl Target {
         // SAFETY: live file descriptor; fchflags does not access borrowed memory.
         result(unsafe { libc::fchflags(file.as_raw_fd(), flags) })
     }
-    #[cfg(not(target_vendor = "apple"))]
+    /// Upstream's Linux set_fflags_platform, past its file type check:
+    /// changes the flags through the entry's descriptor or one opened here
+    /// (if that fails there is nothing to do), keeping the flags only root
+    /// may change as they are if setting them is refused.
+    #[cfg(target_os = "linux")]
+    pub fn flags(&self, set: u32, clear: u32) -> std::io::Result<()> {
+        const SF_MASK: u32 = FS_IMMUTABLE_FL | FS_APPEND_FL | FS_JOURNAL_DATA_FL;
+        if set | clear == 0 {
+            return Ok(());
+        }
+        let opened;
+        let fd = match &self.live {
+            Some(file) => file.as_raw_fd(),
+            None => match self.fixup_file(false) {
+                Ok(file) => {
+                    opened = file;
+                    opened.as_raw_fd()
+                }
+                Err(_) => return Ok(()),
+            },
+        };
+        let old = get_flags(fd)?;
+        let new = (old & !clear) | set;
+        match set_flags(fd, new) {
+            // If we couldn't set all the flags, try again with a subset.
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                set_flags(fd, (new & !SF_MASK) | (old & SF_MASK))
+            }
+            r => r,
+        }
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     pub fn flags(&self, _set: u32, _clear: u32) -> std::io::Result<()> {
         Ok(())
     }

@@ -34,7 +34,7 @@ use crate::archive::{ARCHIVE_ERRNO_MISC, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_
 use crate::entry::Entry;
 use crate::ffi::disk_sys::{DirError, Target, check_symlinks, create_dir, euid, fstat, umask};
 use crate::util::Error;
-use std::ffi::c_int;
+use std::ffi::{c_int, c_ulong};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -54,21 +54,46 @@ pub const NO_AUTODIR: c_int = 0x400;
 pub const NO_OVERWRITE_NEWER: c_int = 0x800;
 pub const MAC_METADATA: c_int = 0x2000;
 pub const SECURE_NOABSOLUTEPATHS: c_int = 0x10000;
+pub const CLEAR_NOCHANGE_FFLAGS: c_int = 0x20000;
 pub const SAFE_WRITES: c_int = 0x40000;
 
-/// Whether `flags` hold one that would get in the way of the rest of the
-/// extraction. Only Apple platforms restore file flags here.
-fn has_critical_flags(flags: std::ffi::c_ulong) -> bool {
-    #[cfg(target_vendor = "apple")]
-    return flags
-        & (libc::SF_IMMUTABLE | libc::UF_IMMUTABLE | libc::SF_APPEND | libc::UF_APPEND)
-            as std::ffi::c_ulong
-        != 0;
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        let _ = flags;
-        false
+/// The file flags that forbid changes, which CLEAR_NOCHANGE_FFLAGS clears
+/// from what is in the way, and those that would get in the way of the
+/// rest of the extraction, which wait for close (upstream's
+/// nochange_flags and critical_flags).
+#[cfg(target_vendor = "apple")]
+const NOCHANGE_FLAGS: c_ulong =
+    (libc::SF_IMMUTABLE | libc::UF_IMMUTABLE | libc::SF_APPEND | libc::UF_APPEND) as c_ulong;
+#[cfg(target_vendor = "apple")]
+const CRITICAL_FLAGS: c_ulong = NOCHANGE_FLAGS;
+#[cfg(target_os = "linux")]
+const NOCHANGE_FLAGS: c_ulong =
+    (crate::ffi::disk_sys::FS_APPEND_FL | crate::ffi::disk_sys::FS_IMMUTABLE_FL) as c_ulong;
+#[cfg(target_os = "linux")]
+const CRITICAL_FLAGS: c_ulong =
+    NOCHANGE_FLAGS | crate::ffi::disk_sys::FS_JOURNAL_DATA_FL as c_ulong;
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+const NOCHANGE_FLAGS: c_ulong = 0;
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+const CRITICAL_FLAGS: c_ulong = 0;
+
+/// Upstream's set_fflags_platform for an entry of type `filetype`. Linux
+/// keeps flags only on regular files and directories.
+fn set_fflags_platform(
+    target: &Target,
+    filetype: crate::entry::Mode,
+    set: c_ulong,
+    clear: c_ulong,
+) -> std::io::Result<()> {
+    if cfg!(target_os = "linux") && ![libc::S_IFREG, libc::S_IFDIR].contains(&filetype) {
+        return Ok(());
     }
+    target.flags(set as u32, clear as u32)
+}
+
+/// Upstream's clear_nochange_fflags, on what is in the way of `entry`.
+fn clear_nochange_fflags(target: &Target, entry: &Entry) {
+    let _ = set_fflags_platform(target, entry.filetype(), 0, NOCHANGE_FLAGS);
 }
 
 /// What close restores on an entry. It holds no descriptor: close finds
@@ -227,6 +252,9 @@ impl WriteDisk {
         if options & UNLINK != 0 && !directory {
             // Unlink whatever is there, or failing that rmdir it.
             let removed = Target::prepare(path, secure).and_then(|t| {
+                if options & CLEAR_NOCHANGE_FFLAGS != 0 {
+                    clear_nochange_fflags(&t, entry);
+                }
                 t.remove(false).or_else(|e| match e.raw_os_error() {
                     Some(libc::ENOENT) => Err(e),
                     _ => t.remove(true),
@@ -298,6 +326,9 @@ impl WriteDisk {
                 return failed(libc::EIO, "Refusing to overwrite archive");
             }
             if in_the_way != libc::S_IFDIR {
+                if options & CLEAR_NOCHANGE_FFLAGS != 0 {
+                    clear_nochange_fflags(&existing, entry);
+                }
                 if options & SAFE_WRITES != 0 && entry.filetype() == libc::S_IFREG {
                     // Extract to a temporary file, renamed over it at the end.
                     let (tmp, file) = match existing.atomic_file(self.creation_mode(entry)) {
@@ -313,6 +344,9 @@ impl WriteDisk {
                 }
                 (target, en) = self.create(a, path, entry);
             } else if !directory {
+                if options & CLEAR_NOCHANGE_FFLAGS != 0 {
+                    clear_nochange_fflags(&existing, entry);
+                }
                 if let Err(e) = existing.remove(true) {
                     return failed(
                         errno(e),
@@ -632,7 +666,7 @@ impl WriteDisk {
                 entry.hardlink_is_set() != 0 && (entry.size_is_set() == 0 || entry.size() <= 0);
             let todo = if link_only { 0 } else { options };
             // Flags that forbid changes wait for close, after any hardlinks.
-            let mut deferred = if has_critical_flags(entry.fflags().0) {
+            let mut deferred = if entry.fflags().0 & CRITICAL_FLAGS != 0 {
                 FFLAGS
             } else {
                 0
@@ -792,7 +826,7 @@ impl WriteDisk {
         }
         if todo & FFLAGS != 0 {
             let (set, clear) = entry.fflags();
-            if let Err(e) = target.flags(set as u32, clear as u32) {
+            if let Err(e) = set_fflags_platform(target, entry.filetype(), set, clear) {
                 warn(&mut ret, errno(e), b"Failed to set file flags".to_vec());
             }
         }
@@ -908,7 +942,7 @@ impl WriteDisk {
                 let _ = self.set_acls(a, &entry, &target);
             }
             if todo & FFLAGS != 0
-                && let Err(e) = target.flags(entry.fflags().0 as u32, 0)
+                && let Err(e) = set_fflags_platform(&target, entry.filetype(), entry.fflags().0, 0)
             {
                 let _ = a.warn(
                     e.raw_os_error().unwrap_or(libc::EIO),
