@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Seed bounded writer properties, budget checks and deeper reader coverage.
+
+Usage: scripts/fuzz-writer-seeds [CORPUS_DIR] (default: fuzz/corpus).
+Existing seeds are retained. Files are named by SHA-256 of their contents.
+"""
+import gzip
+import hashlib
+import io
+import pathlib
+import sys
+import tarfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+WRITERS = ["writer_tar", "writer_zip", "writer_cpio", "writer_ar",
+           "writer_7zip", "writer_xar", "writer_iso9660"]
+
+
+def seed(out, target, data):
+    directory = out / target
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / hashlib.sha256(data).hexdigest()).write_bytes(data)
+
+
+def controls(count, mode, lengths):
+    data = bytearray([count - 1, 30, mode])
+    for index in range(count):
+        length = lengths[index % len(lengths)]
+        data.extend(length.to_bytes(2, "little"))
+        data.extend(bytes((i + index) % 256 for i in range(min(length, 1024))))
+    return bytes(data)
+
+
+def main(out):
+    for count in [1, 3, 5]:
+        for mode in range(4):
+            for lengths in [[0, 1, 5], [4096, 8192]]:
+                data = controls(count, mode, lengths)
+                for index, writer in enumerate(WRITERS):
+                    seed(out, writer, data)
+                    seed(out, "writer_roundtrip", bytes([index]) + data)
+                seed(out, "read_limits", data)
+
+    # A valid 3 MiB member reaches beyond the ordinary harness's 1 MiB
+    # data loop while remaining within the deeper reader's explicit caps.
+    payload = bytes(range(256)) * (3 * 1024 * 1024 // 256)
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        entry = tarfile.TarInfo("payload")
+        entry.size, entry.mode, entry.mtime = len(payload), 0o644, 0
+        archive.addfile(entry, io.BytesIO(payload))
+    archive = output.getvalue()
+    seed(out, "all_deep", archive)
+    seed(out, "all_deep", gzip.compress(archive, mtime=0))
+    print(f"Seeded {len(WRITERS)} writers, writer_roundtrip, read_limits and all_deep into {out}")
+
+
+if __name__ == "__main__":
+    main(pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "fuzz/corpus")

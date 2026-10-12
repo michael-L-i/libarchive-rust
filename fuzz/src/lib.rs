@@ -7,6 +7,7 @@ use std::ffi::{c_char, c_int, c_void};
 use std::sync::Once;
 
 pub use libfuzzer_sys;
+pub mod writer;
 
 extern crate libarchive_rust;
 
@@ -18,6 +19,7 @@ pub type Setup = unsafe extern "C" fn(*mut Archive) -> c_int;
 unsafe extern "C" {
     fn archive_read_new() -> *mut Archive;
     fn archive_read_open_memory(a: *mut Archive, buf: *const c_void, n: usize) -> c_int;
+    fn archive_read_set_options(a: *mut Archive, options: *const c_char) -> c_int;
     fn archive_read_next_header(a: *mut Archive, e: *mut *mut Entry) -> c_int;
     fn archive_read_data(a: *mut Archive, buf: *mut c_void, n: usize) -> isize;
     fn archive_read_close(a: *mut Archive) -> c_int;
@@ -74,7 +76,7 @@ macro_rules! target {
     };
 }
 
-pub fn run(data: &[u8], setups: &[Setup]) {
+pub(crate) fn abort_on_panic() {
     static HOOK: Once = Once::new();
     // Exported functions swallow panics into ARCHIVE_FATAL; make them crashes.
     HOOK.call_once(|| {
@@ -83,6 +85,19 @@ pub fn run(data: &[u8], setups: &[Setup]) {
             std::process::abort();
         }));
     });
+}
+
+pub fn run(data: &[u8], setups: &[Setup]) {
+    run_with_budget(data, setups, false);
+}
+
+/// Exercise longer streams with a larger, still bounded processing budget.
+pub fn run_deep(data: &[u8], setups: &[Setup]) {
+    run_with_budget(data, setups, true);
+}
+
+fn run_with_budget(data: &[u8], setups: &[Setup], deep: bool) {
+    abort_on_panic();
     // SAFETY: `a` comes from archive_read_new and is freed once; `data`
     // outlives the handle; entry pointers are valid until the next header;
     // getter strings are NUL-terminated or null and only read here.
@@ -91,12 +106,17 @@ pub fn run(data: &[u8], setups: &[Setup]) {
         for s in setups {
             s(a);
         }
+        // These guard header work as well as entry data. The larger mode
+        // exercises streams beyond the ordinary harness's 1 MiB data cap.
+        let options = if deep {
+            c"limits:decoded-bytes=67108864,limits:metadata-bytes=8388608,limits:entries=65536,limits:filter-depth=25,limits:decoder-memory=268435456"
+        } else {
+            c"limits:decoded-bytes=8388608,limits:metadata-bytes=2097152,limits:entries=16384,limits:filter-depth=25,limits:decoder-memory=268435456"
+        };
+        assert_eq!(archive_read_set_options(a, options.as_ptr()), 0);
         if archive_read_open_memory(a, data.as_ptr().cast(), data.len()) == 0 {
             let mut buf = vec![0u8; 1 << 16];
-            // Upstream has no output limit either: a tiny gzip can expand
-            // through the 25 filter layers it may nest into without end, so
-            // stop reading after 1 MiB of data.
-            let mut budget: usize = 1 << 20;
+            let mut budget: usize = if deep { 16 << 20 } else { 1 << 20 };
             let mut e = std::ptr::null_mut();
             // ARCHIVE_OK 0, ARCHIVE_WARN -20 continue; RETRY -10 and FATAL -30 stop.
             while matches!(archive_read_next_header(a, &mut e), 0 | -20) {

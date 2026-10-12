@@ -19,6 +19,77 @@ libc = "0.2"
 [workspace]
 
 [[bin]]
+name = "writer_tar"
+path = "fuzz_targets/writer_tar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "writer_zip"
+path = "fuzz_targets/writer_zip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "writer_cpio"
+path = "fuzz_targets/writer_cpio.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "writer_ar"
+path = "fuzz_targets/writer_ar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "writer_7zip"
+path = "fuzz_targets/writer_7zip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "writer_xar"
+path = "fuzz_targets/writer_xar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "writer_iso9660"
+path = "fuzz_targets/writer_iso9660.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "writer_roundtrip"
+path = "fuzz_targets/writer_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_limits"
+path = "fuzz_targets/read_limits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "all_deep"
+path = "fuzz_targets/all_deep.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
 name = "all"
 path = "fuzz_targets/all.rs"
 test = false
