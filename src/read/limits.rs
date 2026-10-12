@@ -5,8 +5,10 @@ use std::cell::Cell;
 
 /// Optional resource limits for one archive read handle.
 ///
-/// Configure before opening the archive. `None` preserves the existing C
-/// behavior and hard safety caps; `Some(0)` permits no work in that category.
+/// Configure before opening the archive. Configure `decoder_memory` before
+/// explicitly appending filters; changing it afterwards returns `Status::Failed`
+/// and `EINVAL`, because appended decoders are already initialized. `None`
+/// preserves the existing C behavior and hard safety caps; `Some(0)` permits no work in that category.
 /// Exceeding a budget returns `Status::Fatal`, `EFBIG`, and an error beginning
 /// with `Archive resource limit exceeded:`. A failure is persistent until close.
 /// Decoder memory rejection uses the existing codec error (`ENOMEM` where
@@ -15,10 +17,14 @@ use std::cell::Cell;
 pub struct ReadLimits {
     /// Sum of newly produced source blocks, filter outputs and instrumented
     /// format decoder outputs, including intermediate layers, headers, skips
-    /// and rereads. Buffer copies are not charged. A producer may finish one
-    /// bounded output block before the limit is detected.
+    /// and rereads. Optimized source skips and materialized sparse holes are
+    /// also charged. Buffer copies are not charged. A producer may finish one
+    /// bounded output block before the limit is detected; source-owned input
+    /// buffers, decoder overhead, external programs and callback work are
+    /// outside the allocation/work guarantee.
     pub decoded_bytes: Option<u64>,
-    /// Maximum returned entries and eagerly parsed entry-table members.
+    /// Maximum returned entries and eagerly parsed entry-table records,
+    /// including hidden and duplicate records.
     pub entries: Option<u64>,
     /// Aggregate bytes consumed during format bidding/header parsing, plus
     /// instrumented decoded/retained metadata. This includes syntax and parsing
@@ -28,7 +34,7 @@ pub struct ReadLimits {
     /// The existing hard maximum of 25 automatically detected filters remains.
     pub filter_depth: Option<usize>,
     /// Per-decoder cap in bytes for supported decoder dictionaries/windows.
-    /// Applies to XZ/LZMA/lzip outer filters; LZMA/XZ/Zstd/PPMd in ZIP,
+    /// Applies to XZ/LZMA/lzip/Zstd outer filters; LZMA/XZ/Zstd/PPMd in ZIP,
     /// LZMA/LZMA2/Zstd/PPMd in 7-Zip; XZ/LZMA in XAR; RAR windows and
     /// PPMd models; and RAR5 windows. Zstd limits the window, PPMd the model
     /// arena, and raw LZMA/lzip the dictionary; decoder overhead and other
@@ -283,5 +289,76 @@ mod tests {
         rd.metadata = false;
         rd.consume(4).unwrap();
         assert_eq!(rd.budget.metadata.get(), 4);
+    }
+
+    #[test]
+    fn limits_sticky_failure_blocks_already_buffered_reads() {
+        let a = Base::new(READ_MAGIC);
+        let mut r = Read::default();
+        assert_eq!(
+            r.set_limits(
+                &a,
+                ReadLimits {
+                    metadata_bytes: Some(0),
+                    ..ReadLimits::default()
+                }
+            ),
+            ARCHIVE_OK
+        );
+        r.open_client(&a, Box::new(Memory::new([0; 8], 8))).unwrap();
+        let mut rd = r.reader(&a);
+        assert_eq!(rd.peek_available(1).unwrap().len(), 8);
+        assert!(rd.budget.metadata(1u64).is_err());
+        assert_eq!(rd.peek_available(1).unwrap_err().errno, libc::EFBIG);
+        assert_eq!(rd.consume(0).unwrap_err().errno, libc::EFBIG);
+    }
+
+    #[test]
+    fn limits_materialized_sparse_holes_obey_output_budget() {
+        use crate::entry::Entry;
+        use crate::read::{Data, Format, Reader, Status};
+        struct Sparse;
+        impl Format for Sparse {
+            fn name(&self) -> &'static str {
+                "sparse-test"
+            }
+            fn bid(&mut self, _: &mut Reader<'_>, _: libc::c_int) -> Result<libc::c_int, Error> {
+                Ok(1)
+            }
+            fn read_header(&mut self, _: &mut Reader<'_>, _: &mut Entry) -> Result<Status, Error> {
+                Ok(Status::Ok)
+            }
+            fn read_data<'x>(&'x mut self, _: &'x mut Reader<'_>) -> Result<Data<'x>, Error> {
+                Ok(Data::Eof { offset: 100 })
+            }
+        }
+        let a = Base::new(READ_MAGIC);
+        let mut r = Read::default();
+        assert_eq!(
+            r.set_limits(
+                &a,
+                ReadLimits {
+                    decoded_bytes: Some(33),
+                    ..ReadLimits::default()
+                }
+            ),
+            ARCHIVE_OK
+        );
+        assert_eq!(r.register_format(Box::new(Sparse)).unwrap(), Status::Ok);
+        assert_eq!(r.open(&a, Box::new(Memory::new(b"x", 1))), ARCHIVE_OK);
+        assert_eq!(r.next_header2(&a, &mut Entry::new(None)), ARCHIVE_OK);
+        let mut out = [0xff; 8];
+        for _ in 0..4 {
+            assert_eq!(r.read_data(&a, None, &mut out), 8);
+            assert_eq!(out, [0; 8]);
+        }
+        out.fill(0xff);
+        assert_eq!(
+            r.read_data(&a, None, &mut out),
+            isize::try_from(ARCHIVE_FATAL).unwrap()
+        );
+        assert_eq!(out, [0xff; 8]);
+        assert_eq!(a.errno.get(), libc::EFBIG);
+        assert_eq!(r.close(&a), ARCHIVE_OK);
     }
 }

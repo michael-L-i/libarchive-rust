@@ -47,7 +47,9 @@ pub(super) enum Fail {
 pub(super) type P<T> = Result<T, Fail>;
 
 /// `n` copies of `value`, or `NoMem`.
-fn vec_of<T: Clone>(n: usize, value: T) -> P<Vec<T>> {
+fn vec_of<T: Clone>(r: &Reader<'_>, n: usize, value: T) -> P<Vec<T>> {
+    r.metadata(n.checked_mul(std::mem::size_of::<T>()).ok_or(Fail::NoMem)?)
+        .map_err(|_| Fail::Bad)?;
     let mut v = Vec::new();
     v.try_reserve_exact(n).map_err(|_| Fail::NoMem)?;
     v.resize(n, value);
@@ -69,8 +71,12 @@ fn decode_codec_id(id: &[u8]) -> Option<i64> {
 }
 
 /// The first of `i` such that no bind pair has `inIndex == i`.
-fn first_unbound_in_stream(pairs: &[(usize, usize)], total: usize) -> P<Option<usize>> {
-    let mut bound = vec_of(total, false)?;
+fn first_unbound_in_stream(
+    r: &Reader<'_>,
+    pairs: &[(usize, usize)],
+    total: usize,
+) -> P<Option<usize>> {
+    let mut bound = vec_of(r, total, false)?;
     for &(in_index, _) in pairs {
         if let Some(b) = bound.get_mut(in_index) {
             *b = true;
@@ -112,6 +118,7 @@ impl SevenZip {
         let mut out = Vec::new();
         while n > 0 {
             let b = n.min(UBUFF_SIZE);
+            r.metadata(b).map_err(|_| Fail::Bad)?;
             let ok = self.header_with(r, b, |p| {
                 out.try_reserve(b).ok()?;
                 out.extend_from_slice(p);
@@ -160,7 +167,7 @@ impl SevenZip {
     }
 
     fn read_bools(&mut self, r: &mut Reader<'_>, num: usize) -> P<Vec<bool>> {
-        let mut data = vec_of(num, false)?;
+        let mut data = vec_of(r, num, false)?;
         let (mut mask, mut avail) = (0u8, 0u8);
         for d in &mut data {
             if mask == 0 {
@@ -182,9 +189,9 @@ impl SevenZip {
             self.read_bools(r, num)?
         } else {
             // All are defined.
-            vec_of(num, true)?
+            vec_of(r, num, true)?
         };
-        let mut digests = vec_of(num, 0u32)?;
+        let mut digests = vec_of(r, num, 0u32)?;
         for (d, &defined) in digests.iter_mut().zip(&defineds) {
             if defined {
                 *d = u32::from_le_bytes(self.hb_array(r)?);
@@ -215,8 +222,8 @@ impl SevenZip {
         {
             return Err(Fail::Bad);
         }
-        pi.sizes = vec_of(pi.num_pack_streams, 0)?;
-        pi.positions = vec_of(pi.num_pack_streams, 0)?;
+        pi.sizes = vec_of(r, pi.num_pack_streams, 0)?;
+        pi.positions = vec_of(r, pi.num_pack_streams, 0)?;
         for i in 0..pi.num_pack_streams {
             let size = self.parse_int64(r)?;
             if let Some(s) = pi.sizes.get_mut(i) {
@@ -229,8 +236,8 @@ impl SevenZip {
             K_END => {
                 // PackStreamDigests[num] are not present.
                 pi.digest = Digests {
-                    defineds: vec_of(pi.num_pack_streams, false)?,
-                    digests: vec_of(pi.num_pack_streams, 0)?,
+                    defineds: vec_of(r, pi.num_pack_streams, false)?,
+                    digests: vec_of(r, pi.num_pack_streams, 0)?,
                 };
                 return Ok(pi);
             }
@@ -258,6 +265,15 @@ impl SevenZip {
             return Err(Fail::Bad);
         }
 
+        r.metadata(
+            num_coders
+                .checked_mul(std::mem::size_of::<Coder>())
+                .ok_or(Fail::NoMem)?,
+        )
+        .map_err(|_| Fail::Bad)?;
+        f.coders
+            .try_reserve_exact(num_coders)
+            .map_err(|_| Fail::NoMem)?;
         for _ in 0..num_coders {
             // 0:3 CodecIdSize
             // 4:  0 - IsSimple
@@ -310,6 +326,15 @@ impl SevenZip {
         if u64::try_from(self.header_bytes_remaining).unwrap_or(0) < num_bind_pairs as u64 {
             return Err(Fail::Bad);
         }
+        r.metadata(
+            num_bind_pairs
+                .checked_mul(std::mem::size_of::<(usize, usize)>())
+                .ok_or(Fail::NoMem)?,
+        )
+        .map_err(|_| Fail::Bad)?;
+        f.bind_pairs
+            .try_reserve_exact(num_bind_pairs)
+            .map_err(|_| Fail::NoMem)?;
         for _ in 0..num_bind_pairs {
             let in_index = self.parse_size(r)?;
             let out_index = self.parse_size(r)?;
@@ -319,7 +344,7 @@ impl SevenZip {
         f.num_packed_streams = in_streams_total - num_bind_pairs;
         // packedStreams are not needed; parse/verify nonetheless.
         if f.num_packed_streams == 1 {
-            if first_unbound_in_stream(&f.bind_pairs, in_streams_total)?.is_none() {
+            if first_unbound_in_stream(r, &f.bind_pairs, in_streams_total)?.is_none() {
                 return Err(Fail::Bad);
             }
         } else {
@@ -352,6 +377,12 @@ impl SevenZip {
         let mut folders = Vec::new();
         match self.hb_u8(r)? {
             0 => {
+                r.metadata(
+                    num_folders
+                        .checked_mul(std::mem::size_of::<Folder>())
+                        .ok_or(Fail::NoMem)?,
+                )
+                .map_err(|_| Fail::Bad)?;
                 folders
                     .try_reserve_exact(num_folders)
                     .map_err(|_| Fail::NoMem)?;
@@ -373,7 +404,7 @@ impl SevenZip {
         }
 
         for folder in &mut folders {
-            folder.unpack_size = vec_of(folder.num_out_streams, 0)?;
+            folder.unpack_size = vec_of(r, folder.num_out_streams, 0)?;
             for j in 0..folder.num_out_streams {
                 let size = self.parse_int64(r)?;
                 if let Some(s) = folder.unpack_size.get_mut(j) {
@@ -445,9 +476,9 @@ impl SevenZip {
         }
 
         ss.unpack_streams = unpack_streams;
-        ss.unpack_sizes = vec_of(unpack_streams, 0)?;
-        ss.digests_defined = vec_of(unpack_streams, false)?;
-        ss.digests = vec_of(unpack_streams, 0)?;
+        ss.unpack_sizes = vec_of(r, unpack_streams, 0)?;
+        ss.digests_defined = vec_of(r, unpack_streams, false)?;
+        ss.digests = vec_of(r, unpack_streams, 0)?;
 
         let mut usizes = 0usize;
         for f in folders.iter() {
@@ -622,6 +653,13 @@ impl SevenZip {
         }
 
         self.num_files = self.parse_size(r)?;
+        r.check_entries(self.num_files).map_err(|_| Fail::Bad)?;
+        r.metadata(
+            self.num_files
+                .checked_mul(std::mem::size_of::<ZEntry>())
+                .ok_or(Fail::NoMem)?,
+        )
+        .map_err(|_| Fail::Bad)?;
         if !self.files_info_numfiles_is_sane() {
             return Err(Fail::Bad);
         }
@@ -899,5 +937,40 @@ impl SevenZip {
             return Err(Error::fatal(-1, "Malformed Header offset"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    use crate::archive::{ARCHIVE_OK, Base, READ_MAGIC};
+    use crate::read::{Read, ReadLimits};
+    use crate::read_open_memory::Memory;
+
+    #[test]
+    fn limits_pack_tables_fail_before_wire_sizes_are_parsed() {
+        let input = [0, 3, K_SIZE, 1, 1, 1, K_END];
+        let a = Base::new(READ_MAGIC);
+        let mut read = Read::default();
+        assert_eq!(
+            read.set_limits(
+                &a,
+                ReadLimits {
+                    metadata_bytes: Some(32),
+                    ..ReadLimits::default()
+                }
+            ),
+            ARCHIVE_OK
+        );
+        read.open_client(&a, Box::new(Memory::new(input, input.len())))
+            .unwrap();
+        let mut sevenzip = SevenZip {
+            header_bytes_remaining: input.len() as i64,
+            ..SevenZip::default()
+        };
+        let mut r = read.reader(&a);
+        assert!(matches!(sevenzip.read_pack_info(&mut r), Err(Fail::Bad)));
+        assert_eq!(r.budget.check().unwrap_err().errno, libc::EFBIG);
+        assert_eq!(sevenzip.header_bytes_remaining, 4);
     }
 }

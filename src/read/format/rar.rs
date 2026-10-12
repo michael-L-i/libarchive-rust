@@ -482,6 +482,14 @@ impl Rar {
     fn read_header(
         &mut self,
         r: &mut Reader<'_>,
+        entry: Option<&mut Entry>,
+    ) -> Result<Status, Error> {
+        r.with_metadata(|r| self.read_header_inner(r, entry))
+    }
+
+    fn read_header_inner(
+        &mut self,
+        r: &mut Reader<'_>,
         mut entry: Option<&mut Entry>,
     ) -> Result<Status, Error> {
         let a = r.base();
@@ -1147,6 +1155,7 @@ impl Rar {
         let mut ret = Status::Ok;
 
         let size = usize::try_from(self.packed_size).unwrap_or(usize::MAX);
+        r.budget.check_metadata(size)?;
         let Ok(Some(link)) = r.read_ahead(size) else {
             return Err(fatal(a, "Failed to read link"));
         };
@@ -1309,7 +1318,8 @@ impl Format for Rar {
                     self.start_new_table = true;
                     self.ppmd_valid = false;
                 }
-                Ok(match out? {
+                let out = out?;
+                Ok(match out {
                     Out::Unpacked { len, offset } => Data::Block {
                         data: self.unp_buffer.get(..len).unwrap_or_default(),
                         offset,
@@ -1862,6 +1872,12 @@ impl Rar {
             if new_size == 0 {
                 return Err(failed(a, "Zero window size is invalid"));
             }
+            if u64::from(new_size) > r.decoder_memory(u64::MAX) {
+                return Err(Error::fatal(
+                    libc::ENOMEM,
+                    "RAR window requires too much memory",
+                ));
+            }
             self.window.clear();
             if self.window.try_reserve_exact(new_size as usize).is_err() {
                 return Err(Error::fatal(
@@ -1900,6 +1916,15 @@ impl Rar {
             // reading a broken file causes this abnormal sequence.
             ppmd.model.free();
 
+            let allocation = u64::from(self.dictionary_size)
+                + u64::from(4 - (self.dictionary_size & 3))
+                + u64::from(crate::ppmd::UNIT_SIZE);
+            if allocation > r.decoder_memory(u64::MAX) {
+                return Err(Error::fatal(
+                    libc::ENOMEM,
+                    "PPMd model requires too much memory",
+                ));
+            }
             if !ppmd.model.alloc(self.dictionary_size) {
                 return Err(Error::fatal(libc::ENOMEM, "Out of memory"));
             }
@@ -2073,6 +2098,7 @@ impl Rar {
             let offs: u32;
             let len: u32;
             if symbol < 256 {
+                r.decoded(1u64)?;
                 self.emit_literal(symbol as u8);
                 continue;
             } else if symbol == 256 {
@@ -2202,6 +2228,7 @@ impl Rar {
             self.last_offset = offs;
             self.last_length = len;
 
+            r.decoded(len)?;
             self.emit_match(offs as usize, len as usize);
         }
     }
@@ -2480,6 +2507,7 @@ impl Rar {
                         return Err(invalid());
                     }
                     if sym as u32 != self.ppmd_escape {
+                        r.decoded(1u64)?;
                         self.emit_literal(sym as u8);
                         self.bytes_uncopied += 1;
                     } else {
@@ -2521,6 +2549,7 @@ impl Rar {
                                 if length < 0 {
                                     return Err(invalid());
                                 }
+                                r.decoded(u64::try_from(length).unwrap_or(0) + 32)?;
                                 self.emit_match(lzss_offset as usize + 2, length as usize + 32);
                                 self.bytes_uncopied += i64::from(length) + 32;
                             }
@@ -2530,11 +2559,13 @@ impl Rar {
                                 if length < 0 {
                                     return Err(invalid());
                                 }
+                                r.decoded(u64::try_from(length).unwrap_or(0) + 4)?;
                                 self.emit_match(1, length as usize + 4);
                                 self.bytes_uncopied += i64::from(length) + 4;
                             }
 
                             _ => {
+                                r.decoded(1u64)?;
                                 self.emit_literal(sym as u8);
                                 self.bytes_uncopied += 1;
                             }
@@ -2595,6 +2626,34 @@ impl Rar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limits_charge_window_production_before_output_is_returned() {
+        use crate::archive::{ARCHIVE_OK, Base, READ_MAGIC};
+        use crate::read::ReadLimits;
+        let a = Base::new(READ_MAGIC);
+        let mut read = Read::default();
+        assert_eq!(
+            read.set_limits(
+                &a,
+                ReadLimits {
+                    decoded_bytes: Some(1),
+                    ..ReadLimits::default()
+                }
+            ),
+            ARCHIVE_OK
+        );
+        let mut rar = Rar::new();
+        rar.window = vec![0; 8];
+        rar.filters.filter_start = i64::MAX;
+        rar.br.avail = 32;
+        rar.br.ready = true;
+        rar.maincode = Code::create(&[1, 1], MAX_SYMBOL_LENGTH).unwrap();
+        let e = rar.expand(&mut read.reader(&a), &mut 4).unwrap_err();
+        assert_eq!(e.errno, libc::EFBIG);
+        assert_eq!(rar.position, 1);
+        assert!(rar.unp_buffer.is_empty());
+    }
 
     /// The Unicode name decoder against upstream's, compiled from the
     /// pinned source: (case, size, end, FNV-1a of the name and its two

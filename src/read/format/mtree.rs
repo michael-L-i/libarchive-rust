@@ -693,7 +693,10 @@ fn mutable_global<'a>(
     if Rc::strong_count(global) > 1 {
         let size = global
             .iter()
-            .try_fold(0usize, |n, token| n.checked_add(token.len()))
+            .try_fold(0usize, |n, token| {
+                n.checked_add(std::mem::size_of::<Vec<u8>>())?
+                    .checked_add(token.len())
+            })
             .ok_or_else(mtree_no_memory)?;
         r.metadata(size)?;
         let mut copy = Vec::new();

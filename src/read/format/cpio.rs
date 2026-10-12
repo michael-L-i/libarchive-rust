@@ -581,6 +581,7 @@ impl Format for Cpio {
             ));
         }
 
+        r.budget.check_metadata(namelength)?;
         let Some(h) = r.read_ahead(namelength)?.and_then(|h| h.get(..namelength)) else {
             return Err(Error::silent(ARCHIVE_FATAL));
         };
@@ -613,6 +614,7 @@ impl Format for Cpio {
             let Ok(n) = usize::try_from(self.entry_bytes_remaining) else {
                 return Err(Error::silent(ARCHIVE_FATAL));
             };
+            r.budget.check_metadata(n)?;
             let Some(hl) = r.read_ahead(n)?.and_then(|hl| hl.get(..n)) else {
                 return Err(Error::silent(ARCHIVE_FATAL));
             };

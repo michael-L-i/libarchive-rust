@@ -2023,6 +2023,22 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
             // data.
             r.consume(46)?;
             let budget = r.budget;
+            budget.check_entries(
+                self.zip_entries
+                    .len()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::fatal(libc::ENOMEM, "No memory for ZIP entries"))?,
+            )?;
+            // Both regular and hidden records retain an entry and tree key.
+            budget
+                .metadata(std::mem::size_of::<ZipEntry>() + std::mem::size_of::<(i64, usize)>())?;
+            if self.process_mac_extensions {
+                let names = filename_length
+                    .checked_add(12)
+                    .and_then(|n| n.checked_mul(2))
+                    .ok_or_else(|| Error::fatal(libc::ENOMEM, "No memory for ZIP names"))?;
+                budget.metadata(names)?;
+            }
             let p = match r.read_ahead(filename_length + extra_length) {
                 Ok(Some(p)) => p,
                 _ => return Err(truncated_header()),
@@ -2041,12 +2057,6 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
                 ..e
             })?;
 
-            budget.check_entries(
-                self.zip_entries
-                    .len()
-                    .checked_add(1)
-                    .ok_or_else(|| Error::fatal(libc::ENOMEM, "No memory for ZIP entries"))?,
-            )?;
             if self.zip_entries.try_reserve(1).is_err() {
                 return Err(Error::fatal(libc::ENOMEM, "Can't allocate zip entry"));
             }
@@ -2218,6 +2228,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
 
         let mut metadata = Vec::new();
         let size = usize::try_from(rsrc.uncompressed_size).unwrap_or(0);
+        r.metadata(size)?;
         if metadata.try_reserve_exact(size).is_err() {
             return Err(Error::fatal(
                 libc::ENOMEM,
@@ -2241,6 +2252,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
         let mut eof = false;
         let result = (|| -> Result<(), Error> {
             while !eof && remaining_bytes > 0 {
+                let budget = r.budget;
                 let p = match r.read_ahead(1) {
                     Ok(Some(p)) => p,
                     _ => {
@@ -2279,6 +2291,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
                         let out = metadata.get_mut(mp..).unwrap_or_default();
                         let (consumed, written, ended) =
                             inflate(state, input, out).map_err(inflate_failed)?;
+                        budget.decoded(written)?;
                         eof = ended;
                         bytes_used = consumed;
                         metadata_bytes -= written;
