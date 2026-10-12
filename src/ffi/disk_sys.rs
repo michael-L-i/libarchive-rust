@@ -938,12 +938,13 @@ impl Target {
     }
     #[cfg(target_vendor = "apple")]
     pub fn read_file(&self) -> std::io::Result<File> {
+        // O_NONBLOCK: a FIFO has no writer to wait for.
         // SAFETY: live parent/name; final symlink not followed.
         let fd = unsafe {
             libc::openat(
                 self.parent.as_raw_fd(),
                 self.name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
         };
         if fd < 0 {

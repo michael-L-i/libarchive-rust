@@ -552,12 +552,15 @@ impl WriteDisk {
                 target.retain_file(file);
             }
             let mut ret = ARCHIVE_OK;
-            // An AppleDouble file "._name" is merged into "name" and removed.
+            // An AppleDouble file "._name" with data is merged into "name"
+            // and removed.
             #[cfg(target_vendor = "apple")]
-            if let Some(name) = path
-                .file_name()
-                .map(std::ffi::OsStr::as_bytes)
-                .filter(|name| name.starts_with(b"._"))
+            if entry.size_is_set() != 0
+                && entry.size() > 0
+                && let Some(name) = path
+                    .file_name()
+                    .map(std::ffi::OsStr::as_bytes)
+                    .filter(|name| name.starts_with(b"._"))
                 && let Ok(dest) = target.sibling(&name[2..])
                 && dest.stat().is_ok_and(|st| {
                     [libc::S_IFREG, libc::S_IFDIR, libc::S_IFLNK]
@@ -1627,6 +1630,35 @@ mod tests {
             std::fs::metadata(outside.join("sub")).unwrap().mtime(),
             before
         );
+    }
+
+    #[test]
+    fn only_appledouble_files_with_data_are_merged() {
+        let output = Output::new();
+        std::fs::write(output.0.join("x"), b"x").unwrap();
+        std::fs::create_dir(output.0.join("d")).unwrap();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        // A FIFO, even one claiming data, is never waited on, and a
+        // directory is no AppleDouble file.
+        for (name, kind, size) in [
+            ("._x", libc::S_IFIFO, 0),
+            ("._x", libc::S_IFIFO, 8),
+            ("._d", libc::S_IFDIR, 0),
+        ] {
+            let _ = std::fs::remove_file(output.0.join(name));
+            let mut entry = Entry::new(None);
+            entry.set_pathname(output.0.join(name).as_os_str().as_bytes());
+            entry.set_mode(kind | 0o644);
+            entry.set_size(size);
+            assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+            assert_eq!(
+                disk.finish_entry(&base),
+                ARCHIVE_OK,
+                "{name} {kind:o} {size}"
+            );
+        }
+        assert_eq!(disk.close(&base), ARCHIVE_OK);
     }
 
     #[test]
