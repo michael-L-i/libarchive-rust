@@ -422,8 +422,9 @@ pub fn create_dir(
     path: &Path,
     secure: bool,
     no_overwrite: bool,
+    umask: u32,
 ) -> Result<(), (PathBuf, DirError)> {
-    let mode = ((0o777 & !umask()) | 0o700) & 0o775;
+    let mode = ((0o777 & !umask) | 0o700) & 0o775;
     let test = |e| (path.to_path_buf(), DirError::Test(e));
     let start = if path.is_absolute() { c"/" } else { c"." };
     let mut dir = open_dir(libc::AT_FDCWD, start, true).map_err(test)?;
@@ -1196,7 +1197,7 @@ mod tests {
         let missing = root.0.join("missing/nested/file");
         assert!(Target::prepare(&missing, true).is_err());
         assert!(!root.0.join("missing").exists());
-        create_dir(missing.parent().unwrap(), true, false).unwrap();
+        create_dir(missing.parent().unwrap(), true, false, umask()).unwrap();
         assert!(Target::prepare(&missing, true).is_ok());
     }
 

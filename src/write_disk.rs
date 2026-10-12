@@ -96,6 +96,8 @@ pub struct WriteDisk {
     permissions_created: bool,
     new_directory: bool,
     directory_mode: bool,
+    /// The umask, read once per entry as upstream does.
+    umask: u32,
 }
 
 /// Upstream's cleanup_pathname_fsobj: drops empty and `.` elements and a
@@ -142,6 +144,7 @@ impl WriteDisk {
         }
         a.clear_error();
         a.state.set(state::HEADER);
+        self.umask = umask();
         if self.start_time == 0 {
             self.start_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -231,7 +234,8 @@ impl WriteDisk {
         if (en == libc::ENOTDIR || en == libc::ENOENT) && options & NO_AUTODIR == 0 {
             // A failure is reported, but the entry is still tried.
             if let Some(parent) = path.parent()
-                && let Err((dir, e)) = create_dir(parent, secure, options & NO_OVERWRITE != 0)
+                && let Err((dir, e)) =
+                    create_dir(parent, secure, options & NO_OVERWRITE != 0, self.umask)
             {
                 let dir = dir.as_os_str().as_bytes();
                 let (errno, msg, tail) = match e {
@@ -330,7 +334,13 @@ impl WriteDisk {
     /// The mode upstream creates a file with: the final permissions with
     /// the umask applied, and no set-id bits.
     fn creation_mode(&self, entry: &Entry) -> u32 {
-        entry.mode() as u32 & 0o777 & !umask()
+        let mode = entry.mode() as u32 & 0o777 & !self.umask;
+        // Writable, so that a user other than root can set its attributes.
+        if euid() != 0 && self.options & XATTR != 0 {
+            mode | 0o200
+        } else {
+            mode
+        }
     }
 
     /// Upstream's create_filesystem_object: one attempt to create the entry.
@@ -387,23 +397,29 @@ impl WriteDisk {
                     self.limit = Some(0);
                     // Upstream's limits keep a new directory usable and
                     // private to its group until close sets its mode.
-                    let final_mode = final_mode(entry, options);
-                    let mode = ((final_mode & 0o777 & !umask()) | 0o700) & 0o775;
+                    let final_mode = final_mode(entry, options, self.umask);
+                    let mode = ((final_mode & 0o777 & !self.umask) | 0o700) & 0o775;
                     let created = target.mkdir(mode);
                     self.new_directory = created.is_ok();
                     self.directory_mode = mode != final_mode || options & PERM != 0;
                     created
                 }
-                libc::S_IFCHR | libc::S_IFBLK | libc::S_IFIFO => {
-                    target.special(entry.mode() as u32, entry.rdev() as u64)
+                // Created without set-id bits; the mode is set afterwards
+                // unless it is already final. On Apple, creation applies the
+                // umask without Linux's default-ACL substitution.
+                kind => {
+                    let mode = self.creation_mode(entry);
+                    self.permissions_created = cfg!(target_vendor = "apple")
+                        && mode == final_mode(entry, options, self.umask);
+                    match kind {
+                        libc::S_IFCHR | libc::S_IFBLK | libc::S_IFIFO => {
+                            target.special(kind as u32 | mode, entry.rdev() as u64)
+                        }
+                        // POSIX requires any other type to be created as a
+                        // regular file.
+                        _ => target.open(mode, true).map(|file| self.file = Some(file)),
+                    }
                 }
-                // POSIX requires any other type to be created as a regular file.
-                _ => target.open(self.creation_mode(entry), true).map(|file| {
-                    self.file = Some(file);
-                    // On Apple, creation applies the umask without Linux's
-                    // default-ACL substitution: the mode is final.
-                    self.permissions_created = cfg!(target_vendor = "apple") && options & PERM == 0;
-                }),
             }
         };
         match created {
@@ -635,7 +651,7 @@ impl WriteDisk {
                 self.fixups.push(Fixup {
                     name: name.to_vec(),
                     todo: todo & (deferred | SECURE_SYMLINKS),
-                    mode: (directory && mode).then(|| final_mode(&entry, options)),
+                    mode: (directory && mode).then(|| final_mode(&entry, options, self.umask)),
                     entry,
                     id: (st.st_dev as u64, st.st_ino),
                 });
@@ -677,7 +693,7 @@ impl WriteDisk {
             warn(&mut ret, errno(e), b"Failed to compress file".to_vec());
         }
         let euid = euid();
-        let mut final_mode = final_mode(entry, todo);
+        let mut final_mode = final_mode(entry, todo, self.umask);
         let (uid, gid) = if todo & OWNER != 0 || (mode && final_mode & 0o6000 != 0) {
             let mut names = entry.clone_entry();
             let uid = self.user.lookup(names.uname(), entry.uid(), false);
@@ -905,11 +921,11 @@ impl WriteDisk {
 
 /// The permissions an entry ends up with: without PERM, no set-id or
 /// sticky bits and the umask applied.
-fn final_mode(entry: &Entry, options: c_int) -> u32 {
+fn final_mode(entry: &Entry, options: c_int, umask: u32) -> u32 {
     if options & PERM != 0 {
         entry.mode() as u32 & 0o7777
     } else {
-        entry.mode() as u32 & 0o777 & !umask()
+        entry.mode() as u32 & 0o777 & !umask
     }
 }
 
@@ -967,6 +983,7 @@ mod tests {
     use super::*;
     use crate::archive::ARCHIVE_WARN;
     use crate::archive::WRITE_DISK_MAGIC;
+    use crate::ffi::disk_sys::umask;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct Output(PathBuf);
@@ -1659,6 +1676,44 @@ mod tests {
             );
         }
         assert_eq!(disk.close(&base), ARCHIVE_OK);
+    }
+
+    #[test]
+    fn files_are_created_without_special_bits_then_get_their_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let output = Output::new();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        disk.options = PERM | XATTR;
+        let mode = |name: &str| {
+            let path = output.0.join(name);
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        let mut fifo = Entry::new(None);
+        fifo.set_pathname(output.0.join("fifo").as_os_str().as_bytes());
+        fifo.set_mode(libc::S_IFIFO | 0o4755);
+        fifo.set_uid(euid().into());
+        assert_eq!(disk.header(&base, &mut fifo), ARCHIVE_OK);
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+        assert_eq!(mode("fifo"), 0o4755);
+        // A read-only file is created writable for its attributes.
+        let mut file = Entry::new(None);
+        file.set_pathname(output.0.join("file").as_os_str().as_bytes());
+        file.set_mode(libc::S_IFREG | 0o444);
+        file.xattr_add(c"user.file", b"v");
+        assert_eq!(disk.header(&base, &mut file), ARCHIVE_OK);
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+        assert_eq!(mode("file"), 0o444);
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut read = Entry::new(None);
+            crate::ffi::disk_sys::read_xattrs(&output.0.join("file"), &mut read, false).unwrap();
+            assert_eq!(read.xattrs.len(), 1);
+        }
     }
 
     #[test]
