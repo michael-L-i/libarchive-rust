@@ -34,7 +34,7 @@ use crate::archive::{
     ARCHIVE_ERRNO_MISC, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, ARCHIVE_WARN, Base, state,
 };
 use crate::entry::Entry;
-use crate::ffi::disk_sys::{PrepareError, Target, check_symlinks};
+use crate::ffi::disk_sys::{DirError, Target, check_symlinks, create_dir};
 use crate::util::Error;
 use std::ffi::c_int;
 use std::fs::File;
@@ -138,9 +138,6 @@ impl WriteDisk {
         let hardlink = entry
             .hardlink()
             .map(|p| PathBuf::from(std::ffi::OsStr::from_bytes(p.to_bytes())));
-        let link = entry
-            .symlink()
-            .map(|p| PathBuf::from(std::ffi::OsStr::from_bytes(p.to_bytes())));
         if let Some(target) = &hardlink {
             if name == target.as_os_str().as_bytes() {
                 let msg = [b"Skipping hardlink pointing to itself: ", name.as_slice()];
@@ -150,83 +147,13 @@ impl WriteDisk {
                 return a.raise(Error::new(ARCHIVE_FAILED, ARCHIVE_ERRNO_MISC, msg));
             }
         }
-        let secure = self.options & SECURE_SYMLINKS != 0;
-        let unlink = self.options & UNLINK != 0;
-        if secure && let Err((code, errno, msg)) = check_symlinks(&name, unlink, secure, false) {
+        let options = self.options;
+        let secure = options & SECURE_SYMLINKS != 0;
+        if secure
+            && let Err((code, errno, msg)) =
+                check_symlinks(&name, options & UNLINK != 0, secure, false)
+        {
             return a.raise(Error::new(code, errno, [msg.as_bytes(), &name].concat()));
-        }
-        let mut target = match Target::prepare(&path, secure, self.options & NO_AUTODIR == 0) {
-            Ok(t) => t,
-            Err(PrepareError::Mkdir(dir, e)) => return failure(a, e, "Failed to create dir", &dir),
-            Err(PrepareError::Other(e)) => {
-                return failure(a, e, "Can't create parent directory", &path);
-            }
-        };
-        if !secure
-            && self.options & UNLINK == 0
-            && entry.filetype() == libc::S_IFDIR
-            && std::fs::metadata(&path).is_ok_and(|m| m.is_dir())
-            && target
-                .stat()
-                .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFLNK)
-            && let Ok(real) = std::fs::canonicalize(&path)
-        {
-            match Target::prepare(&real, false, false) {
-                Ok(t) => target = t,
-                Err(e) => return failure(a, e.into(), "Can't follow directory", &path),
-            }
-        }
-        // SAFE_WRITES extracts a regular file to a temporary and renames it over
-        // whatever non-directory is in the way; anything else in the way is removed.
-        // Any other type is created as a regular file, as POSIX requires.
-        let regular = hardlink.is_none()
-            && link.is_none()
-            && !matches!(
-                entry.filetype(),
-                libc::S_IFDIR | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFIFO
-            );
-        let safe_write = regular && self.options & SAFE_WRITES != 0;
-        // A successful exclusive create cannot replace an existing inode. Fall back
-        // to the original checks on any error, including a racing creation.
-        let created_file = if regular && !safe_write {
-            target.open(entry.mode() as u32 & 0o777, true).ok()
-        } else {
-            None
-        };
-        if created_file.is_none()
-            && let Ok(existing) = target.stat()
-        {
-            let directory = existing.st_mode & libc::S_IFMT == libc::S_IFDIR;
-            if self.options & NO_OVERWRITE != 0
-                || (self.options & NO_OVERWRITE_NEWER != 0
-                    && !directory
-                    && (existing.st_mtime, existing.st_mtime_nsec)
-                        >= (entry.mtime(), entry.mtime_nsec()))
-            {
-                self.skipped = true;
-            } else if self.skip_file == Some((existing.st_dev as i64, existing.st_ino as i64)) {
-                return a.raise(Error::new(
-                    ARCHIVE_FAILED,
-                    libc::EIO,
-                    "Refusing to overwrite archive",
-                ));
-            } else if !(directory && entry.filetype() == libc::S_IFDIR)
-                && !(safe_write && !directory)
-                && let Err(e) = target.remove(directory)
-            {
-                let msg = if self.options & UNLINK != 0 {
-                    "Could not unlink"
-                } else if directory {
-                    "Can't replace existing directory with non-directory"
-                } else {
-                    "Can't unlink already-existing object"
-                };
-                return a.raise(Error::new(
-                    ARCHIVE_FAILED,
-                    e.raw_os_error().unwrap_or(libc::EIO),
-                    msg,
-                ));
-            }
         }
         self.offset = 0;
         self.max_offset = 0;
@@ -234,91 +161,225 @@ impl WriteDisk {
         if entry.hardlink_is_set() != 0 && entry.size_is_set() == 0 {
             self.limit = Some(0);
         }
-        if !self.skipped {
-            let hardlink_name = hardlink.as_ref().map(|p| p.as_os_str().as_bytes().to_vec());
-            let result = if let Some(file) = created_file {
-                self.file = Some(file);
-                // On Apple, creation applies the umask without Linux's default-ACL
-                // substitution. Match upstream's creation-time mask for new files.
-                self.permissions_created =
-                    cfg!(target_vendor = "apple") && self.options & PERM == 0;
-                Ok(())
-            } else if let Some(source) = hardlink {
-                let clean = cleanup_pathname(source.as_os_str().as_bytes(), 0).unwrap_or_default();
-                if let Err((_, errno, msg)) = check_symlinks(&clean, unlink, secure, true) {
-                    return a.raise(Error::new(
-                        ARCHIVE_FAILED,
-                        errno,
-                        [msg.as_bytes(), &clean].concat(),
-                    ));
-                }
-                Target::prepare(&source, secure, false)
-                    .map_err(std::io::Error::from)
-                    .and_then(|source| target.hardlink(&source))
-            } else if let Some(link) = link {
-                self.limit = Some(0);
-                target.symlink(&link)
-            } else if entry.filetype() == libc::S_IFDIR {
-                self.limit = Some(0);
-                match target.mkdir(0o777) {
-                    Ok(()) => {
-                        self.new_directory = true;
-                        Ok(())
-                    }
-                    Err(e)
-                        if e.raw_os_error() == Some(libc::EEXIST)
-                            && target
-                                .stat()
-                                .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR) =>
-                    {
-                        Ok(())
-                    }
-                    result => result,
-                }
-            } else if regular {
-                if safe_write {
-                    match target.atomic_file(entry.mode() as u32 & 0o777) {
-                        Ok((tmp, file)) => {
-                            self.atomic = Some(target);
-                            target = tmp;
-                            self.file = Some(file);
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    target
-                        .open(entry.mode() as u32 & 0o777, false)
-                        .map(|file| self.file = Some(file))
-                }
-            } else {
-                target.special(entry.mode() as u32, entry.rdev() as u64)
-            };
-            if let Err(e) = result {
-                if e.raw_os_error() == Some(libc::ENOENT)
-                    && let Some(name) = hardlink_name
-                {
-                    return a.raise(Error::new(
-                        ARCHIVE_FAILED,
-                        libc::ENOENT,
-                        [b"Hard-link target '".as_slice(), &name, b"' does not exist"].concat(),
-                    ));
-                }
-                return failure(a, e, "Can't create", &path);
-            }
-            if self.file.is_none() && entry.hardlink_is_set() != 0 && self.limit != Some(0) {
-                match target.open(entry.mode() as u32 & 0o777, false) {
-                    Ok(file) => self.file = Some(file),
-                    Err(e) => return failure(a, e, "Can't open", &path),
-                }
-            }
-        }
+        let target = match self.restore_entry(a, &path, &mut entry) {
+            Ok(target) => target,
+            Err(code) => return code,
+        };
         self.file_offset = self.file.as_ref().map(|_| 0);
         self.file_len = self.file.as_ref().map(|_| 0);
-        self.current = Some((path, entry, target, self.options));
+        self.current = Some((path, entry, target, options));
         a.state.set(state::DATA);
         a.file_count.set(a.file_count.get() + 1);
         ARCHIVE_OK
+    }
+
+    /// Upstream's restore_entry: creates the entry, recovering from what is
+    /// in the way, and returns the target, or the status to return.
+    fn restore_entry(&mut self, a: &Base, path: &Path, entry: &mut Entry) -> Result<Target, c_int> {
+        let options = self.options;
+        let secure = options & SECURE_SYMLINKS != 0;
+        let errno = |e: std::io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+        let failed = |errno, msg: &str| Err(a.raise(Error::new(ARCHIVE_FAILED, errno, msg)));
+        let directory = entry.filetype() == libc::S_IFDIR;
+        if options & UNLINK != 0 && !directory {
+            // Unlink whatever is there, or failing that rmdir it.
+            let removed = Target::prepare(path, secure).and_then(|t| {
+                t.remove(false).or_else(|e| match e.raw_os_error() {
+                    Some(libc::ENOENT) => Err(e),
+                    _ => t.remove(true),
+                })
+            });
+            if let Err(e) = removed
+                && e.raw_os_error() != Some(libc::ENOENT)
+            {
+                return failed(errno(e), "Could not unlink");
+            }
+        }
+        let (mut target, mut en) = self.create(a, path, entry);
+        if (en == libc::ENOTDIR || en == libc::ENOENT) && options & NO_AUTODIR == 0 {
+            // A failure is reported, but the entry is still tried.
+            if let Some(parent) = path.parent()
+                && let Err((dir, e)) = create_dir(parent, secure, options & NO_OVERWRITE != 0)
+            {
+                let dir = dir.as_os_str().as_bytes();
+                let (errno, msg, tail) = match e {
+                    DirError::Exists => (libc::EEXIST, "Can't create directory '", "'"),
+                    DirError::Conflict(e) => (
+                        errno(e),
+                        "Can't create directory '",
+                        "': Conflicting file cannot be removed",
+                    ),
+                    DirError::Test(e) => (errno(e), "Can't test directory '", "'"),
+                    DirError::Mkdir(e) => (errno(e), "Failed to create dir '", "'"),
+                };
+                let msg = [msg.as_bytes(), dir, tail.as_bytes()].concat();
+                a.raise(Error::new(ARCHIVE_FAILED, errno, msg));
+            }
+            (target, en) = self.create(a, path, entry);
+        }
+        if en == libc::ENOENT
+            && let Some(link) = entry.hardlink()
+        {
+            let msg = [b"Hard-link target '", link.to_bytes(), b"' does not exist"].concat();
+            return Err(a.raise(Error::new(ARCHIVE_FAILED, en, msg)));
+        }
+        if let Some(mut existing) = target.take_if(|_| en == libc::EEXIST) {
+            if options & NO_OVERWRITE != 0 {
+                self.skipped = true;
+                return Ok(existing);
+            }
+            // Something is in the way. The SECURE_SYMLINKS check already
+            // removed a symlink, so a directory follows one.
+            let followed = if directory {
+                existing.stat_follow().ok()
+            } else {
+                None
+            };
+            let st = match followed.filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR) {
+                Some(st) => st,
+                None => match existing.stat() {
+                    Ok(st) => st,
+                    Err(e) => return failed(errno(e), "Can't stat existing object"),
+                },
+            };
+            let in_the_way = st.st_mode & libc::S_IFMT;
+            if options & NO_OVERWRITE_NEWER != 0
+                && in_the_way != libc::S_IFDIR
+                && (st.st_mtime, st.st_mtime_nsec) >= (entry.mtime(), entry.mtime_nsec())
+            {
+                self.skipped = true;
+                return Ok(existing);
+            }
+            if self.skip_file == Some((st.st_dev as i64, st.st_ino as i64)) {
+                return failed(libc::EIO, "Refusing to overwrite archive");
+            }
+            if in_the_way != libc::S_IFDIR {
+                if options & SAFE_WRITES != 0 && entry.filetype() == libc::S_IFREG {
+                    // Extract to a temporary file, renamed over it at the end.
+                    let (tmp, file) = match existing.atomic_file(self.creation_mode(entry)) {
+                        Ok(created) => created,
+                        Err(e) => return failed(errno(e), "Can't create temporary file"),
+                    };
+                    self.atomic = Some(existing);
+                    self.file = Some(file);
+                    return Ok(tmp);
+                }
+                if let Err(e) = existing.remove(false) {
+                    return failed(errno(e), "Can't unlink already-existing object");
+                }
+                (target, en) = self.create(a, path, entry);
+            } else if !directory {
+                if let Err(e) = existing.remove(true) {
+                    return failed(
+                        errno(e),
+                        "Can't replace existing directory with non-directory",
+                    );
+                }
+                (target, en) = self.create(a, path, entry);
+            } else {
+                // A directory in the way of a directory is kept as it is.
+                if !secure
+                    && existing
+                        .stat()
+                        .is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFLNK)
+                {
+                    existing = std::fs::canonicalize(path)
+                        .and_then(|real| Target::prepare(&real, false))
+                        .or_else(|e| failed(errno(e), "Can't follow directory"))?;
+                }
+                return Ok(existing);
+            }
+        }
+        match target {
+            Some(target) if en == 0 => Ok(target),
+            _ => {
+                if a.error_string().is_none() {
+                    let e = std::io::Error::from_raw_os_error(en);
+                    return Err(failure(a, e, "Can't create", path));
+                }
+                Err(ARCHIVE_FAILED)
+            }
+        }
+    }
+
+    /// The mode upstream creates a file with: the final permissions with
+    /// the umask applied, and no set-id bits.
+    fn creation_mode(&self, entry: &Entry) -> u32 {
+        entry.mode() as u32 & 0o777 & !crate::ffi::disk_sys::umask()
+    }
+
+    /// Upstream's create_filesystem_object: one attempt to create the entry.
+    /// Returns its target, if its parent could be opened, and the errno of
+    /// the failure, or 0.
+    fn create(&mut self, a: &Base, path: &Path, entry: &mut Entry) -> (Option<Target>, c_int) {
+        let options = self.options;
+        let secure = options & SECURE_SYMLINKS != 0;
+        let errno = |e: std::io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+        let hardlink = entry.hardlink().map(|p| p.to_bytes().to_vec());
+        if let Some(link) = &hardlink {
+            // A refused target is reported as EPERM, keeping its message.
+            let check = cleanup_pathname(link, options)
+                .map_err(|msg| (ARCHIVE_ERRNO_MISC, msg.as_bytes().to_vec()))
+                .and_then(|clean| {
+                    check_symlinks(&clean, options & UNLINK != 0, secure, true)
+                        .map_err(|(_, errno, msg)| (errno, [msg.as_bytes(), &clean].concat()))
+                });
+            if let Err((errno, msg)) = check {
+                a.raise(Error::new(ARCHIVE_FAILED, errno, msg));
+                return (None, libc::EPERM);
+            }
+        }
+        let target = match Target::prepare(path, secure) {
+            Ok(target) => target,
+            Err(e) => return (None, errno(e)),
+        };
+        let created = if let Some(link) = hardlink {
+            if options & SAFE_WRITES != 0 {
+                let _ = target.remove(false);
+            }
+            let source = Path::new(std::ffi::OsStr::from_bytes(&link));
+            Target::prepare(source, secure)
+                .and_then(|source| target.hardlink(&source))
+                .and_then(|()| {
+                    // A hardlink that carries data is written like a file.
+                    if self.limit == Some(0)
+                        || target.stat()?.st_mode & libc::S_IFMT != libc::S_IFREG
+                    {
+                        return Ok(());
+                    }
+                    self.file = Some(target.open(entry.mode() as u32 & 0o777, false)?);
+                    Ok(())
+                })
+        } else if let Some(link) = entry.symlink() {
+            if options & SAFE_WRITES != 0 {
+                let _ = target.remove(false);
+            }
+            self.limit = Some(0);
+            target.symlink(Path::new(std::ffi::OsStr::from_bytes(link.to_bytes())))
+        } else {
+            match entry.filetype() {
+                libc::S_IFDIR => {
+                    self.limit = Some(0);
+                    let created = target.mkdir(0o777);
+                    self.new_directory = created.is_ok();
+                    created
+                }
+                libc::S_IFCHR | libc::S_IFBLK | libc::S_IFIFO => {
+                    target.special(entry.mode() as u32, entry.rdev() as u64)
+                }
+                // POSIX requires any other type to be created as a regular file.
+                _ => target.open(self.creation_mode(entry), true).map(|file| {
+                    self.file = Some(file);
+                    // On Apple, creation applies the umask without Linux's
+                    // default-ACL substitution: the mode is final.
+                    self.permissions_created = cfg!(target_vendor = "apple") && options & PERM == 0;
+                }),
+            }
+        };
+        match created {
+            Ok(()) => (Some(target), 0),
+            Err(e) => (Some(target), errno(e)),
+        }
     }
 
     pub fn data(&mut self, a: &Base, data: &[u8]) -> isize {
@@ -969,6 +1030,68 @@ mod tests {
         assert_eq!(disk.header(&base, &entry), ARCHIVE_FAILED);
         assert_eq!(base.errno.get(), ARCHIVE_ERRNO_MISC);
         assert_eq!(*base.error_string().unwrap(), *b"Invalid empty pathname");
+    }
+
+    #[test]
+    fn what_is_in_the_way_of_a_parent_is_handled_as_upstream_does() {
+        let output = Output::new();
+        let root = std::fs::canonicalize(&output.0).unwrap();
+        let file = root.join("a");
+        let entry_path = file.join("b/c");
+        let at = |p: &Path| p.as_os_str().as_bytes().to_vec();
+        let quoted = |msg: &[u8], p: &Path| [msg, &at(p), b"'"].concat();
+        for (options, code, errno, message) in [
+            (0, ARCHIVE_OK, 0, None),
+            (
+                NO_OVERWRITE,
+                ARCHIVE_FAILED,
+                libc::EEXIST,
+                Some(quoted(b"Can't create directory '", &file)),
+            ),
+            (
+                UNLINK,
+                ARCHIVE_FAILED,
+                libc::ENOTDIR,
+                Some(b"Could not unlink".to_vec()),
+            ),
+            (
+                SECURE_SYMLINKS,
+                ARCHIVE_FAILED,
+                libc::ENOTDIR,
+                Some([&b"Could not stat "[..], &at(&entry_path)].concat()),
+            ),
+            (
+                NO_AUTODIR,
+                ARCHIVE_FAILED,
+                libc::ENOTDIR,
+                Some(quoted(b"Can't create '", &entry_path)),
+            ),
+        ] {
+            let _ = std::fs::remove_dir_all(&file);
+            std::fs::write(&file, b"old").unwrap();
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = WriteDisk::default();
+            disk.options = options;
+            let mut entry = Entry::new(None);
+            entry.set_pathname(&at(&entry_path));
+            entry.set_mode(libc::S_IFREG | 0o644);
+            assert_eq!(disk.header(&base, &entry), code, "{options:#x}");
+            assert_eq!(base.errno.get(), errno, "{options:#x}");
+            assert_eq!(base.error_string().map(|m| m.to_vec()), message);
+            assert_eq!(file.is_dir(), code == ARCHIVE_OK);
+        }
+        // A dangling symlink is in the way, but upstream doesn't remove it.
+        let link = root.join("link");
+        std::os::unix::fs::symlink("missing", &link).unwrap();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        let mut entry = Entry::new(None);
+        entry.set_pathname(&at(&link.join("x")));
+        entry.set_mode(libc::S_IFREG | 0o644);
+        assert_eq!(disk.header(&base, &entry), ARCHIVE_FAILED);
+        assert_eq!(base.errno.get(), libc::EEXIST);
+        let expected = quoted(b"Failed to create dir '", &link);
+        assert_eq!(*base.error_string().unwrap(), *expected);
     }
 
     #[test]

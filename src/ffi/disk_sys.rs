@@ -398,24 +398,85 @@ pub fn check_symlinks(
     }
 }
 
-/// Why `Target::prepare` failed: creating a missing parent directory, or
-/// anything else.
+/// What upstream's create_dir reports, for the directory it names.
 #[derive(Debug)]
-pub enum PrepareError {
-    Mkdir(PathBuf, std::io::Error),
-    Other(std::io::Error),
+pub enum DirError {
+    /// "Can't create directory": a non-directory is in the way under
+    /// NO_OVERWRITE.
+    Exists,
+    /// "...: Conflicting file cannot be removed".
+    Conflict(std::io::Error),
+    /// "Can't test directory".
+    Test(std::io::Error),
+    /// "Failed to create dir".
+    Mkdir(std::io::Error),
 }
-impl From<std::io::Error> for PrepareError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Other(e)
-    }
-}
-impl From<PrepareError> for std::io::Error {
-    fn from(e: PrepareError) -> Self {
-        match e {
-            PrepareError::Mkdir(_, e) | PrepareError::Other(e) => e,
+
+/// Upstream's create_dir for an entry's parent `path` (cleaned up): makes
+/// each missing directory, first removing a non-directory in its place.
+/// Like upstream it follows symlinks, except with `secure`, where
+/// check_symlinks has already removed or refused them. New directories get
+/// upstream's mode, (0777 & ~umask | 0700) & 0775: its fixup to the final
+/// mode never applies (see NOTES.md).
+pub fn create_dir(
+    path: &Path,
+    secure: bool,
+    no_overwrite: bool,
+) -> Result<(), (PathBuf, DirError)> {
+    let mode = ((0o777 & !umask()) | 0o700) & 0o775;
+    let test = |e| (path.to_path_buf(), DirError::Test(e));
+    let start = if path.is_absolute() { c"/" } else { c"." };
+    let mut dir = open_dir(libc::AT_FDCWD, start, true).map_err(test)?;
+    let components: Vec<_> = path.components().collect();
+    let mut prefix = PathBuf::new();
+    for (i, component) in components.iter().enumerate() {
+        prefix.push(component);
+        let name = match component {
+            Component::Normal(name) => CString::new(name.as_bytes())
+                .map_err(|_| test(std::io::Error::from_raw_os_error(libc::EINVAL)))?,
+            Component::ParentDir => c"..".to_owned(),
+            _ => continue,
+        };
+        let missing = *component != Component::ParentDir
+            && match stat_at(&dir, &name, !secure) {
+                Ok(st) if st.st_mode & libc::S_IFMT == libc::S_IFDIR => false,
+                Ok(_) if no_overwrite => return Err((prefix, DirError::Exists)),
+                Ok(_) => {
+                    // SAFETY: live descriptor and terminated name.
+                    if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                        let e = std::io::Error::last_os_error();
+                        return Err((prefix, DirError::Conflict(e)));
+                    }
+                    true
+                }
+                Err(e) if [Some(libc::ENOENT), Some(libc::ENOTDIR)].contains(&e.raw_os_error()) => {
+                    true
+                }
+                Err(e) => return Err(test(e)),
+            };
+        // SAFETY: live descriptor and terminated name.
+        if missing && unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), mode as _) } != 0 {
+            let e = std::io::Error::last_os_error();
+            // Without this check, a/b/../b/c/d fails at the second visit to b.
+            let errno = match (e.raw_os_error(), stat_at(&dir, &name, true)) {
+                (Some(libc::EEXIST), Ok(st)) if st.st_mode & libc::S_IFMT == libc::S_IFDIR => None,
+                (Some(libc::EEXIST), Ok(_)) => Some(libc::ENOTDIR),
+                (Some(libc::EEXIST), Err(_)) => Some(libc::EEXIST),
+                (errno, _) => Some(errno.unwrap_or(libc::EIO)),
+            };
+            if let Some(errno) = errno {
+                let e = std::io::Error::from_raw_os_error(errno);
+                return Err((prefix, DirError::Mkdir(e)));
+            }
+        }
+        match open_dir(dir.as_raw_fd(), &name, !secure) {
+            Ok(next) => dir = next,
+            // Upstream stops here too; creating the entry fails the same way.
+            Err(_) if i + 1 == components.len() => return Ok(()),
+            Err(e) => return Err(test(e)),
         }
     }
+    Ok(())
 }
 
 /// Holds the destination directory open so renames cannot redirect extraction.
@@ -443,7 +504,7 @@ impl Target {
         // SAFETY: successful open returns a uniquely owned descriptor.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
-    pub fn prepare(path: &Path, secure: bool, autodir: bool) -> Result<Self, PrepareError> {
+    pub fn prepare(path: &Path, secure: bool) -> std::io::Result<Self> {
         let mut components = path.components();
         let last = components
             .next_back()
@@ -484,17 +545,12 @@ impl Target {
             )
         };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(std::io::Error::last_os_error());
         }
         // SAFETY: fd is a successfully opened, uniquely owned descriptor.
         let mut parent = unsafe { File::from_raw_fd(fd) };
-        let mut prefix = PathBuf::new();
         for component in components {
-            if component == Component::CurDir {
-                continue;
-            }
-            prefix.push(component);
-            if component == Component::RootDir {
+            if matches!(component, Component::CurDir | Component::RootDir) {
                 continue;
             }
             let part = CString::new(component.as_os_str().as_bytes())
@@ -504,27 +560,9 @@ impl Target {
                 | libc::O_CLOEXEC
                 | if secure { libc::O_NOFOLLOW } else { 0 };
             // SAFETY: parent fd and component name are live.
-            let mut fd = unsafe { libc::openat(parent.as_raw_fd(), part.as_ptr(), flags) };
+            let fd = unsafe { libc::openat(parent.as_raw_fd(), part.as_ptr(), flags) };
             if fd < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ENOENT) {
-                    return Err(error.into());
-                }
-                if !autodir {
-                    return Err(error.into());
-                }
-                // SAFETY: mkdirat uses a valid parent descriptor and path.
-                if unsafe { libc::mkdirat(parent.as_raw_fd(), part.as_ptr(), 0o777) } != 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::EEXIST) {
-                        return Err(PrepareError::Mkdir(prefix, error));
-                    }
-                }
-                // SAFETY: retry opens the newly created directory, never a symlink when secure.
-                fd = unsafe { libc::openat(parent.as_raw_fd(), part.as_ptr(), flags) };
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
+                return Err(std::io::Error::last_os_error());
             }
             // SAFETY: the new descriptor is uniquely owned by this File.
             parent = unsafe { File::from_raw_fd(fd) };
@@ -547,6 +585,10 @@ impl Target {
             )
         })?;
         Ok(st)
+    }
+    /// The stat of what a symlink here points to.
+    pub fn stat_follow(&self) -> std::io::Result<libc::stat> {
+        stat_at(&self.parent, &self.name, true)
     }
     pub fn remove(&self, directory: bool) -> std::io::Result<()> {
         // SAFETY: parent/name designate a directory entry; no borrowed memory is modified.
@@ -1105,7 +1147,7 @@ mod tests {
             (root.0.join("dir/.."), root.0.join("dir"), ".."),
             (root.0.join("dir/"), root.0.clone(), "dir"),
         ] {
-            let target = Target::prepare(&path, true, false).unwrap();
+            let target = Target::prepare(&path, true).unwrap();
             let actual = target.parent.metadata().unwrap();
             let expected = std::fs::metadata(parent).unwrap();
             assert_eq!(
@@ -1126,9 +1168,9 @@ mod tests {
         let link = root.0.join("link");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let path = link.join("file");
-        assert!(Target::prepare(&path, true, true).is_err());
+        assert!(Target::prepare(&path, true).is_err());
         assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
-        Target::prepare(&path, false, false)
+        Target::prepare(&path, false)
             .unwrap()
             .open(0o600, true)
             .unwrap()
@@ -1136,9 +1178,10 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(outside.join("file")).unwrap(), b"followed");
         let missing = root.0.join("missing/nested/file");
-        assert!(Target::prepare(&missing, true, false).is_err());
+        assert!(Target::prepare(&missing, true).is_err());
         assert!(!root.0.join("missing").exists());
-        assert!(Target::prepare(&missing, true, true).is_ok());
+        create_dir(missing.parent().unwrap(), true, false).unwrap();
+        assert!(Target::prepare(&missing, true).is_ok());
     }
 
     #[test]
@@ -1199,7 +1242,7 @@ mod tests {
             .0
             .set_permissions(std::fs::Permissions::from_mode(0o111))
             .unwrap();
-        let target = Target::prepare(&ancestor.join("parent/file"), true, false).unwrap();
+        let target = Target::prepare(&ancestor.join("parent/file"), true).unwrap();
         target.open(0o600, true).unwrap();
         assert!(ancestor.join("parent/file").exists());
     }
@@ -1225,7 +1268,7 @@ mod tests {
         let _cleanup = Cleanup(root.clone());
         let path = root.join("file");
         std::fs::write(&path, b"keep").unwrap();
-        let target = Target::prepare(&path, true, false).unwrap();
+        let target = Target::prepare(&path, true).unwrap();
         assert_eq!(
             target.open(0o600, true).unwrap_err().raw_os_error(),
             Some(libc::EEXIST)
@@ -1255,7 +1298,7 @@ mod tests {
         let root = std::fs::canonicalize(root).unwrap();
         std::fs::create_dir(root.join("parent")).unwrap();
         std::fs::create_dir(root.join("outside")).unwrap();
-        let target = Target::prepare(&root.join("parent/file"), true, false).unwrap();
+        let target = Target::prepare(&root.join("parent/file"), true).unwrap();
         std::fs::rename(root.join("parent"), root.join("original")).unwrap();
         std::os::unix::fs::symlink(root.join("outside"), root.join("parent")).unwrap();
         target
@@ -1265,7 +1308,7 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(root.join("original/file")).unwrap(), b"safe");
         assert!(!root.join("outside/file").exists());
-        assert!(Target::prepare(&root.join("parent/other"), true, false).is_err());
+        assert!(Target::prepare(&root.join("parent/other"), true).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
