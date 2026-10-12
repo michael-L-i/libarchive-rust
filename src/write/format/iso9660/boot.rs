@@ -36,7 +36,7 @@ impl Iso9660 {
         Ok(())
     }
 
-    pub(super) fn isoent_create_boot_catalog(&mut self) -> Result<(), Error> {
+    pub(super) fn isoent_create_boot_catalog(&mut self, a: Option<&Base>) -> Result<(), Error> {
         // Create the entry which is the "boot.catalog" file.
         let file = self.isofile_new(None);
         let (uid, gid) = crate::ffi::sys::user_ids();
@@ -52,7 +52,7 @@ impl Iso9660 {
         e.set_mode(AE_IFREG | 0o444);
         e.set_nlink(1);
 
-        self.isofile_gen_utility_names(None, file)?;
+        self.isofile_gen_utility_names(a, file)?;
         let f = &mut self.files[file];
         f.boot = Boot::Catalog;
         f.content[0].size = LOGICAL_BLOCK_SIZE as i64;

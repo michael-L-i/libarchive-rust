@@ -582,7 +582,7 @@ impl Iso9660 {
         Ok(())
     }
 
-    /// The error isoent_tree() fails with for two entries of one name.
+    /// Merge duplicate entries or report their conflicting file types.
     fn isoent_same_entry(&mut self, np: Option<EntId>, isoent: EntId) -> Result<EntId, Error> {
         let np = np.ok_or_else(|| misc("Can't find the duplicate entry"))?;
         // We have already has the entry the filename of which is the same.
@@ -909,7 +909,7 @@ impl Iso9660 {
             }
             // strncmp() stops at a NUL; memcmp() does not.
             if !joliet && c1 == 0 {
-                return 0;
+                break;
             }
         }
         let pad = if joliet { 0 } else { 0x20 };

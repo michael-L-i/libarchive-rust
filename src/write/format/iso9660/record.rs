@@ -162,11 +162,10 @@ impl Iso9660 {
 
     fn extra_close_record(
         &mut self,
-        dr: Option<&mut [u8]>,
+        mut dr: Option<&mut [u8]>,
         ctl: &mut CtlExtrRec,
         ce_size: i32,
     ) -> Result<(), Error> {
-        let mut dr = dr;
         let mut padding = 0;
 
         if ce_size > 0 {
@@ -878,8 +877,6 @@ impl Iso9660 {
             };
 
             let mut rec = [0u8; 33];
-            // Extended Attribute Record Length
-            rec[1] = 0;
             // Location of Extent
             rec[2..10].copy_from_slice(&num_733(location));
             // Data Length
@@ -893,9 +890,6 @@ impl Iso9660 {
             rec[18..25].copy_from_slice(&set_time_915(self.files[xe.file].entry.mtime()));
             // File Flags
             rec[25] = flag;
-            // File Unit Size, Interleave Gap Size
-            rec[26] = 0;
-            rec[27] = 0;
             // Volume Sequence Number
             rec[28..32].copy_from_slice(&descriptor::num_723(self.volume_sequence_number as u16));
             // Length of File Identifier

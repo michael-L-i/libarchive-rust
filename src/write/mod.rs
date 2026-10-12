@@ -83,6 +83,9 @@ pub trait Format {
     fn data(&mut self, data: &[u8], sink: &mut dyn Sink) -> Result<usize, Error>;
     fn finish_entry(&mut self, sink: &mut dyn Sink) -> Result<(), Error>;
     fn close(&mut self, sink: &mut dyn Sink) -> Result<(), Error>;
+    fn close_with_base(&mut self, _a: &Base, sink: &mut dyn Sink) -> Result<(), Error> {
+        self.close(sink)
+    }
     fn options(&mut self, _a: &Base, _key: &[u8], _value: Option<&[u8]>) -> Result<c_int, Error> {
         Ok(ARCHIVE_WARN)
     }
@@ -442,7 +445,7 @@ impl Write {
             r = self.finish_entry(a);
         }
         if self.format.is_some() {
-            match self.run(a, |f, s| f.close(s)) {
+            match self.run(a, |f, s| f.close_with_base(a, s)) {
                 Ok(()) => {
                     if let Some(n) = self.format.as_ref().and_then(|f| f.bytes_in_last_block()) {
                         self.bytes_in_last_block = n;

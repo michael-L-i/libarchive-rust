@@ -26,7 +26,9 @@ extern "C" fn compare<T: Copy, F: Fn(T, T) -> i32>(a: *const c_void, b: *const c
     }
     match catch_unwind(AssertUnwindSafe(|| (a.compare)(a.value, b.value))) {
         Ok(order) => order,
-        Err(_) => {
+        Err(payload) => {
+            // A panic payload may itself panic when dropped.
+            std::mem::forget(payload);
             a.panicked.set(true);
             0
         }

@@ -1009,7 +1009,7 @@ impl Iso9660 {
         Ok(())
     }
 
-    fn iso9660_close(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
+    fn iso9660_close(&mut self, a: Option<&Base>, out: &mut dyn Sink) -> Result<(), Error> {
         // Write remaining data out to the temporary file.
         if self.wbuff_remaining > 0 {
             self.wb_write_out(out)?;
@@ -1031,7 +1031,7 @@ impl Iso9660 {
                 self.wb_write_out(out)?;
             }
             // Create the boot catalog.
-            self.isoent_create_boot_catalog()?;
+            self.isoent_create_boot_catalog(a)?;
         }
 
         // Prepare joliet extensions.
@@ -1209,7 +1209,7 @@ impl Iso9660 {
             while ext_bytes >= self.wbuff_remaining as i64 {
                 let n = self.wbuff_remaining;
                 self.write_null(out, n)?;
-                ext_bytes -= n as i64;
+                ext_bytes -= self.wbuff_remaining as i64;
             }
             if ext_bytes > 0 {
                 self.write_null(out, ext_bytes as usize)?;
@@ -1303,8 +1303,11 @@ impl Format for Iso9660 {
     fn finish_entry(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
         self.iso9660_finish_entry(out)
     }
+    fn close_with_base(&mut self, a: &Base, out: &mut dyn Sink) -> Result<(), Error> {
+        self.iso9660_close(Some(a), out)
+    }
     fn close(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
-        self.iso9660_close(out)
+        self.iso9660_close(None, out)
     }
 }
 

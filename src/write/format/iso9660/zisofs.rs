@@ -354,9 +354,9 @@ impl Iso9660 {
         buff[13] = file.zisofs.log2_bs;
         // Reserved: 14 and 15
 
-        // Move to the right position to write the header. Upstream ignores
-        // how that went.
-        let _ = self.wb_set_offset(out, file.content[0].offset_of_temp);
+        // Upstream ignores seek failures; propagate them before using a
+        // buffer position rejected by our bounds guard.
+        self.wb_set_offset(out, file.content[0].offset_of_temp)?;
 
         // Write the header.
         self.wb_write_to_temp(out, &buff)?;
@@ -372,16 +372,12 @@ impl Iso9660 {
         r?;
 
         // Set a file pointer back to the end of the temporary file.
-        let _ = self.wb_set_offset(out, tail);
+        self.wb_set_offset(out, tail)?;
 
         Ok(())
     }
 
-    fn zisofs_extract_init(
-        &self,
-        zisofs: &mut ZisofsExtract,
-        mut p: &[u8],
-    ) -> Result<usize, Error> {
+    fn zisofs_extract_init(zisofs: &mut ZisofsExtract, mut p: &[u8]) -> Result<usize, Error> {
         let mut avail = p.len();
 
         // Allocate block pointers buffer.
@@ -449,7 +445,7 @@ impl Iso9660 {
         let mut start = 0;
 
         if !zisofs.initialized {
-            let rs = self.zisofs_extract_init(zisofs, p)?;
+            let rs = Self::zisofs_extract_init(zisofs, p)?;
             if !zisofs.initialized {
                 // We need more data.
                 zisofs.pz_offset = zisofs.pz_offset.wrapping_add(bytes as u32);
