@@ -34,16 +34,19 @@ use crate::ffi::disk_sys::{self, Filesystem};
 use crate::util::Error;
 use std::collections::VecDeque;
 use std::ffi::c_int;
-use std::fs::{self, File};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// The (dev, ino) of each directory above a path, which catch symlink loops.
 type Ancestors = Vec<(u64, u64)>;
 /// A path to visit, whether it is the root, and its ancestors.
-type Pending = (PathBuf, bool, Ancestors);
+type Pending = (PathBuf, bool, Ancestors, disk_sys::ReadPath);
 
 /// `archive_read_disk_set_metadata_filter_callback`'s filter: whether to
 /// return the entry. Through `Base` it can ask to descend into it.
@@ -71,6 +74,10 @@ struct Dir {
     ancestors: Ancestors,
     restore: RestoreTime,
     restore_file: Option<File>,
+    access: disk_sys::ReadPath,
+    stat: libc::stat,
+    follow: bool,
+    anchor: Option<Rc<File>>,
     read: bool,
 }
 
@@ -89,11 +96,16 @@ pub struct ReadDisk {
     pub(crate) entry: *mut Entry,
     /// The path `open` was given, until it is visited.
     root: Option<PathBuf>,
+    initial: Option<Rc<File>>,
     /// Directories `descend` asked for, the most recent last: upstream's
     /// tree stack. One being read stays under those it asks for.
     stack: Vec<Dir>,
     /// The directory whose entries are being visited, in readdir order.
-    reading: Option<(fs::ReadDir, PathBuf, Ancestors)>,
+    reading: Option<(disk_sys::ReadDir, PathBuf, Ancestors, Rc<File>)>,
+    current_access: Option<disk_sys::ReadPath>,
+    current_stat: Option<libc::stat>,
+    current_follow: bool,
+    current_dir: Option<Rc<File>>,
     current: Option<PathBuf>,
     ancestors: Ancestors,
     /// The current entry's times, which its data and a descent into it
@@ -139,6 +151,10 @@ impl ReadDisk {
         {
             path = rest;
         }
+        self.initial = match disk_sys::ReadPath::initial_dir() {
+            Ok(dir) => Some(dir),
+            Err(e) => return io_error(a, e, "Can't open initial directory"),
+        };
         self.root = Some(PathBuf::from(std::ffi::OsStr::from_bytes(path)));
         self.stack.clear();
         self.reading = None;
@@ -154,11 +170,18 @@ impl ReadDisk {
         let Some(path) = &self.current else {
             return ARCHIVE_OK;
         };
+        let (Some(access), Some(stat)) = (&self.current_access, self.current_stat) else {
+            return ARCHIVE_OK;
+        };
         self.stack.push(Dir {
             path: path.clone(),
             ancestors: self.ancestors.clone(),
             restore: self.restore,
             restore_file: None,
+            access: access.clone(),
+            stat,
+            follow: self.current_follow,
+            anchor: self.current_dir.clone(),
             read: false,
         });
         ARCHIVE_OK
@@ -172,12 +195,19 @@ impl ReadDisk {
     /// puts back its times, as tree_ascend does.
     fn next_path(&mut self, a: &Base) -> Result<Option<Pending>, c_int> {
         if let Some(root) = self.root.take() {
-            return Ok(Some((root, true, Vec::new())));
+            let initial = self.initial.clone().ok_or(ARCHIVE_FAILED)?;
+            let access = disk_sys::ReadPath::root(initial, &root)
+                .map_err(|e| path_failure(a, &root, e, b"Cannot stat"))?;
+            return Ok(Some((root, true, Vec::new(), access)));
         }
         loop {
-            if let Some((dir, path, ancestors)) = &mut self.reading {
+            if let Some((dir, path, ancestors, anchor)) = &mut self.reading {
                 match dir.next() {
-                    Some(Ok(child)) => return Ok(Some((child.path(), false, ancestors.clone()))),
+                    Some(Ok(child)) => {
+                        let access = disk_sys::ReadPath::child(anchor.clone(), child.as_bytes())
+                            .map_err(|e| path_failure(a, path, e, b"Cannot stat"))?;
+                        return Ok(Some((path.join(child), false, ancestors.clone(), access)));
+                    }
                     Some(Err(e)) => {
                         let path = std::mem::take(path);
                         self.reading = None;
@@ -199,17 +229,18 @@ impl ReadDisk {
                 continue;
             }
             top.read = true;
-            if self.behavior & 1 != 0 && !top.restore.noatime {
-                match disk_sys::open_read(&top.path, libc::O_DIRECTORY) {
-                    Ok(file) => top.restore_file = Some(file),
-                    Err(e) => {
-                        let path = self.stack.pop().map(|dir| dir.path).unwrap_or_default();
-                        return Err(path_failure(a, &path, e, b"Couldn't visit directory"));
-                    }
+            let opened = top
+                .anchor
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| top.access.directory(top.follow, &top.stat));
+            match opened.and_then(|anchor| {
+                disk_sys::ReadDir::open(&anchor).map(|(dir, file)| (anchor, dir, file))
+            }) {
+                Ok((anchor, dir, file)) => {
+                    top.restore_file = Some(file);
+                    self.reading = Some((dir, top.path.clone(), top.ancestors.clone(), anchor));
                 }
-            }
-            match fs::read_dir(&top.path) {
-                Ok(dir) => self.reading = Some((dir, top.path.clone(), top.ancestors.clone())),
                 Err(e) => {
                     let path = self.stack.pop().map(|dir| dir.path).unwrap_or_default();
                     return Err(path_failure(a, &path, e, b"Couldn't visit directory"));
@@ -228,6 +259,9 @@ impl ReadDisk {
         }
         a.clear_error();
         self.close_data();
+        self.current_access = None;
+        self.current_stat = None;
+        self.current_dir = None;
         entry.clear();
         self.block.clear();
         self.offset = 0;
@@ -243,7 +277,7 @@ impl ReadDisk {
             self.can_descend = false;
             a.disk_can_descend.set(false);
             a.disk_descend_requested.set(false);
-            let (path, root, ancestors) = match self.next_path(a) {
+            let (path, root, ancestors, mut access_path) = match self.next_path(a) {
                 Ok(Some(next)) => next,
                 Ok(None) => {
                     a.state.set(state::EOF);
@@ -251,7 +285,7 @@ impl ReadDisk {
                 }
                 Err(ret) => return ret,
             };
-            let lst = match disk_sys::stat(&path, -1, false) {
+            let lst = match access_path.stat(false) {
                 Ok(st) => st,
                 Err(e) if e.raw_os_error() == Some(libc::ENOENT) && !root => {
                     if !removed.is_empty() {
@@ -263,6 +297,11 @@ impl ReadDisk {
                 }
                 Err(e) => return path_failure(a, &path, e, b"Cannot stat"),
             };
+            if lst.st_mode & libc::S_IFMT == libc::S_IFLNK
+                && let Err(e) = access_path.pin_link(&lst)
+            {
+                return path_failure(a, &path, e, b"Cannot stat");
+            }
             if self.behavior & 4 != 0
                 && path
                     .file_name()
@@ -273,6 +312,9 @@ impl ReadDisk {
             entry.clear();
             entry.set_pathname(path.as_os_str().as_bytes());
             self.current = Some(path.clone());
+            self.current_access = Some(access_path.clone());
+            self.current_stat = None;
+            self.current_dir = None;
             self.ancestors = ancestors;
             match self.excluded(a, entry, |m, e| m.match_path_excluded(Some(e))) {
                 Ok(false) => {}
@@ -282,7 +324,7 @@ impl ReadDisk {
             // Following symlinks, archive the target unless the link is
             // broken or loops back to a parent; then the link itself.
             let follow = self.symlinks == 1 || (self.symlinks == 2 && root);
-            let (st, followed) = match disk_sys::stat(&path, -1, true) {
+            let (st, followed) = match access_path.stat(true) {
                 Ok(st)
                     if follow
                         && !(st.st_mode & libc::S_IFMT == libc::S_IFDIR
@@ -292,6 +334,38 @@ impl ReadDisk {
                 }
                 _ => (lst, false),
             };
+            #[cfg(target_os = "linux")]
+            if let Err(e) = access_path.pin_metadata(&st, followed) {
+                return path_failure(a, &path, e, b"Cannot stat");
+            }
+            self.current_access = Some(access_path.clone());
+            self.current_stat = Some(st);
+            self.current_follow = followed;
+            self.current_dir = if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                access_path.directory(followed, &st).ok()
+            } else {
+                None
+            };
+            let metadata_file =
+                if matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR) {
+                    access_path.open(libc::O_NONBLOCK, followed, &st).ok()
+                } else {
+                    None
+                };
+            #[cfg(target_vendor = "apple")]
+            let metadata_file = metadata_file.or_else(|| {
+                if let Some(link) = access_path.link_file() {
+                    return link.try_clone().ok();
+                }
+                let flags = if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                    libc::O_SYMLINK
+                } else {
+                    libc::O_EVTONLY
+                };
+                access_path
+                    .open(flags | libc::O_NONBLOCK, followed, &st)
+                    .ok()
+            });
             entry.copy_stat(&st);
             #[cfg(target_vendor = "apple")]
             if self.behavior & 0x40 == 0 {
@@ -315,15 +389,16 @@ impl ReadDisk {
                     // working directory for the root), or a symlink's
                     // target on another file system.
                     #[cfg(target_os = "linux")]
-                    let found = if followed && st.st_dev != lst.st_dev {
-                        disk_sys::filesystem(&path, true)
+                    let inspect = if followed && st.st_dev != lst.st_dev {
+                        metadata_file.as_ref().unwrap_or(access_path.parent())
+                    } else if root {
+                        self.initial.as_deref().unwrap_or(access_path.parent())
                     } else {
-                        let dir = path.parent().filter(|_| !root);
-                        disk_sys::filesystem(dir.unwrap_or(Path::new(".")), false)
+                        access_path.parent()
                     };
                     #[cfg(not(target_os = "linux"))]
-                    let found =
-                        disk_sys::filesystem(&path, follow && entry.filetype() != libc::S_IFLNK);
+                    let inspect = metadata_file.as_ref().unwrap_or(access_path.parent());
+                    let found = disk_sys::filesystem_fd(inspect);
                     match found {
                         Ok(fs) => {
                             *probe = Some(fs);
@@ -352,22 +427,14 @@ impl ReadDisk {
                 continue;
             }
             #[cfg(target_os = "linux")]
-            let fd = if self.behavior & 2 != 0
-                && matches!(entry.filetype(), libc::S_IFREG | libc::S_IFDIR)
+            if self.behavior & 2 != 0
+                && metadata_file.as_ref().is_some_and(|file| {
+                    disk_sys::get_flags(file.as_raw_fd())
+                        .is_ok_and(|flags| flags & disk_sys::FS_NODUMP_FL != 0)
+                })
             {
-                disk_sys::open_read(&path, libc::O_NONBLOCK).ok()
-            } else {
-                None
-            };
-            #[cfg(target_os = "linux")]
-            if fd.as_ref().is_some_and(|file| {
-                disk_sys::get_flags(file.as_raw_fd())
-                    .is_ok_and(|flags| flags & disk_sys::FS_NODUMP_FL != 0)
-            }) {
                 continue;
             }
-            #[cfg(not(target_os = "linux"))]
-            let fd: Option<File> = None;
             self.restore = RestoreTime {
                 atime: (entry.atime(), entry.atime_nsec()),
                 mtime: (entry.mtime(), entry.mtime_nsec()),
@@ -406,13 +473,27 @@ impl ReadDisk {
                 .file_name()
                 .filter(|_| !root)
                 .unwrap_or(path.as_os_str());
-            let ret = self.fill_metadata(
+            // Open metadata after callbacks, but verify the inode selected by stat.
+            let metadata_file = if matches!(entry.filetype(), libc::S_IFREG | libc::S_IFDIR) {
+                access_path
+                    .open(libc::O_NONBLOCK, followed, &st)
+                    .ok()
+                    .or_else(|| {
+                        self.current_dir
+                            .as_ref()
+                            .and_then(|dir| dir.try_clone().ok())
+                    })
+            } else {
+                metadata_file
+            };
+            let ret = self.fill_metadata_at(
                 a,
                 entry,
                 &path,
                 followed,
-                fd.as_ref().map(AsRawFd::as_raw_fd),
+                metadata_file.as_ref().map(AsRawFd::as_raw_fd),
                 access.as_bytes(),
+                Some((&access_path, &st)),
             );
             if ret < ARCHIVE_WARN {
                 return ret;
@@ -499,7 +580,13 @@ impl ReadDisk {
         };
         #[cfg(not(target_os = "linux"))]
         let flags = 0;
-        match disk_sys::open_read(path, flags) {
+        let opened = match (&self.current_access, &self.current_stat) {
+            (Some(access), Some(st)) => {
+                access.open(flags | libc::O_NONBLOCK, self.current_follow, st)
+            }
+            _ => Err(std::io::Error::from_raw_os_error(libc::ESTALE)),
+        };
+        match opened {
             Ok(file) => {
                 self.restore.noatime |= flags != 0;
                 self.file = Some(file);
@@ -536,11 +623,40 @@ impl ReadDisk {
         fd: Option<c_int>,
         access: &[u8],
     ) -> c_int {
+        self.fill_metadata_at(a, entry, path, follow, fd, access, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn fill_metadata_at(
+        &mut self,
+        a: &Base,
+        entry: &mut Entry,
+        path: &Path,
+        follow: bool,
+        fd: Option<c_int>,
+        access: &[u8],
+        anchored: Option<(&disk_sys::ReadPath, &libc::stat)>,
+    ) -> c_int {
         if let Some(name) = self.user.lookup(entry.uid(), false) {
             entry.set_uname(name.to_bytes());
         }
         if let Some(name) = self.group.lookup(entry.gid(), true) {
             entry.set_gname(name.to_bytes());
+        }
+        #[cfg(target_vendor = "apple")]
+        if anchored.is_some()
+            && fd.is_none()
+            && (self.behavior & 0x20 == 0
+                || self.behavior & 0x10 == 0
+                || self.behavior & 4 != 0
+                || (self.behavior & 0x80 == 0 && entry.filetype() == libc::S_IFREG))
+        {
+            return failure(
+                a,
+                ARCHIVE_WARN,
+                std::io::Error::from_raw_os_error(libc::EACCES),
+                b"Couldn't open metadata descriptor",
+            );
         }
         // Linux takes a descriptor to read the file flags, which then
         // serves the rest of the metadata too.
@@ -552,7 +668,12 @@ impl ReadDisk {
         #[cfg(target_os = "linux")]
         let fd = match fd {
             None if read_flags => {
-                opened = disk_sys::open_read(path, libc::O_NONBLOCK).ok();
+                opened = anchored
+                    .map_or_else(
+                        || disk_sys::open_read(path, libc::O_NONBLOCK),
+                        |(access, st)| access.open(libc::O_NONBLOCK, follow, st),
+                    )
+                    .ok();
                 opened.as_ref().map(AsRawFd::as_raw_fd)
             }
             fd => fd,
@@ -565,15 +686,27 @@ impl ReadDisk {
             entry.set_fflags(flags as c_int as std::ffi::c_ulong, 0);
         }
         if entry.filetype() == libc::S_IFLNK {
-            match fs::read_link(path) {
+            match anchored.map_or_else(
+                || std::fs::read_link(path),
+                |(access, st)| access.read_link(st),
+            ) {
                 Ok(p) => entry.set_symlink(p.as_os_str().as_bytes()),
                 Err(e) => return io_error(a, e, "Couldn't read link data"),
             }
         }
+        #[cfg(target_os = "linux")]
+        if self.behavior & 0x10 == 0
+            && entry.filetype() == libc::S_IFLNK
+            && let Some((access, st)) = anchored
+            && let Err(e) = access.verify_name(st, false)
+        {
+            return failure(a, ARCHIVE_WARN, e, b"Couldn't list extended attributes");
+        }
         let mut ret = ARCHIVE_OK;
         #[cfg(target_vendor = "apple")]
         if self.behavior & 0x20 == 0
-            && let Err(e) = crate::ffi::disk_acl::read(path, entry, &mut self.user, &mut self.group)
+            && let Err(e) =
+                crate::ffi::disk_acl::read(path, entry, &mut self.user, &mut self.group, fd)
         {
             ret = ret.min(failure(
                 a,
@@ -583,7 +716,13 @@ impl ReadDisk {
             ));
         }
         #[cfg(target_os = "linux")]
-        let cpath = disk_sys::path_c(path).ok();
+        let metadata_path = fd
+            .map(|fd| PathBuf::from(format!("/proc/self/fd/{fd}")))
+            .or_else(|| anchored.map(|(access, _)| access.metadata_path()));
+        #[cfg(target_os = "linux")]
+        let follow = follow || anchored.is_some_and(|(access, _)| access.metadata_follows());
+        #[cfg(target_os = "linux")]
+        let cpath = disk_sys::path_c(metadata_path.as_deref().unwrap_or(path)).ok();
         #[cfg(target_os = "linux")]
         if self.behavior & 0x20 == 0
             && let Some(cpath) = &cpath
@@ -591,9 +730,9 @@ impl ReadDisk {
             let (user, group) = (&mut self.user, &mut self.group);
             crate::ffi::disk_acl_linux::read(entry, fd, cpath, follow, user, group);
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_vendor = "apple")]
         if self.behavior & 0x10 == 0
-            && let Err((e, msg)) = disk_sys::read_xattrs(path, entry, follow)
+            && let Err((e, msg)) = disk_sys::read_xattrs_fd(path, entry, follow, fd)
         {
             ret = ret.min(failure(a, ARCHIVE_WARN, e, msg.as_bytes()));
         }
@@ -608,13 +747,13 @@ impl ReadDisk {
             ret = ret.min(setup_xattrs(a, entry, source));
         }
         if self.behavior & 4 != 0
-            && let Err(e) = disk_sys::pack_mac_metadata(path, entry)
+            && let Err(e) = disk_sys::pack_mac_metadata(path, entry, fd)
         {
             ret = ret.min(failure(a, ARCHIVE_FAILED, e, b"Can't read Mac metadata"));
         }
         #[cfg(not(target_os = "linux"))]
         if self.behavior & 0x80 == 0 && entry.filetype() == libc::S_IFREG {
-            match disk_sys::sparse(path, self.symlinks != 0, entry.size()) {
+            match disk_sys::sparse(path, self.symlinks != 0, entry.size(), fd) {
                 Ok(extents) => {
                     for (offset, len) in extents {
                         entry.sparse_add(offset, len);
@@ -625,7 +764,27 @@ impl ReadDisk {
         }
         #[cfg(target_os = "linux")]
         if self.behavior & 0x80 == 0 {
-            ret = ret.min(setup_sparse(a, entry, fd, path, access));
+            ret = ret.min(setup_sparse(
+                a,
+                entry,
+                fd,
+                metadata_path.as_deref().unwrap_or(path),
+                access,
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if self.behavior & 0x10 == 0
+            && entry.filetype() == libc::S_IFLNK
+            && let Some((access, st)) = anchored
+            && let Err(e) = access.verify_name(st, false)
+        {
+            entry.xattrs.clear();
+            ret = ret.min(failure(
+                a,
+                ARCHIVE_WARN,
+                e,
+                b"Couldn't retrieve extended attributes",
+            ));
         }
         ret
     }
@@ -759,6 +918,10 @@ impl ReadDisk {
     pub fn close(&mut self, a: &Base) -> c_int {
         self.close_data();
         self.root = None;
+        self.initial = None;
+        self.current_access = None;
+        self.current_stat = None;
+        self.current_dir = None;
         self.stack.clear();
         self.reading = None;
         a.state.set(state::CLOSED);
@@ -1095,7 +1258,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn metadata_warning_still_initializes_the_entry_data() {
+    fn metadata_stays_on_the_inode_renamed_by_the_callback() {
         let root =
             std::env::temp_dir().join(format!("libarchive-metadata-warn-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -1113,7 +1276,7 @@ mod tests {
         }));
         assert_eq!(disk.open(&a, path.as_os_str().as_bytes()), ARCHIVE_OK);
         let mut entry = Entry::new(None);
-        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_WARN);
+        assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
         assert_eq!(a.state.get(), state::DATA);
         assert_eq!(a.file_count.get(), 1);
         fs::rename(&moved, &path).unwrap();

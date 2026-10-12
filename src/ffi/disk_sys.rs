@@ -33,6 +33,11 @@ pub fn stat(path: &Path, fd: libc::c_int, follow: bool) -> std::io::Result<libc:
     Ok(st)
 }
 /// Opens `path` for reading, following symlinks, with `flags` added.
+#[cfg(any(
+    test,
+    target_os = "linux",
+    not(any(target_vendor = "apple", target_os = "linux"))
+))]
 pub fn open_read(path: &Path, flags: libc::c_int) -> std::io::Result<File> {
     let path = path_c(path)?;
     // SAFETY: the path is terminated; a successful open returns a new descriptor.
@@ -43,6 +48,272 @@ pub fn open_read(path: &Path, flags: libc::c_int) -> std::io::Result<File> {
     // SAFETY: nothing else owns the descriptor open just returned.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
+/// A pathname relative to a directory kept open by the disk walker.
+#[derive(Clone)]
+pub struct ReadPath {
+    parent: std::rc::Rc<File>,
+    name: CString,
+    link: Option<std::rc::Rc<File>>,
+    #[cfg(target_os = "linux")]
+    metadata: Option<std::rc::Rc<File>>,
+}
+impl ReadPath {
+    pub fn initial_dir() -> std::io::Result<std::rc::Rc<File>> {
+        open_dir(libc::AT_FDCWD, c".", true).map(std::rc::Rc::new)
+    }
+    pub fn root(initial: std::rc::Rc<File>, path: &Path) -> std::io::Result<Self> {
+        let bytes = path.as_os_str().as_bytes();
+        let (parent, name) = match bytes.iter().rposition(|&b| b == b'/') {
+            Some(n) => (&bytes[..n.max(1)], &bytes[n + 1..]),
+            None => (&b"."[..], bytes),
+        };
+        let parent =
+            CString::new(parent).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let parent = std::rc::Rc::new(open_dir(initial.as_raw_fd(), &parent, true)?);
+        Self::child(parent, if name.is_empty() { b"." } else { name })
+    }
+    pub fn child(parent: std::rc::Rc<File>, name: &[u8]) -> std::io::Result<Self> {
+        Ok(Self {
+            parent,
+            link: None,
+            #[cfg(target_os = "linux")]
+            metadata: None,
+            name: CString::new(name)
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?,
+        })
+    }
+    pub fn pin_link(&mut self, expected: &libc::stat) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let flags = libc::O_PATH;
+        #[cfg(target_vendor = "apple")]
+        let flags = libc::O_SYMLINK;
+        #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+        let flags = libc::O_NONBLOCK;
+        self.link = Some(std::rc::Rc::new(self.open(flags, false, expected)?));
+        Ok(())
+    }
+    pub fn stat(&self, follow: bool) -> std::io::Result<libc::stat> {
+        if !follow && let Some(link) = &self.link {
+            return fstat(link);
+        }
+        stat_at(&self.parent, &self.name, follow)
+    }
+    #[cfg(target_vendor = "apple")]
+    pub fn link_file(&self) -> Option<&File> {
+        self.link.as_deref()
+    }
+    pub fn parent(&self) -> &File {
+        &self.parent
+    }
+    pub fn directory(
+        &self,
+        follow: bool,
+        expected: &libc::stat,
+    ) -> std::io::Result<std::rc::Rc<File>> {
+        let file = open_dir(self.parent.as_raw_fd(), &self.name, follow)?;
+        same_file(expected, &fstat(&file)?)?;
+        Ok(std::rc::Rc::new(file))
+    }
+    pub fn open(
+        &self,
+        flags: libc::c_int,
+        follow: bool,
+        expected: &libc::stat,
+    ) -> std::io::Result<File> {
+        #[cfg(target_vendor = "apple")]
+        let follow = follow || flags & libc::O_SYMLINK != 0;
+        // SAFETY: the parent descriptor and terminated name remain live.
+        let fd = unsafe {
+            libc::openat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_CLOEXEC
+                    | flags
+                    | if follow { 0 } else { libc::O_NOFOLLOW },
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a uniquely owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        same_file(expected, &fstat(&file)?)?;
+        Ok(file)
+    }
+    pub fn read_link(&self, expected: &libc::stat) -> std::io::Result<PathBuf> {
+        same_file(expected, &self.stat(false)?)?;
+        let mut bytes = vec![0u8; 256];
+        loop {
+            // SAFETY: live parent/name and writable buffer of the supplied length.
+            let n = unsafe {
+                #[cfg(target_os = "linux")]
+                {
+                    libc::readlinkat(
+                        self.link
+                            .as_ref()
+                            .map_or(self.parent.as_raw_fd(), |f| f.as_raw_fd()),
+                        if self.link.is_some() {
+                            c"".as_ptr()
+                        } else {
+                            self.name.as_ptr()
+                        },
+                        bytes.as_mut_ptr().cast(),
+                        bytes.len(),
+                    )
+                }
+                #[cfg(target_vendor = "apple")]
+                {
+                    match &self.link {
+                        Some(link) => libc::freadlink(
+                            link.as_raw_fd(),
+                            bytes.as_mut_ptr().cast(),
+                            bytes.len(),
+                        ) as isize,
+                        None => libc::readlinkat(
+                            self.parent.as_raw_fd(),
+                            self.name.as_ptr(),
+                            bytes.as_mut_ptr().cast(),
+                            bytes.len(),
+                        ),
+                    }
+                }
+                #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+                {
+                    libc::readlinkat(
+                        self.parent.as_raw_fd(),
+                        self.name.as_ptr(),
+                        bytes.as_mut_ptr().cast(),
+                        bytes.len(),
+                    )
+                }
+            };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if (n as usize) < bytes.len() {
+                same_file(expected, &self.stat(false)?)?;
+                bytes.truncate(n as usize);
+                return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)));
+            }
+            if bytes.len() >= 1024 * 1024 {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOMEM));
+            }
+            bytes.resize(bytes.len() * 2, 0);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub fn pin_metadata(&mut self, expected: &libc::stat, follow: bool) -> std::io::Result<()> {
+        if expected.st_mode & libc::S_IFMT != libc::S_IFLNK {
+            self.metadata = Some(std::rc::Rc::new(self.open(
+                libc::O_PATH,
+                follow,
+                expected,
+            )?));
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub fn metadata_path(&self) -> PathBuf {
+        if let Some(file) = &self.metadata {
+            return PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        }
+        PathBuf::from(format!("/proc/self/fd/{}", self.parent.as_raw_fd()))
+            .join(std::ffi::OsStr::from_bytes(self.name.to_bytes()))
+    }
+    #[cfg(target_os = "linux")]
+    pub fn metadata_follows(&self) -> bool {
+        self.metadata.is_some()
+    }
+    #[cfg(target_os = "linux")]
+    pub fn verify_name(&self, expected: &libc::stat, follow: bool) -> std::io::Result<()> {
+        same_file(expected, &stat_at(&self.parent, &self.name, follow)?)
+    }
+}
+fn same_file(expected: &libc::stat, actual: &libc::stat) -> std::io::Result<()> {
+    if (
+        expected.st_dev,
+        expected.st_ino,
+        expected.st_mode & libc::S_IFMT,
+    ) == (actual.st_dev, actual.st_ino, actual.st_mode & libc::S_IFMT)
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(libc::ESTALE))
+    }
+}
+
+/// A native readdir stream opened relative to the pinned directory.
+pub struct ReadDir(*mut libc::DIR);
+impl ReadDir {
+    pub fn open(parent: &File) -> std::io::Result<(Self, File)> {
+        // SAFETY: live parent and literal terminated name; successful open owns a descriptor.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful openat returned a uniquely owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let iter = file.try_clone()?;
+        use std::os::fd::IntoRawFd;
+        let fd = iter.into_raw_fd();
+        // SAFETY: fd is uniquely owned; success transfers ownership to DIR.
+        let dir = unsafe { libc::fdopendir(fd) };
+        if dir.is_null() {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: fdopendir failed and did not consume the descriptor.
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        Ok((Self(dir), file))
+    }
+}
+impl Iterator for ReadDir {
+    type Item = std::io::Result<std::ffi::OsString>;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            #[cfg(target_os = "linux")]
+            // SAFETY: errno belongs to this thread.
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            #[cfg(target_vendor = "apple")]
+            // SAFETY: errno belongs to this thread.
+            unsafe {
+                *libc::__error() = 0;
+            }
+            // SAFETY: DIR is live; readdir's storage is copied before the next call.
+            let entry = unsafe { libc::readdir(self.0) };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                return if error.raw_os_error() == Some(0) {
+                    None
+                } else {
+                    Some(Err(error))
+                };
+            }
+            // SAFETY: readdir returned a live dirent with a terminated d_name.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            return Some(Ok(std::ffi::OsStr::from_bytes(name).to_owned()));
+        }
+    }
+}
+impl Drop for ReadDir {
+    fn drop(&mut self) {
+        // SAFETY: this stream uniquely owns the DIR and its descriptor.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
 /// Upstream's close_and_restore_time: puts back the access and
 /// modification times, each (seconds, nanoseconds), of what `file` is.
 pub fn restore_times(file: &File, atime: (i64, i64), mtime: (i64, i64)) -> std::io::Result<()> {
@@ -141,16 +412,30 @@ pub fn id(name: &CStr, fallback: i64, group: bool) -> i64 {
 /// Upstream's Darwin `setup_xattrs`: adds `path`'s extended attributes
 /// (its target's when `follow`), skipping any it can't read. A failure to
 /// list them comes back with upstream's message for it.
-#[cfg(target_vendor = "apple")]
+#[cfg(all(test, target_vendor = "apple"))]
 pub fn read_xattrs(
     path: &Path,
     entry: &mut Entry,
     follow: bool,
 ) -> Result<(), (std::io::Error, &'static str)> {
+    read_xattrs_fd(path, entry, follow, None)
+}
+#[cfg(target_vendor = "apple")]
+pub fn read_xattrs_fd(
+    path: &Path,
+    entry: &mut Entry,
+    follow: bool,
+    fd: Option<libc::c_int>,
+) -> Result<(), (std::io::Error, &'static str)> {
     let path = path_c(path).map_err(|e| (e, "Couldn't list extended attributes"))?;
     let flags = if follow { 0 } else { libc::XATTR_NOFOLLOW };
     // SAFETY: querying length does not write through the NULL buffer.
-    let count = unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, flags) };
+    let count = unsafe {
+        match fd {
+            Some(fd) => libc::flistxattr(fd, std::ptr::null_mut(), 0, 0),
+            None => libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, flags),
+        }
+    };
     if count < 0 {
         let e = std::io::Error::last_os_error();
         if [libc::ENOTSUP, libc::ENOSYS].contains(&e.raw_os_error().unwrap_or(0)) {
@@ -164,8 +449,12 @@ pub fn read_xattrs(
     }
     let mut names = vec![0u8; count as usize];
     // SAFETY: buffer is writable for its full size.
-    let count =
-        unsafe { libc::listxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len(), flags) };
+    let count = unsafe {
+        match fd {
+            Some(fd) => libc::flistxattr(fd, names.as_mut_ptr().cast(), names.len(), 0),
+            None => libc::listxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len(), flags),
+        }
+    };
     if count < 0 {
         let e = std::io::Error::last_os_error();
         return Err((e, "Couldn't retrieve extended attributes"));
@@ -177,14 +466,17 @@ pub fn read_xattrs(
         };
         // SAFETY: query with no destination only reports value length.
         let len = unsafe {
-            libc::getxattr(
-                path.as_ptr(),
-                name.as_ptr(),
-                std::ptr::null_mut(),
-                0,
-                0,
-                flags,
-            )
+            match fd {
+                Some(fd) => libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0, 0, 0),
+                None => libc::getxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    flags,
+                ),
+            }
         };
         // Upstream skips an attribute it can't read; a value too large to
         // trust is skipped too.
@@ -194,14 +486,24 @@ pub fn read_xattrs(
         let mut value = vec![0; len as usize];
         // SAFETY: both C strings and writable value remain live.
         let len = unsafe {
-            libc::getxattr(
-                path.as_ptr(),
-                name.as_ptr(),
-                value.as_mut_ptr().cast(),
-                value.len(),
-                0,
-                flags,
-            )
+            match fd {
+                Some(fd) => libc::fgetxattr(
+                    fd,
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                ),
+                None => libc::getxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                    0,
+                    flags,
+                ),
+            }
         };
         if len >= 0 {
             value.truncate(len as usize);
@@ -946,17 +1248,31 @@ fn temporary() -> std::io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 #[cfg(target_vendor = "apple")]
-pub fn pack_mac_metadata(path: &Path, entry: &mut Entry) -> std::io::Result<()> {
+pub fn pack_mac_metadata(
+    path: &Path,
+    entry: &mut Entry,
+    fd: Option<libc::c_int>,
+) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     let path = path_c(path)?;
-    // SAFETY: live pathname; COPYFILE_CHECK reports metadata without writing to NULL destination.
+    // SAFETY: live pathname or descriptor; NULL destination only queries metadata.
     let check = unsafe {
-        copyfile(
-            path.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            (1 << 16) | 1 | 4,
-        )
+        match fd {
+            Some(fd) => {
+                let count = libc::flistxattr(fd, std::ptr::null_mut(), 0, 0);
+                if count < 0 {
+                    -1
+                } else {
+                    libc::c_int::from(count > 0 || super::disk_acl::has_acl(fd))
+                }
+            }
+            None => copyfile(
+                path.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                (1 << 16) | 1 | 4,
+            ),
+        }
     };
     if check == 0 {
         return Ok(());
@@ -966,10 +1282,13 @@ pub fn pack_mac_metadata(path: &Path, entry: &mut Entry) -> std::io::Result<()> 
     }
     // SAFETY: valid string, descriptor uniquely owned on success; O_SYMLINK avoids target following.
     let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_SYMLINK | libc::O_CLOEXEC,
-        )
+        match fd {
+            Some(fd) => libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0),
+            None => libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_SYMLINK | libc::O_CLOEXEC,
+            ),
+        }
     };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
@@ -999,7 +1318,11 @@ pub fn pack_mac_metadata(path: &Path, entry: &mut Entry) -> std::io::Result<()> 
     Ok(())
 }
 #[cfg(not(target_vendor = "apple"))]
-pub fn pack_mac_metadata(_path: &Path, _entry: &mut Entry) -> std::io::Result<()> {
+pub fn pack_mac_metadata(
+    _path: &Path,
+    _entry: &mut Entry,
+    _fd: Option<libc::c_int>,
+) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1282,7 +1605,7 @@ pub struct Filesystem {
     pub block_size: usize,
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(all(test, target_vendor = "apple"))]
 pub fn filesystem(path: &Path, follow: bool) -> Result<Filesystem, (std::io::Error, &'static str)> {
     let inspect =
         if follow || std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink()) {
@@ -1293,11 +1616,16 @@ pub fn filesystem(path: &Path, follow: bool) -> Result<Filesystem, (std::io::Err
                 .unwrap_or(Path::new("."))
         };
     let failed = |e| (e, "statfs failed");
-    let path = path_c(inspect).map_err(failed)?;
+    let file = open_read(inspect, libc::O_NONBLOCK).map_err(failed)?;
+    filesystem_fd(&file)
+}
+#[cfg(target_vendor = "apple")]
+pub fn filesystem_fd(file: &File) -> Result<Filesystem, (std::io::Error, &'static str)> {
+    let failed = |e| (e, "statfs failed");
     // SAFETY: statfs is a plain C struct with integer and byte-array fields.
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: live pathname and writable statfs destination.
-    result(unsafe { libc::statfs(path.as_ptr(), &mut st) }).map_err(failed)?;
+    result(unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) }).map_err(failed)?;
     Ok(Filesystem {
         remote: libc::c_int::from(st.f_flags & libc::MNT_LOCAL as u32 == 0),
         synthetic: -1,
@@ -1310,8 +1638,25 @@ pub fn filesystem(path: &Path, follow: bool) -> Result<Filesystem, (std::io::Err
 /// being read, or with `target` a symlink's target on another file
 /// system, which upstream opens (with O_NONBLOCK here, so that a FIFO
 /// can't hang the walk).
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 pub fn filesystem(path: &Path, target: bool) -> Result<Filesystem, (std::io::Error, &'static str)> {
+    let file = if target {
+        Some(open_read(path, libc::O_NONBLOCK).map_err(|e| (e, "openat failed"))?)
+    } else {
+        None
+    };
+    let fd = file.as_ref().map(AsRawFd::as_raw_fd);
+    filesystem_impl(path, fd)
+}
+#[cfg(target_os = "linux")]
+pub fn filesystem_fd(file: &File) -> Result<Filesystem, (std::io::Error, &'static str)> {
+    filesystem_impl(Path::new("."), Some(file.as_raw_fd()))
+}
+#[cfg(target_os = "linux")]
+fn filesystem_impl(
+    path: &Path,
+    fd: Option<libc::c_int>,
+) -> Result<Filesystem, (std::io::Error, &'static str)> {
     const AFS_SUPER_MAGIC: u32 = 0x5346_414f;
     const CIFS_SUPER_MAGIC: u32 = 0xff53_4d42;
     const CODA_SUPER_MAGIC: u32 = 0x7375_7245;
@@ -1322,12 +1667,6 @@ pub fn filesystem(path: &Path, target: bool) -> Result<Filesystem, (std::io::Err
     const PROC_SUPER_MAGIC: u32 = 0x9fa0;
     const USBDEVICE_SUPER_MAGIC: u32 = 0x9fa2;
     let failed = |e| (e, "statfs failed");
-    let file = if target {
-        Some(open_read(path, libc::O_NONBLOCK).map_err(|e| (e, "openat failed"))?)
-    } else {
-        None
-    };
-    let fd = file.as_ref().map(AsRawFd::as_raw_fd);
     let path = path_c(path).map_err(failed)?;
     // SAFETY: statvfs and statfs are plain C structs of integers.
     let (mut vfs, mut sfs): (libc::statvfs, libc::statfs) = unsafe { std::mem::zeroed() };
@@ -1438,18 +1777,31 @@ pub fn filesystem(
     })
 }
 
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+pub fn filesystem_fd(_file: &File) -> Result<Filesystem, (std::io::Error, &'static str)> {
+    filesystem(Path::new("."), false)
+}
+
 #[cfg(not(target_os = "linux"))]
-pub fn sparse(path: &Path, follow: bool, size: i64) -> std::io::Result<Vec<(i64, i64)>> {
+pub fn sparse(
+    path: &Path,
+    follow: bool,
+    size: i64,
+    fd: Option<libc::c_int>,
+) -> std::io::Result<Vec<(i64, i64)>> {
     if size <= 0 {
         return Ok(Vec::new());
     }
     let path = path_c(path)?;
     // SAFETY: live pathname; successful descriptor is newly owned.
     let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | if follow { 0 } else { libc::O_NOFOLLOW },
-        )
+        match fd {
+            Some(fd) => libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0),
+            None => libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | if follow { 0 } else { libc::O_NOFOLLOW },
+            ),
+        }
     };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
