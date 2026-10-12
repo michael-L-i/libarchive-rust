@@ -206,6 +206,31 @@ impl Iso9660 {
         self.zisofs.making = false;
     }
 
+    pub(super) fn zisofs_check_magic(
+        &mut self,
+        out: &mut dyn Sink,
+        buff: &[u8],
+    ) -> Result<(), Error> {
+        let making = self.zisofs.making;
+        let previous = self.zisofs.magic_cnt.max(0) as usize;
+        self.zisofs_detect_magic(buff);
+        if making && !self.zisofs.making {
+            // The original bytes are already zisofs: discard the reserved
+            // new header and any compression done before detection finished.
+            let offset = self.cur_content()?.offset_of_temp;
+            self.wb_set_offset(out, offset)?;
+            let prefix = self
+                .zisofs
+                .magic_buffer
+                .get(..previous)
+                .ok_or_else(|| misc("Invalid zisofs magic length"))?
+                .to_vec();
+            self.wb_write_to_temp(out, &prefix)?;
+            self.cur_content()?.size = previous as i64;
+        }
+        Ok(())
+    }
+
     /// Compress data and write it to a temporary file.
     pub(super) fn zisofs_write_to_temp(
         &mut self,

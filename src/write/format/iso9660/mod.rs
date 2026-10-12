@@ -908,7 +908,7 @@ impl Iso9660 {
             let head = buff.get(..ts).ok_or_else(|| misc("Invalid extent size"))?;
 
             if self.zisofs.detect_magic {
-                self.zisofs_detect_magic(head);
+                self.zisofs_check_magic(out, head)?;
             }
 
             if self.zisofs.making {
@@ -943,7 +943,7 @@ impl Iso9660 {
         }
 
         if self.zisofs.detect_magic {
-            self.zisofs_detect_magic(buff);
+            self.zisofs_check_magic(out, buff)?;
         }
 
         if self.zisofs.making {
