@@ -45,10 +45,14 @@ pub const PERM: c_int = 2;
 pub const TIME: c_int = 4;
 pub const NO_OVERWRITE: c_int = 8;
 pub const UNLINK: c_int = 16;
+pub const ACL: c_int = 0x20;
+pub const FFLAGS: c_int = 0x40;
+pub const XATTR: c_int = 0x80;
 pub const SECURE_SYMLINKS: c_int = 0x100;
 pub const SECURE_NODOTDOT: c_int = 0x200;
 pub const NO_AUTODIR: c_int = 0x400;
 pub const NO_OVERWRITE_NEWER: c_int = 0x800;
+pub const MAC_METADATA: c_int = 0x2000;
 pub const SECURE_NOABSOLUTEPATHS: c_int = 0x10000;
 pub const SAFE_WRITES: c_int = 0x40000;
 
@@ -61,7 +65,7 @@ pub struct WriteDisk {
     pub group: crate::ffi::disk::IdLookup,
     file: Option<File>,
     current: Option<(PathBuf, Entry, Target, c_int)>,
-    directories: Vec<(Entry, Target, c_int)>,
+    directories: Vec<(Entry, Target, c_int, bool)>,
     offset: u64,
     max_offset: u64,
     file_offset: Option<u64>,
@@ -70,6 +74,7 @@ pub struct WriteDisk {
     skipped: bool,
     atomic: Option<Target>,
     permissions_created: bool,
+    new_directory: bool,
 }
 
 fn failure(a: &Base, err: std::io::Error, action: &str, path: &Path) -> c_int {
@@ -90,6 +95,7 @@ impl WriteDisk {
         a.state.set(state::HEADER);
         self.skipped = false;
         self.permissions_created = false;
+        self.new_directory = false;
         let mut entry = entry.clone_entry();
         let Some(name) = entry.pathname().map(|p| p.to_bytes().to_vec()) else {
             return a.raise(Error::new(
@@ -191,10 +197,6 @@ impl WriteDisk {
             && let Ok(existing) = target.stat()
         {
             let directory = existing.st_mode & libc::S_IFMT == libc::S_IFDIR;
-            if directory && entry.filetype() == libc::S_IFDIR && self.options & PERM == 0 {
-                entry.set_perm(existing.st_mode);
-            }
-
             if self.skip_file == Some((existing.st_dev as i64, existing.st_ino as i64)) {
                 return a.raise(Error::new(
                     ARCHIVE_FAILED,
@@ -251,6 +253,10 @@ impl WriteDisk {
             } else if entry.filetype() == libc::S_IFDIR {
                 self.limit = Some(0);
                 match target.mkdir(0o777) {
+                    Ok(()) => {
+                        self.new_directory = true;
+                        Ok(())
+                    }
                     Err(e)
                         if e.raw_os_error() == Some(libc::EEXIST)
                             && target
@@ -458,9 +464,29 @@ impl WriteDisk {
                 }
             }
             if entry.filetype() == libc::S_IFDIR {
-                self.directories.push((entry, target, options));
+                // Only a directory this entry created waits for close to get its
+                // times and mode; one already there gets them now, and its mode
+                // changes only for PERM. ACLs and Mac metadata always wait.
+                let mut deferred = options;
+                let mut mode = true;
+                if !self.new_directory {
+                    mode = options & PERM != 0
+                        && target.stat().is_ok_and(|st| st.st_mode != entry.mode());
+                    let ret = self.restore(
+                        a,
+                        &entry,
+                        &mut target,
+                        options & !(ACL | MAC_METADATA),
+                        false,
+                    );
+                    if ret < 0 {
+                        return ret;
+                    }
+                    deferred &= !(OWNER | TIME | XATTR | FFLAGS);
+                }
+                self.directories.push((entry, target, deferred, mode));
             } else {
-                let ret = self.restore(a, &entry, &mut target, options, permissions_created);
+                let ret = self.restore(a, &entry, &mut target, options, !permissions_created);
                 if ret < 0 {
                     return ret;
                 }
@@ -476,7 +502,7 @@ impl WriteDisk {
         entry: &Entry,
         target: &mut Target,
         options: c_int,
-        permissions_created: bool,
+        mode: bool,
     ) -> c_int {
         if entry.hardlink_is_set() != 0 && (entry.size_is_set() == 0 || entry.size() == 0) {
             return ARCHIVE_OK;
@@ -516,7 +542,7 @@ impl WriteDisk {
                 ret = ARCHIVE_WARN;
             }
         }
-        if !permissions_created {
+        if mode {
             let mut mode = if options & PERM != 0 {
                 entry.mode() as u32 & 0o7777
             } else {
@@ -553,7 +579,7 @@ impl WriteDisk {
                 .code();
             ret = ARCHIVE_WARN;
         }
-        if options & 0x80 != 0
+        if options & XATTR != 0
             && let Err(e) = target.write_xattrs(entry)
         {
             a.warn(
@@ -564,7 +590,7 @@ impl WriteDisk {
             ret = ARCHIVE_WARN;
         }
         #[cfg(target_vendor = "apple")]
-        if options & 0x20 != 0
+        if options & ACL != 0
             && let Err(e) = target.metadata_file().and_then(|file| {
                 crate::ffi::disk_acl::write(&file, entry, &mut self.user, &mut self.group)
             })
@@ -573,7 +599,7 @@ impl WriteDisk {
                 .warn(e.raw_os_error().unwrap_or(libc::EIO), "Can't restore ACL")
                 .code();
         }
-        if options & 0x2000 != 0
+        if options & MAC_METADATA != 0
             && let Some(metadata) = entry.mac_metadata()
             && let Err(e) = target.unpack_mac_metadata(metadata)
         {
@@ -583,7 +609,7 @@ impl WriteDisk {
             );
             ret = ARCHIVE_WARN;
         }
-        if options & 0x40 != 0 {
+        if options & FFLAGS != 0 {
             let (set, clear) = entry.fflags();
             if let Err(e) = target.flags(set as u32, clear as u32) {
                 let _ = a.warn(
@@ -601,8 +627,8 @@ impl WriteDisk {
             return crate::archive::ARCHIVE_FATAL;
         }
         let mut ret = self.finish_entry(a);
-        while let Some((entry, mut target, options)) = self.directories.pop() {
-            ret = ret.min(self.restore(a, &entry, &mut target, options, false));
+        while let Some((entry, mut target, options, mode)) = self.directories.pop() {
+            ret = ret.min(self.restore(a, &entry, &mut target, options, mode));
         }
         a.state.set(state::CLOSED);
         ret
@@ -784,6 +810,55 @@ mod tests {
         let metadata = std::fs::metadata(output.path()).unwrap();
         assert_eq!(metadata.mtime(), 1_000_000_000);
         assert_eq!(std::fs::read(output.path()).unwrap(), [b'a'; 8192]);
+    }
+
+    fn directory(output: &Output, disk: &mut WriteDisk, base: &Base, mode: crate::entry::Mode) {
+        let mut entry = Entry::new(None);
+        entry.set_pathname(output.path().as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFDIR | mode);
+        entry.set_mtime(1_000_000_000, 0);
+        assert_eq!(disk.header(base, &entry), ARCHIVE_OK);
+        assert_eq!(disk.finish_entry(base), ARCHIVE_OK);
+    }
+
+    #[test]
+    fn only_new_directories_wait_for_close_for_times() {
+        use std::os::unix::fs::MetadataExt;
+        for existing in [false, true] {
+            let output = Output::new();
+            if existing {
+                std::fs::create_dir(output.path()).unwrap();
+            }
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = WriteDisk::default();
+            disk.options = TIME;
+            directory(&output, &mut disk, &base, 0o755);
+            std::fs::write(output.path().join("child"), b"").unwrap();
+            assert_eq!(disk.close(&base), ARCHIVE_OK);
+            let mtime = std::fs::metadata(output.path()).unwrap().mtime();
+            assert_eq!(mtime == 1_000_000_000, !existing);
+        }
+    }
+
+    #[test]
+    fn existing_directory_mode_changes_only_for_perm() {
+        use std::os::unix::fs::PermissionsExt;
+        for options in [0, PERM] {
+            let output = Output::new();
+            std::fs::create_dir(output.path()).unwrap();
+            std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o777))
+                .unwrap();
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = WriteDisk::default();
+            disk.options = options;
+            directory(&output, &mut disk, &base, 0o700);
+            assert_eq!(disk.close(&base), ARCHIVE_OK);
+            let mode = std::fs::metadata(output.path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, if options == PERM { 0o700 } else { 0o777 });
+        }
     }
 
     #[test]
