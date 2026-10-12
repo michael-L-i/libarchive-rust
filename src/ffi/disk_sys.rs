@@ -289,6 +289,12 @@ fn open_dir(dir: libc::c_int, name: &CStr, follow: bool) -> std::io::Result<File
     // SAFETY: openat returned a new descriptor that nothing else owns.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
+pub fn fstat(file: &File) -> std::io::Result<libc::stat> {
+    let mut st = super::entry::zeroed_stat();
+    // SAFETY: live descriptor and writable stat.
+    result(unsafe { libc::fstat(file.as_raw_fd(), &mut st) })?;
+    Ok(st)
+}
 fn stat_at(dir: &File, name: &CStr, follow: bool) -> std::io::Result<libc::stat> {
     let mut st = super::entry::zeroed_stat();
     let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };

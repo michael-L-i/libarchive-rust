@@ -32,7 +32,7 @@ mod hfs;
 
 use crate::archive::{ARCHIVE_ERRNO_MISC, ARCHIVE_FAILED, ARCHIVE_FATAL, ARCHIVE_OK, Base, state};
 use crate::entry::Entry;
-use crate::ffi::disk_sys::{DirError, Target, check_symlinks, create_dir, euid, umask};
+use crate::ffi::disk_sys::{DirError, Target, check_symlinks, create_dir, euid, fstat, umask};
 use crate::util::Error;
 use std::ffi::c_int;
 use std::fs::File;
@@ -864,18 +864,21 @@ impl WriteDisk {
             let Ok(mut target) = Target::prepare(path, todo & SECURE_SYMLINKS != 0) else {
                 continue;
             };
-            let directory = entry.filetype() == libc::S_IFDIR;
-            let Ok(file) = target.fixup_file(directory) else {
-                continue;
+            let same = |st: libc::stat| {
+                (st.st_dev as u64, st.st_ino) == id && st.st_mode & libc::S_IFMT == entry.filetype()
             };
-            use std::os::unix::fs::MetadataExt;
-            if !file.metadata().is_ok_and(|st| {
-                (st.dev(), st.ino()) == id
-                    && st.mode() & libc::S_IFMT as u32 == u32::from(entry.filetype())
-            }) {
-                continue;
+            // A symlink's own flags are set through the link, as by lchflags.
+            if entry.filetype() == libc::S_IFLNK {
+                if !target.stat().is_ok_and(same) {
+                    continue;
+                }
+            } else {
+                let file = target.fixup_file(entry.filetype() == libc::S_IFDIR);
+                let Some(file) = file.ok().filter(|file| fstat(file).is_ok_and(same)) else {
+                    continue;
+                };
+                target.retain_file(file);
             }
-            target.retain_file(file);
             if todo & TIME != 0 && (entry.mtime_is_set() != 0 || entry.atime_is_set() != 0) {
                 let start = (self.start_time, 0);
                 let time = |set, sec, nsec| if set != 0 { (sec, nsec) } else { start };
@@ -1714,6 +1717,27 @@ mod tests {
             crate::ffi::disk_sys::read_xattrs(&output.0.join("file"), &mut read, false).unwrap();
             assert_eq!(read.xattrs.len(), 1);
         }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_symlink_gets_its_deferred_flags_at_close() {
+        use std::os::macos::fs::MetadataExt;
+        let output = Output::new();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        disk.options = FFLAGS;
+        let mut entry = Entry::new(None);
+        entry.set_pathname(output.path().as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFLNK | 0o755);
+        entry.set_symlink(b"target");
+        entry.set_fflags(libc::UF_IMMUTABLE as std::ffi::c_ulong, 0);
+        assert_eq!(disk.header(&base, &mut entry), ARCHIVE_OK);
+        assert_eq!(disk.close(&base), ARCHIVE_OK);
+        let flags = std::fs::symlink_metadata(output.path()).unwrap().st_flags();
+        let target = Target::prepare(&output.path(), false).unwrap();
+        target.flags(0, libc::UF_IMMUTABLE).unwrap();
+        assert_eq!(flags, libc::UF_IMMUTABLE);
     }
 
     #[test]
