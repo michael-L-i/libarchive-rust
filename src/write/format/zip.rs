@@ -37,6 +37,7 @@ use crate::hmac::HmacSha1;
 use crate::string::StringConv;
 use crate::util::Error;
 use crate::write::{Filter, Format, Sink};
+use std::borrow::Cow;
 use std::ffi::{CStr, c_int};
 use std::io::Read;
 use std::sync::Arc;
@@ -117,10 +118,11 @@ fn trad_update(k: &mut [u32; 3], c: u8) {
     k[2] = !crate::crc32::crc32(!k[2], &[(k[1] >> 24) as u8]);
 }
 impl Cipher {
-    fn encrypt(&mut self, input: &[u8]) -> Vec<u8> {
+    fn encrypt<'a>(&mut self, input: &'a [u8]) -> Cow<'a, [u8]> {
         let mut out = input.to_vec();
         match self {
-            Self::None => {}
+            // Unencrypted data goes out as the client's own buffer, as upstream's does.
+            Self::None => return Cow::Borrowed(input),
             Self::Traditional(k) => {
                 for b in &mut out {
                     let c = *b;
@@ -134,7 +136,7 @@ impl Cipher {
                 h.update(&out);
             }
         }
-        out
+        Cow::Owned(out)
     }
 }
 fn random(len: usize) -> Result<Vec<u8>, Error> {
