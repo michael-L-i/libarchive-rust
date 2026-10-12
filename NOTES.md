@@ -1950,39 +1950,137 @@ Upstream quirks ported as-is:
   compressed TOC. fflags are written as empty `<flags/>` and `<ext2/>`.
 - 7zip: the first non-empty file's encoder setup replaces the return code
   of a pathname-conversion warning. zip sets the UTF-8 flag on non-ASCII
-  names that aren't valid UTF-8. ISO9660's Joliet name for `dir/.` is `.`.
+  names that aren't valid UTF-8. ISO9660's Joliet name for `dir/.` is `.`;
+  the ISO9660 writer's other quirks are listed under "ISO9660 writer".
 
 Still different:
 
-- ISO9660 images: directory extent order, Rock Ridge field placement
-  (upstream caps in-record fields at 226 bytes and splits NM/SL), PX link
-  counts, empty files' extent numbers and duplicate-name suffixes. The
-  writer is a reimplementation; matching needs a port of upstream's layout,
-  `set_directory_record_rr` and `idr` code.
 - xar in a non-UTF-8 locale escapes a non-ASCII symlink target differently.
 - 7zip compression names are matched in any case, and invalid levels have
   other messages than upstream's.
 
-## 7zip and ISO9660 writers
+## 7zip writer
 
 - The 7zip writer uses a seekable anonymous temporary file for encoded data
   and native solid stream headers. Copy, deflate, BZip2, LZMA1, LZMA2,
   Zstandard and the native PPMd7 encoder are supported. BZip2 and Zstandard
   output differs from the C codecs' bytes. PPMd has checked model accesses and a bounded
   model arena; its encoded bytes follow the upstream range coder.
-- ISO9660 implements levels 1–4, Joliet and Rock Ridge, deep-directory
-  relocation, hardlinks, multi-extent records, zisofs and El Torito boot
-  images. File data and compressed data use anonymous temporary files;
-  metadata stays in memory and size-derived temporary buffers allocate
-  fallibly. Zisofs boot-image restoration caps compressed and uncompressed
-  blocks at 256 MiB; unusually large valid blocks fail with ENOMEM.
-- Boot information-table checksum tails are zero padded. Upstream reads
-  uninitialized bytes after a partial final word; this port never does.
-  Sizes exceeding the boot table's 32-bit fields are rejected.
-- ISO9660 retains upstream's unwritten-entry behavior: an entry with a
-  declared body but no bytes written is not zero-filled or registered as
-  file content. An unwritten boot image therefore fails while emitting
-  the image, after the volume descriptors.
+
+## ISO9660 writer (`src/write/format/iso9660/`)
+
+- A function-by-function port of `archive_write_set_format_iso9660.c`,
+  under upstream's function names, split along its sections: `tree`,
+  `idr`, `record`, `descriptor`, `boot` and `zisofs`. Linked lists are
+  vectors of indices, except the path tables' `ptnext` chains, which
+  deep-directory relocation shares between levels. Everything goes through
+  upstream's 64 KiB write buffer and an unlinked temporary file, so where
+  upstream misplaces bytes in that buffer, so does this.
+- Images match upstream's byte for byte, with the same messages and exit
+  codes: 3,459 of 3,493 cases of
+  `../diagnostics/round14-iso9660` (every option, every level, Joliet and
+  Rock Ridge variants, zisofs, El Torito, deep trees, 3,000 random
+  archives and an API probe); the other 34 are inputs upstream crashes
+  on, listed below.
+- The identifier resolver keeps upstream's red-black tree (`src/rb.rs`,
+  insertion and lookup from `archive_rb.c`). Its comparison is not a total
+  order: `FOO` and `FOO.` each sort before the other, so the tree's shape
+  decides which names collide and how they sort.
+- Path tables are sorted with macOS's `qsort` (`qsort.rs`, from Apple
+  Libc). Upstream's comparison only looks at the part of a directory name
+  before its last dot, so `A.B` and `A.C` compare equal and their order is
+  whatever libc's unstable sort leaves; an upstream built with glibc can
+  order them differently.
+- Sizes from entries use checked or wrapping arithmetic as upstream's
+  types do; the block pointer table (up to 128 MiB for a 4 GiB file with
+  128-byte zisofs blocks), path tables and resolver pools allocate
+  fallibly. Unmaking a zisofs boot image streams through a 32 KiB buffer
+  as upstream does, so it needs no size cap; it inflates with miniz_oxide,
+  whose consumption can differ from zlib's only after output space runs
+  out, which upstream's dropped input (below) has already broken.
+- The boot information table's size field is 32 bits; a larger boot image
+  is rejected ("Boot image size exceeds its information table") where
+  upstream truncates the size.
+
+Where upstream reads or writes through a null or wild pointer, this fails
+with `ARCHIVE_FATAL` (bsdtar exits 1 where upstream's dies of SIGSEGV):
+
+- `!volume-id`, `!publisher`, `!application-id`, `!copyright-file`,
+  `!abstract-file`, `!biblio-file` and `!boot-catalog` reach `strlen(NULL)`;
+  here they fail with "Invalid value(empty) for option ``KEY''".
+- A Rock Ridge "SL" entry that continues with exactly 11 bytes left in its
+  continuation area sets the continue flag of a component it never
+  started: "No room for a symbolic link component".
+- With more than eight levels kept (`!limit-depth`, or `iso-level=4` with
+  a tree deeper than 8) and Rock Ridge on, relocation leaves an entry
+  behind that the walks then treat as a directory, and upstream
+  dereferences its file's exhausted extent list: "No current file
+  content".
+- An existing `rr_moved` directory that heads the root's subdirectory
+  chain but not its children: `isoent_remove_child()` runs off the chain.
+  "Can't remove an entry from its directory".
+- A path table chain whose length disagrees with its count would overrun
+  upstream's array or leave it partly unset; it fails here. A buffer
+  position `wb_set_offset()` would put past the buffer fails too.
+
+Where upstream reads uninitialized memory this uses zeros: the boot
+table checksum's last word when the first read ends inside it (after a
+later read, upstream sums the bytes the previous read left, and so does
+this); the `struct tm` of a time `localtime_r()` can't convert; the bytes
+a level-1 name copies from past its end, which never reach the image; and
+a path component longer than NAME_MAX in an option's file name, which is
+not found here where upstream looks up an unset name and steps back a
+byte before the string.
+
+Upstream bugs ported as-is:
+
+- zisofs truncates a block's zlib stream when its output doesn't fit the
+  write buffer: zisofs_write_to_temp() stops calling deflate() once the
+  input is consumed and then resets the stream. Incompressible blocks
+  usually hit it.
+- zisofs_finish_entry() moves back to the file's start to write its header
+  and block pointers. If that start has been flushed, the partial block
+  still buffered is dropped and the header lands on it, so the file's last
+  bytes are replaced. Files whose compressed data outgrows the buffer hit
+  it.
+- After an all-zero zisofs block moves the write position back,
+  deflate() keeps writing where the position was, so a later block in
+  the same call lands off by the bytes the zero block had produced (its
+  zlib header when its data came in more than one call).
+- A file holding an mkzftree image is detected after its zisofs header has
+  been reserved: its own header goes into the 'ZF' entry but its data
+  follows the zeros reserved for a new one, so readers reject it ("Illegal
+  zisofs file body"). Detected only once compression has begun (data in
+  pieces under 64 bytes), it keeps the compressed start and the rest
+  follows raw.
+- Unmaking a zisofs boot image hands each 32 KiB read to zisofs_extract()
+  once and drops what it leaves, so only single-block images survive;
+  others fail with "Can't read temporary file(0)" or "Illegal zisofs block
+  pointers(cannot seek)".
+
+  Together these corrupt zisofs files that upstream's own reader then
+  rejects ("zisofs decompression failed (-3)"); the reimplementation this
+  replaces wrote them correctly.
+- Relocation runs its second pass over level 8 on entries the first pass
+  already relocated, so a tree deeper than 13 levels fails with "Unable to
+  insert rr_moved entry"; so do two relocated directories of one name.
+- A path table that fills its last 4 KiB block exactly makes
+  write_path_table() return the size of its deepest level, which close
+  takes for a failure: `ARCHIVE_FATAL` with no message (bsdtar prints
+  "(null)").
+- "Directories too deep" returns before the last write-out, so the image
+  lacks what was still buffered, up to 64 KiB of its end: padding, or with
+  `!pad` directory records and file data.
+- `Rockridge` is checked under the switch's `case 'r'`, so it is an
+  undefined option.
+- Symbolic links and empty files get extent numbers counting down from
+  0xFFFFFFF0. A hardlink target added again under the same name keeps the
+  first one's link group.
+- `limit-dirs` checks the Joliet directory count when Joliet is on.
+- An entry with a declared body but no bytes written is not zero-filled or
+  registered as file content (with zisofs it is, since its reserved header
+  counts as content). An unwritten boot image therefore fails while
+  emitting the image, after the volume descriptors.
 
 ## Deflate compressor (`deflate/`)
 
@@ -2000,12 +2098,8 @@ Still different:
 - The hash key is computed from each string's three bytes instead of
   zlib's running ins_h; with hash_shift * MIN_MATCH >= hash_bits the keys
   are the same.
-- Upstream bug, not ported: zisofs_write_to_temp() stops calling deflate()
-  once a block's input is consumed, even when the block's output did not
-  fit the write buffer, so C truncates the zlib stream of a block whenever
-  the buffer fills inside it (8 of 128 blocks of a 4 MiB file, each a
-  prefix of the complete stream). The port writes complete blocks; the
-  other blocks match C's.
+- zisofs output is byte-identical to upstream's, including the blocks whose
+  zlib streams upstream truncates (see "ISO9660 writer").
 - Unchanged here: the gzip filter writes any original-filename, where
   upstream ignores one of 32K or more with a warning.
 
