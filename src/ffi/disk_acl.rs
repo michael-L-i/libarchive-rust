@@ -33,6 +33,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 unsafe extern "C" {
+    fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
     fn acl_get_file(path: *const libc::c_char, kind: c_int) -> *mut c_void;
     fn acl_get_link_np(path: *const libc::c_char, kind: c_int) -> *mut c_void;
     fn acl_get_entry(acl: *mut c_void, next: c_int, entry: *mut *mut c_void) -> c_int;
@@ -90,17 +91,31 @@ fn code(ret: c_int) -> std::io::Result<()> {
         Err(std::io::Error::last_os_error())
     }
 }
+pub fn has_acl(fd: c_int) -> bool {
+    // SAFETY: caller supplies a live descriptor; success returns an owned ACL.
+    let acl = unsafe { acl_get_fd_np(fd, 0x100) };
+    if acl.is_null() {
+        return false;
+    }
+    let acl = Native(acl);
+    let mut entry = std::ptr::null_mut();
+    // SAFETY: ACL remains live and entry is a writable pointer.
+    unsafe { acl_get_entry(acl.0, 0, &mut entry) == 0 }
+}
 pub fn read(
     path: &Path,
     entry: &mut Entry,
     user: &mut super::disk::NameLookup,
     group: &mut super::disk::NameLookup,
+    fd: Option<c_int>,
 ) -> std::io::Result<()> {
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
     // SAFETY: path terminated and live; successful call allocates owned ACL.
     let ptr = unsafe {
-        if entry.filetype() == libc::S_IFLNK {
+        if let Some(fd) = fd {
+            acl_get_fd_np(fd, 0x100)
+        } else if entry.filetype() == libc::S_IFLNK {
             acl_get_link_np(path.as_ptr(), 0x100)
         } else {
             acl_get_file(path.as_ptr(), 0x100)
@@ -328,7 +343,7 @@ mod tests {
             restored.set_mode(filetype | 0o600);
             let mut user = super::super::disk::NameLookup::default();
             let mut group = super::super::disk::NameLookup::default();
-            read(&path, &mut restored, &mut user, &mut group).unwrap();
+            read(&path, &mut restored, &mut user, &mut group, None).unwrap();
             assert!(restored.acl.reset(TYPE_NFS4) > 0);
             let (code, item) = restored.acl_next(TYPE_NFS4);
             assert_eq!(code, 0);
