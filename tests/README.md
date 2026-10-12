@@ -31,12 +31,17 @@ disk fixes; the baseline must be merged with those fixes.
 
 The required Ubuntu CI jobs run Rust checks and both full upstream suites.
 Both jobs use `scripts/setup-linux-tests` to install the development packages from
-`diagnostics/round14-linux-env/run.sh`, plus `libattr1-dev`, and generates
+`diagnostics/round14-linux-env/run.sh`, plus `libattr1-dev`, and generate
 the seven locales from `setup-user.sh`. Its locale setup suppresses only
 the expected ASCII compatibility warning for SHIFT_JIS. Builds and tests
 run as the GitHub runner user; only dependency and locale installation use
 `sudo`. The setup script contains the reproducible package and locale lists.
 GitHub CI itself has not been run before publication.
+
+The oracle jobs also run `scripts/test-iso-zisofs --library target/debug
+--reader build/oracle/bin/bsdtar`. It drives public-API chunk boundaries with
+a C test helper and checks eight corrected images with upstream's reader.
+Only the test helper uses C; the writer under test is the Rust C-ABI library.
 
 The runner's Python checks exercise platform selection, failure exit codes,
 skip regressions and baseline updates without building the C test programs:

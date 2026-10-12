@@ -10,10 +10,10 @@ upstream's own test suite.
 
 - **Library:** all 454 public functions, in Rust. `unsafe` is confined to the C
   ABI layer (`src/ffi/`); the rest of the crate denies it.
-- **Upstream tests:** 926 of upstream's tests pass against this library and
-  its tools, and none fail. Of the 184 that skip, 73 reach into libarchive's
-  internals, which a public ABI can't link (their checks are ported as Rust
-  tests); the rest skip on this platform for upstream too.
+- **Upstream tests:** 926 pass on macOS and 969 on Linux against this library
+  and its tools, with no failures or baseline regressions. There are 184
+  macOS skips and 141 Linux skips. Of those, 73 need libarchive's internal
+  layout, which a public ABI can't link; the others reflect platform support.
 - **Tools:** `bsdtar`, `bsdcpio`, `bsdcat` and `bsdunzip` are Rust programs
   with upstream's options, output, messages and exit codes.
 - **Codecs:** pure Rust. DEFLATE and LZMA/XZ compression are ports of zlib
@@ -21,32 +21,35 @@ upstream's own test suite.
   `bsdtar` writes the same `.tar.gz`, `.zip`, `.tar.xz` and `.7z` archives as
   the C build. Zstandard compression ports libzstd 1.5.7's strategies.
 - **Fidelity:** in a byte-for-byte comparison of every writer against C
-  `bsdtar`, 64 of 68 format and input cases are identical; the other four
-  are mtree digests the macOS C build lacks. The ISO9660 writer also
-  matches C on 3,459 of 3,493 differential cases on macOS and 3,457 on
-  Linux; C crashes on the rest. Listing and
-  extracting upstream's 562 test archives matches upstream's own `bsdtar` on
-  all but one, a damaged bzip2 stream the safe decoder reports differently.
-  `NOTES.md` records each remaining difference and every intended one.
+  `bsdtar`, 64 of 68 format and input cases are identical; the four differences
+  are RIPEMD-160 absent from the macOS C build. A previous comparison of 562
+  test archives differed only on a damaged bzip2 stream the safe decoder
+  reports differently. The ISO writer uses platform libc ordering and fixes
+  six documented upstream output corruptions. Eight regression images
+  recover their original bytes with upstream's reader on both platforms.
+  `NOTES.md` records the remaining and intended differences.
 - **Extraction safety:** the disk writer follows upstream's checks for
   absolute paths, `..`, symlinks and hardlinks, verified with a 169-case
   malicious-archive suite against upstream. Where they differ, this port
   leaves files outside the extraction directory alone where upstream would
-  change them.
+  change them. A further 240 Linux comparisons check ACLs, xattrs, flags,
+  symlinks and hardlinks; Rust adds no outside mutation where C preserves
+  the target. Explicit `-P` can still permit paths through symlinks.
 - **Fuzzing:** a `cargo fuzz` target for every reader and filter (`fuzz/`).
 
 ## Performance
 
-`bench/compare.py` times C and Rust `bsdtar` on 8 datasets, 6 formats,
-creation and extraction: 96 cases, whole-process time including startup,
+The last benchmark round used `bench/compare.py` to time C and Rust `bsdtar`
+on 8 datasets and 6 formats for creation and extraction: 96 cases,
+whole-process time including startup,
 warm cache, 5 rotating repeats. A win is a median more than 5% below C. On
 an Apple M5 Pro (macOS 26.6), against upstream bsdtar built with its usual
 C libraries (Apple zlib, liblzma 5.8.4, libzstd 1.5.7):
 
 | | Wins | Ties | Losses |
 |---|---:|---:|---:|
-| This version (two runs) | 59–61 | 32–34 | 3 |
-| This version, with `scripts/build-pgo` | 63 | 31 | 2 |
+| Round 13 (two runs) | 59–61 | 32–34 | 3 |
+| Round 13, with `scripts/build-pgo` | 63 | 31 | 2 |
 | Previous version | 24 | 22 | 50 |
 
 Across all 96 cases the geometric mean of Rust/C time is 0.90. Close cases
@@ -54,6 +57,8 @@ move by a few percent between runs. The remaining losses are Zstandard
 creation of two datasets (1.05–1.08x) and one 7-Zip extraction
 (1.06–1.09x). `scripts/build-pgo` trains on data other than the
 benchmark's; it changes no output byte.
+
+The subsequent disk and ISO correctness fixes have not been rebenchmarked.
 
 ## What is Rust
 
@@ -104,12 +109,15 @@ scripts/build-oracle                  # upstream's C build, the reference (CMake
 scripts/build-port --release          # our library and tools, upstream's tests relinked
 scripts/run-tests --suite all         # upstream's tests against ours
 cargo test --workspace --release      # Rust tests
+scripts/test-iso-zisofs --library target/release --reader build/oracle/bin/bsdtar
 ```
 
 `AGENTS.md` describes the rules (memory safety, never trusting archive bytes,
-faithfulness to upstream) and the validation layers in detail. Development
-and validation happen on macOS; the code builds and lints cleanly on Linux,
-but its tests have not been run there yet.
+faithfulness to upstream) and the validation layers in detail. Full upstream
+suites, release and dev Rust tests, formatting and strict Clippy have run on
+macOS and Linux. `scripts/run-tests` enforces separate platform baselines.
+CI requires both platforms and checks corrected zisofs images with the C
+reader; the hosted workflow will first run after publication.
 
 ## License
 

@@ -1980,7 +1980,10 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   would get the ioctl in its driver; here that fails with ENOTTY.
 - The umask is read from /proc/self/status, as upstream's
   __archive_get_umask does in a threaded process, rather than set and
-  restored, which other threads creating files could see.
+  restored, which other threads creating files could see. If procfs is
+  unavailable or its value cannot be parsed, the fallback sets and restores
+  the process mask as upstream does; that fallback is not atomic with other
+  threads creating files.
 
 ## Temporary files
 

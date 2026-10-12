@@ -1,10 +1,20 @@
 # libarchive-rust status
 
-Date 2026-10-11. Upstream pin `8bb3bbdc`. Run: port.
+Date 2026-10-12. Upstream pin `8bb3bbdc`. Runs: port and oracle on macOS and Linux.
 
-**All suites: 926 passed, 184 skipped; zero failures, crashes or timeouts.**
+**All suites: 926 passed on macOS and 969 on Linux; zero failures, crashes,
+timeouts or platform-ratchet regressions.**
 
-Libarchive: 764 passed / upstream baseline 829 / 934 total.
+| Platform | Port pass | Oracle pass | Port skip | Oracle skip |
+|---|---:|---:|---:|---:|
+| macOS | 926 | 991 | 184 | 119 |
+| Linux (unprivileged) | 969 | 1039 | 141 | 71 |
+
+Libarchive: macOS 764 / oracle 829; Linux 807 / oracle 877; 934 total.
+The front-end suites pass the same 162 cases on both platforms. The detailed
+area table below is macOS; Linux's passes are in `tests/passing-linux.txt`.
+The 65 macOS and 70 Linux oracle-pass-to-port-skip differences are tests
+that cannot link through the public ABI; 73 such tests are excluded in total.
 
 | Area | Ours | Upstream | Total |
 |---|---:|---:|---:|
@@ -49,28 +59,72 @@ Libarchive: 764 passed / upstream baseline 829 / 934 total.
 | other | 96 | 96 | 139 |
 
 Remaining stubs (`src/ffi/stubs.rs`): 0
-`unsafe` in `src/` (excluding stubs.rs): 256; in the tools: 39, all in
+`unsafe` in `src/` (excluding stubs.rs): 283; in the tools: 40, all in
 `tools/libarchive_fe/src/sys.rs`
 
-## ISO9660 writer port checkpoint
+## Round 14 continuation: Linux and ISO correctness
 
-The ISO9660 writer, until now a reimplementation, is a function-by-function
-port of upstream's (`src/write/format/iso9660/`, with `src/rb.rs` for the
-identifier resolver's red-black tree and a port of macOS's `qsort` for the
-path tables). The round-twelve writer sweep is 64 of 68 identical (the four
-others are mtree's RIPEMD-160). `../diagnostics/round14-iso9660` compares
-C and Rust bsdtar on 3,493 cases: 3,459 identical images, messages and exit
-codes; on the other 34 upstream dereferences null and this fails cleanly
-(NOTES.md, "ISO9660 writer"). On Linux, against upstream built with glibc
-2.41, 3,457 are identical and upstream crashes on the other 36; path tables
-sort as each platform's `qsort` does. Creating a 204 MB, 3,000-file image takes
-0.90x C's time, 0.91x with zisofs. Byte identity includes upstream's zisofs
-bugs, which corrupt some compressed files that the reimplementation wrote
-correctly. Write options without a module now combine the format's and the
-filters' answers as upstream does, and a failed format close leaves the
-archive closed.
+Merged the reviewed Linux ACL, xattr, file-flag, filesystem and sparse-file
+port. Review fixes count every sparse scan iteration/extent, including
+unwritten FIEMAP pages, and reject overflow or backwards seek results.
+Metadata warnings initialize usable entry data, and directory timestamps
+restore through a retained descriptor after rename rather than its old name.
+The metadata differential run remains 61 identical comparisons. A further
+240 extraction comparisons as tester and root add no outside mutation
+where upstream preserves files; four differences per privilege level are
+stricter xattr handling under explicit `-P`, documented in NOTES.md.
 
-## Phase 5 checkpoint
+ISO path tables now use the actual platform libc qsort through a safe,
+reentrant wrapper that contains comparator panics and handles unaligned
+scratch values. Option-handler routing, allocation, warning propagation
+and other review corrections match the pinned source. Before deliberate
+output fixes, the follow-up harness matched in 460 of 491 macOS cases and
+436 of 469 Linux cases; the rest crashed upstream, with zero unexplained
+differences. Linux's subset omitted the older round-12 fixtures.
+
+With the user's approval, five zisofs output corruptions and one temporary
+buffer padding bug are fixed rather than preserved. Eight deterministic
+public-API images recover their original bytes through upstream's reader
+on both platforms, in both release and dev builds. Upstream's writer fails
+all eight cases in the macOS regression driver. ISO unit tests also cover
+information blocks, options, Joliet paths/conversion/relocation and truncated
+deep-tree output. The declared 4 GiB multi-extent test passed explicitly on
+macOS and stays ignored by default to avoid routine 4 GiB temporary I/O.
+
+Temporary files now use supported upstream credential checks before
+trusting TMPDIR, including Linux saved IDs. Subprocess tests isolate all
+six UID/GID changes; the formerly failing root XAR file-flags test passes.
+NOTES.md explains why these checks are stronger than the pinned CMake
+oracle's configuration and preserves its remaining umask fallback limitation.
+
+Final verification: formatting, strict all-target Clippy, eight Python runner
+checks, release and dev workspace tests on both platforms (581/582 passes
+on macOS, 579/580 on Linux), all 454 ABI symbols, and the full suites above.
+The macOS writer sweep remains 64/68 byte-identical: four mtree RIPEMD-160
+cases differ because that C build lacks the digest. Both platform baselines
+and failure exit codes are enforced. Required CI jobs run both platforms and
+the independent zisofs reader checks; hosted CI has not run before publication.
+
+Generated compiler caches in vendored crates are no longer tracked, and
+all target directories are ignored. Their old blobs remain in existing
+history; merged history was preserved. Work is local, with no remotes or
+pushes. Benchmark results below predate these correctness changes; the
+remaining Zstandard/7-Zip losses have not been remeasured. The Linux container
+lacks successful privileged immutable/append flags and trusted.* coverage;
+failure/retry paths and unprivileged metadata were checked. Windows was not
+built or validated in this continuation.
+
+## Initial ISO9660 writer port (historical)
+
+The first function-by-function ISO writer port used a handwritten macOS
+qsort translation and reproduced upstream's zisofs corruptions. Its 3,493-case
+baseline matched 3,459 images/messages/statuses on macOS and 3,457 on Linux;
+upstream crashed in the remaining cases. At that checkpoint, creating a
+204 MB, 3,000-file image took 0.90x C's time, 0.91x with zisofs. The current
+wrapper and output fixes supersede that ordering implementation and corrupt
+byte identity; see the continuation above and NOTES.md.
+
+## Phase 5 checkpoint (historical)
 
 Complete on macOS under the safe-backend policy. All archive writers and
 compression write filters, output clients, format selectors, matching,
