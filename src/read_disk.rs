@@ -354,7 +354,9 @@ impl ReadDisk {
                 };
             #[cfg(target_vendor = "apple")]
             let metadata_file = metadata_file.or_else(|| {
-                if let Some(link) = access_path.link_file() {
+                if st.st_mode & libc::S_IFMT == libc::S_IFLNK
+                    && let Some(link) = access_path.link_file()
+                {
                     return link.try_clone().ok();
                 }
                 let flags = if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
@@ -1462,6 +1464,36 @@ mod tests {
         assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
         assert_eq!(entry.filetype(), libc::S_IFIFO);
         assert_eq!(disk.data_block(&a).unwrap().0, ARCHIVE_EOF);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn followed_fifo_symlink_reads_the_targets_metadata() {
+        use std::os::unix::fs::symlink;
+        let root = Directory::new("fifo-link");
+        let fifo = root.0.join("fifo");
+        let link = root.0.join("link");
+        let target = disk_sys::Target::prepare(&fifo, false).unwrap();
+        target.special(libc::S_IFIFO as u32 | 0o600, 0).unwrap();
+        target.xattr(c"user.libarchive-fifo", b"target").unwrap();
+        symlink(&fifo, &link).unwrap();
+        for policy in [1, 2] {
+            let a = Base::new(READ_DISK_MAGIC);
+            let mut disk = ReadDisk::new();
+            disk.symlinks = policy;
+            disk.behavior = 0x20;
+            let mut entry = Entry::new(None);
+            assert_eq!(disk.open(&a, link.as_os_str().as_bytes()), ARCHIVE_OK);
+            assert_eq!(disk.next_header2(&a, &mut entry), ARCHIVE_OK);
+            assert_eq!(entry.filetype(), libc::S_IFIFO);
+            assert!(
+                entry
+                    .xattrs
+                    .iter()
+                    .any(|x| { x.name == c"user.libarchive-fifo" && x.value == b"target" })
+            );
+            assert_eq!(disk.data_block(&a).unwrap().0, ARCHIVE_EOF);
+        }
     }
 
     #[test]
