@@ -5,7 +5,7 @@ use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-fn path_c(path: &Path) -> std::io::Result<CString> {
+pub fn path_c(path: &Path) -> std::io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
 }
@@ -32,46 +32,26 @@ pub fn stat(path: &Path, fd: libc::c_int, follow: bool) -> std::io::Result<libc:
     result(code)?;
     Ok(st)
 }
-pub fn restore_times(path: &Path, entry: &Entry) -> std::io::Result<()> {
+/// Opens `path` for reading, following symlinks, with `flags` added.
+pub fn open_read(path: &Path, flags: libc::c_int) -> std::io::Result<File> {
     let path = path_c(path)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let times = [
-        libc::timespec {
-            tv_sec: if entry.atime_is_set() != 0 {
-                entry.atime()
-            } else {
-                now.as_secs() as i64
-            },
-            tv_nsec: if entry.atime_is_set() != 0 {
-                entry.atime_nsec() as _
-            } else {
-                now.subsec_nanos() as _
-            },
-        },
-        libc::timespec {
-            tv_sec: if entry.mtime_is_set() != 0 {
-                entry.mtime()
-            } else {
-                now.as_secs() as i64
-            },
-            tv_nsec: if entry.mtime_is_set() != 0 {
-                entry.mtime_nsec() as _
-            } else {
-                now.subsec_nanos() as _
-            },
-        },
-    ];
-    // SAFETY: the pathname and two timespec values are live, properly sized.
-    result(unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            times.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    })
+    // SAFETY: the path is terminated; a successful open returns a new descriptor.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: nothing else owns the descriptor open just returned.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+/// Upstream's close_and_restore_time: puts back the access and
+/// modification times, each (seconds, nanoseconds), of what `file` is.
+pub fn restore_times(file: &File, atime: (i64, i64), mtime: (i64, i64)) -> std::io::Result<()> {
+    let times = [atime, mtime].map(|(tv_sec, tv_nsec)| libc::timespec {
+        tv_sec: tv_sec as _,
+        tv_nsec: tv_nsec as _,
+    });
+    // SAFETY: live descriptor and two timespecs that outlive the call.
+    result(unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) })
 }
 pub fn name(id: i64, group: bool) -> Option<CString> {
     let mut buffer = vec![0u8; 16384];
@@ -1037,8 +1017,19 @@ impl Target {
     }
 }
 
+/// What upstream's setup_current_filesystem learns of a file system:
+/// whether it is remote and synthetic (1, 0, or -1 for unknown), whether
+/// it is mounted noatime, and the size of the blocks its files are read in.
+#[derive(Clone, Copy)]
+pub struct Filesystem {
+    pub remote: libc::c_int,
+    pub synthetic: libc::c_int,
+    pub noatime: bool,
+    pub block_size: usize,
+}
+
 #[cfg(target_vendor = "apple")]
-pub fn filesystem(path: &Path, follow: bool) -> std::io::Result<(libc::c_int, libc::c_int)> {
+pub fn filesystem(path: &Path, follow: bool) -> Result<Filesystem, (std::io::Error, &'static str)> {
     let inspect =
         if follow || std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink()) {
             path
@@ -1047,19 +1038,31 @@ pub fn filesystem(path: &Path, follow: bool) -> std::io::Result<(libc::c_int, li
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new("."))
         };
-    let path = path_c(inspect)?;
+    let failed = |e| (e, "statfs failed");
+    let path = path_c(inspect).map_err(failed)?;
     // SAFETY: statfs is a plain C struct with integer and byte-array fields.
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: live pathname and writable statfs destination.
-    result(unsafe { libc::statfs(path.as_ptr(), &mut st) })?;
-    Ok((
-        libc::c_int::from(st.f_flags & libc::MNT_LOCAL as u32 == 0),
-        -1,
-    ))
+    result(unsafe { libc::statfs(path.as_ptr(), &mut st) }).map_err(failed)?;
+    Ok(Filesystem {
+        remote: libc::c_int::from(st.f_flags & libc::MNT_LOCAL as u32 == 0),
+        synthetic: -1,
+        noatime: st.f_flags & libc::MNT_NOATIME as u32 != 0,
+        block_size: 64 * 1024,
+    })
 }
+
 #[cfg(not(target_vendor = "apple"))]
-pub fn filesystem(_path: &Path, _follow: bool) -> std::io::Result<(libc::c_int, libc::c_int)> {
-    Ok((-1, -1))
+pub fn filesystem(
+    _path: &Path,
+    _follow: bool,
+) -> Result<Filesystem, (std::io::Error, &'static str)> {
+    Ok(Filesystem {
+        remote: -1,
+        synthetic: -1,
+        noatime: false,
+        block_size: 64 * 1024,
+    })
 }
 
 pub fn sparse(path: &Path, follow: bool, size: i64) -> std::io::Result<Vec<(i64, i64)>> {

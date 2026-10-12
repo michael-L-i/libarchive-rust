@@ -639,11 +639,14 @@ mod tests {
             let path = PathBuf::from(std::ffi::OsStr::from_bytes(
                 entry.pathname().unwrap().to_bytes(),
             ));
-            let (remote, synthetic) = super::super::disk_sys::filesystem(&path, false).unwrap();
-            assert_eq!(archive_read_disk_current_filesystem_is_remote(disk), remote);
+            let fs = super::super::disk_sys::filesystem(&path, false).unwrap();
+            assert_eq!(
+                archive_read_disk_current_filesystem_is_remote(disk),
+                fs.remote
+            );
             assert_eq!(
                 archive_read_disk_current_filesystem_is_synthetic(disk),
-                synthetic
+                fs.synthetic
             );
             if archive_read_disk_can_descend(disk) != 0 {
                 assert_eq!(archive_read_disk_descend(disk), 0);

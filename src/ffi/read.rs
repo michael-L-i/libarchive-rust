@@ -686,10 +686,8 @@ pub extern "C" fn archive_read_data_block(
     offset: *mut i64,
 ) -> c_int {
     if let Some(ret) = with(a, None, |h| match &h.kind {
-        Kind::ReadDisk(d) => Some({
-            let mut d = d.borrow_mut();
-            let block = d.data_block(&h.base);
-            if let Ok((data, o)) = &block {
+        Kind::ReadDisk(d) => Some(match d.borrow_mut().data_block(&h.base) {
+            Ok((code, data, o)) => {
                 put(
                     buff,
                     if data.is_empty() {
@@ -699,9 +697,10 @@ pub extern "C" fn archive_read_data_block(
                     },
                 );
                 put(size, data.len());
-                put(offset, *o);
+                put(offset, o);
+                code
             }
-            crate::api::read_disk::block_code(&block)
+            Err(code) => code,
         }),
         _ => None,
     }) {
