@@ -32,6 +32,14 @@ pub(crate) const MEMCMPLEN_EXTRA: u32 = 8;
 pub(crate) const HASH_2_SIZE: usize = 1 << 10;
 pub(crate) const HASH_3_SIZE: usize = 1 << 16;
 
+/// A repeat proven by the match finder; see `Mf::run`.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Run {
+    pub(crate) delta: u32,
+    pub(crate) start: u32,
+    pub(crate) len: u32,
+}
+
 /// The encoder's view of `lzma_action`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -95,6 +103,9 @@ pub(crate) struct Mf {
     /// Hash indices and chain head loaded ahead for a position:
     /// (position, hash_2_value, hash_3_value, hash_value, head).
     pub(crate) hash4_hint: Option<(u32, usize, usize, usize, u32)>,
+    /// Bytes the BT4 skip proved to repeat: `buffer[p] == buffer[p - delta]`
+    /// for the positions `p` (`read_pos + offset`) in `[start, start + len)`.
+    pub(crate) run: Run,
     pub(crate) cyclic_pos: u32,
     /// Must be dictionary size + 1.
     pub(crate) cyclic_size: u32,
@@ -152,6 +163,7 @@ impl Mf {
             hash: vec![0; hs as usize + 1],
             son: vec![0; cyclic_size as usize * if is_bt { 2 } else { 1 }],
             hash4_hint: None,
+            run: Run::default(),
             cyclic_pos: 0,
             cyclic_size,
             hash_mask: hs,

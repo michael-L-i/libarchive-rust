@@ -102,6 +102,19 @@ instructions retired, not time, judge these).
   14 presets, the sync-flush runs and the preset-dictionary runs are
   byte-identical to liblzma.
 
+- Inside a long repeat, the BT4 skip's first node at consecutive
+  positions is usually at the same distance and matches `nice_len`
+  bytes. When it does, the skip keeps comparing up to the last byte its
+  remaining positions need and records the proven repeat (`Mf::run`).
+  A later position whose first node is at that distance and whose
+  `nice_len` bytes the repeat covers takes the match without comparing,
+  with the tree update liblzma makes after comparing. Window moves keep
+  the record (it uses `read_pos + offset`), normalization clears it,
+  and debug builds check every use. Preset-6 `.xz` instructions on the
+  16 MiB text corpus (one repeated JSON line) 3.885 -> 2.822 G, about
+  64 compared bytes fewer per skipped byte; the source slice
+  6.490 -> 6.512 G and records 11.123 -> 11.126 G.
+
 ## LZMA2 decoder resident dictionary pages
 
 `src/lz/lz_decoder.rs` and `src/lzma2_reader.rs` defer initialization of

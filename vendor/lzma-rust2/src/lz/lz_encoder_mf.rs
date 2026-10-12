@@ -2,7 +2,7 @@
 //! `lz/lz_encoder_hash.h`, `common/memcmplen.h`; Igor Pavlov, Lasse Collin;
 //! 0BSD).
 
-use super::lz_encoder::{Action, HASH_2_SIZE, MEMCMPLEN_EXTRA, Match, Mf, MfType};
+use super::lz_encoder::{Action, HASH_2_SIZE, MEMCMPLEN_EXTRA, Match, Mf, MfType, Run};
 
 const HASH_2_MASK: u32 = HASH_2_SIZE as u32 - 1;
 const HASH_3_MASK: u32 = (1 << 16) - 1;
@@ -230,7 +230,12 @@ fn bt_find_func(
     }
 }
 
-fn bt_skip_func(s: &Search, son: &mut [u32], mut cur_match: u32) {
+/// Like `bt_find_func()` without collecting matches. Inside a long repeat,
+/// the first node of consecutive positions is usually at the same
+/// distance and reaches `len_limit`. When it does, the repeat is measured
+/// up to `run_limit` bytes into `run`, and the next positions it covers
+/// take `len_limit` at that node without comparing bytes.
+fn bt_skip_func(s: &Search, son: &mut [u32], mut cur_match: u32, run: &mut Run, run_limit: u32) {
     let Search {
         len_limit,
         pos,
@@ -244,6 +249,19 @@ fn bt_skip_func(s: &Search, son: &mut [u32], mut cur_match: u32) {
     let mut ptr1 = (cyclic_pos as usize) * 2;
     let mut len0 = 0;
     let mut len1 = 0;
+
+    let delta = pos.wrapping_sub(cur_match);
+    let done = pos.wrapping_sub(run.start);
+    if delta == run.delta && done < run.len && run.len - done >= len_limit && depth != 0 {
+        let pair = cyclic_index(cyclic_pos, delta, cyclic_size) * 2;
+        debug_assert_eq!(
+            buf[cur - delta as usize..][..len_limit as usize],
+            buf[cur..][..len_limit as usize]
+        );
+        son[ptr1] = son[pair];
+        son[ptr0] = son[pair + 1];
+        return;
+    }
 
     loop {
         let delta = pos.wrapping_sub(cur_match);
@@ -261,6 +279,13 @@ fn bt_skip_func(s: &Search, son: &mut [u32], mut cur_match: u32) {
         if buf[pb + len as usize] == buf[cur + len as usize] {
             len = memcmplen(buf, pb, cur, len + 1, len_limit);
             if len == len_limit {
+                if depth + 1 == s.depth {
+                    *run = Run {
+                        delta,
+                        start: pos,
+                        len: memcmplen(buf, pb, cur, len_limit, run_limit),
+                    };
+                }
                 son[ptr1] = son[pair];
                 son[ptr0] = son[pair + 1];
                 return;
@@ -362,6 +387,7 @@ impl Mf {
             }
         }
         self.offset -= subvalue;
+        self.run = Run::default();
     }
 
     /// Marks the current byte as processed from point of view of the match
@@ -601,7 +627,7 @@ impl Mf {
         let (count, mut len_best, cur_match) = self.hash4_find(len_limit, matches);
         if count != 0 && len_best == len_limit {
             let s = search!(self, len_limit);
-            bt_skip_func(&s, &mut self.son, cur_match);
+            bt_skip_func(&s, &mut self.son, cur_match, &mut self.run, len_limit);
             self.move_pos();
             return count;
         }
@@ -617,9 +643,12 @@ impl Mf {
     fn bt4_skip(&mut self, mut amount: u32) {
         loop {
             if let Some(len_limit) = self.header(true, 4) {
+                // Proving the repeat for the remaining positions of this
+                // skip is enough.
+                let run_limit = (len_limit + amount - 1).min(self.avail());
                 let cur_match = self.hash4_skip();
                 let s = search!(self, len_limit);
-                bt_skip_func(&s, &mut self.son, cur_match);
+                bt_skip_func(&s, &mut self.son, cur_match, &mut self.run, run_limit);
                 self.move_pos();
             }
             amount -= 1;
