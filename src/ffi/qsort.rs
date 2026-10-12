@@ -12,13 +12,13 @@ struct Element<'a, T, F> {
 }
 
 extern "C" fn compare<T: Copy, F: Fn(T, T) -> i32>(a: *const c_void, b: *const c_void) -> c_int {
-    // SAFETY: qsort only passes aligned pointers to initialized elements of
-    // the array supplied below. It has exclusive access to the array and
-    // moves whole elements; the referenced comparator and flag stay live.
+    // SAFETY: qsort passes pointers to initialized elements or scratch
+    // copies. Scratch need not retain T's alignment, so read unaligned.
+    // All fields are Copy and their referents remain live throughout.
     let (a, b) = unsafe {
         (
-            &*a.cast::<Element<'_, T, F>>(),
-            &*b.cast::<Element<'_, T, F>>(),
+            std::ptr::read_unaligned(a.cast::<Element<'_, T, F>>()),
+            std::ptr::read_unaligned(b.cast::<Element<'_, T, F>>()),
         )
     };
     if a.panicked.get() {
@@ -95,6 +95,21 @@ mod tests {
             .is_ok()
         );
         assert_eq!(values, [1, 2, 3]);
+    }
+
+    #[test]
+    fn over_aligned_elements_can_be_compared_from_libc_scratch() {
+        #[repr(align(64))]
+        #[derive(Clone, Copy)]
+        struct Aligned(i32);
+        let mut values = (0..100).rev().map(Aligned).collect::<Vec<_>>();
+        assert!(qsort(&mut values, |a, b| a.0 - b.0).is_ok());
+        assert!(
+            values
+                .iter()
+                .enumerate()
+                .all(|(i, value)| value.0 == i as i32)
+        );
     }
 
     #[test]
