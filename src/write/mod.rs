@@ -465,9 +465,9 @@ impl Write {
                 r = r.min(a.raise(e));
             }
         }
-        if a.state.get() != state::FATAL {
-            a.state.set(state::CLOSED);
-        }
+        // Upstream calls the format's finish_entry and close directly, so
+        // their failures leave the state alone and the archive ends closed.
+        a.state.set(state::CLOSED);
         r
     }
     /// `archive_set_format_option`.
@@ -785,6 +785,24 @@ mod tests {
             empty.option(&base, None, b"x", None, true, false),
             ARCHIVE_FAILED
         );
+    }
+
+    #[test]
+    fn a_failed_format_close_still_closes() {
+        let base = Base::new(WRITE_MAGIC);
+        let mut writer = Write::default();
+        writer.set_format(&base, Box::new(format::iso9660::Iso9660::default()));
+        assert_eq!(
+            writer.option(&base, None, b"boot", Some(b"missing"), true, true),
+            ARCHIVE_OK
+        );
+        let out = Rc::new(RefCell::new(Vec::new()));
+        assert_eq!(writer.open(&base, Box::new(Collect(out))), ARCHIVE_OK);
+        assert_eq!(writer.header(&base, &mut file(1)), ARCHIVE_OK);
+        assert_eq!(writer.data(&base, b"x"), 1);
+        assert_eq!(writer.close(&base), ARCHIVE_FATAL);
+        assert_eq!(base.state.get(), state::CLOSED);
+        assert_eq!(writer.close(&base), ARCHIVE_OK);
     }
 
     #[test]
