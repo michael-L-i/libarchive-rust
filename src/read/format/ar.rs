@@ -244,6 +244,7 @@ impl Ar {
                 let _ = r.consume(*unconsumed);
                 *unconsumed = 0;
             }
+            r.budget.check_metadata(strtab_size)?;
             let Some(mut table) = r
                 .read_ahead(strtab_size)?
                 .and_then(|data| data.get(..strtab_size))
@@ -295,6 +296,7 @@ impl Ar {
                 let _ = r.consume(*unconsumed);
                 *unconsumed = 0;
             }
+            r.budget.check_metadata(len)?;
             let bytes = match r.read_ahead(len) {
                 Ok(Some(data)) => c_str(data.get(..len).unwrap_or_default()).to_vec(),
                 _ => return Err(Error::fatal(ARCHIVE_ERRNO_MISC, "Truncated input file")),

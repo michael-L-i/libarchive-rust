@@ -77,6 +77,111 @@ fn zip(data: &[u8], symlink: bool, descriptor: bool) -> Vec<u8> {
     out
 }
 
+fn named_zip(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for &(name, data) in entries {
+        let offset = out.len() as u32;
+        let packed = miniz_oxide::deflate::compress_to_vec(data, 6);
+        let crc = crc32fast::hash(data);
+        out.extend(0x04034b50u32.to_le_bytes());
+        for n in [20u16, 0, 8, 0, 0] {
+            out.extend(n.to_le_bytes());
+        }
+        for n in [crc, packed.len() as u32, data.len() as u32] {
+            out.extend(n.to_le_bytes());
+        }
+        out.extend((name.len() as u16).to_le_bytes());
+        out.extend(0u16.to_le_bytes());
+        out.extend(name);
+        out.extend(packed);
+        central.extend(0x02014b50u32.to_le_bytes());
+        for n in [0x314u16, 20, 0, 8, 0, 0] {
+            central.extend(n.to_le_bytes());
+        }
+        for n in [
+            crc,
+            (out.len() as u32 - offset - 30 - name.len() as u32),
+            data.len() as u32,
+        ] {
+            central.extend(n.to_le_bytes());
+        }
+        for n in [name.len() as u16, 0, 0, 0, 0] {
+            central.extend(n.to_le_bytes());
+        }
+        central.extend((0o100644u32 << 16).to_le_bytes());
+        central.extend(offset.to_le_bytes());
+        central.extend(name);
+    }
+    let directory = out.len() as u32;
+    let directory_size = central.len() as u32;
+    out.extend(central);
+    out.extend(0x06054b50u32.to_le_bytes());
+    for n in [0u16, 0, entries.len() as u16, entries.len() as u16] {
+        out.extend(n.to_le_bytes());
+    }
+    out.extend(directory_size.to_le_bytes());
+    out.extend(directory.to_le_bytes());
+    out.extend(0u16.to_le_bytes());
+    out
+}
+
+#[test]
+fn limits_zip_hidden_mac_metadata_obeys_decoder_and_metadata_budgets() {
+    let input = named_zip(&[(b"a", b""), (b"__MACOSX/._a", &[b'm'; 8192])]);
+    assert!(input.len() < 512);
+    let mut normal = reader(ReadLimits::default());
+    assert_eq!(normal.set_options(b"zip:mac-ext"), Status::Ok);
+    assert_eq!(normal.open_memory(input.clone()), Status::Ok);
+    assert_eq!(normal.next_header(), Status::Ok);
+    assert_eq!(normal.next_header(), Status::Eof);
+    for (limits, category) in [
+        (
+            ReadLimits {
+                decoded_bytes: Some(2048),
+                ..ReadLimits::default()
+            },
+            "decoded bytes",
+        ),
+        (
+            ReadLimits {
+                metadata_bytes: Some(2048),
+                ..ReadLimits::default()
+            },
+            "metadata bytes",
+        ),
+        (
+            ReadLimits {
+                entries: Some(1),
+                ..ReadLimits::default()
+            },
+            "entries",
+        ),
+    ] {
+        let mut a = reader(limits);
+        assert_eq!(a.set_options(b"zip:mac-ext"), Status::Ok);
+        assert_eq!(a.open_memory(input.clone()), Status::Ok);
+        assert_eq!(a.next_header(), Status::Fatal);
+        assert_limit(&a, category);
+        assert_eq!(a.close(), Status::Ok);
+    }
+}
+
+#[test]
+fn limits_zip_metadata_includes_eager_entry_structures() {
+    let input = named_zip(&[(b"a".as_slice(), b"".as_slice()); 20]);
+    assert!(input.len() < 2048);
+    let mut a = reader(ReadLimits {
+        metadata_bytes: Some(2048),
+        ..ReadLimits::default()
+    });
+    assert_eq!(a.set_options(b"zip:!mac-ext"), Status::Ok);
+    assert_eq!(a.open_memory(input), Status::Ok);
+    assert_eq!(a.next_header(), Status::Fatal);
+    assert_limit(&a, "metadata bytes");
+    assert_eq!(a.close(), Status::Ok);
+}
+
 #[test]
 fn limits_zip_compressed_symlinks_fail_during_header_read() {
     let input = zip(&[b't'; 4096], true, false);
@@ -252,6 +357,56 @@ fn limits_xar_toc_and_eager_entries_obey_budgets() {
     }
 }
 
+#[test]
+fn limits_xar_attributes_check_metadata_before_decoding_values() {
+    let value = [b'v'; 8192];
+    let packed = miniz_oxide::deflate::compress_to_vec_zlib(&value, 6);
+    let xml = format!(
+        "<xar><toc><file id=\"1\"><name>a</name><type>file</type>\
+        <ea id=\"0\"><name>user.value</name><offset>0</offset><length>{}</length>\
+        <size>{}</size><encoding style=\"application/x-gzip\"/></ea>\
+        </file></toc></xar>",
+        packed.len(),
+        value.len()
+    );
+    let mut input = xar(xml.as_bytes());
+    input.extend(packed);
+    let mut normal = reader(ReadLimits::default());
+    assert_eq!(normal.open_memory(input.clone()), Status::Ok);
+    assert_eq!(normal.next_header(), Status::Ok);
+    let mut a = reader(ReadLimits {
+        metadata_bytes: Some(2048),
+        decoded_bytes: Some(4096),
+        ..ReadLimits::default()
+    });
+    assert_eq!(a.open_memory(input), Status::Ok);
+    assert_eq!(a.next_header(), Status::Fatal);
+    // Checking the retained size rejects before the value decoder runs.
+    assert_limit(&a, "metadata bytes");
+    assert_eq!(a.close(), Status::Ok);
+}
+
+#[test]
+fn limits_ar_declared_name_table_checks_metadata_before_read_ahead() {
+    let mut input = b"!<arch>\n".to_vec();
+    input.extend(
+        format!(
+            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            "//", 0, 0, 0, "100644", 8192
+        )
+        .as_bytes(),
+    );
+    // There is no table body: the declaration must fail the budget first.
+    let mut a = reader(ReadLimits {
+        metadata_bytes: Some(1024),
+        ..ReadLimits::default()
+    });
+    assert_eq!(a.open_memory(input), Status::Ok);
+    assert_eq!(a.next_header(), Status::Fatal);
+    assert_limit(&a, "metadata bytes");
+    assert_eq!(a.close(), Status::Ok);
+}
+
 fn tar_entry(name: &[u8], kind: u8, body: &[u8]) -> Vec<u8> {
     let mut out = vec![0; 512];
     out[..name.len()].copy_from_slice(name);
@@ -319,13 +474,30 @@ fn limits_tar_special_headers_check_metadata_before_allocating_body() {
 
 #[test]
 fn limits_options_validate_numbers_and_unlimited() {
-    for value in [b"-1".as_slice(), b"+1", b"1x", b"18446744073709551616"] {
+    for value in [
+        b"".as_slice(),
+        b"-1",
+        b"+1",
+        b" 1",
+        b"1x",
+        b"18446744073709551616",
+    ] {
         let mut a = reader(ReadLimits::default());
         let option = [b"limits:decoded-bytes=".as_slice(), value].concat();
         assert_eq!(a.set_options(&option), Status::Failed, "{value:?}");
         assert_eq!(a.errno(), libc::EINVAL);
     }
     let mut a = reader(ReadLimits::default());
+    assert_eq!(
+        a.set_options(b"limits:decoded-bytes=18446744073709551615,limits:entries=000"),
+        Status::Ok
+    );
+    // The separate-argument option API preserves upstream's empty-as-missing rule.
+    assert_eq!(
+        a.set_option(Some(b"limits"), Some(b"entries"), Some(b"")),
+        Status::Ok
+    );
+    assert_eq!(a.set_options(b"limits:!decoded-bytes"), Status::Ok);
     assert_eq!(
         a.set_options(b"limits:decoded-bytes=0,limits:entries=0,limits:metadata-bytes=0"),
         Status::Ok

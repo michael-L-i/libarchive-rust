@@ -1092,6 +1092,7 @@ impl Iso9660 {
         let lbs = self.lbs();
         let step = usize::try_from(psize.div_ceil(lbs) * lbs).unwrap_or(usize::MAX);
         let budget = r.budget;
+        budget.check_metadata(step)?;
         let Some(b) = r.read_ahead(step)? else {
             return Err(no_full_block());
         };

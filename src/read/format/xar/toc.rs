@@ -572,6 +572,9 @@ impl Toc {
             .iter()
             .position(|x| id < x.id)
             .unwrap_or(file.xattrs.len());
+        file.xattrs
+            .try_reserve(1)
+            .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for XAR attributes"))?;
         file.xattrs.insert(
             pos,
             Xattr {
@@ -701,7 +704,12 @@ impl Toc {
                 }
                 self.file_new(attrs)?;
             }
-            FileEa => self.xattr_new(attrs)?,
+            FileEa => {
+                if let Some(budget) = budget {
+                    budget.metadata(std::mem::size_of::<Xattr>())?;
+                }
+                self.xattr_new(attrs)?;
+            }
             FileType => self.type_links(attrs)?,
             FileName => {
                 self.base64text = attrs

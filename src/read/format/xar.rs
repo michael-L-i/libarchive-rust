@@ -711,6 +711,7 @@ impl Format for Xar {
                     "XAR attribute exceeds size limit",
                 ));
             }
+            r.metadata(xattr.size)?;
             let mut value = Vec::new();
             let mut remaining = xattr.length;
             while remaining != 0 || self.contents.has_pending() {
