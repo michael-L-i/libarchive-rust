@@ -622,6 +622,13 @@ impl SevenZip {
         }
 
         self.num_files = self.parse_size(r)?;
+        r.check_entries(self.num_files).map_err(|_| Fail::Bad)?;
+        r.metadata(
+            self.num_files
+                .checked_mul(std::mem::size_of::<ZEntry>())
+                .ok_or(Fail::NoMem)?,
+        )
+        .map_err(|_| Fail::Bad)?;
         if !self.files_info_numfiles_is_sane() {
             return Err(Fail::Bad);
         }

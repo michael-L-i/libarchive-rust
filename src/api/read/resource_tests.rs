@@ -125,6 +125,133 @@ fn limits_zip_unknown_size_skips_cannot_bypass_decoder_budget() {
     assert_eq!(r.close(&a), ARCHIVE_OK);
 }
 
+fn sevenzip(entries: usize, name_padding: usize) -> Vec<u8> {
+    use crate::{AE_IFREG, ArchiveEntry, ArchiveWrite};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "limits-7zip-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let mut writer = ArchiveWrite::new();
+    assert_eq!(writer.set_format_7zip(), Status::Ok);
+    assert_eq!(writer.set_options(b"compression=deflate"), Status::Ok);
+    assert_eq!(writer.set_bytes_per_block(0), Status::Ok);
+    assert_eq!(writer.open_fd(file), Status::Ok);
+    for i in 0..entries {
+        let mut name = format!("entry{i}-").into_bytes();
+        name.extend(std::iter::repeat_n(b'n', name_padding));
+        let mut entry = ArchiveEntry::new();
+        entry.set_pathname(Some(&name));
+        entry.set_mode(AE_IFREG | 0o644);
+        entry.set_size(0);
+        assert_eq!(writer.header(&mut entry), Status::Ok);
+    }
+    assert_eq!(writer.close(), Status::Ok);
+    drop(writer);
+    let out = std::fs::read(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    out
+}
+
+#[test]
+fn limits_sevenzip_encoded_headers_obey_output_budget() {
+    let input = sevenzip(20, 512);
+    assert!(input.len() < 4096);
+    let mut normal = reader(ReadLimits::default());
+    assert_eq!(normal.open_memory(input.clone()), Status::Ok);
+    assert_eq!(normal.next_header(), Status::Ok);
+    let mut a = reader(ReadLimits {
+        decoded_bytes: Some(4096),
+        ..ReadLimits::default()
+    });
+    let opened = a.open_memory(input);
+    assert!(opened == Status::Fatal || a.next_header() == Status::Fatal);
+    assert_limit(&a, "decoded bytes");
+    assert_eq!(a.close(), Status::Ok);
+}
+
+#[test]
+fn limits_sevenzip_entries_fail_before_eager_allocation() {
+    let input = sevenzip(3, 0);
+    let mut a = reader(ReadLimits {
+        entries: Some(2),
+        ..ReadLimits::default()
+    });
+    assert_eq!(a.open_memory(input), Status::Ok);
+    assert_eq!(a.next_header(), Status::Fatal);
+    assert_limit(&a, "entries");
+    assert_eq!(a.close(), Status::Ok);
+}
+
+fn xar(xml: &[u8]) -> Vec<u8> {
+    let packed = miniz_oxide::deflate::compress_to_vec_zlib(xml, 6);
+    let mut input = b"xar!".to_vec();
+    input.extend(28u16.to_be_bytes());
+    input.extend(1u16.to_be_bytes());
+    input.extend((packed.len() as u64).to_be_bytes());
+    input.extend((xml.len() as u64).to_be_bytes());
+    input.extend(0u32.to_be_bytes());
+    input.extend(packed);
+    input
+}
+
+#[test]
+fn limits_xar_toc_and_eager_entries_obey_budgets() {
+    let mut xml = b"<xar><toc>".to_vec();
+    for i in 0..3 {
+        xml.extend(
+            format!("<file id=\"{i}\"><name>f{i}</name><type>file</type></file>").as_bytes(),
+        );
+    }
+    xml.extend(b"</toc></xar>");
+    let input = xar(&xml);
+    let mut normal = reader(ReadLimits::default());
+    assert_eq!(normal.open_memory(input.clone()), Status::Ok);
+    assert_eq!(normal.next_header(), Status::Ok);
+    let mut a = reader(ReadLimits {
+        entries: Some(2),
+        ..ReadLimits::default()
+    });
+    assert_eq!(a.open_memory(input), Status::Ok);
+    assert_eq!(a.next_header(), Status::Fatal);
+    assert_limit(&a, "entries");
+    let mut xml = b"<xar><toc>".to_vec();
+    xml.extend([b' '; 8192]);
+    xml.extend(b"</toc></xar>");
+    let input = xar(&xml);
+    for limits in [
+        ReadLimits {
+            decoded_bytes: Some(1024),
+            ..ReadLimits::default()
+        },
+        ReadLimits {
+            metadata_bytes: Some(1024),
+            ..ReadLimits::default()
+        },
+    ] {
+        let mut a = reader(limits);
+        assert_eq!(a.open_memory(input.clone()), Status::Ok);
+        assert_eq!(a.next_header(), Status::Fatal);
+        assert_limit(
+            &a,
+            if limits.decoded_bytes.is_some() {
+                "decoded bytes"
+            } else {
+                "metadata bytes"
+            },
+        );
+        assert_eq!(a.close(), Status::Ok);
+    }
+}
+
 #[test]
 fn limits_options_validate_numbers_and_unlimited() {
     for value in [b"-1".as_slice(), b"+1", b"1x", b"18446744073709551616"] {

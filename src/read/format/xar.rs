@@ -172,7 +172,7 @@ enum Codec {
 }
 
 impl Codec {
-    fn new(encoding: Enc, entry_encoding: Enc) -> Codec {
+    fn new(encoding: Enc, entry_encoding: Enc, mem_limit: u32) -> Codec {
         match encoding {
             Enc::None => Codec::None,
             Enc::Gzip => Codec::Gzip {
@@ -183,9 +183,9 @@ impl Codec {
             Enc::Lzma | Enc::Xz => {
                 let xz = entry_encoding == Enc::Xz;
                 let stream = if xz {
-                    Stream::Xz(Box::new(XzStream::new_mem_limit(true, MEM_LIMIT_KIB)))
+                    Stream::Xz(Box::new(XzStream::new_mem_limit(true, mem_limit)))
                 } else {
-                    Stream::Lzma(Box::new(LzmaStream::new_mem_limit(MEM_LIMIT_KIB, None)))
+                    Stream::Lzma(Box::new(LzmaStream::new_mem_limit(mem_limit, None)))
                 };
                 Codec::Xz {
                     stream: Some(stream),
@@ -291,14 +291,26 @@ impl Codec {
     /// Drains what the decoder holds back once all the input is used:
     /// lzma-rust2's streams keep decoded bytes that did not fit the output,
     /// which liblzma does not.
-    fn drain(&mut self, into: &mut Vec<u8>, scratch: &mut Vec<u8>) {
+    fn drain(
+        &mut self,
+        into: &mut Vec<u8>,
+        scratch: &mut Vec<u8>,
+        budget: &crate::read::limits::Budget,
+    ) -> Result<(), Error> {
+        scratch
+            .try_reserve(OUTBUFF_SIZE.saturating_sub(scratch.len()))
+            .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for XAR decoder output"))?;
         scratch.resize(OUTBUFF_SIZE, 0);
         while let Ok((_, produced)) = self.decompress(&[], scratch, true) {
             if produced == 0 {
                 break;
             }
+            budget.decoded(produced)?;
+            into.try_reserve(produced)
+                .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for XAR decoder output"))?;
             into.extend_from_slice(scratch.get(..produced).unwrap_or_default());
         }
+        Ok(())
     }
 }
 
@@ -339,8 +351,13 @@ struct Contents {
 
 impl Contents {
     /// `decompression_init`.
-    fn init(&mut self, encoding: Enc, entry_encoding: Enc) {
-        self.codec = Some(Codec::new(encoding, entry_encoding));
+    fn init(&mut self, encoding: Enc, entry_encoding: Enc, r: &Reader<'_>) {
+        self.codec = Some(Codec::new(
+            encoding,
+            entry_encoding,
+            u32::try_from(r.decoder_memory(u64::from(MEM_LIMIT_KIB) * 1024) / 1024)
+                .unwrap_or(MEM_LIMIT_KIB),
+        ));
         self.pending.clear();
         self.pending_pos = 0;
     }
@@ -389,6 +406,7 @@ impl Contents {
             return Ok((0, data, *pending_pos < pending.len()));
         }
 
+        let budget = r.budget;
         // Get whatever bytes are immediately available.
         let wanted = codec.as_ref().map_or(1, Codec::wanted);
         let b = r.peek_available(wanted)?;
@@ -408,6 +426,9 @@ impl Contents {
         } else {
             codec.decompress(b, out, bytes < wanted)?
         };
+        if !matches!(codec, Codec::None) {
+            budget.decoded(size)?;
+        }
         let data: &'x [u8] = if zero_copy {
             b
         } else {
@@ -426,7 +447,7 @@ impl Contents {
 
         // The decoder may hold output back when its input is all used.
         if used == bytes && size == out.len() {
-            codec.drain(pending, scratch);
+            codec.drain(pending, scratch, budget)?;
         }
         Ok((used, data, *pending_pos < pending.len()))
     }
@@ -461,6 +482,9 @@ impl io::Read for TocSource<'_, '_> {
             let _ = self.r.consume(used);
             *self.remaining -= used as u64;
             *self.offset = self.offset.wrapping_add(used as u64);
+            if let Err(e) = self.r.metadata(size) {
+                return Err(self.fail(e));
+            }
             *self.total += size as u64;
             if *self.total > MAX_TOC_SIZE {
                 let msg = "Rejecting malformed xar archive: TOC exceeds 1 gigabyte";
@@ -676,7 +700,7 @@ impl Format for Xar {
         // Read extended attributes.
         for xattr in &file.xattrs {
             self.move_reading_point(r, xattr.offset)?;
-            self.contents.init(xattr.encoding, self.entry_encoding);
+            self.contents.init(xattr.encoding, self.entry_encoding, r);
             self.sums.init(xattr.a_sum.alg, xattr.e_sum.alg)?;
             // Attribute values are owned by Entry; collect incremental decoder
             // output instead of assuming one client block contains the value.
@@ -744,7 +768,8 @@ impl Format for Xar {
         }
 
         if self.entry_init {
-            self.contents.init(self.entry_encoding, self.entry_encoding);
+            self.contents
+                .init(self.entry_encoding, self.entry_encoding, r);
             let r = self.sums.init(self.entry_a_sum.alg, self.entry_e_sum.alg);
             if let Err(e) = r {
                 self.entry_remaining = 0;
@@ -815,9 +840,10 @@ impl Xar {
         // Read TOC(Table of Contents).
         // Initialize reading contents.
         self.move_reading_point(r, HEADER_SIZE as u64)?;
-        self.contents.init(Enc::Gzip, Enc::None);
+        self.contents.init(Enc::Gzip, Enc::None, r);
         self.sums.init(toc_chksum_alg, CKSUM_NONE)?;
 
+        let budget = r.budget;
         let mut source = TocSource {
             contents: &mut self.contents,
             sums: &mut self.sums,
@@ -827,7 +853,7 @@ impl Xar {
             total: &mut self.toc_total,
             failure: None,
         };
-        let parsed = self.toc.parse(&mut source);
+        let parsed = self.toc.parse(&mut source, Some(budget));
         if let Some(e) = source.failure {
             return Err(e);
         }

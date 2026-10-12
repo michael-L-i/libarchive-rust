@@ -1048,6 +1048,7 @@ impl Lha {
         // decompression layer returns a count of available bytes; asking
         // for more than that forces the decompressor to combine reads by
         // copying data.
+        let budget = r.budget;
         let later = r.consume_later();
         let Some(buff) = ahead(r, 1) else {
             return Err(Error::fatal(
@@ -1087,6 +1088,7 @@ impl Lha {
             return Ok(Data::Block { data: &[], offset });
         }
         let out = self.dec.as_ref().map_or(&[][..], Lzh::output);
+        budget.decoded(out.len())?;
         self.entry_crc_calculated = crc16(self.entry_crc_calculated, out);
         self.entry_offset += out.len() as i64;
         Ok(Data::Block { data: out, offset })

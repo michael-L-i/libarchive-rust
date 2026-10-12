@@ -1309,7 +1309,11 @@ impl Format for Rar {
                     self.start_new_table = true;
                     self.ppmd_valid = false;
                 }
-                Ok(match out? {
+                let out = out?;
+                if let Out::Unpacked { len, .. } | Out::Filtered { len, .. } = out {
+                    r.decoded(len)?;
+                }
+                Ok(match out {
                     Out::Unpacked { len, offset } => Data::Block {
                         data: self.unp_buffer.get(..len).unwrap_or_default(),
                         offset,
@@ -1862,6 +1866,12 @@ impl Rar {
             if new_size == 0 {
                 return Err(failed(a, "Zero window size is invalid"));
             }
+            if u64::from(new_size) > r.decoder_memory(u64::MAX) {
+                return Err(Error::fatal(
+                    libc::ENOMEM,
+                    "RAR window requires too much memory",
+                ));
+            }
             self.window.clear();
             if self.window.try_reserve_exact(new_size as usize).is_err() {
                 return Err(Error::fatal(
@@ -1900,6 +1910,12 @@ impl Rar {
             // reading a broken file causes this abnormal sequence.
             ppmd.model.free();
 
+            if u64::from(self.dictionary_size) > r.decoder_memory(u64::MAX) {
+                return Err(Error::fatal(
+                    libc::ENOMEM,
+                    "PPMd model requires too much memory",
+                ));
+            }
             if !ppmd.model.alloc(self.dictionary_size) {
                 return Err(Error::fatal(libc::ENOMEM, "Out of memory"));
             }

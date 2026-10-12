@@ -115,6 +115,9 @@ impl SevenZip {
             let _ = self.read_consume(r);
         }
 
+        if self.header_is_encoded {
+            r.metadata(n).ok()?;
+        }
         let n_i64 = n as i64;
         if !self.header_is_encoded {
             let p = r.read_ahead(n).ok()??.get(..n)?;
@@ -400,6 +403,7 @@ impl SevenZip {
                 e
             })?;
             self.pack_stream_inbytes_remaining -= bytes_in as i64;
+            r.decoded(bytes_out)?;
             if bytes_out as u64 > self.folder_outbytes_remaining as u64 {
                 bytes_out = self.folder_outbytes_remaining as usize;
             }
@@ -639,7 +643,7 @@ impl SevenZip {
         }
 
         // Initialize the decompressor for the new folder's pack streams.
-        self.init_decompression(&coder1, coder2.as_ref())
+        self.init_decompression(&coder1, coder2.as_ref(), r.decoder_memory(u64::MAX))
             .map_err(|mut e| {
                 e.code = ARCHIVE_FATAL;
                 e
@@ -745,10 +749,11 @@ impl SevenZip {
                 sunpack[i]
             };
 
-            self.init_decompression(&scoder[i], None).map_err(|mut e| {
-                e.code = ARCHIVE_FATAL;
-                e
-            })?;
+            self.init_decompression(&scoder[i], None, r.decoder_memory(u64::MAX))
+                .map_err(|mut e| {
+                    e.code = ARCHIVE_FATAL;
+                    e
+                })?;
 
             // Extract a sub stream. The decoded size is the stream's own,
             // whatever the header claims, so the buffer grows with the data.

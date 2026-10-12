@@ -574,6 +574,7 @@ impl SevenZip {
         &mut self,
         coder1: &Coder,
         coder2: Option<&Coder>,
+        mem_limit: u64,
     ) -> Result<(), Error> {
         self.codec = coder1.codec;
         self.codec2 = -1;
@@ -609,11 +610,11 @@ impl SevenZip {
 
         match self.codec {
             CODEC_COPY => {}
-            CODEC_LZMA | CODEC_LZMA2 => self.init_lzma(coder1, coder2)?,
+            CODEC_LZMA | CODEC_LZMA2 => self.init_lzma(coder1, coder2, mem_limit)?,
             CODEC_BZ2 => self.coders.backend = Backend::Bzip2(Box::new(Bz2Decoder::new()), false),
             CODEC_ZSTD => {
                 let mut decoder = FrameDecoder::new();
-                decoder.set_max_window_size(ZSTD_MAX_WINDOW);
+                decoder.set_max_window_size(mem_limit.min(ZSTD_MAX_WINDOW));
                 self.coders.backend = Backend::Zstd(Box::new(Zstd {
                     decoder,
                     in_frame: false,
@@ -627,7 +628,7 @@ impl SevenZip {
                 self.coders.backend =
                     Backend::Deflate(InflateState::new_boxed(DataFormat::Raw), false);
             }
-            CODEC_PPMD => self.init_ppmd(coder1)?,
+            CODEC_PPMD => self.init_ppmd(coder1, mem_limit)?,
             CODEC_X86 | CODEC_X86_BCJ2 | CODEC_POWERPC | CODEC_IA64 | CODEC_ARM
             | CODEC_ARMTHUMB | CODEC_ARM64 | CODEC_RISCV | CODEC_SPARC | CODEC_DELTA => {
                 return Err(failed(format!("Unexpected codec ID: {:X}", self.codec)));
@@ -666,7 +667,12 @@ impl SevenZip {
         Ok(())
     }
 
-    fn init_lzma(&mut self, coder1: &Coder, coder2: Option<&Coder>) -> Result<(), Error> {
+    fn init_lzma(
+        &mut self,
+        coder1: &Coder,
+        coder2: Option<&Coder>,
+        mem_limit: u64,
+    ) -> Result<(), Error> {
         self.coders.backend = Backend::None;
 
         // NOTE: liblzma incompletely handle the BCJ+LZMA compressed data
@@ -713,7 +719,7 @@ impl SevenZip {
             } else {
                 (2 | u32::from(b & 1)) << (b / 2 + 11)
             };
-            if dict_size > MAX_DECODER_MEMORY {
+            if u64::from(dict_size) > mem_limit.min(u64::from(MAX_DECODER_MEMORY)) {
                 return Err(failed("Decompression failed (5)"));
             }
             // No valid match can refer farther back than this stream's output.
@@ -729,7 +735,7 @@ impl SevenZip {
                 return Err(lzma_options_error());
             }
             let dict_size = u32::from_le_bytes([d0, d1, d2, d3]);
-            if dict_size > MAX_DECODER_MEMORY {
+            if u64::from(dict_size) > mem_limit.min(u64::from(MAX_DECODER_MEMORY)) {
                 return Err(failed("Decompression failed (5)"));
             }
             // The size of the stream is known; a stream with no end marker
@@ -746,7 +752,7 @@ impl SevenZip {
         Ok(())
     }
 
-    fn init_ppmd(&mut self, coder1: &Coder) -> Result<(), Error> {
+    fn init_ppmd(&mut self, coder1: &Coder, mem_limit: u64) -> Result<(), Error> {
         let c = &mut self.coders;
         if c.ppmd_valid {
             c.ppmd.free();
@@ -764,7 +770,7 @@ impl SevenZip {
         {
             return Err(malformed());
         }
-        if msize > MAX_DECODER_MEMORY {
+        if u64::from(msize) > mem_limit.min(u64::from(MAX_DECODER_MEMORY)) {
             return Err(Error::fatal(
                 libc::ENOMEM,
                 "Coludn't allocate memory for PPMd",
@@ -977,7 +983,9 @@ mod tests {
                 main_stream_bytes_remaining: main_size,
                 ..SevenZip::default()
             };
-            reader.init_lzma(&coder, filter).unwrap();
+            reader
+                .init_lzma(&coder, filter, u64::from(MAX_DECODER_MEMORY))
+                .unwrap();
             let Backend::Lzma2(stream) = &mut reader.coders.backend else {
                 panic!("missing LZMA2 decoder");
             };
@@ -995,7 +1003,9 @@ mod tests {
             folder_outbytes_remaining: 1,
             ..SevenZip::default()
         };
-        reader.init_lzma(&coder, None).unwrap();
+        reader
+            .init_lzma(&coder, None, u64::from(MAX_DECODER_MEMORY))
+            .unwrap();
         let Backend::Lzma2(stream) = &mut reader.coders.backend else {
             panic!("missing LZMA2 decoder");
         };
@@ -1023,9 +1033,9 @@ mod tests {
                 ..Coder::default()
             };
             let error = if codec == CODEC_PPMD {
-                reader.init_ppmd(&coder)
+                reader.init_ppmd(&coder, u64::from(MAX_DECODER_MEMORY))
             } else {
-                reader.init_lzma(&coder, None)
+                reader.init_lzma(&coder, None, u64::from(MAX_DECODER_MEMORY))
             }
             .unwrap_err();
             if codec == CODEC_PPMD {

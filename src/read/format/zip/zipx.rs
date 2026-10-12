@@ -240,7 +240,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
             return Err(init_error());
         }
         // The dictionary and the decoder's tables have to fit the limit.
-        if u64::from(dict_size) + 32 * 1024 > LZMA_MEMLIMIT {
+        if u64::from(dict_size) + 32 * 1024 > r.decoder_memory(LZMA_MEMLIMIT) {
             return Err(Error::fatal(
                 libc::ENOMEM,
                 "lzma stream requires too much memory",
@@ -373,6 +373,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
         self.crypto.finish(to_consume, comp);
         r.consume(to_consume)?;
         self.entry_compressed_bytes_read += to_consume as i64;
+        r.decoded(step.produced)?;
         self.entry_uncompressed_bytes_read += step.produced as i64;
 
         if self.zipx.lzma_drain {
@@ -422,9 +423,13 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
         Ok(Out::Buf(step.produced))
     }
 
-    fn xz_init(&mut self) -> Result<(), Error> {
+    fn xz_init(&mut self, r: &Reader<'_>) -> Result<(), Error> {
         self.zipx.lzma = None;
-        self.zipx.xz = Some(XzStream::new_mem_limit(false, XZ_MEM_LIMIT_KIB));
+        self.zipx.xz = Some(XzStream::new_mem_limit(
+            false,
+            u32::try_from(r.decoder_memory(u64::from(XZ_MEM_LIMIT_KIB) * 1024) / 1024)
+                .unwrap_or(XZ_MEM_LIMIT_KIB),
+        ));
         self.zipx.lz_allow_buf_error = false;
         self.alloc_buffer(BUFFER_SIZE, "No memory for xz decompression")?;
         self.decompress_init = true;
@@ -434,7 +439,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
     pub(super) fn read_zipx_xz(&mut self, r: &mut Reader<'_>) -> Result<Out, Error> {
         // Initialize decompressor if not yet initialized.
         if !self.decompress_init {
-            self.xz_init()?;
+            self.xz_init(r)?;
         }
 
         let truncated = || Error::fatal(ARCHIVE_ERRNO_FILE_FORMAT, "Truncated xz file body");
@@ -480,6 +485,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
         r.consume(to_consume)?;
         self.entry_bytes_remaining -= to_consume as i64;
         self.entry_compressed_bytes_read += to_consume as i64;
+        r.decoded(step.produced)?;
         self.entry_uncompressed_bytes_read += step.produced as i64;
 
         if self.end_of_entry
@@ -533,6 +539,12 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
             ));
         }
 
+        if u64::from(mem << 20) > r.decoder_memory(u64::MAX) {
+            return Err(Error::fatal(
+                libc::ENOMEM,
+                "PPMd8 stream requires too much memory",
+            ));
+        }
         // Allocate the memory needed to properly decompress the file.
         if !self.zipx.ppmd8.alloc(mem << 20) {
             return Err(Error::fatal(
@@ -627,6 +639,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
         // Update pointers so we can continue decompression in another call.
         self.entry_bytes_remaining -= z.ppmd_read_compressed;
         self.entry_compressed_bytes_read += z.ppmd_read_compressed;
+        r.decoded(consumed_bytes)?;
         self.entry_uncompressed_bytes_read += consumed_bytes as i64;
 
         // If we're at the end of stream, deinitialize Ppmd8 context.
@@ -699,6 +712,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
 
         self.entry_bytes_remaining -= to_consume as i64;
         self.entry_compressed_bytes_read += to_consume as i64;
+        r.decoded(progress.produced)?;
         self.entry_uncompressed_bytes_read += progress.produced as i64;
 
         if self.end_of_entry
@@ -717,7 +731,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
         // time.
         if !self.decompress_init {
             let mut decoder = FrameDecoder::new();
-            decoder.set_max_window_size(ZSTD_MAX_WINDOW);
+            decoder.set_max_window_size(r.decoder_memory(ZSTD_MAX_WINDOW));
             self.zipx.zstd = Some(Zstd {
                 decoder,
                 in_frame: false,
@@ -819,6 +833,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
             z.zstd = None;
         }
 
+        r.decoded(produced)?;
         self.entry_uncompressed_bytes_read += produced as i64;
 
         if self.end_of_entry

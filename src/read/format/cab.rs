@@ -797,10 +797,15 @@ impl Cab {
             0
         };
         let bytes = stride * usize::from(hd.folder_count);
+        let budget = r.budget;
         let Some(p) = ahead(r, bytes) else {
             return Err(truncated_error());
         };
-        let mut folders = Vec::with_capacity(usize::from(hd.folder_count));
+        budget.metadata(usize::from(hd.folder_count) * std::mem::size_of::<Cffolder>())?;
+        let mut folders = Vec::new();
+        folders
+            .try_reserve_exact(usize::from(hd.folder_count))
+            .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for CAB folders"))?;
         let mut offset32 = 0;
         for q in p.chunks_exact(stride).take(usize::from(hd.folder_count)) {
             let comptype = le16(q, 6);
@@ -843,7 +848,12 @@ impl Cab {
             self.cab_offset += skip;
         }
 
-        let mut files = Vec::with_capacity(usize::from(hd.file_count));
+        r.check_entries(hd.file_count)?;
+        r.metadata(usize::from(hd.file_count) * std::mem::size_of::<Cffile>())?;
+        let mut files = Vec::new();
+        files
+            .try_reserve_exact(usize::from(hd.file_count))
+            .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for CAB entries"))?;
         let mut prev_folder: i32 = -1;
         for i in 0..usize::from(hd.file_count) {
             let Some(p) = ahead(r, 16) else {
@@ -1312,6 +1322,7 @@ impl Cab {
             self.dict_len = size;
         }
 
+        r.decoded(uavail)?;
         self.cfdata()?.uncompressed_avail = uavail;
         self.buffered_cfdata()
     }
@@ -1388,6 +1399,7 @@ impl Cab {
             lzx.translation(buffer, offset);
         }
 
+        r.decoded(uavail)?;
         self.cfdata()?.uncompressed_avail = uavail;
         self.buffered_cfdata()
     }
