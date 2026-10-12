@@ -34,6 +34,10 @@ struct ZisofsExtract {
     block_pointers_avail: usize,
     block_off: usize,
     block_avail: u32,
+    block_active: bool,
+    block_hole: bool,
+    block_remaining: usize,
+    output_remaining: u64,
 
     stream: Option<Box<InflateState>>,
 }
@@ -509,7 +513,10 @@ impl Iso9660 {
         }
 
         // Get block offsets from block pointers.
-        if zisofs.block_avail == 0 {
+        if !zisofs.block_active {
+            if zisofs.output_remaining == 0 {
+                return Ok(bytes);
+            }
             if zisofs.block_off + 4 >= zisofs.block_pointers_size {
                 // There isn't a pair of offsets.
                 return Err(illegal("Illegal zisofs block pointers"));
@@ -524,6 +531,11 @@ impl Iso9660 {
             }
             zisofs.block_avail = bed - bst;
             zisofs.block_off += 4;
+            zisofs.block_active = true;
+            zisofs.block_hole = bed == bst;
+            zisofs.block_remaining = zisofs
+                .uncompressed_buffer_size
+                .min(zisofs.output_remaining as usize);
 
             // Initialize compression library for new block.
             match &mut zisofs.stream {
@@ -533,16 +545,19 @@ impl Iso9660 {
         }
 
         // Make uncompressed data.
-        if zisofs.block_avail == 0 {
+        if zisofs.block_hole {
             // It's basically 32K bytes NUL data.
-            let mut size = zisofs.uncompressed_buffer_size;
+            let mut size = zisofs.block_remaining;
             while size > 0 {
                 let wb = self.wb_buffptr();
                 let wsize = size.min(self.wbuff_remaining);
                 self.wbuff[wb..wb + wsize].fill(0);
                 self.wb_consume(out, wsize)?;
                 size -= wsize;
+                zisofs.output_remaining -= wsize as u64;
             }
+            zisofs.block_remaining = 0;
+            zisofs.block_active = false;
         } else {
             let n = avail.min(zisofs.block_avail as usize);
             let stream = zisofs
@@ -553,7 +568,10 @@ impl Iso9660 {
             let res = inflate(
                 stream,
                 &p[start..start + n],
-                &mut self.wbuff[wb..],
+                &mut self.wbuff[wb..wb
+                    + self
+                        .wbuff_remaining
+                        .min(zisofs.block_remaining.saturating_add(1))],
                 MZFlush::None,
             );
             let failed = |code: i32| misc(format!("zisofs decompression failed ({code})"));
@@ -566,15 +584,26 @@ impl Iso9660 {
             }
             avail -= res.bytes_consumed;
             zisofs.block_avail -= res.bytes_consumed as u32;
+            if res.bytes_written > zisofs.block_remaining {
+                return Err(illegal("Illegal zisofs block size"));
+            }
             self.wb_consume(out, res.bytes_written)?;
+            zisofs.block_remaining -= res.bytes_written;
+            zisofs.output_remaining -= res.bytes_written as u64;
+            if res.status == Ok(MZStatus::StreamEnd) {
+                if zisofs.block_avail != 0 || zisofs.block_remaining != 0 {
+                    return Err(illegal("Illegal zisofs block size"));
+                }
+                zisofs.block_active = false;
+            }
         }
-        zisofs.pz_offset = zisofs.pz_offset.wrapping_add(bytes as u32);
-        Ok(bytes - avail)
+        let consumed = bytes - avail;
+        zisofs.pz_offset = zisofs.pz_offset.wrapping_add(consumed as u32);
+        Ok(consumed)
     }
 
     /// zisofs_rewind_boot_file(): uncompress a zisofs'ed boot image to the
-    /// end of the temporary file. Like upstream, each read of the file
-    /// goes to zisofs_extract() once, which drops what it leaves unused.
+    /// end of the temporary file, feeding every byte and every hole.
     pub(super) fn zisofs_rewind_boot_file(&mut self, out: &mut dyn Sink) -> Result<(), Error> {
         let boot = self
             .el_torito
@@ -593,6 +622,7 @@ impl Iso9660 {
         let mut zext = ZisofsExtract {
             pz_uncompressed_size: u64::from(header.uncompressed_size),
             pz_log2_bs: header.log2_bs,
+            output_remaining: u64::from(header.uncompressed_size),
             ..ZisofsExtract::default()
         };
 
@@ -634,12 +664,32 @@ impl Iso9660 {
             // Put the file pointer back to write.
             temp_seek(&mut self.temp, write_offset);
 
-            if let Err(e) = self.zisofs_extract(out, &mut zext, &rbuff[..rs]) {
-                ret = Err(e);
+            let mut at = 0;
+            while at < rs || (remaining == 0 && (zext.output_remaining > 0 || zext.block_active)) {
+                let before = (zext.block_off, zext.output_remaining, zext.block_active);
+                let consumed = match self.zisofs_extract(out, &mut zext, &rbuff[at..rs]) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        ret = Err(e);
+                        break;
+                    }
+                };
+                at += consumed;
+                if consumed == 0
+                    && before == (zext.block_off, zext.output_remaining, zext.block_active)
+                {
+                    ret = Err(illegal("Truncated zisofs boot image"));
+                    break;
+                }
+            }
+            if ret.is_err() {
                 break;
             }
         }
 
+        if ret.is_ok() && (zext.output_remaining != 0 || zext.block_active) {
+            ret = Err(illegal("Truncated zisofs boot image"));
+        }
         if ret.is_ok() {
             // Change the boot file content from zisofs'ed data to plain
             // data.
