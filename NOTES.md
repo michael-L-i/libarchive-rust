@@ -1796,8 +1796,8 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   unlinking and automatic-directory behavior. A cached uname query gates this
   path conservatively; old/unknown kernels and other targets keep the walker.
   The query adds two documented unsafe blocks in the OS FFI layer; directory
-  opening uses safe std APIs. Searchable but unreadable intermediate ancestors
-  are now accepted, matching C; the final parent still requires read permission.
+  opening uses safe std APIs. Parents are opened with O_SEARCH, so like
+  upstream's paths they need only search permission, the last one included.
   Actual Opus 5.5 design/final review, primary kernel sources, filesystem
   differential checks and rotating six-format measurements are retained in
   `../diagnostics/round9-system`.
@@ -1824,6 +1824,17 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   kept, by path: its chmod follows a symlink there (without SECURE_SYMLINKS,
   which removes one). Here the kept file's metadata is left alone. Data writes
   to it fail with "Attempt to write to an empty file" as upstream's do.
+- Kept: where upstream restores a non-directory's metadata by path, its
+  chmod() follows a symlink in the entry's place, e.g. for a hardlink entry
+  with data whose target is a symlink; here the mode goes on the link itself,
+  as all its other calls do. A directory's extended attributes, Mac metadata
+  and ACLs are set by the entry's own pathname, so a trailing slash makes them
+  follow a symlink to a directory in its place (`d/` over `d -> ../outside`);
+  here they go on the link itself.
+- Kept: an AppleDouble entry `._name` that is a symlink with data (cpio keeps
+  the target as data) is opened by upstream through the link, to merge
+  whatever it points to; here it isn't followed, so the merge fails with
+  "Failed to open a restoring file" and ELOOP rather than the target's errno.
 - Disk writes keep each parent directory open and create/open/link children
   relative to its descriptor. `SECURE_SYMLINKS` opens every ancestor with
   `O_NOFOLLOW`; replacing an ancestor after the check cannot redirect a write.
@@ -1833,7 +1844,12 @@ can't start with a digit): `mod.rs` (entries, `read_data`), `parse.rs`
   upstream, a new directory's times and mode, any directory's ACLs and Mac
   metadata, and immutable or append-only flags wait for close, which applies
   them deepest path first to what still has the entry's type; data-less
-  hardlinks leave the target's metadata alone. Kept: upstream's close-time
+  hardlinks leave the target's metadata alone. Like upstream, the waiting
+  entries hold names, not descriptors. Close walks the parents again as the
+  entry was made and opens the entry with O_NOFOLLOW. Kept, stricter than
+  upstream: under SECURE_SYMLINKS a parent swapped for a symlink before close
+  is not followed, and an entry that is no longer the file (device and inode)
+  finish_entry saw is skipped, where upstream fixes up whatever has its name. Kept: upstream's close-time
   flags fixup starts from the flags of the last entry's path (its stat cache
   is filled from `a->name`), and skips the fixup if that path is gone; here
   each file's own flags are used. "Can't set UID=%jd" carries whatever errno
