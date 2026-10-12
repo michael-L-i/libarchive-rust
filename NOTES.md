@@ -570,7 +570,9 @@ Differences:
   damaged block therefore delivers no partial bytes, where libbz2 can
   deliver some. The pinned `test_read_format_mtree_crash747.mtree.bz2`
   fixture errors in both libraries, but upstream delivers 131072 bytes and
-  this port delivers none. Legacy randomized bzip2 blocks are rejected by
+  this port delivers none, so format detection fails differently: bsdtar
+  reports "Unrecognized archive format" upstream and "bzip decompression
+  failed" here. Legacy randomized bzip2 blocks are rejected by
   the safe backend. Valid ordinary and concatenated bzip2 fixtures match.
 - `archive_libzstd_version` reports `ruzstd <version>`. ruzstd has no libzstd
   version, so this is not a libzstd number.
