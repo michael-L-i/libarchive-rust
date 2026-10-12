@@ -213,13 +213,6 @@ impl WriteDisk {
             && let Ok(existing) = target.stat()
         {
             let directory = existing.st_mode & libc::S_IFMT == libc::S_IFDIR;
-            if self.skip_file == Some((existing.st_dev as i64, existing.st_ino as i64)) {
-                return a.raise(Error::new(
-                    ARCHIVE_FAILED,
-                    libc::EPERM,
-                    "Refusing to overwrite archive",
-                ));
-            }
             if self.options & NO_OVERWRITE != 0
                 || (self.options & NO_OVERWRITE_NEWER != 0
                     && !directory
@@ -227,6 +220,12 @@ impl WriteDisk {
                         >= (entry.mtime(), entry.mtime_nsec()))
             {
                 self.skipped = true;
+            } else if self.skip_file == Some((existing.st_dev as i64, existing.st_ino as i64)) {
+                return a.raise(Error::new(
+                    ARCHIVE_FAILED,
+                    libc::EIO,
+                    "Refusing to overwrite archive",
+                ));
             } else if !(directory && entry.filetype() == libc::S_IFDIR)
                 && !(safe_write && !directory)
                 && let Err(e) = target.remove(directory)
@@ -994,6 +993,35 @@ mod tests {
                 let metadata = std::fs::metadata(output.path()).unwrap();
                 assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
             }
+        }
+    }
+
+    #[test]
+    fn archive_is_kept_unless_overwriting_is_off() {
+        use std::os::unix::fs::MetadataExt;
+        for options in [0, NO_OVERWRITE] {
+            let output = Output::new();
+            std::fs::write(output.path(), b"archive").unwrap();
+            let metadata = std::fs::metadata(output.path()).unwrap();
+            let base = Base::new(WRITE_DISK_MAGIC);
+            let mut disk = WriteDisk::default();
+            disk.options = options;
+            disk.skip_file = Some((metadata.dev() as i64, metadata.ino() as i64));
+            let mut entry = Entry::new(None);
+            entry.set_pathname(output.path().as_os_str().as_bytes());
+            entry.set_mode(libc::S_IFREG | 0o644);
+            entry.set_size(0);
+            let expected = if options == 0 {
+                ARCHIVE_FAILED
+            } else {
+                ARCHIVE_OK
+            };
+            assert_eq!(disk.header(&base, &entry), expected);
+            if options == 0 {
+                assert_eq!(base.errno.get(), libc::EIO);
+            }
+            assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+            assert_eq!(std::fs::read(output.path()).unwrap(), b"archive");
         }
     }
 
