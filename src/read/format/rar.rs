@@ -482,6 +482,14 @@ impl Rar {
     fn read_header(
         &mut self,
         r: &mut Reader<'_>,
+        entry: Option<&mut Entry>,
+    ) -> Result<Status, Error> {
+        r.with_metadata(|r| self.read_header_inner(r, entry))
+    }
+
+    fn read_header_inner(
+        &mut self,
+        r: &mut Reader<'_>,
         mut entry: Option<&mut Entry>,
     ) -> Result<Status, Error> {
         let a = r.base();

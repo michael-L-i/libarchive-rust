@@ -1402,10 +1402,13 @@ impl Rar5 {
     /// skip the <magic> block, <MAIN> block, and then we're standing on the
     /// proper <FILE> block.
     fn process_base_block(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Res<Step> {
-        const SMALLEST_RAR5_BLOCK_SIZE: usize = 3;
-
-        // Skip any unprocessed data for this file.
+        // Skip any unprocessed data for this file before accounting its header.
         self.skip_unprocessed_bytes(r)?;
+        r.with_metadata(|r| self.process_base_block_inner(r, entry))
+    }
+
+    fn process_base_block_inner(&mut self, r: &mut Reader<'_>, entry: &mut Entry) -> Res<Step> {
+        const SMALLEST_RAR5_BLOCK_SIZE: usize = 3;
 
         // Read the expected CRC32 checksum.
         let hdr_crc = read_u32(r).ok_or(Stop::Eof)?;

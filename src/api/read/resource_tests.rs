@@ -252,6 +252,71 @@ fn limits_xar_toc_and_eager_entries_obey_budgets() {
     }
 }
 
+fn tar_entry(name: &[u8], kind: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![0; 512];
+    out[..name.len()].copy_from_slice(name);
+    out[100..108].copy_from_slice(b"0000644\0");
+    out[108..116].copy_from_slice(b"0000000\0");
+    out[116..124].copy_from_slice(b"0000000\0");
+    out[124..136].copy_from_slice(format!("{:011o}\0", body.len()).as_bytes());
+    out[136..148].copy_from_slice(b"00000000000\0");
+    out[148..156].fill(b' ');
+    out[156] = kind;
+    let sum: usize = out.iter().map(|&b| usize::from(b)).sum();
+    out[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    out.extend(body);
+    out.resize(out.len().div_ceil(512) * 512, 0);
+    out
+}
+
+#[test]
+fn limits_tar_auto_skips_preserve_budget_across_entry_resets() {
+    use crate::archive::{ARCHIVE_FATAL, ARCHIVE_OK, Base, READ_MAGIC};
+    use crate::entry::Entry;
+    use crate::read_open_memory::Memory;
+    let mut input = tar_entry(b"a", b'0', &[0; 512]);
+    input.extend(tar_entry(b"b", b'0', &[0; 512]));
+    input.extend([0; 1024]);
+    let mut r = read::Read::default();
+    let a = Base::new(READ_MAGIC);
+    assert_eq!(
+        crate::read::format::tar::support(&mut r).unwrap(),
+        read::Status::Ok
+    );
+    assert_eq!(
+        r.set_limits(
+            &a,
+            ReadLimits {
+                decoded_bytes: Some(1536),
+                ..ReadLimits::default()
+            }
+        ),
+        ARCHIVE_OK
+    );
+    assert_eq!(r.open(&a, Box::new(Memory::new(input, 512))), ARCHIVE_OK);
+    let mut entry = Entry::new(None);
+    assert_eq!(r.next_header2(&a, &mut entry), ARCHIVE_OK);
+    assert_eq!(r.next_header2(&a, &mut entry), ARCHIVE_OK);
+    assert_eq!(r.next_header2(&a, &mut entry), ARCHIVE_FATAL);
+    assert_eq!(a.errno.get(), libc::EFBIG);
+    assert_eq!(r.close(&a), ARCHIVE_OK);
+}
+
+#[test]
+fn limits_tar_special_headers_check_metadata_before_allocating_body() {
+    let mut input = tar_entry(b"long-name", b'L', &[b'p'; 8192]);
+    input.extend(tar_entry(b"a", b'0', b""));
+    input.extend([0; 1024]);
+    let mut a = reader(ReadLimits {
+        metadata_bytes: Some(1024),
+        ..ReadLimits::default()
+    });
+    assert_eq!(a.open_memory(input), Status::Ok);
+    assert_eq!(a.next_header(), Status::Fatal);
+    assert_limit(&a, "metadata bytes");
+    assert_eq!(a.close(), Status::Ok);
+}
+
 #[test]
 fn limits_options_validate_numbers_and_unlimited() {
     for value in [b"-1".as_slice(), b"+1", b"1x", b"18446744073709551616"] {
@@ -306,6 +371,46 @@ fn limits_filter_depth_counts_nested_and_explicit_filters() {
     assert_eq!(a.append_filter(read::filter_code::GZIP), Status::Fatal);
     assert_limit(&a, "filter depth");
     assert_eq!(a.close(), Status::Ok);
+}
+
+#[test]
+fn limits_decoder_memory_cannot_change_after_filters_are_initialized() {
+    for filter in [read::filter_code::XZ, read::filter_code::ZSTD] {
+        let limits = ReadLimits {
+            decoder_memory: Some(4096),
+            ..ReadLimits::default()
+        };
+        let mut a = reader(limits);
+        assert_eq!(a.append_filter(filter), Status::Ok);
+        assert_eq!(
+            a.set_limits(ReadLimits {
+                decoder_memory: Some(8192),
+                ..limits
+            }),
+            Status::Failed
+        );
+        assert_eq!(a.errno(), libc::EINVAL);
+        assert!(error(&a).contains("before appending filters"));
+        assert_eq!(
+            a.set_options(b"limits:decoder-memory=unlimited"),
+            Status::Failed
+        );
+        assert_eq!(
+            a.set_limits(ReadLimits {
+                entries: Some(2),
+                ..limits
+            }),
+            Status::Ok
+        );
+        assert_eq!(
+            a.set_limits(ReadLimits {
+                filter_depth: Some(0),
+                ..limits
+            }),
+            Status::Failed
+        );
+        assert_eq!(a.close(), Status::Ok);
+    }
 }
 
 #[test]

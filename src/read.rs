@@ -969,6 +969,14 @@ impl<'a> Reader<'a> {
         self.budget.metadata(n)
     }
 
+    /// Includes headers read internally while seeking or changing volumes.
+    pub(crate) fn with_metadata<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let metadata = std::mem::replace(&mut self.metadata, true);
+        let result = f(self);
+        self.metadata = metadata;
+        result
+    }
+
     /// The configured per-decoder memory cap, bounded by the existing hard cap.
     pub(crate) fn decoder_memory(&self, hard_cap: u64) -> u64 {
         self.budget
@@ -1041,6 +1049,7 @@ impl<'a> Reader<'a> {
     /// (empty at the end of input). Check the length before indexing it:
     /// `peek_available(512)?[..512]` panics on a short archive.
     pub fn peek_available(&mut self, min: usize) -> Result<&[u8], Error> {
+        self.budget.check()?;
         self.flush()?;
         let Some((top, mut up)) = self.split() else {
             return Ok(&[]);
@@ -1091,6 +1100,7 @@ impl<'a> Reader<'a> {
 
     /// `consume` without the flush.
     fn consume_now(&mut self, n: impl TryInto<i64>) -> Result<(), Error> {
+        self.budget.check()?;
         let a = self.a;
         let request = match n.try_into() {
             Ok(n) if n >= 0 => n,
@@ -1304,6 +1314,13 @@ impl Read {
             .iter()
             .filter(|s| matches!(s.imp, Imp::Filter(_)))
             .count();
+        if depth != 0 && limits.decoder_memory != self.budget.limits.decoder_memory {
+            return a.raise(Error::new(
+                ARCHIVE_FAILED,
+                libc::EINVAL,
+                "Decoder memory limit must be configured before appending filters",
+            ));
+        }
         if limits.filter_depth.is_some_and(|max| depth > max) {
             return a.raise(Error::new(
                 ARCHIVE_FAILED,
@@ -2269,9 +2286,18 @@ impl Read {
             r2 = a.raise(e);
         }
         if matches!(r2, ARCHIVE_OK | ARCHIVE_WARN) && self.budget.limits.metadata_bytes.is_some() {
-            let size = entry.resource_metadata_size();
-            if let Err(e) = self.budget.metadata(size.unwrap_or(u64::MAX)) {
-                r2 = a.raise(e);
+            match entry.resource_metadata_size() {
+                Some(size) => {
+                    if let Err(e) = self.budget.metadata(size) {
+                        r2 = a.raise(e);
+                    }
+                }
+                None => {
+                    r2 = a.raise(Error::fatal(
+                        libc::EOVERFLOW,
+                        "Archive metadata size overflow",
+                    ))
+                }
             }
         }
         if let Err(e) = self.budget.check() {

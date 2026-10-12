@@ -617,11 +617,19 @@ impl ArchiveRead {
     pub fn data_block(&mut self) -> (Status, &[u8], i64) {
         let block = &mut self.block;
         block.clear();
+        let a = &self.a.h.base;
         let r = self
             .a
             .h
             .read_data_block(Some(&mut self.entry.0), |d| match d {
                 Data::Block { data, offset } => {
+                    if block.try_reserve_exact(data.len()).is_err() {
+                        a.state.set(state::FATAL);
+                        return (
+                            a.raise(Error::fatal(libc::ENOMEM, "No memory for archive data")),
+                            offset,
+                        );
+                    }
                     block.extend_from_slice(data);
                     (ARCHIVE_OK, offset)
                 }
