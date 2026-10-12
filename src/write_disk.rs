@@ -501,7 +501,7 @@ impl WriteDisk {
                 ret = ARCHIVE_WARN;
             }
         }
-        if !permissions_created && (entry.filetype() != libc::S_IFLNK || options & PERM != 0) {
+        if !permissions_created {
             let mut mode = if options & PERM != 0 {
                 entry.mode() as u32 & 0o7777
             } else {
@@ -517,13 +517,17 @@ impl WriteDisk {
                     mode &= !0o2000;
                 }
             }
-            if let Err(e) = target.chmod(mode) {
-                let _ = a
-                    .warn(
-                        e.raw_os_error().unwrap_or(libc::EPERM),
-                        "Can't restore permissions",
-                    )
-                    .code();
+            // A symlink's mode is set with lchmod, whose lack is no error.
+            if let Err(e) = target.chmod(mode)
+                && !(entry.filetype() == libc::S_IFLNK
+                    && e.raw_os_error().is_some_and(|errno| {
+                        [libc::ENOTSUP, libc::ENOSYS, libc::EOPNOTSUPP].contains(&errno)
+                    }))
+            {
+                let _ = a.warn(
+                    e.raw_os_error().unwrap_or(libc::EPERM),
+                    format!("Can't set permissions to 0{mode:o}"),
+                );
                 ret = ARCHIVE_WARN;
             }
         }
@@ -734,6 +738,28 @@ mod tests {
             let metadata = std::fs::symlink_metadata(output.path()).unwrap();
             assert!(metadata.is_file());
             assert_eq!(std::fs::read(output.path()).unwrap(), b"x");
+        }
+    }
+
+    #[test]
+    fn symlink_mode_is_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let output = Output::new();
+        let base = Base::new(WRITE_DISK_MAGIC);
+        let mut disk = WriteDisk::default();
+        let mut entry = Entry::new(None);
+        entry.set_pathname(output.path().as_os_str().as_bytes());
+        entry.set_mode(libc::S_IFLNK | 0o640);
+        entry.set_symlink(b"target");
+        assert_eq!(disk.header(&base, &entry), ARCHIVE_OK);
+        assert_eq!(disk.finish_entry(&base), ARCHIVE_OK);
+        let mode = std::fs::symlink_metadata(output.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        // Linux has no symlink modes; its lchmod fails with EOPNOTSUPP.
+        if cfg!(target_vendor = "apple") {
+            assert_eq!(mode & 0o777, 0o640 & !crate::ffi::disk_sys::umask());
         }
     }
 
