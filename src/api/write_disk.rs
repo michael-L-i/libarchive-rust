@@ -70,8 +70,10 @@ impl Handle {
 
 /// `archive_write_disk_new`.
 pub(crate) fn new() -> Handle {
+    let base = Base::new(WRITE_DISK_MAGIC);
+    base.state.set(crate::archive::state::HEADER);
     Handle {
-        base: Base::new(WRITE_DISK_MAGIC),
+        base,
         kind: Kind::WriteDisk(RefCell::new(WriteDisk::default())),
     }
 }
@@ -161,6 +163,18 @@ mod tests {
     use std::cell::Cell;
     use std::os::unix::ffi::OsStrExt;
     use std::rc::Rc;
+
+    #[test]
+    fn header_and_finish_entry_check_the_state() {
+        let mut disk = ArchiveWriteDisk::new();
+        let mut entry = ArchiveEntry::new();
+        // No pathname: the header fails, so the handle stays in the header
+        // state and writing data is a programming error.
+        assert_eq!(disk.header(&mut entry), Status::Failed);
+        assert_eq!(disk.data(b"x"), Err(Status::Fatal));
+        assert_eq!(disk.finish_entry(), Status::Fatal);
+        assert_eq!(disk.header(&mut entry), Status::Fatal);
+    }
 
     #[test]
     fn extract2_writes_an_entry_and_reports_progress() {

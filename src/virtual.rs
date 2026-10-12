@@ -158,7 +158,17 @@ impl Handle {
             Kind::Write(w) => w
                 .try_borrow_mut()
                 .map_or(ARCHIVE_FATAL, |mut w| w.header(&self.base, entry)),
-            Kind::WriteDisk(w) => w.borrow_mut().header(&self.base, entry),
+            Kind::WriteDisk(w) => {
+                let func = "archive_write_disk_header";
+                if self
+                    .base
+                    .check_magic(WRITE_DISK_MAGIC, state::HEADER | state::DATA, func)
+                    < 0
+                {
+                    return ARCHIVE_FATAL;
+                }
+                w.borrow_mut().header(&self.base, entry)
+            }
         }
     }
 
@@ -166,7 +176,17 @@ impl Handle {
         match &self.kind {
             Kind::Read(_) | Kind::ReadDisk(_) | Kind::Match(_) => ARCHIVE_FATAL,
             Kind::Write(w) => w.borrow_mut().finish_entry(&self.base),
-            Kind::WriteDisk(w) => w.borrow_mut().finish_entry(&self.base),
+            Kind::WriteDisk(w) => {
+                let func = "archive_write_finish_entry";
+                if self
+                    .base
+                    .check_magic(WRITE_DISK_MAGIC, state::HEADER | state::DATA, func)
+                    < 0
+                {
+                    return ARCHIVE_FATAL;
+                }
+                w.borrow_mut().finish_entry(&self.base)
+            }
         }
     }
 
