@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Relink pinned upstream bsdtar objects against the C shared library.
+
+Build the oracle first. This produces one unchanged C client and a small
+symbol-provider probe; neither is rebuilt when selecting the Rust library.
+"""
+import argparse
+import os
+from pathlib import Path
+import platform
+import shlex
+import subprocess
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--oracle-build', type=Path, required=True)
+    parser.add_argument('--out', type=Path, required=True)
+    args = parser.parse_args()
+    oracle = args.oracle_build.resolve()
+    out = args.out.resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    directory = oracle / 'tar'
+    command = shlex.split((directory / 'CMakeFiles/bsdtar.dir/link.txt').read_text())
+    first_object = next(i for i, word in enumerate(command) if word.endswith('.o'))
+    objects = [str((directory / word).resolve()) for word in command if word.endswith('.o')]
+    name = 'libarchive.13.dylib' if platform.system() == 'Darwin' else 'libarchive.so.13'
+    library = oracle / 'libarchive' / name
+    if not library.is_file():
+        parser.error(f'shared C library not found: {library}')
+    # Only libarchive and the C runtime are direct dependencies of this client.
+    # Compression libraries remain transitive dependencies of the C library.
+    flags = [str(library), f'-Wl,-rpath,{library.parent}']
+    subprocess.run([*command[:first_object], *objects, *flags,
+                    '-o', str(out / 'bsdtar-shared')], check=True)
+    # The standalone headers belong to this checkout, independent of the oracle.
+    include = Path(__file__).resolve().parent.parent / 'include'
+    probe_flags = ['-ldl'] if platform.system() == 'Linux' else []
+    subprocess.run([*shlex.split(os.environ.get('CC', command[0])), '-Wall', '-Wextra', '-Werror',
+                    '-I', str(include), str(Path(__file__).with_name('shared-provider.c')),
+                    *flags, *probe_flags, '-o', str(out / 'shared-provider')], check=True)
+
+
+if __name__ == '__main__':
+    main()
