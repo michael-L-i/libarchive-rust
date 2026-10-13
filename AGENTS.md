@@ -1,8 +1,9 @@
 # libarchive-rust
 
-A memory-safe Rust port of [libarchive](https://github.com/libarchive/libarchive)
-that is a drop-in replacement: same C ABI, same headers, same behavior. Existing
-C programs (bsdtar, package managers) link it in place of `libarchive.so`.
+A Rust port of [libarchive](https://github.com/libarchive/libarchive) and its
+command-line tools. It targets the pinned upstream public C ABI and headers.
+Document supported platforms and behavior differences in `NOTES.md`; do not
+claim compatibility beyond validated configurations.
 
 ## Rules
 
@@ -54,13 +55,12 @@ coverage and error behavior in `src/read/limits.rs` and `NOTES.md`.
 
 ## Layout
 
-Target layout; create directories as units land.
+The library, C interface and tools share one Cargo workspace and Git repository.
 
 ```
-upstream/libarchive/  submodule pinned at 8bb3bbd (3.9.0dev). Read-only.
+upstream/libarchive/  pinned C reference for oracle tests; read-only, never shipped.
 include/              archive.h, archive_entry.h copied unchanged from upstream
-src/ffi/              exported archive_* functions; the only unsafe code
-src/ffi/stubs.rs      generated stubs for unported functions (scripts/gen-stubs)
+src/ffi/              archive_* exports and operating-system wrappers
 src/                  one module per upstream file (naming rule below)
 src/api/              the Rust API: typed handles over the C API's behavior
 capi/                 builds libarchive.{so,dylib,a} for C programs, + variadic.c
@@ -186,31 +186,6 @@ per fixture and tags each with the filter it exercises, so a filter agent can fi
 Run the narrowest check that covers the change. Keep harness output terse: pass
 and fail counts plus the first failure.
 
-## Port order
-
-Sizes are code lines (no comments or blanks) at the pin. The library is 103k
-lines; the read side (phases 1–4) is about 67k.
-
-| Phase | Units | Lines |
-|---|---|---|
-| 0 | Harness: oracle build, stubs for the 454 public functions, relinked test binary, runner, ratchet | — |
-| 1 | Core read path: `archive_read`, `archive_entry`, `archive_string` (+ composition table), `archive_acl`, `archive_util`, `archive_rb`, `archive_read_open_*` | 12k |
-| 2 | Read filters: gzip, bzip2, xz, zstd, lz4, compress, uu, lzop, rpm, program | 4k |
-| 3 | Small readers: raw, empty, ar, cpio, warc, mtree | 4k |
-| 4 | Large readers: tar, iso9660, cab, lha, zip, xar, rar, rar5, 7zip (+ `archive_ppmd7`/`8`, digest, cryptor) | 30k |
-| 5 | Writers, `archive_write_disk`, `archive_read_disk`, `archive_match` | 34k |
-
-Each unit comes with its test list: the upstream tests it should turn green,
-by name pattern (`test_read_format_cpio*`). The read side alone can pass 540
-tests; writers, disk and match tests (338) wait for phase 5.
-
-**Checkpoint:** after phase 1, stop for human review of the core internal API
-(read-ahead and consume, entries, errors) before the readers fan out.
-
-The front-ends are ported too (see Front-ends): `tar/`, `cpio/`, `cat/` and
-`unzip/` are Rust programs; upstream's C ones, relinked against our library,
-remain as references in `build/port/c-bin`. Windows-only files come last.
-
 ## Front-ends
 
 Upstream's command-line tools are Rust programs built on the library's Rust
@@ -310,43 +285,14 @@ the `ArchiveMatch` `set_matching` gives it; `matching()` lends it back.
 4. `otool -L` (or `ldd`) on the binary lists only the system libraries
    (libSystem and libiconv on macOS).
 
-## Agents and models
+## Review and parallel work
 
-**Orchestrator: Sonnet 5.5** (`claude-sonnet-5-5`, set in
-`.claude/settings.json`). It picks units, dispatches subagents, runs the
-oracle, merges and updates `STATUS.md`. It does not write large ports itself.
-
-**Subagents: Haiku 5.5** (`claude-haiku-5-5`) by default. Use **Sonnet 5.5**
-when a unit is:
-
-- over ~1,500 lines, or one function group of such a file
-- a decompressor: PPMd, RAR/RAR5 LZSS and filters, LHA, CAB LZX, 7-Zip coders
-- `archive_read`, `archive_string` charset conversion, `src/ffi/`, or the disk
-  readers and writers (path traversal and symlink safety)
-- a Haiku attempt that failed twice on the same oracle failures
-
-Escalate to **Opus 5.5** (`claude-opus-5-5`) when a unit is really stuck:
-Sonnet has failed twice on the same oracle failures, or a divergence from
-upstream persists that no one can explain. Hand Opus the failing tests, what
-was tried, and the evidence so far; drop back to the default model for the
-next unit.
-
-In Claude Code, `porter` and `reviewer` in `.claude/agents/` default to Haiku.
-Pass `model: "sonnet"` or `model: "opus"` on the Agent call to escalate.
-
-Per unit:
-
-1. `porter` ports one unit (one upstream file, or one function group of a large
-   file) until its oracle tests pass, committing incrementally as it goes.
-2. `reviewer`, in a fresh context with only the unit's commit range and the
-   upstream file, checks memory safety, fidelity and concision. Use the
-   porter's model or higher. `STOP` means the porter fixes it in follow-up
-   commits before the unit is merged.
-3. The orchestrator runs the full oracle, merges and updates `STATUS.md`.
-
-Parallel units run in separate git worktrees, one branch per unit, and touch
-different files. Phase 1 is mostly serial; the readers in phases 3–4
-parallelize well.
+Use separate worktrees for concurrent changes with different file ownership.
+Keep performance measurements free of competing builds or test campaigns.
+Before merging a functional change, obtain an independent review of safety,
+fidelity and concision, run the applicable oracle tests, and update `STATUS.md`.
+Resolve blocking review findings before integration. Remove temporary worktrees
+once their changes have been integrated or their experiments archived.
 
 ## Commits
 

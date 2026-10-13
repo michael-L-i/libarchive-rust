@@ -1,6 +1,7 @@
 target/
 /build
-/.claude/worktrees
+/.claude/
+/.codex/
 /bench/work/
 /bench/out/
 __pycache__/
