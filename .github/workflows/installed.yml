@@ -39,6 +39,8 @@ jobs:
       - name: Install consumer build tools (macOS)
         if: runner.os == 'macOS'
         run: brew install pkg-config cmake
+      - name: Build an independent Rust consumer
+        run: scripts/test-rust-consumer
       - name: Stage standalone libraries and tools
         run: scripts/install --prefix '/opt/libarchive install' --destdir "$RUNNER_TEMP/package stage" --libdir '${{ matrix.libdir }}' --profile release
       - name: Exercise relocated packages from C, C++ and the tools
@@ -72,5 +74,6 @@ jobs:
           cd "$RUNNER_TEMP/extracted source"
           cargo build --workspace --release --frozen
           cargo test --workspace --frozen
+          scripts/test-rust-consumer
           scripts/install --prefix /usr --destdir "$RUNNER_TEMP/offline stage" --profile release --target-dir target
           scripts/test-installed --prefix "$RUNNER_TEMP/offline stage/usr" --tools
