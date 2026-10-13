@@ -57,14 +57,14 @@ Thread-option handling is in
 The Zstd implementation can use a bounded worker pipeline, but the accepted
 `threads` value does not change the number of codec workers.
 
-One historical note remains under review: the XZ/LZMA section of `NOTES.md`
-describes acceptance of certain truncated `.lzma` end-marker streams through
-zero padding. The current
+The historical `.lzma` zero-padding acceptance note has been corrected.
+The current
 [`LzmaStream` implementation](../vendor/lzma-rust2/src/lzma_reader.rs)
-tracks padding use and explicitly rejects an EOF finish that consumes
-synthetic padding. That check alone does not reproduce every historical
-fixture or establish parity with liblzma. This audit does not classify the
-historical acceptance claim as a confirmed current bug.
+tracks padding use and rejects an EOF finish that consumes synthetic padding.
+The upstream truncation regression test passes, and focused one-to-seven-byte
+cuts from a 17 KiB binary stream were rejected by both implementations.
+These checks resolve the old claim that the decoder cannot detect padding;
+they do not establish identical behavior for every malformed LZMA stream.
 
 ## Deliberate differences and limits
 
