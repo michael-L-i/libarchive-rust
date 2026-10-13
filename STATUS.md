@@ -84,6 +84,24 @@ Remaining stubs (`src/ffi/stubs.rs`): 0
 `unsafe` in `src/` (excluding stubs.rs): 301; in the tools: 40, all in
 `tools/libarchive_fe/src/sys.rs`
 
+## Publication validation (2026-10-13)
+
+The library, C interface and four tools are published as one Cargo workspace.
+Patched codec dependencies now use explicit repository paths, so independent
+Rust consumers work without inheriting workspace patches. Rust 1.95 consumers
+passed gzip, xz and Zstd round trips through local paths, the public Git URL
+and a standalone source release with a fresh Cargo home and networking disabled.
+
+Local publication checks passed: 632 workspace tests (five ignored), strict
+Clippy, formatting, 20 Python tests and all 926 macOS oracle cases with zero
+ratchet regressions. These packaging changes do not alter runtime algorithms.
+Hosted Linux/macOS validation is tracked in the repository's Actions runs;
+configured jobs alone are not evidence of a passing native x86 campaign.
+
+Generated dependency build metadata was removed from the unpublished history;
+[the revision map](docs/history.md) preserves older report provenance. Obsolete
+worktrees and branches were archived outside the repository before removal.
+
 ## Round 15: processing limits, filesystem races and archive properties
 
 Five improvements landed in separate branches and passed fresh independent
