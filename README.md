@@ -2,13 +2,15 @@
 
 A memory-safe Rust port of [libarchive](https://github.com/libarchive/libarchive),
 the archive and compression library behind `bsdtar`, `bsdcpio` and many
-package managers, together with its command-line tools. It is a drop-in
-replacement: the same C ABI and headers, the same behavior, checked against
-upstream's own test suite.
+package managers, together with its command-line tools. It targets the same
+public C ABI and headers, checked against upstream's own test suite. Supported
+platforms and documented behavior differences are described below and in
+`NOTES.md`.
 
 ## Status
 
-- **Library:** all 454 public functions, in Rust. `unsafe` is confined to the C
+- **Library:** all 454 public functions implemented; the C build retains a small
+  variadic formatting shim for `archive_set_error`. `unsafe` is confined to the C
   ABI layer (`src/ffi/`); the rest of the crate denies it.
 - **Upstream tests:** 926 pass on macOS and 969 on Linux against this library
   and its tools, with no failures or baseline regressions. There are 184
@@ -103,7 +105,7 @@ handling untrusted archives still need appropriate process limits.
 | Library (`src/`) and its Rust API (`src/api/`) | Rust |
 | Codecs (`deflate/`, patched crates in `vendor/`) | Rust |
 | Command-line tools (`tools/`) | Rust |
-| C library for C programs (`capi/`) | Rust, plus one 56-line C file: `archive_set_error` takes printf-style varargs, which stable Rust can't define |
+| C library for C programs (`capi/`) | Rust, plus one C file for printf-style `archive_set_error` arguments, retained for the supported Rust 1.95 compiler |
 | Test oracle (`upstream/libarchive`, a submodule) | upstream's C tests, unchanged |
 
 Rust programs, including the tools, link only the Rust crate and contain no
@@ -127,14 +129,19 @@ upstream/       upstream libarchive at the pinned commit (submodule)
 
 ## Build
 
+The minimum supported build compiler is Rust 1.95. End users of installed
+libraries and tools need only the platform runtime libraries. See
+[installation and packaging](docs/install.md) for staged installation,
+`pkg-config` and CMake consumers, and [source releases](docs/releases.md)
+for offline builds. The upstream submodule is required only for oracle tests.
+
 ```sh
-git submodule update --init
 cargo build --release                         # the library and the tools
 cargo build --release -p libarchive-capi      # target/release/libarchive.{a,dylib,so}
 ```
 
 The tools are `target/release/bsdtar` and so on. C programs compile against
-upstream's `archive.h` and `archive_entry.h` (`upstream/libarchive/libarchive/`)
+the pinned `archive.h` and `archive_entry.h` in `include/`
 and link `libarchive` from `target/release`. Rust programs depend on the
 `libarchive-rust` crate; `src/api/mod.rs` documents the API.
 

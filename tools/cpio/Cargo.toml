@@ -2,6 +2,7 @@
 name = "bsdcpio"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license = "BSD-2-Clause"
 description = "bsdcpio: copies files into and out of cpio and other archives (upstream's cpio/)"
 

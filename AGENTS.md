@@ -36,8 +36,7 @@ C programs (bsdtar, package managers) link it in place of `libarchive.so`.
   backend is allowed only when no safe option exists, and is tracked for
   replacement. A new dependency needs one line in the commit body saying why.
   The one C file is `capi/variadic.c`, which formats `archive_set_error`'s
-  varargs and calls into Rust, because stable Rust can't define C variadic
-  functions. Only the C library (`capi/`) compiles it; the Rust crate and
+  varargs and calls into Rust, to support the minimum Rust 1.95 compiler. Only the C library (`capi/`) compiles it; the Rust crate and
   everything built on it contain no C.
 
 ## Processing limits

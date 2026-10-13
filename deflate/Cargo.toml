@@ -2,6 +2,7 @@
 name = "deflate"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license = "Zlib"
 description = "zlib 1.2.12's deflate compressor, ported to safe Rust"
 
