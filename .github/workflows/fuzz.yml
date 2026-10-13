@@ -23,13 +23,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-10-10
-          components: clippy, rustfmt
+          components: clippy
       - name: Check property harness
         run: |
-          cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+          cargo +1.97.1 fmt --manifest-path fuzz/Cargo.toml --all --check
           cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
           cargo test --manifest-path fuzz/Cargo.toml --locked --lib -- --nocapture
       - name: Install and build fuzz targets
