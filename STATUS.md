@@ -2,6 +2,14 @@
 
 Date 2026-10-12. Upstream pin `8bb3bbdc`. Runs: port and oracle on macOS and Linux.
 
+Standalone staged installation and offline source releases are implemented.
+Rust 1.95 is the tested minimum build compiler; runtime clients need no Rust
+installation. Installed C/C++ shared/static and CMake consumers, relocated
+tools, reproducible source archives and fresh-cache offline builds pass on
+macOS arm64 and Debian 12 arm64 (glibc 2.36). The upstream counts below remain
+unchanged after integration. See [installation validation](docs/install-validation.md)
+for exact checks, source revision and remaining deployment coverage.
+
 **All suites: 926 passed on macOS and 969 on Linux; zero failures, crashes,
 timeouts or platform-ratchet regressions.**
 
