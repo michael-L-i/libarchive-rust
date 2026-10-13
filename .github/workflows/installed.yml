@@ -1,0 +1,64 @@
+name: Installed packages
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  installed:
+    name: Installed consumers (${{ matrix.os }}, Rust ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, '1.95.0']
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            libdir: lib64
+          - os: macos-latest
+            libdir: lib
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+      - name: Install consumer build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config binutils cmake
+      - name: Install consumer build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install pkg-config cmake
+      - name: Stage standalone libraries and tools
+        run: scripts/install --prefix '/opt/libarchive install' --destdir "$RUNNER_TEMP/package stage" --libdir '${{ matrix.libdir }}' --profile release
+      - name: Exercise relocated packages from C, C++ and the tools
+        run: scripts/test-installed --prefix "$RUNNER_TEMP/package stage/opt/libarchive install" --libdir '${{ matrix.libdir }}' --tools
+
+  source-release:
+    name: Reproducible offline source release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install consumer build tools and test locales
+        run: |
+          scripts/setup-linux-tests
+          sudo apt-get install -y pkg-config binutils cmake
+      - name: Produce identical source archives
+        run: |
+          scripts/source-release --output "$RUNNER_TEMP/release1.tar.gz"
+          scripts/source-release --output "$RUNNER_TEMP/release2.tar.gz"
+          cmp "$RUNNER_TEMP/release1.tar.gz" "$RUNNER_TEMP/release2.tar.gz"
+      - name: Build, test and install offline from a fresh Cargo home
+        run: |
+          export CARGO_HOME="$RUNNER_TEMP/offline-cargo-home"
+          export CARGO_NET_OFFLINE=true
+          mkdir -p "$CARGO_HOME" "$RUNNER_TEMP/extracted source"
+          tar -xzf "$RUNNER_TEMP/release1.tar.gz" -C "$RUNNER_TEMP/extracted source" --strip-components=1
+          cd "$RUNNER_TEMP/extracted source"
+          cargo build --workspace --release --frozen
+          cargo test --workspace --frozen
+          scripts/install --prefix /usr --destdir "$RUNNER_TEMP/offline stage" --profile release --target-dir target
+          scripts/test-installed --prefix "$RUNNER_TEMP/offline stage/usr" --tools
