@@ -35,14 +35,14 @@ def relative_directory(value):
 
 def run(command, env):
     print("+ " + shlex.join(command), flush=True)
-    process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True)
     output = []
-    for line in process.stdout:
-        print(line, end="", flush=True)
-        output.append(line)
-    if process.wait():
-        raise RuntimeError(f"command failed: {shlex.join(command)}")
+    with subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True) as process:
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            output.append(line)
+        if process.wait():
+            raise RuntimeError(f"command failed: {shlex.join(command)}")
     return "".join(output)
 
 
