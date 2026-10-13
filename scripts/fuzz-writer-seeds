@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seed bounded writer properties, budget checks and deeper reader coverage.
+"""Seed bounded writer properties, reader budget checks and decoder boundaries.
 
 Usage: scripts/fuzz-writer-seeds [CORPUS_DIR] (default: fuzz/corpus).
 Existing seeds are retained. Files are named by SHA-256 of their contents.
@@ -52,7 +52,13 @@ def main(out):
     archive = output.getvalue()
     seed(out, "all_deep", archive)
     seed(out, "all_deep", gzip.compress(archive, mtime=0))
-    print(f"Seeded {len(WRITERS)} writers, writer_roundtrip, read_limits and all_deep into {out}")
+    # The allowed 256 MiB logical dictionary reservation reaches libFuzzer's
+    # inclusive 256 MiB malloc threshold, despite lazy resident initialization.
+    # Retain this short rejected stream so campaigns exercise the boundary.
+    lzip_boundary = b"LZIP\x01\x1c\x00\x00\xffIP\x01\x0c\x12\x00"
+    for target in ("filter_lzip", "all", "all_deep"):
+        seed(out, target, lzip_boundary)
+    print(f"Seeded {len(WRITERS)} writers, reader budgets and decoder boundary into {out}")
 
 
 if __name__ == "__main__":

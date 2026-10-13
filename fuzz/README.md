@@ -35,10 +35,18 @@ scripts/fuzz-writer-seeds
 cargo test --manifest-path fuzz/Cargo.toml --lib
 cd fuzz
 cargo +nightly fuzz build
-cargo +nightly fuzz run writer_roundtrip -- -max_total_time=60 -timeout=10 -rss_limit_mb=1024 -malloc_limit_mb=256
-cargo +nightly fuzz run read_limits -- -max_total_time=60 -timeout=10 -rss_limit_mb=1024 -malloc_limit_mb=256
-cargo +nightly fuzz run all_deep -- -max_total_time=60 -timeout=10 -rss_limit_mb=1024 -malloc_limit_mb=256
+cargo +nightly fuzz run writer_roundtrip -- -max_total_time=60 -timeout=10 -rss_limit_mb=1024 -malloc_limit_mb=257
+cargo +nightly fuzz run read_limits -- -max_total_time=60 -timeout=10 -rss_limit_mb=1024 -malloc_limit_mb=257
+cargo +nightly fuzz run all_deep -- -max_total_time=60 -timeout=10 -rss_limit_mb=1024 -malloc_limit_mb=257
 ```
+
+The reader decoder allowance is 256 MiB. libFuzzer stops allocations at
+its `malloc_limit_mb` threshold, so use 257 MiB to permit that boundary
+while retaining the independent RSS and timeout controls. The logical LZMA
+dictionary can reserve the full allowance before a short input is rejected;
+its untouched pages need not become resident. A 15-byte lzip input found
+this threshold mismatch during an extended campaign and is included in the
+deterministic seeds. The original guard failure is retained as evidence.
 
 Corpora and failure artifacts are ignored by Git. The deterministic writer
 seeds cover empty and binary members, each tar variant, small chunks and
