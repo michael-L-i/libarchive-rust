@@ -10,6 +10,14 @@ macOS arm64 and Debian 12 arm64 (glibc 2.36). The upstream counts below remain
 unchanged after integration. See [installation validation](docs/install-validation.md)
 for exact checks, source revision and remaining deployment coverage.
 
+Additional adoption validation exercised unchanged Linux applications and
+pacman transactions on native ARM64 and translated x86_64, extended all 39
+fuzz targets, and measured the installed shared library through one C client.
+The 96-case native macOS benchmark has 49 Rust wins, 45 ties and two losses,
+with geometric mean Rust/C elapsed time 0.910324. Native x86 validation remains
+outstanding; emulated development failures and a dependency-related skip are
+recorded in [adoption validation](docs/adoption-validation.md).
+
 **All suites: 926 passed on macOS and 969 on Linux; zero failures, crashes,
 timeouts or platform-ratchet regressions.**
 
