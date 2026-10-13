@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""Build and stage the C library, development files and optional Rust tools."""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+ABI = "13"
+VERSION = "3.9.0dev"
+LIBRARY_VERSION = "13.9.0"
+TOOLS = ("bsdtar", "bsdcpio", "bsdcat", "bsdunzip")
+
+
+def relative_directory(value):
+    path = Path(value)
+    if path.is_absolute() or not path.parts or ".." in path.parts:
+        raise argparse.ArgumentTypeError("must be a relative directory without '..'")
+    if any(character in value for character in '\n\r;"\\$'):
+        raise argparse.ArgumentTypeError("unsupported character in directory")
+    return path
+
+
+def run(command, env):
+    print("+ " + shlex.join(command), flush=True)
+    process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True)
+    output = []
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        output.append(line)
+    if process.wait():
+        raise RuntimeError(f"command failed: {shlex.join(command)}")
+    return "".join(output)
+
+
+def checksum(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def license_notices():
+    cargo = os.environ.get("CARGO", "cargo")
+    packages = json.loads(subprocess.check_output(
+        [cargo, "metadata", "--locked", "--format-version", "1"], cwd=ROOT, text=True
+    ))["packages"]
+    notices = []
+    for package in sorted(packages, key=lambda item: (item["name"], item["version"])):
+        directory = Path(package["manifest_path"]).parent
+        for path in sorted(directory.iterdir()):
+            if path.is_file() and path.name.upper().startswith(("LICENSE", "COPYING", "NOTICE")):
+                notices.append(f"{package['name']} {package['version']}: {path.name}\n\n{path.read_text()}")
+    blocks = {}
+    for directory in ("src", "capi", "tools", "deflate"):
+        for path in sorted((ROOT / directory).rglob("*")):
+            if path.suffix not in (".rs", ".c"):
+                continue
+            for match in re.finditer(r"/\*.*?\*/|(?:^//[^\n]*\n)+", path.read_text(), re.DOTALL | re.MULTILINE):
+                block = match.group()
+                if re.search(r"copyright|redistribution|public domain|permission is hereby granted", block, re.I):
+                    blocks.setdefault(block, []).append(str(path.relative_to(ROOT)))
+    for block, paths in blocks.items():
+        notices.append(", ".join(paths) + "\n\n" + block)
+    return "Third-party and source-module notices\n\n" + "\n\n-----\n\n".join(notices) + "\n"
+
+
+def build(args, target_dir):
+    env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
+    cargo = os.environ.get("CARGO", "cargo")
+    profile = "release" if args.profile == "release" else "dev"
+    output_dir = target_dir / ("release" if profile == "release" else "debug")
+    command = [cargo, "rustc", "--locked", "-p", "libarchive-capi", "--lib",
+               "--profile", profile, "--", "--print=native-static-libs"]
+    output = run(command, env)
+    archive = output_dir / "libarchive.a"
+    report = output_dir / "libarchive-native-libs.json"
+    match = re.search(r"native-static-libs:\s*([^\n]+)", output)
+    if match:
+        native = shlex.split(match.group(1))
+    else:
+        try:
+            cached = json.loads(report.read_text())
+            native = cached["libs"] if cached["sha256"] == checksum(archive) else None
+        except (OSError, ValueError, KeyError):
+            native = None
+        if native is None:
+            # Cargo does not repeat rustc's native-library note for a cached build.
+            # Only discard this package's products, retaining dependency caches.
+            run([cargo, "clean", "-p", "libarchive-capi", "--profile", profile], env)
+            output = run(command, env)
+            match = re.search(r"native-static-libs:\s*([^\n]+)", output)
+            if not match:
+                raise RuntimeError("rustc did not report static library dependencies")
+            native = shlex.split(match.group(1))
+    report.write_text(json.dumps({"sha256": checksum(archive), "libs": native}) + "\n")
+    if not args.without_tools:
+        run([cargo, "build", "--locked", "--profile", profile,
+             *[item for tool in TOOLS for item in ("-p", tool)]], env)
+    return output_dir, native
+
+
+def cmake_quote(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
+
+
+def replace_file(target, mode, *, source=None, text=None):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            if source is not None:
+                with source.open("rb") as original:
+                    shutil.copyfileobj(original, stream)
+            else:
+                stream.write(text.encode("utf-8"))
+        temporary.chmod(mode)
+        temporary.replace(target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def metadata(libdir, shared, native):
+    pc_prefix = Path(os.path.relpath(".", str(libdir / "pkgconfig"))).as_posix()
+    pc = f"""prefix=${{pcfiledir}}/{pc_prefix}
+exec_prefix=${{prefix}}
+libdir=${{prefix}}/{libdir.as_posix()}
+includedir=${{prefix}}/include
+
+Name: libarchive
+Description: Rust implementation of the libarchive C API
+Version: {VERSION}
+Libs: -L${{libdir}} -larchive
+Libs.private: {shlex.join(native)}
+Cflags: -I${{includedir}}
+"""
+    cmake_prefix = Path(os.path.relpath(".", str(libdir / "cmake" / "LibArchive"))).as_posix()
+    cmake = f"""get_filename_component(_LIBARCHIVE_PREFIX "${{CMAKE_CURRENT_LIST_DIR}}/{cmake_prefix}" ABSOLUTE)
+set(LibArchive_VERSION "3.9.0")
+set(LibArchive_INCLUDE_DIRS "${{_LIBARCHIVE_PREFIX}}/include")
+set(LibArchive_LIBRARIES LibArchive::LibArchive)
+if(NOT TARGET LibArchive::LibArchive)
+  add_library(LibArchive::LibArchive SHARED IMPORTED)
+  set_target_properties(LibArchive::LibArchive PROPERTIES
+    IMPORTED_LOCATION "${{_LIBARCHIVE_PREFIX}}/{libdir.as_posix()}/{shared}"
+    INTERFACE_INCLUDE_DIRECTORIES "${{LibArchive_INCLUDE_DIRS}}")
+endif()
+if(NOT TARGET LibArchive::LibArchiveStatic)
+  add_library(LibArchive::LibArchiveStatic STATIC IMPORTED)
+  set_target_properties(LibArchive::LibArchiveStatic PROPERTIES
+    IMPORTED_LOCATION "${{_LIBARCHIVE_PREFIX}}/{libdir.as_posix()}/libarchive.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${{LibArchive_INCLUDE_DIRS}}"
+    INTERFACE_LINK_LIBRARIES {cmake_quote(';'.join(native))})
+endif()
+unset(_LIBARCHIVE_PREFIX)
+"""
+    version = """set(PACKAGE_VERSION "3.9.0")
+if(PACKAGE_FIND_VERSION VERSION_GREATER PACKAGE_VERSION)
+  set(PACKAGE_VERSION_COMPATIBLE FALSE)
+else()
+  set(PACKAGE_VERSION_COMPATIBLE TRUE)
+  if(PACKAGE_FIND_VERSION VERSION_EQUAL PACKAGE_VERSION)
+    set(PACKAGE_VERSION_EXACT TRUE)
+  endif()
+endif()
+"""
+    return pc, cmake, version
+
+
+def stage(args, output, native, system):
+    destination = args.destdir.resolve()
+    prefix = destination / args.prefix.relative_to("/")
+    shared = f"libarchive.{LIBRARY_VERSION}.dylib" if system == "Darwin" else f"libarchive.so.{LIBRARY_VERSION}"
+    abi_name = f"libarchive.{ABI}.dylib" if system == "Darwin" else f"libarchive.so.{ABI}"
+    link_name = "libarchive.dylib" if system == "Darwin" else "libarchive.so"
+    pc, cmake, version = metadata(args.libdir, abi_name, native)
+    files = {
+        args.libdir / shared: output / link_name,
+        args.libdir / "libarchive.a": output / "libarchive.a",
+        Path("include/archive.h"): ROOT / "include/archive.h",
+        Path("include/archive_entry.h"): ROOT / "include/archive_entry.h",
+        Path("share/licenses/libarchive-rust/LICENSE"): ROOT / "LICENSE",
+        Path("share/licenses/libarchive-rust/COPYING"): ROOT / "COPYING",
+    }
+    if not args.without_tools:
+        files.update({Path("bin") / tool: output / tool for tool in TOOLS})
+    texts = {
+        args.libdir / "pkgconfig/libarchive.pc": pc,
+        args.libdir / "cmake/LibArchive/LibArchiveConfig.cmake": cmake,
+        args.libdir / "cmake/LibArchive/LibArchiveConfigVersion.cmake": version,
+        Path("share/licenses/libarchive-rust/NOTICES"): license_notices(),
+    }
+    links = {args.libdir / abi_name: shared, args.libdir / link_name: abi_name}
+    for source in files.values():
+        if not source.is_file():
+            raise RuntimeError(f"missing build or distribution file: {source}")
+    destinations = [prefix / path for path in (*files, *texts, *links)]
+    # Refuse symlink directories and files instead of following them outside staging.
+    for path in destinations:
+        if path.is_dir() and not path.is_symlink():
+            raise RuntimeError(f"destination is a directory: {path}")
+        if path.is_symlink() and path not in [prefix / link for link in links]:
+            raise RuntimeError(f"refusing to overwrite symlink: {path}")
+        for parent in path.parents:
+            if parent == destination:
+                break
+            if parent.is_symlink():
+                raise RuntimeError(f"refusing symlink directory in staging: {parent}")
+    for relative, source in files.items():
+        target = prefix / relative
+        mode = 0o755 if relative.parts[0] == "bin" or relative.name == shared else 0o644
+        replace_file(target, mode, source=source)
+    for relative, content in texts.items():
+        target = prefix / relative
+        replace_file(target, 0o644, text=content)
+    for relative, link in links.items():
+        target = prefix / relative
+        target.unlink(missing_ok=True)
+        target.symlink_to(link)
+    print(f"Staged {len(destinations)} files in {prefix}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--prefix", type=Path, default=Path("/usr/local"))
+    parser.add_argument("--destdir", type=Path, required=True,
+                        help="staging root; this script does not install into the running system")
+    parser.add_argument("--libdir", type=relative_directory, default=Path("lib"))
+    parser.add_argument("--profile", choices=("release", "dev"), default="release")
+    parser.add_argument("--without-tools", action="store_true")
+    parser.add_argument("--target-dir", type=Path, default=ROOT / "build/install-target")
+    args = parser.parse_args()
+    if not args.prefix.is_absolute() or ".." in args.prefix.parts:
+        parser.error("--prefix must be absolute without '..'")
+    if any(character in str(args.prefix) for character in "\n\r"):
+        parser.error("--prefix cannot contain line breaks")
+    system = platform.system()
+    if system not in ("Linux", "Darwin"):
+        parser.error("installation is supported on Linux and macOS")
+    if os.environ.get("CARGO_BUILD_TARGET"):
+        parser.error("cross compilation is not supported by this installer")
+    destination = args.destdir.resolve()
+    if destination == Path("/") or destination == ROOT or destination in ROOT.parents:
+        parser.error("--destdir must be a dedicated staging directory")
+    if args.destdir.is_symlink():
+        parser.error("--destdir cannot be a symlink")
+    target_dir = args.target_dir.resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with (target_dir / ".install.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        output, native = build(args, target_dir)
+        stage(args, output, native, system)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError) as error:
+        print(f"install: {error}", file=sys.stderr)
+        sys.exit(1)
