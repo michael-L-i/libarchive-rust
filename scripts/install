@@ -93,7 +93,7 @@ def build(args, target_dir):
     profile = "release" if args.profile == "release" else "dev"
     output_dir = target_dir / host / ("release" if profile == "release" else "debug")
     command = [cargo, "rustc", "--locked", "-p", "libarchive-capi", "--lib",
-               "--target", host, "--profile", profile, "--", "--print=native-static-libs"]
+               "--target", host, "--profile", profile, "--color=never", "--", "--print=native-static-libs"]
     output = run(command, env)
     archive = output_dir / "libarchive.a"
     report = output_dir / "libarchive-native-libs.json"
@@ -104,6 +104,9 @@ def build(args, target_dir):
         try:
             cached = json.loads(report.read_text())
             native = cached["libs"] if cached["sha256"] == checksum(archive) else None
+            if not isinstance(native, list) or not all(isinstance(flag, str) and
+                    not any(ord(character) < 32 for character in flag) for flag in native):
+                native = None
         except (OSError, ValueError, KeyError):
             native = None
         if native is None:

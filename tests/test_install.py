@@ -5,6 +5,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -18,6 +19,10 @@ LOADER = importlib.machinery.SourceFileLoader("installer", str(ROOT / "scripts/i
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 INSTALL = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(INSTALL)
+CONSUMER_LOADER = importlib.machinery.SourceFileLoader("installed_tests", str(ROOT / "scripts/test-installed"))
+CONSUMER_SPEC = importlib.util.spec_from_loader(CONSUMER_LOADER.name, CONSUMER_LOADER)
+CONSUMER = importlib.util.module_from_spec(CONSUMER_SPEC)
+CONSUMER_LOADER.exec_module(CONSUMER)
 
 
 class InstallerPaths(unittest.TestCase):
@@ -67,6 +72,32 @@ class InstallerPaths(unittest.TestCase):
             self.assertEqual((lib / "libarchive.dylib").readlink(), Path("libarchive.13.dylib"))
             self.assertIn("prefix=${pcfiledir}/../../..", (lib / "pkgconfig/libarchive.pc").read_text())
             self.assertIn("${prefix}/lib/x86_64-linux-gnu", (lib / "pkgconfig/libarchive.pc").read_text())
+
+    def test_pkg_config_preserves_relocated_paths_and_static_dependencies(self):
+        with tempfile.TemporaryDirectory(prefix="pkg config space ") as temporary:
+            libdir = Path(temporary) / "relocated prefix/lib"
+            pcdir = libdir / "pkgconfig"
+            pcdir.mkdir(parents=True)
+            pc = INSTALL.metadata(Path("lib"), "libarchive.so.13", ["-lm", "-lc"])[0]
+            (pcdir / "libarchive.pc").write_text(pc)
+            env = dict(os.environ, PKG_CONFIG_LIBDIR=str(pcdir))
+            for variable in ("PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR"):
+                env.pop(variable, None)
+            command = os.environ.get("PKG_CONFIG", "pkg-config")
+            pkg = lambda *options: CONSUMER.run([command, *options, "libarchive"], env=env).strip()
+            values = {name: pkg(f"--variable={name}") for name in ("prefix", "libdir", "includedir")}
+            cflags, dynamic, static = CONSUMER.pkg_config_flags(pkg, values, libdir, libdir.parent / "include")
+            self.assertEqual(len(cflags), 1)
+            self.assertEqual(dynamic[1:], ["-larchive"])
+            self.assertEqual(static[1:], ["-larchive", "-lm", "-lc"])
+
+    def test_pkg_config_does_not_repair_arbitrary_wrong_flags(self):
+        values = {"libdir": "/prefix space/lib", "includedir": "/prefix space/include"}
+        outputs = {("--cflags",): "-I/wrong include", ("--libs",): "-L/prefix space/lib -larchive",
+                   ("--libs", "--static"): "-L/prefix space/lib -larchive -lc"}
+        with self.assertRaisesRegex(RuntimeError, "installed include directory"):
+            CONSUMER.pkg_config_flags(lambda *options: outputs[options], values,
+                                      Path(values["libdir"]), Path(values["includedir"]))
 
     def test_refuses_staging_directory_symlink(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -130,9 +161,18 @@ class InstallerPaths(unittest.TestCase):
             args = SimpleNamespace(profile="dev", without_tools=True)
             env = dict(os.environ)
             env.pop("CARGO_BUILD_TARGET", None)
+            env["CARGO_TERM_COLOR"] = "always"
             with patch.object(INSTALL, "ROOT", directory), patch.dict(os.environ, env, clear=True):
                 with contextlib.redirect_stdout(io.StringIO()):
                     output, native = INSTALL.build(args, target)
+                    self.assertTrue(all("\x1b" not in flag for flag in native), native)
+                    report = output / "libarchive-native-libs.json"
+                    cached = json.loads(report.read_text())
+                    cached["libs"][-1] += "\x1b[0m"
+                    report.write_text(json.dumps(cached))
+                    _, recovered = INSTALL.build(args, target)
+                    self.assertEqual(recovered, native)
+                    self.assertEqual(json.loads(report.read_text())["libs"], native)
             self.assertNotEqual(output, stale.parent)
             self.assertNotEqual((output / "libarchive.a").read_bytes(), stale.read_bytes())
             self.assertEqual(stale.read_bytes(), b"stale archive")

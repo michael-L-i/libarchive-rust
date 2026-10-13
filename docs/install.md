@@ -60,6 +60,17 @@ export PKG_CONFIG_PATH=/opt/libarchive/lib/pkgconfig
 cc example.c $(pkg-config --cflags --libs libarchive) -o example
 ```
 
+For paths containing spaces, consume pkg-config output with a build system
+that parses its shell escapes, such as CMake or Meson; unquoted command
+substitution in the example above does not preserve those paths. The original
+pkg-config 0.29.2 also leaves spaces in its built-in `pcfiledir` variable
+unescaped when expanding relocatable metadata. Consumers using that version
+can pass `--define-variable=pcfiledir=PATH` with spaces in `PATH` escaped as
+`\ ` before querying compiler and linker flags. `scripts/test-installed`
+checks the unmodified relocation variables and retries this override only
+when the emitted flags exhibit that exact legacy spacing defect. Newer
+pkgconf implementations handle the unmodified metadata directly.
+
 For a fully static libarchive dependency, request `pkg-config --static --libs
 libarchive` and select `libarchive.a` explicitly instead of the shared library.
 `Libs.private` is generated from the building Rust compiler's reported native

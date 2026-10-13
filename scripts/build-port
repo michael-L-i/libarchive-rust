@@ -30,12 +30,14 @@ esac
 # 1. Build the crate. The rustc note lists the system libs the staticlib needs; it is only
 # printed when rustc runs, so cache it and fall back to the cache when cargo replays nothing.
 cd "$root"
-build() { cargo rustc $rel -p libarchive-capi --lib -- --print native-static-libs >>"$log" 2>&1 || { tail -30 "$log" >&2; exit 1; }; }
+build() { cargo rustc --color=never $rel -p libarchive-capi --lib -- --print native-static-libs >>"$log" 2>&1 || { tail -30 "$log" >&2; exit 1; }; }
 native_line() { grep -o 'native-static-libs: .*' "$log" | tail -1 | sed 's/^native-static-libs: //' || true; }
 cache="$out/native-libs.$profile"
 build
 native=$(native_line)
 if [ -z "$native" ] && [ -s "$cache" ]; then native=$(cat "$cache"); fi
+# Older runs may have cached ANSI colors as part of the final linker flag.
+[[ "$native" == *$'\033'* ]] && native=""
 if [ -z "$native" ]; then touch capi/src/lib.rs; build; native=$(native_line); fi
 echo "$native" > "$cache"
 read -ra native <<<"$native"

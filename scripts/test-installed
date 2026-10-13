@@ -25,6 +25,36 @@ def run(command, *, env=None, cwd=None, input=None):
     return result.stdout.decode()
 
 
+def pkg_config_flags(pkg, directory_values, libdir, includedir):
+    queries = (("--cflags",), ("--libs",), ("--libs", "--static"))
+    texts = [pkg(*options) for options in queries]
+    flags = [shlex.split(text) for text in texts]
+    raw_include = "-I" + directory_values["includedir"]
+    raw_dynamic = "-L" + directory_values["libdir"] + " -larchive"
+    split_include = shlex.split(raw_include)
+    if (len(flags[0]) > 1 and " " in directory_values["includedir"]
+            and flags[0] in (split_include, split_include[1:] + split_include[:1])
+            and texts[1] == raw_dynamic
+            and (texts[2] == raw_dynamic or texts[2].startswith(raw_dynamic + " "))):
+        # pkg-config 0.29 leaves spaces in pcfiledir unescaped and may
+        # move the resulting non-flag tokens ahead of the truncated -I flag.
+        # Override only that value; the unchanged variable queries were validated first.
+        pcfiledir = str(libdir / "pkgconfig").replace("\\", "\\\\").replace(" ", "\\ ")
+        option = "--define-variable=pcfiledir=" + pcfiledir
+        flags = [shlex.split(pkg(option, *options)) for options in queries]
+        if flags[2][2:] != shlex.split(texts[2][len(raw_dynamic):]):
+            raise RuntimeError("pkg-config pcfiledir override changed static dependencies")
+    cflags, dynamic_flags, static_flags = flags
+    if (len(cflags) != 1 or not cflags[0].startswith("-I")
+            or Path(cflags[0][2:]).resolve() != includedir.resolve()):
+        raise RuntimeError("pkg-config must select the installed include directory")
+    for link_flags in (dynamic_flags, static_flags):
+        directories = [Path(flag[2:]).resolve() for flag in link_flags if flag.startswith("-L")]
+        if directories != [libdir.resolve()] or "-larchive" not in link_flags:
+            raise RuntimeError("pkg-config must select the installed library directory and libarchive")
+    return cflags, dynamic_flags, static_flags
+
+
 def check_metadata(library):
     if sys.platform == "darwin":
         identity = run(["otool", "-D", str(library)]).splitlines()[1:]
@@ -156,16 +186,14 @@ def main():
         env["PKG_CONFIG_LIBDIR"] = str(libdir / "pkgconfig")
         pkg_config = shlex.split(env.get("PKG_CONFIG", "pkg-config"))
         pkg = lambda *options: run([*pkg_config, *options, "libarchive"], env=env).strip()
+        directory_values = {}
         for name, expected in (("prefix", prefix), ("libdir", libdir), ("includedir", prefix / "include")):
             # pkgconf escapes spaces in pcfiledir even in variable queries.
-            actual = Path(pkg(f"--variable={name}").replace("\\ ", " "))
+            directory_values[name] = pkg(f"--variable={name}")
+            actual = Path(directory_values[name].replace("\\ ", " "))
             if actual.resolve() != expected.resolve():
                 raise RuntimeError(f"pkg-config {name} escaped relocated installation: {actual}")
-        cflags = shlex.split(pkg("--cflags"))
-        dynamic_flags = shlex.split(pkg("--libs"))
-        static_flags = shlex.split(pkg("--libs", "--static"))
-        if "-larchive" not in dynamic_flags or "-larchive" not in static_flags:
-            raise RuntimeError("pkg-config must link libarchive")
+        cflags, dynamic_flags, static_flags = pkg_config_flags(pkg, directory_values, libdir, prefix / "include")
         static_flags = [str(static_library) if flag == "-larchive" else flag for flag in static_flags]
         runtime = env.copy()
         runtime["PATH"] = "/usr/bin:/bin"
