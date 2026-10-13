@@ -23,6 +23,48 @@ def require(condition, message):
         raise AssertionError(message)
 
 
+def checksum(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def large_package(directory):
+    output = directory / "archive-interrupt-1.0-1-any.pkg.tar.zst"
+    with output.open("wb") as destination:
+        compressor = subprocess.Popen(["zstd", "-q", "-c"], stdin=subprocess.PIPE, stdout=destination)
+        try:
+            with tarfile.open(fileobj=compressor.stdin, mode="w|", format=tarfile.PAX_FORMAT) as archive:
+                info = b"pkgname = archive-interrupt\npkgver = 1.0-1\npkgdesc = interrupt fixture\narch = any\nsize = 536870912\n"
+                item = tarfile.TarInfo(".PKGINFO")
+                item.size, item.mode = len(info), 0o644
+                archive.addfile(item, io.BytesIO(info))
+                for path in ("usr/", "usr/share/", "usr/share/interruption/"):
+                    item = tarfile.TarInfo(path)
+                    item.type, item.mode = tarfile.DIRTYPE, 0o755
+                    archive.addfile(item)
+                item = tarfile.TarInfo("usr/share/interruption/large")
+                item.size, item.mode = 512 * 1024 * 1024, 0o644
+
+                class Zeros:
+                    def read(self, size):
+                        return b"\0" * size
+
+                archive.addfile(item, Zeros())
+                item = tarfile.TarInfo("usr/share/interruption/zz-after")
+                item.size, item.mode = 8, 0o644
+                archive.addfile(item, io.BytesIO(b"complete"))
+            compressor.stdin.close()
+            require(compressor.wait(timeout=30) == 0, "large fixture compression failed")
+        finally:
+            if compressor.poll() is None:
+                compressor.kill()
+                compressor.wait()
+    return output
+
+
 def package(directory, version, *, name="archive-adoption", collision=False):
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:
@@ -72,10 +114,13 @@ def snapshot(root):
         elif path.is_dir():
             record.update(type="directory")
         else:
-            content = path.read_bytes()
             if relative.startswith("var/lib/pacman/local/") and path.name == "desc":
+                content = path.read_bytes()
                 content = re.sub(rb"%INSTALLDATE%\n\d+", b"%INSTALLDATE%\n<TIME>", content)
-            record.update(type="file", sha256=hashlib.sha256(content).hexdigest())
+                digest = hashlib.sha256(content).hexdigest()
+            else:
+                digest = checksum(path)
+            record.update(type="file", sha256=digest)
             if item.st_nlink > 1:
                 hardlinks.setdefault((item.st_dev, item.st_ino), []).append(relative)
         record["xattrs"] = {name: os.getxattr(path, name, follow_symlinks=False).hex()
@@ -187,6 +232,52 @@ class Transactions:
             raise AssertionError(f"interrupt statuses differ: {statuses}")
         self.commands.append({"case": "interrupt-before-commit", "statuses": statuses, "state_equal": True})
 
+    def interrupt_extraction(self, package_path):
+        outcomes = {}
+        for implementation in ("c", "rust"):
+            root = self.roots[implementation]
+            payload = root / "usr/share/interruption/large"
+            process = subprocess.Popen(self.command(implementation, ["-U", package_path]),
+                                       env=self.environments[implementation], stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT)
+            try:
+                deadline = time.monotonic() + 30
+                while not payload.exists() or payload.stat().st_size == 0:
+                    if process.poll() is not None or time.monotonic() > deadline:
+                        raise AssertionError("pacman did not reach payload extraction for interruption")
+                    time.sleep(0.001)
+                size_at_signal = payload.stat().st_size
+                require(size_at_signal < 512 * 1024 * 1024, "payload completed before interrupt")
+                process.send_signal(signal.SIGINT)
+                output, _ = process.communicate(timeout=30)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+            (self.report / f"mid-extraction-{implementation}.log").write_bytes(output)
+            require(b"Interrupt signal received" in output, "pacman did not acknowledge the extraction signal")
+            require(process.returncode in (0, 1, 130), f"pacman crashed during extraction: {process.returncode}")
+            require(not (root / "var/lib/pacman/db.lck").exists(), "interrupted transaction left its lock")
+            query = subprocess.run(self.command(implementation, ["-Q", "archive-interrupt"]),
+                                   env=self.environments[implementation], capture_output=True, timeout=30)
+            outcomes[implementation] = {"status": process.returncode, "bytes_at_signal": size_at_signal,
+                                       "bytes_after_exit": payload.stat().st_size if payload.exists() else 0,
+                                       "final_entry_exists": (root / "usr/share/interruption/zz-after").exists(),
+                                       "database_registered": query.returncode == 0}
+        semantic = lambda outcome: (outcome["status"], outcome["database_registered"], outcome["final_entry_exists"])
+        require(semantic(outcomes["c"]) == semantic(outcomes["rust"]), "mid-extraction transaction outcomes differ")
+        self.commands.append({"case": "interrupt-during-extraction", "outcomes": outcomes,
+                              "semantic_outcome_equal": True, "partial_state_compared": False})
+        # SIGINT timing is nondeterministic. Recovery must converge completely.
+        self.compare("retry-mid-extraction", ["-U", package_path, "--overwrite", "usr/share/interruption/*"])
+        digest = hashlib.sha256()
+        for _ in range(512):
+            digest.update(b"\0" * (1024 * 1024))
+        for root in self.roots.values():
+            require(checksum(root / "usr/share/interruption/large") == digest.hexdigest(), "retry payload differs")
+            require((root / "usr/share/interruption/zz-after").read_bytes() == b"complete", "retry lost final entry")
+        self.compare("remove-interrupt-fixture", ["-R", "archive-interrupt"])
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -206,7 +297,7 @@ def main():
                "pacman_sha256": hashlib.sha256(Path("/usr/bin/pacman").read_bytes()).hexdigest(),
                "limitations": ["Local unsigned fixtures; no remote repositories or signature verification",
                                "Package scripts and hooks disabled",
-                               "Interruption is SIGINT at confirmation, before transaction commit; no crash-consistency claim"]}
+                               "SIGINT at confirmation and during payload extraction; no SIGKILL or power-loss crash-consistency claim"]}
     try:
         with tempfile.TemporaryDirectory(prefix="archive-pacman-") as temporary:
             directory = Path(temporary)
@@ -255,6 +346,9 @@ def main():
             transactions.compare("retry-after-interrupt", ["-U", second])
             for root in transactions.roots.values():
                 require((root / "usr/share/adoption/data").read_bytes() == b"payload 2.0-1\n", "retry payload differs")
+            large = large_package(directory)
+            summary["fixture_sha256"][large.name] = checksum(large)
+            transactions.interrupt_extraction(large)
             summary["cases"] = transactions.commands
             summary["passed"] = len(transactions.commands)
     except Exception as error:
