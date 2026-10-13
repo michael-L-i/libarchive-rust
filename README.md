@@ -48,6 +48,17 @@ running system. See [installation](docs/install.md) for C/C++ consumers and
 documented in [src/api/mod.rs](src/api/mod.rs); run
 `cargo doc --no-deps -p libarchive-rust --open` to browse it locally.
 
+Rust applications can depend on this repository through Cargo:
+
+```toml
+[dependencies]
+libarchive-rust = { git = "https://github.com/michael-L-i/libarchive-rust.git" }
+```
+
+The crate is not published on crates.io yet. The repository dependency includes
+the patched codec sources; consumers do not need their own Cargo patches.
+Pin a reviewed commit with Cargo's `rev` option when deploying an application.
+
 ## One repository, one Cargo workspace
 
 The library and tools are separate Cargo crates sharing one Git history and
