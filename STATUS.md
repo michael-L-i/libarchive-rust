@@ -18,6 +18,12 @@ with geometric mean Rust/C elapsed time 0.910324. Native x86 validation remains
 outstanding; emulated development failures and a dependency-related skip are
 recorded in [adoption validation](docs/adoption-validation.md).
 
+A final performance screen tried four LZMA changes, two Zstd changes and
+two ThinLTO configurations. None demonstrated a repeatable gain sufficient
+to retain; runtime code and release defaults remain unchanged. See the
+[final performance screen](docs/final-performance-screen.md) for profiles,
+validation, rejected trials and raw evidence locations.
+
 **All suites: 926 passed on macOS and 969 on Linux; zero failures, crashes,
 timeouts or platform-ratchet regressions.**
 
