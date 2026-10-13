@@ -26,8 +26,10 @@ def relative_directory(value):
     path = Path(value)
     if path.is_absolute() or not path.parts or ".." in path.parts:
         raise argparse.ArgumentTypeError("must be a relative directory without '..'")
-    if any(character in value for character in '\n\r;"\\$'):
-        raise argparse.ArgumentTypeError("unsupported character in directory")
+    if re.fullmatch(r"[A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)*", value) is None:
+        raise argparse.ArgumentTypeError(
+            "directory components must use ASCII letters, digits, '_', '.', '+', or '-'"
+        )
     return path
 
 

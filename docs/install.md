@@ -16,7 +16,10 @@ This builds the C shared and static libraries and all four Rust tools in the
 release profile, using the locked dependencies. `--without-tools` stages only
 the library and development files. `--profile dev` selects a development build.
 `--libdir lib64` or `--libdir lib/x86_64-linux-gnu` selects a directory relative
-to the prefix. `--target-dir PATH` overrides the dedicated `build/install-target`
+to the prefix. Library-directory components accept ASCII letters, digits,
+`_`, `.`, `+` and `-`; spaces and other punctuation are rejected because this
+path is also embedded in pkg-config and CMake metadata. The prefix and staging
+directory may contain spaces. `--target-dir PATH` overrides the dedicated `build/install-target`
 Cargo cache. Ordinary Cargo environment variables, such as `CARGO_HOME`, are
 supported; cross compilation is not supported by this installer.
 
