@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Exercise an installation after relocating it outside the source checkout."""
+
+import argparse
+import gzip
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def run(command, *, env=None, cwd=None, input=None):
+    result = subprocess.run(command, env=env, cwd=cwd, input=input,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise RuntimeError(
+            f"{shlex.join(map(str, command))}\n"
+            f"{result.stdout.decode(errors='replace')}"
+            f"{result.stderr.decode(errors='replace')}"
+        )
+    return result.stdout.decode()
+
+
+def check_metadata(library):
+    if sys.platform == "darwin":
+        identity = run(["otool", "-D", str(library)]).splitlines()[1:]
+        if identity != ["@rpath/libarchive.13.dylib"]:
+            raise RuntimeError(f"non-relocatable library identity: {identity}")
+        dependencies = run(["otool", "-L", str(library)])
+        symbols = run(["nm", "-gU", str(library)])
+    else:
+        dependencies = run(["readelf", "-d", str(library)])
+        if not re.search(r"\(SONAME\).*\[libarchive\.so\.13\]", dependencies):
+            raise RuntimeError("installed shared library has no libarchive.so.13 SONAME")
+        symbols = run(["nm", "-D", "--defined-only", str(library)])
+    if re.search(r"(?:libstd-|librustc_|lib(?:z|bz2|lzma|zstd|lz4)\.)", dependencies):
+        raise RuntimeError(f"unexpected runtime dependency:\n{dependencies}")
+    exports = {match.group(1) for line in symbols.splitlines()
+               if (match := re.search(r"\b_?(archive_\w+)(?:@@?\S+)?$", line))}
+    if len(exports) < 454:
+        raise RuntimeError(f"only {len(exports)} public archive exports, expected at least 454")
+
+
+def check_linkage(executable, static):
+    dependencies = run((["otool", "-L"] if sys.platform == "darwin"
+                        else ["readelf", "-d"]) + [str(executable)])
+    archive_dependency = re.search(r"libarchive[.\w]*\.(?:so(?:\.\d+)*|dylib)", dependencies)
+    if re.search(r"(?:libstd-|librustc_|lib(?:z|bz2|lzma|zstd|lz4)\.)", dependencies):
+        raise RuntimeError(f"unexpected runtime dependency:\n{dependencies}")
+    if static and archive_dependency:
+        raise RuntimeError(f"static consumer depends on shared libarchive:\n{dependencies}")
+    if not static and not archive_dependency:
+        raise RuntimeError(f"dynamic consumer did not link shared libarchive:\n{dependencies}")
+
+
+def check_tools(prefix, work, env):
+    tools = {name: prefix / "bin" / name
+             for name in ("bsdtar", "bsdcat", "bsdcpio", "bsdunzip")}
+    for tool in tools.values():
+        if not tool.is_file():
+            raise RuntimeError(f"missing installed tool: {tool}")
+        check_linkage(tool, static=True)
+    source = work / "input"
+    source.mkdir()
+    payload = b"relocated installed tools\n"
+    (source / "file.txt").write_bytes(payload)
+    tar = work / "archive.tar"
+    run([str(tools["bsdtar"]), "-cf", str(tar), "-C", str(source), "file.txt"], env=env)
+    extracted = work / "tar-output"
+    extracted.mkdir()
+    run([str(tools["bsdtar"]), "-xf", str(tar), "-C", str(extracted)], env=env)
+    if (extracted / "file.txt").read_bytes() != payload:
+        raise RuntimeError("installed bsdtar changed extracted contents")
+    compressed = work / "payload.gz"
+    compressed.write_bytes(gzip.compress(payload))
+    if run([str(tools["bsdcat"]), str(compressed)], env=env).encode() != payload:
+        raise RuntimeError("installed bsdcat changed decompressed contents")
+    zipfile = work / "archive.zip"
+    run([str(tools["bsdtar"]), "--format=zip", "-cf", str(zipfile),
+         "-C", str(source), "file.txt"], env=env)
+    extracted = work / "zip-output"
+    extracted.mkdir()
+    run([str(tools["bsdunzip"]), "-q", str(zipfile)], env=env, cwd=extracted)
+    if (extracted / "file.txt").read_bytes() != payload:
+        raise RuntimeError("installed bsdunzip changed extracted contents")
+    cpio = work / "archive.cpio"
+    cpio.write_bytes(subprocess.check_output(
+        [str(tools["bsdcpio"]), "-o", "-H", "newc"], input=b"file.txt\n", cwd=source, env=env,
+        stderr=subprocess.PIPE))
+    extracted = work / "cpio-output"
+    extracted.mkdir()
+    run([str(tools["bsdcpio"]), "-i"], input=cpio.read_bytes(), cwd=extracted, env=env)
+    if (extracted / "file.txt").read_bytes() != payload:
+        raise RuntimeError("installed bsdcpio changed extracted contents")
+
+
+def check_cmake(libdir, library, source, work, env, runtime):
+    configuration = libdir / "cmake" / "LibArchive" / "LibArchiveConfig.cmake"
+    if not configuration.is_file():
+        raise RuntimeError("missing installed CMake package configuration")
+    project = work / "cmake-consumer"
+    project.mkdir()
+    shutil.copy2(source, project / "consumer.c")
+    (project / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\n"
+        "project(InstalledConsumer LANGUAGES C)\n"
+        "find_package(LibArchive CONFIG REQUIRED)\n"
+        "add_executable(consumer consumer.c)\n"
+        "target_link_libraries(consumer PRIVATE LibArchive::LibArchive ${CMAKE_DL_LIBS})\n"
+        "add_executable(consumer-static consumer.c)\n"
+        "target_link_libraries(consumer-static PRIVATE LibArchive::LibArchiveStatic ${CMAKE_DL_LIBS})\n"
+    )
+    build = work / "cmake-build"
+    run(["cmake", "-S", str(project), "-B", str(build),
+         f"-DLibArchive_DIR={configuration.parent}"], env=env)
+    run(["cmake", "--build", str(build)], env=env)
+    check_linkage(build / "consumer", static=False)
+    check_linkage(build / "consumer-static", static=True)
+    run([str(build / "consumer"), str(library)], env=runtime)
+    run([str(build / "consumer-static"), "static"], env=runtime)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--prefix", type=Path, required=True, help="installed (or staged) prefix")
+    parser.add_argument("--libdir", default="lib", help="library directory relative to prefix")
+    parser.add_argument("--tools", action="store_true", help="also require and exercise all four tools")
+    args = parser.parse_args()
+    relative_libdir = Path(args.libdir)
+    if relative_libdir.is_absolute() or ".." in relative_libdir.parts:
+        parser.error("--libdir must stay within the installed prefix")
+    source = Path(__file__).resolve().parent.parent / "tests" / "installed" / "consumer.c"
+    with tempfile.TemporaryDirectory(prefix="libarchive installed tests ") as directory:
+        work = Path(directory)
+        prefix = work / "relocated prefix"
+        shutil.copytree(args.prefix.resolve(), prefix, symlinks=True)
+        prefix = prefix.resolve()
+        for path in prefix.rglob("*"):
+            if path.is_symlink() and (Path(os.readlink(path)).is_absolute()
+                                     or not path.resolve().is_relative_to(prefix)):
+                raise RuntimeError(f"installed symlink escapes relocated prefix: {path}")
+        libdir = prefix / relative_libdir
+        library = libdir / ("libarchive.13.dylib" if sys.platform == "darwin" else "libarchive.so.13")
+        static_library = libdir / "libarchive.a"
+        check_metadata(library)
+        env = os.environ.copy()
+        for variable in ("PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR", "LD_LIBRARY_PATH",
+                         "LD_PRELOAD", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH",
+                         "DYLD_INSERT_LIBRARIES", "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH",
+                         "LIBRARY_PATH"):
+            env.pop(variable, None)
+        env["PKG_CONFIG_LIBDIR"] = str(libdir / "pkgconfig")
+        pkg_config = shlex.split(env.get("PKG_CONFIG", "pkg-config"))
+        pkg = lambda *options: run([*pkg_config, *options, "libarchive"], env=env).strip()
+        for name, expected in (("prefix", prefix), ("libdir", libdir), ("includedir", prefix / "include")):
+            # pkgconf escapes spaces in pcfiledir even in variable queries.
+            actual = Path(pkg(f"--variable={name}").replace("\\ ", " "))
+            if actual.resolve() != expected.resolve():
+                raise RuntimeError(f"pkg-config {name} escaped relocated installation: {actual}")
+        cflags = shlex.split(pkg("--cflags"))
+        dynamic_flags = shlex.split(pkg("--libs"))
+        static_flags = shlex.split(pkg("--libs", "--static"))
+        if "-larchive" not in dynamic_flags or "-larchive" not in static_flags:
+            raise RuntimeError("pkg-config must link libarchive")
+        static_flags = [str(static_library) if flag == "-larchive" else flag for flag in static_flags]
+        runtime = env.copy()
+        runtime["PATH"] = "/usr/bin:/bin"
+        for language, compiler, standard in (("C", "CC", "c11"), ("C++", "CXX", "c++17")):
+            command = shlex.split(env.get(compiler, "cc" if language == "C" else "c++"))
+            # Verify the headers actually used; system headers can otherwise conceal a broken install.
+            result = subprocess.run([*command, "-x", "c" if language == "C" else "c++",
+                                     "-E", "-H", *cflags, str(source)], env=env,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            included = result.stderr.decode(errors="replace")
+            included_paths = {Path(match.group(1)).resolve() for line in included.splitlines()
+                              if (match := re.match(r"^\.+ (.+)$", line))}
+            if result.returncode or any((prefix / "include" / header).resolve() not in included_paths
+                                       for header in ("archive.h", "archive_entry.h")):
+                raise RuntimeError(f"{language} did not use installed public headers:\n{included}")
+            for mode, flags in (("dynamic", dynamic_flags), ("static", static_flags)):
+                executable = work / f"consumer-{language}-{mode}"
+                command_flags = [*flags]
+                if mode == "dynamic":
+                    command_flags.append(f"-Wl,-rpath,{libdir}")
+                if sys.platform != "darwin":
+                    command_flags.append("-ldl")
+                reset_language = ["-x", "none"] if mode == "static" else []
+                run([*command, "-x", "c" if language == "C" else "c++", f"-std={standard}",
+                     "-Wall", "-Wextra", "-Werror", *cflags, str(source), *reset_language,
+                     *command_flags, "-o", str(executable)], env=env)
+                check_linkage(executable, static=mode == "static")
+                run([str(executable), str(library) if mode == "dynamic" else "static"], env=runtime)
+        check_cmake(libdir, library, source, work, env, runtime)
+        if args.tools:
+            check_tools(prefix, work, runtime)
+    print("Installed C/C++ dynamic/static and CMake consumers passed" + ("; four tools passed" if args.tools else ""))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        sys.exit(str(error))
