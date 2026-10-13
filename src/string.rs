@@ -2154,9 +2154,6 @@ mod tests {
     #[test]
     fn test_archive_string_conversion() {
         let _g = lock_locale();
-        // Upstream extracts test_archive_string_conversion.txt.Z with its
-        // own reader; here the .uu is decoded and the .Z decompressed by
-        // the system gzip.
         let data = load_normalization_data();
         assert!(data.lines().count() > 18000, "pattern file truncated");
         test_archive_string_normalization_nfc(&data);
