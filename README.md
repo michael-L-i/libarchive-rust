@@ -1,170 +1,132 @@
 # libarchive-rust
 
-A memory-safe Rust port of [libarchive](https://github.com/libarchive/libarchive),
-the archive and compression library behind `bsdtar`, `bsdcpio` and many
-package managers, together with its command-line tools. It targets the same
-public C ABI and headers, checked against upstream's own test suite. Supported
-platforms and documented behavior differences are described below and in
-`NOTES.md`.
+A Rust implementation of [libarchive](https://github.com/libarchive/libarchive),
+with its archive library and four command-line tools: `bsdtar`, `bsdcpio`,
+`bsdcat` and `bsdunzip`.
 
-## Status
+The project provides a Rust API and a C-compatible shared/static library using
+the pinned upstream public headers. It aims to let existing applications use
+the Rust implementation without changing their source. Compatibility is tested
+against upstream and selected downstream applications; documented differences
+and platform limits still apply. This is an independent port, not affiliated
+with the libarchive project.
 
-- **Library:** all 454 public functions implemented; the C build retains a small
-  variadic formatting shim for `archive_set_error`. `unsafe` is confined to the C
-  ABI layer (`src/ffi/`); the rest of the crate denies it.
-- **Upstream tests:** 926 pass on macOS and 969 on Linux against this library
-  and its tools, with no failures or baseline regressions. There are 184
-  macOS skips and 141 Linux skips. Of those, 73 need libarchive's internal
-  layout, which a public ABI can't link; the others reflect platform support.
-- **Tools:** `bsdtar`, `bsdcpio`, `bsdcat` and `bsdunzip` are Rust programs
-  with upstream's options, output, messages and exit codes.
-- **Codecs:** pure Rust. DEFLATE and LZMA/XZ compression are ports of zlib
-  1.2.12 and liblzma 5.8.4 that reproduce their output byte for byte, so
-  `bsdtar` writes the same `.tar.gz`, `.zip`, `.tar.xz` and `.7z` archives as
-  the C build. Zstandard compression ports libzstd 1.5.7's strategies.
-- **Fidelity:** in a byte-for-byte comparison of every writer against C
-  `bsdtar`, 64 of 68 format and input cases are identical; the four differences
-  are RIPEMD-160 absent from the macOS C build. A previous comparison of 562
-  test archives differed only on a damaged bzip2 stream the safe decoder
-  reports differently. The ISO writer uses platform libc ordering and fixes
-  six documented upstream output corruptions. Eight regression images
-  recover their original bytes with upstream's reader on both platforms.
-  `NOTES.md` records the remaining and intended differences.
-- **Extraction safety:** the disk writer follows upstream's checks for
-  absolute paths, `..`, symlinks and hardlinks, verified with a 169-case
-  malicious-archive suite against upstream. Where they differ, this port
-  leaves files outside the extraction directory alone where upstream would
-  change them. A further 240 Linux comparisons check ACLs, xattrs, flags,
-  symlinks and hardlinks; Rust adds no outside mutation where C preserves
-  the target. Explicit `-P` can still permit paths through symlinks.
-- **Disk traversal:** directory operations retain open parents across renames;
-  delayed file opens verify identity. Synchronized replacement tests cover
-  macOS and Linux. Isolated Linux tests also compare successful immutable,
-  append-only and `trusted.*` metadata operations with C.
-- **Fuzzing:** 39 targets cover readers, filters, deeper reads, bounded writer
-  round trips and processing-limit properties (`fuzz/`).
+## Build and use
+
+Builds support macOS and Linux with glibc, using Rust **1.95 or newer** and a
+platform linker. The C interface also requires a C compiler for a small
+`archive_set_error` variadic formatting shim. Installed tools and libraries
+require platform runtime libraries, without a Rust installation.
+
+```sh
+git clone https://github.com/michael-L-i/libarchive-rust.git
+cd libarchive-rust
+cargo build --workspace --release --locked
+target/release/bsdtar --version
+```
+
+This builds the library, C interface and all four tools. The upstream C
+submodule is unnecessary for this build. To build only the Rust library and
+tools, without compiling the C shim:
+
+```sh
+cargo build --release --locked \
+  -p libarchive-rust -p bsdtar -p bsdcpio -p bsdcat -p bsdunzip
+```
+
+The tools are in `target/release/`. The C build produces `libarchive.a` and
+`libarchive.so` or `libarchive.dylib`. Use the installer for versioned libraries,
+headers, pkg-config/CMake metadata and license notices:
+
+```sh
+scripts/install --prefix /usr --destdir "$PWD/build/package"
+```
+
+The installer needs Python 3 and stages a package tree without changing the
+running system. See [installation](docs/install.md) for C/C++ consumers and
+[source releases](docs/releases.md) for offline builds. The Rust API is
+documented in [src/api/mod.rs](src/api/mod.rs); run
+`cargo doc --no-deps -p libarchive-rust --open` to browse it locally.
+
+## One repository, one Cargo workspace
+
+The library and tools are separate Cargo crates sharing one Git history and
+lockfile. They do not need separate repositories.
+
+```text
+src/                    Archive library, Rust API and C ABI exports
+capi/                   Shared/static C library and variadic formatting shim
+deflate/                Rust port of the zlib compressor
+tools/libarchive_fe/    Shared command-line helpers
+tools/tar/              bsdtar
+tools/cpio/             bsdcpio
+tools/cat/              bsdcat
+tools/unzip/            bsdunzip
+include/                Pinned upstream public headers
+vendor/                 Patched Rust codec dependencies and provenance
+tests/                  Compatibility tests and platform baselines
+scripts/                Build, install, test and source-release helpers
+fuzz/                   Separate nightly-only fuzz package
+bench/                  Benchmark harnesses and reproducible data generator
+docs/                   Installation, compatibility and validation reports
+upstream/libarchive/    Read-only C reference submodule, for development tests
+```
+
+The Rust library and tools compile no C codec code. They use the platform's
+libc and iconv where needed. Unsafe operations are confined to the library's
+C/system interface and shared tool system wrappers; the remaining project
+modules deny unsafe code. The only project C source compiled for distribution
+is `capi/variadic.c`, retained to support Rust 1.95.
+
+## Compatibility and validation
+
+The reference is upstream libarchive **3.9.0dev**, commit
+`8bb3bbdc7b117a1e22086a2260f2087aafa90687`. All 454 public functions are
+implemented. The current native ARM64 validation records:
+
+| Upstream suite against Rust library and tools | Passed | Skipped | Failed |
+|---|---:|---:|---:|
+| macOS | 926 | 184 | 0 |
+| Linux | 969 | 141 | 0 |
+
+These are platform-specific results, not a promise that every upstream test
+runs through the public ABI. Internal-layout tests and unavailable platform
+features account for skips. See [installation validation](docs/install-validation.md)
+for environments and [adoption validation](docs/adoption-validation.md) for
+installed consumers, package transactions and extended fuzz campaigns.
+
+Local x86_64 Linux testing used Rosetta translation: downstream checks passed,
+but three process-spawning development tests failed and were reproduced with
+standalone Rust and C programs. [The x86 report](docs/downstream-testing.md)
+records those results. Native x86_64 GitHub Actions jobs are configured; their
+first hosted results are pending publication. Windows and musl are unvalidated.
+
+Read [compatibility](docs/compatibility.md) before evaluating a replacement for
+an existing libarchive installation. [NOTES.md](NOTES.md) contains detailed
+format, codec and filesystem differences. Reader processing limits are opt-in
+and do not replace application memory or time limits.
 
 ## Performance
 
-The final round used `bench/compare.py` to time C and Rust `bsdtar`
-on 8 datasets and 6 formats for creation and extraction: 96 cases,
-whole-process time including startup,
-warm cache, 5 rotating repeats. A win is a median more than 5% below C. On
-an Apple M5 Pro (macOS 26.6), against upstream bsdtar built with its usual
-C libraries (Apple zlib, liblzma 5.8.4, libzstd 1.5.7):
+Two separate measurements on an Apple M5 Pro used 96 warm-cache create/extract
+cases with metadata disabled. A win or loss means a median difference greater
+than 5%; cases are equally weighted in the geometric mean.
 
-| | Wins | Ties | Losses |
-|---|---:|---:|---:|
-| Current, after reviewed limits and race hardening (Oct 12) | 56 | 38 | 2 |
-| Previous Rust, measured in the same final run | 54 | 39 | 3 |
-| Round 14, after disk and ISO fixes (Oct 12) | 57 | 37 | 2 |
-| Round 13 (two runs) | 59–61 | 32–34 | 3 |
-| Round 13, with `scripts/build-pgo` | 63 | 31 | 2 |
-| Previous version | 24 | 22 | 50 |
+| Comparison | Rust wins | Ties | Losses | Rust/C time |
+|---|---:|---:|---:|---:|
+| C vs Rust command-line executables | 56 | 38 | 2 | 0.902 |
+| Same C executable, C vs installed Rust shared library | 49 | 45 | 2 | 0.910324 |
 
-The final run uses the same frozen inputs and C executable as round 13.
-Across all 96 cases the geometric mean of Rust/C time is 0.902, about 10%
-less elapsed time. All 336 content/byte checks pass, including identical
-output from all 48 writers against the previous Rust build. There are no
-run failures. Overall time is comparable to previous Rust (1.002x).
-The remaining losses are compiled-data Zstandard creation (1.054x C's
-time) and 7-Zip extraction (1.078x). Close cases move between runs.
+These correspond to about 9.8% and 9.0% less elapsed time on their respective
+matrices. They are separate runs and do not establish performance on Linux,
+other hardware, cold storage or concurrent applications. See the
+[CLI results](STATUS.md#final-96-case-benchmark-2026-10-12),
+[benchmark method](bench/README.md),
+[shared-library report](docs/shared-library-performance.md) and
+[final optimization screen](docs/final-performance-screen.md).
 
-Small 7-Zip creation cases now peak at about 56–57 MiB, down from 97 MiB
-and close to C's 55 MiB; large-stream RSS is unchanged. A 15-repeat
-many-file tar confirmation measures 50.0 ms versus previous Rust's 48.2 ms
-and C's 60.7 ms. The extra permission/identity checks retain a small cost
-after redundant calls were removed. These results measure regular-file
-contents with metadata disabled; ISO and privileged metadata have separate
-correctness checks.
+## Contributing and license
 
-The PGO result is historical; the current fixes have not been rebuilt with
-PGO. `scripts/build-pgo` trains on data other than the benchmark's; it
-changes no output byte.
-
-## Security limits
-
-Readers accept opt-in `ReadLimits` for decoded processing work, entry counts,
-metadata work, filter depth and supported decoder dictionaries/models. Set
-them before opening input; set decoder memory before appending explicit
-filters. C callers and `bsdtar` can use existing options such as
-`--options 'limits:decoded-bytes=67108864,limits:entries=10000'`.
-Exceeded work, count or depth limits return a sticky fatal error with `EFBIG`;
-decoder-memory rejection uses the codec's existing error.
-
-Defaults preserve upstream behavior and do not impose aggregate budgets.
-These limits are conservative processing checks, not total heap or CPU-time
-quotas; a bounded block can finish before a limit is detected. Applications
-handling untrusted archives still need appropriate process limits.
-`NOTES.md` explains the accounting and supported decoder coverage.
-
-## What is Rust
-
-| Part | Language |
-|---|---|
-| Library (`src/`) and its Rust API (`src/api/`) | Rust |
-| Codecs (`deflate/`, patched crates in `vendor/`) | Rust |
-| Command-line tools (`tools/`) | Rust |
-| C library for C programs (`capi/`) | Rust, plus one C file for printf-style `archive_set_error` arguments, retained for the supported Rust 1.95 compiler |
-| Test oracle (`upstream/libarchive`, a submodule) | upstream's C tests, unchanged |
-
-Rust programs, including the tools, link only the Rust crate and contain no
-C. At run time they use the system's libc and iconv, as upstream does.
-
-## Layout
-
-```
-src/            the library: one module per upstream file
-src/api/        the safe Rust API (typed handles mirroring the C API)
-src/ffi/        the C ABI exports; the library's only unsafe code
-capi/           builds libarchive.{so,dylib,a} for C programs
-deflate/        zlib 1.2.12's compressor, ported
-tools/          bsdtar, bsdcpio, bsdcat, bsdunzip and their shared helpers
-vendor/         patched miniz_oxide, lzma-rust2 and ruzstd
-fuzz/           reader/filter and bounded archive-property fuzz targets
-bench/          C-versus-Rust benchmark harness and dataset generator
-scripts/        oracle build, port build, test runner, PGO build
-upstream/       upstream libarchive at the pinned commit (submodule)
-```
-
-## Build
-
-The minimum supported build compiler is Rust 1.95. End users of installed
-libraries and tools need only the platform runtime libraries. See
-[installation and packaging](docs/install.md) for staged installation,
-`pkg-config` and CMake consumers, and [source releases](docs/releases.md)
-for offline builds. The upstream submodule is required only for oracle tests.
-
-```sh
-cargo build --release                         # the library and the tools
-cargo build --release -p libarchive-capi      # target/release/libarchive.{a,dylib,so}
-```
-
-The tools are `target/release/bsdtar` and so on. C programs compile against
-the pinned `archive.h` and `archive_entry.h` in `include/`
-and link `libarchive` from `target/release`. Rust programs depend on the
-`libarchive-rust` crate; `src/api/mod.rs` documents the API.
-
-## Test
-
-```sh
-scripts/build-oracle                  # upstream's C build, the reference (CMake)
-scripts/build-port --release          # our library and tools, upstream's tests relinked
-scripts/run-tests --suite all         # upstream's tests against ours
-cargo test --workspace --release      # Rust tests
-scripts/test-iso-zisofs --library target/release --reader build/oracle/bin/bsdtar
-```
-
-`AGENTS.md` describes the rules (memory safety, never trusting archive bytes,
-faithfulness to upstream) and the validation layers in detail. Full upstream
-suites, release and dev Rust tests, formatting and strict Clippy have run on
-macOS and Linux. `scripts/run-tests` enforces separate platform baselines.
-CI requires both platforms and checks corrected zisofs images with the C
-reader; the hosted workflow will first run after publication.
-
-## License
-
-BSD-2-Clause, like upstream; see `LICENSE`. `COPYING` lists the files under
-other terms (UC Regents, public domain, CC0/OpenSSL/Apache-2.0, zlib) and the
-vendored crates' licenses. This is an independent port, not affiliated with
-the libarchive project.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and validation commands.
+The project uses BSD-2-Clause; see [LICENSE](LICENSE) and [COPYING](COPYING)
+for retained upstream notices and the components under other licenses.
