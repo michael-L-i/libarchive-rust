@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Build and run an independent Cargo consumer without workspace patches."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument("--source", type=Path, default=ROOT)
+    sources.add_argument("--git", help="Git dependency URL")
+    parser.add_argument("--rev", help="exact Git revision, required with --git")
+    parser.add_argument("--target-dir", type=Path, default=ROOT / "build/rust-consumer-target")
+    args = parser.parse_args()
+    if bool(args.git) != bool(args.rev):
+        parser.error("--git and --rev must be used together")
+    if args.git:
+        dependency = f"git = {json.dumps(args.git)}, rev = {json.dumps(args.rev)}"
+    else:
+        dependency = f"path = {json.dumps(str(args.source.resolve()))}"
+    with tempfile.TemporaryDirectory(prefix="libarchive-rust-consumer-") as temporary:
+        consumer = Path(temporary)
+        (consumer / "src").mkdir()
+        (consumer / "src/main.rs").write_bytes((ROOT / "tests/rust_consumer.rs").read_bytes())
+        (consumer / "Cargo.toml").write_text(
+            '[package]\nname = "libarchive-rust-consumer"\nversion = "0.1.0"\n'
+            'edition = "2024"\nrust-version = "1.95"\n\n'
+            f"[dependencies]\nlibarchive-rust = {{ {dependency} }}\n\n[workspace]\n"
+        )
+        env = dict(os.environ, CARGO_TARGET_DIR=str(args.target_dir.resolve()))
+        cargo = os.environ.get("CARGO", "cargo")
+        subprocess.run([cargo, "generate-lockfile", "--manifest-path", str(consumer / "Cargo.toml")],
+                       env=env, check=True)
+        subprocess.run([cargo, "run", "--locked", "--manifest-path", str(consumer / "Cargo.toml")],
+                       env=env, check=True)
+    print("Independent Rust consumer: gzip, xz and zstd round trips passed")
+
+
+if __name__ == "__main__":
+    main()

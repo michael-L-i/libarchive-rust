@@ -633,7 +633,8 @@ impl Lzma2Stream {
         out_pos: usize,
         stalled: &mut bool,
     ) -> crate::Result<Option<StreamResult>> {
-        self.lz.ensure_capacity_for(self.limits.remaining_size as usize)?;
+        self.lz
+            .ensure_capacity_for(self.limits.remaining_size as usize)?;
         let compressed_left = self.limits.compressed_left.unwrap_or(0);
 
         // Nothing left to feed and the chunk is not over yet. A chunk whose

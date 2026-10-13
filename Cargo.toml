@@ -2,7 +2,7 @@
 members = ["capi", "deflate", "tools/libarchive_fe", "tools/cat", "tools/cpio", "tools/unzip", "tools/tar"]
 default-members = [".", "capi", "deflate", "tools/libarchive_fe", "tools/cat", "tools/cpio", "tools/unzip", "tools/tar"]
 # The patched backends keep their own manifests and tests.
-exclude = ["vendor", "fuzz"]
+exclude = ["vendor/miniz_oxide", "vendor/lzma-rust2", "vendor/ruzstd", "fuzz"]
 
 [workspace.package]
 rust-version = "1.95"
@@ -17,13 +17,13 @@ license = "BSD-2-Clause"
 [dependencies]
 crc32fast = "1.5.2"
 deflate = { path = "deflate" }
-miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+miniz_oxide = { version = "0.9", path = "vendor/miniz_oxide", default-features = false, features = ["with-alloc"] }
 libc = "0.2"
-lzma-rust2 = { version = "0.21.0", default-features = false, features = ["std", "xz", "lzip", "encoder"] }
+lzma-rust2 = { version = "0.21.0", path = "vendor/lzma-rust2", default-features = false, features = ["std", "xz", "lzip", "encoder"] }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "safe-encode", "alloc"] }
 xxhash-rust = { version = "0.8.19", default-features = false, features = ["xxh32"] }
 crabz2 = { version = "0.7.0", default-features = false, features = ["std"] }
-ruzstd = "0.9.0"
+ruzstd = { version = "0.9.0", path = "vendor/ruzstd" }
 md-5 = { version = "0.11", default-features = false, features = ["alloc"] }
 ripemd = { version = "0.2", default-features = false, features = ["alloc"] }
 sha1 = { version = "0.11", default-features = false, features = ["alloc"] }
@@ -43,7 +43,7 @@ opt-level = 1
 opt-level = 3
 
 [dev-dependencies]
-lzma-rust2 = { version = "0.21.0", default-features = false, features = ["std", "xz", "lzip", "encoder"] }
+lzma-rust2 = { version = "0.21.0", path = "vendor/lzma-rust2", default-features = false, features = ["std", "xz", "lzip", "encoder"] }
 
 [patch.crates-io]
 miniz_oxide = { path = "vendor/miniz_oxide" }

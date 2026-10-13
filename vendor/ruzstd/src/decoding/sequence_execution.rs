@@ -19,7 +19,8 @@ pub(crate) fn copy_literals(buf: &mut [u8], op: usize, literals: &[u8], from: us
     buf[op..op + CHUNK].copy_from_slice(&literals[from..from + CHUNK]);
     let mut done = CHUNK;
     while done < len {
-        buf[op + done..op + done + WIDE].copy_from_slice(&literals[from + done..from + done + WIDE]);
+        buf[op + done..op + done + WIDE]
+            .copy_from_slice(&literals[from + done..from + done + WIDE]);
         done += WIDE;
     }
 }
@@ -52,7 +53,9 @@ pub(crate) fn copy_match(buf: &mut [u8], op: usize, offset: usize, len: usize) {
 #[inline(never)]
 fn copy_short_offset(buf: &mut [u8], op: usize, offset: usize, len: usize) {
     // The smallest multiple of each offset that is at least a chunk.
-    const PERIOD: [u8; CHUNK] = [0, 16, 16, 18, 16, 20, 18, 21, 16, 18, 20, 22, 24, 26, 28, 30];
+    const PERIOD: [u8; CHUNK] = [
+        0, 16, 16, 18, 16, 20, 18, 21, 16, 18, 20, 22, 24, 26, 28, 30,
+    ];
     let mut pattern = [0; CHUNK];
     pattern.copy_from_slice(&buf[op - offset..op - offset + CHUNK]);
     for i in offset..CHUNK {

@@ -469,10 +469,9 @@ fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
-            scratch.offsets.build_from_probabilities(
-                OF_DEFAULT_ACC_LOG,
-                &OFFSET_DEFAULT_DISTRIBUTION,
-            )?;
+            scratch
+                .offsets
+                .build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)?;
             scratch.of_rle = None;
         }
         ModeType::Repeat => {
@@ -512,10 +511,9 @@ fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ml table");
-            scratch.match_lengths.build_from_probabilities(
-                ML_DEFAULT_ACC_LOG,
-                &MATCH_LENGTH_DEFAULT_DISTRIBUTION,
-            )?;
+            scratch
+                .match_lengths
+                .build_from_probabilities(ML_DEFAULT_ACC_LOG, &MATCH_LENGTH_DEFAULT_DISTRIBUTION)?;
             scratch.ml_rle = None;
         }
         ModeType::Repeat => {
@@ -571,10 +569,7 @@ const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
 fn test_ll_default() {
     let mut table = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
     table
-        .build_from_probabilities(
-            LL_DEFAULT_ACC_LOG,
-            &LITERALS_LENGTH_DEFAULT_DISTRIBUTION,
-        )
+        .build_from_probabilities(LL_DEFAULT_ACC_LOG, &LITERALS_LENGTH_DEFAULT_DISTRIBUTION)
         .unwrap();
 
     #[cfg(feature = "std")]
@@ -611,4 +606,3 @@ fn test_ll_default() {
     assert!(table.decode[59].num_bits == 5);
     assert!(table.decode[59].base_line == 32);
 }
-

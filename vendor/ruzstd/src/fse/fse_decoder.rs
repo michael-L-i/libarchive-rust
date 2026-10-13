@@ -346,19 +346,21 @@ mod tests {
         if num_states_symbol == 0 {
             return (0, 0);
         }
-        let num_state_slices = if 1 << (highest_bit_set(num_states_symbol) - 1) == num_states_symbol {
+        let num_state_slices = if 1 << (highest_bit_set(num_states_symbol) - 1) == num_states_symbol
+        {
             num_states_symbol
         } else {
             1 << (highest_bit_set(num_states_symbol))
         }; //always power of two
-    
+
         let num_double_width_state_slices = num_state_slices - num_states_symbol; //leftovers to the power of two need to be distributed
         let num_single_width_state_slices = num_states_symbol - num_double_width_state_slices; //these will not receive a double width slice of states
         let slice_width = num_states_total / num_state_slices; //size of a single width slice of states
         let num_bits = highest_bit_set(slice_width) - 1; //number of bits needed to read for one slice
-    
+
         if state_number < num_double_width_state_slices {
-            let baseline = num_single_width_state_slices * slice_width + state_number * slice_width * 2;
+            let baseline =
+                num_single_width_state_slices * slice_width + state_number * slice_width * 2;
             (baseline, num_bits as u8 + 1)
         } else {
             let index_shifted = state_number - num_double_width_state_slices;
