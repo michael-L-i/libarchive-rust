@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Build a private oracle dependency without replacing distribution libraries.
+set -euo pipefail
+
+if [ "$#" -ne 1 ] || [[ "$1" != /* ]] || [ "$1" = / ]; then
+  echo "usage: scripts/setup-oracle-lzma ABSOLUTE_PRIVATE_PREFIX" >&2
+  exit 2
+fi
+test "$(uname -s)" = Linux
+test "$(id -u)" -ne 0
+prefix="$1"
+version=5.8.4
+# Digest published with the official release assets:
+# https://github.com/tukaani-project/xz/releases/tag/v5.8.4
+digest=0014c7886930454fe8bd4228665b51af55eeae560ea135c9c4cd33f55b2591d9
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+  "https://github.com/tukaani-project/xz/releases/download/v${version}/xz-${version}.tar.gz" \
+  --output "$work/source.tar.gz"
+printf '%s  %s\n' "$digest" "$work/source.tar.gz" | sha256sum --check --strict
+mkdir "$work/source"
+tar -xzf "$work/source.tar.gz" -C "$work/source" --strip-components=1
+cmake -S "$work/source" -B "$work/build" \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+  -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+  -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+  -DXZ_TOOL_XZ=OFF -DXZ_TOOL_XZDEC=OFF -DXZ_TOOL_LZMADEC=OFF \
+  -DXZ_TOOL_LZMAINFO=OFF -DXZ_DOC=OFF -DXZ_NLS=OFF
+cmake --build "$work/build" --parallel "$(nproc)"
+cmake --install "$work/build"
+
+# The upstream test checks both the header constant and runtime support.
+cat > "$work/probe.c" <<'C'
+#include <lzma.h>
+#include <stdio.h>
+int main(void) {
+    printf("Oracle liblzma: %s\n", lzma_version_string());
+    return !lzma_filter_decoder_is_supported(LZMA_FILTER_RISCV);
+}
+C
+cc "$work/probe.c" -I"$prefix/include" "$prefix/lib/liblzma.a" -pthread -o "$work/probe"
+"$work/probe"

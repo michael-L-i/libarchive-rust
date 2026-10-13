@@ -63,6 +63,11 @@ jobs:
         run: scripts/setup-linux-tests
       - name: Require an unprivileged test user
         run: test "$(id -u)" -ne 0
+      - name: Build pinned private liblzma with RISC-V support (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          scripts/setup-oracle-lzma "$RUNNER_TEMP/oracle-xz"
+          echo "CMAKE_PREFIX_PATH=$RUNNER_TEMP/oracle-xz" >> "$GITHUB_ENV"
       - name: Build upstream libarchive (the oracle)
         run: scripts/build-oracle
       - name: Run upstream's tests against the oracle
