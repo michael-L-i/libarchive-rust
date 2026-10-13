@@ -54,3 +54,31 @@ No codec or optimization-profile changes were made; the previous 96-case
 performance results remain the latest benchmark, rather than a new measurement
 of installed C consumers. Distribution adoption should next test the intended
 package's real downstream clients in its own build and runtime environments.
+
+## Distribution binary smoke test
+
+A follow-up tested the installed release from source `8d9309c` on Debian 12
+arm64, glibc 2.36 and Rust 1.95. The distribution's CMake 3.25.1 and
+bsdtar/bsdcpio/bsdcat 3.6.2 binaries were left unchanged. Runs compared the
+distribution C libarchive 3.6.2 with the staged Rust library selected by
+`LD_LIBRARY_PATH`, as an unprivileged user with no container network attached.
+Loader traces verified initialization of the staged library for all four
+binaries; an additional binding trace verified 68 CMake archive symbols
+resolved to that library. Eager binding was enabled with `LD_BIND_NOW=1`.
+
+All 23 grouped smoke checks passed, covering:
+
+- CMake `file(ARCHIVE_CREATE)` and the distribution bsdtar writer for tar,
+  gzip, bzip2, xz, zstd, zip and 7zip, with C/Rust cross-extraction and matching
+  recovered file bytes, filenames and directory trees. CMake listings matched.
+- Distribution bsdcpio newc cross-roundtrips and bsdcat decompression.
+- Tar symlink targets and recovered hardlink identity.
+- Rejection of one truncated ZIP by CMake and bsdtar without a crash.
+- CMake FetchContent extraction of a local archived dependency, configuration,
+  compilation and execution of an application returning the expected result.
+
+Fixtures included UTF-8 and spaced filenames, nested directories, empty files
+and binary contents. This small integration run found no defect; it does not
+extend the result to every downstream workflow or measure performance. The CMake
+binding trace, the scratch harness and JSON results are retained outside the
+source tree in `../diagnostics/downstream-smoke-2026-10-12/`.
