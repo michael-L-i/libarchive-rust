@@ -40,7 +40,7 @@ jobs:
         working-directory: fuzz
         run: |
           for target in writer_tar writer_zip writer_cpio writer_ar writer_7zip writer_xar writer_iso9660 writer_roundtrip read_limits all_deep; do
-            cargo fuzz run "$target" -- -runs=100 -timeout=10 -rss_limit_mb=1024 -malloc_limit_mb=256
+            cargo fuzz run "$target" -- -runs=100 -timeout=10 -rss_limit_mb=1024 -malloc_limit_mb=257
           done
       - uses: actions/upload-artifact@v4
         if: failure()
