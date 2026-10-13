@@ -42,9 +42,8 @@ cargo +nightly fuzz run all_deep -- -max_total_time=60 -timeout=10 -rss_limit_mb
 
 The reader decoder allowance is 256 MiB. libFuzzer stops allocations at
 its `malloc_limit_mb` threshold, so use 257 MiB to permit that boundary
-while retaining the independent RSS and timeout controls. The logical LZMA
-dictionary can reserve the full allowance before a short input is rejected;
-its untouched pages need not become resident. A 15-byte lzip input found
+while retaining the independent RSS and timeout controls. The lzip decoder can allocate and initialize its full dictionary allowance
+before a short malformed input is rejected. A 15-byte lzip input found
 this threshold mismatch during an extended campaign and is included in the
 deterministic seeds. The original guard failure is retained as evidence.
 

@@ -52,8 +52,8 @@ def main(out):
     archive = output.getvalue()
     seed(out, "all_deep", archive)
     seed(out, "all_deep", gzip.compress(archive, mtime=0))
-    # The allowed 256 MiB logical dictionary reservation reaches libFuzzer's
-    # inclusive 256 MiB malloc threshold, despite lazy resident initialization.
+    # The allowed 256 MiB dictionary allocation reaches libFuzzer's
+    # inclusive 256 MiB malloc threshold before this malformed stream fails.
     # Retain this short rejected stream so campaigns exercise the boundary.
     lzip_boundary = b"LZIP\x01\x1c\x00\x00\xffIP\x01\x0c\x12\x00"
     for target in ("filter_lzip", "all", "all_deep"):
