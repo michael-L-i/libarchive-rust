@@ -8,28 +8,33 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   properties:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-10
           components: clippy, rustfmt
       - name: Check property harness
         run: |
           cargo fmt --manifest-path fuzz/Cargo.toml --all --check
-          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
-          cargo test --manifest-path fuzz/Cargo.toml --lib -- --nocapture
+          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path fuzz/Cargo.toml --locked --lib -- --nocapture
       - name: Install and build fuzz targets
         run: |
-          cargo install cargo-fuzz --locked
+          cargo install cargo-fuzz --version 0.13.2 --locked
           cd fuzz
           cargo fuzz build
       - name: Seed deterministic properties

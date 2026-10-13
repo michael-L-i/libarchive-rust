@@ -4,19 +4,27 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   installed:
     name: Installed consumers (${{ matrix.os }}, Rust ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         rust: [stable, '1.95.0']
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-15]
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             libdir: lib64
-          - os: macos-latest
+          - os: macos-15
             libdir: lib
     steps:
       - uses: actions/checkout@v4
@@ -38,10 +46,14 @@ jobs:
 
   source-release:
     name: Reproducible offline source release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Install consumer build tools and test locales
         run: |
           scripts/setup-linux-tests
