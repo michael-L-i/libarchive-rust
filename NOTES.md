@@ -385,12 +385,13 @@ Differences:
     bad magic number), input that ends too soon reads "No progress is
     possible", and "Invalid options" is kept for an unsupported filter.
     Every failure is fatal, as liblzma's are.
-  - A .lzma stream with an end marker whose input is cut inside the last
-    bytes of the range coder is accepted with its complete output, when the
-    missing bytes are zero: `LzmaStream` decodes the last bytes of input
-    against zero padding, and cannot say whether it did. liblzma fails with
-    "No progress is possible". It turned up twice in the corpus; a cut
-    lzip member is still caught by its trailer.
+  - An earlier decoder accepted some .lzma end-marker streams cut inside
+    the range coder's last bytes by decoding against zero padding. The
+    current decoder tracks padding use and rejects an EOF finish that
+    consumes it. `test_read_truncated_filter_lzma` passes; a focused check
+    of one-to-seven-byte cuts from a 17 KiB binary .lzma stream is rejected
+    by both Rust and pinned upstream `bsdcat`. This resolves the earlier
+    padding claim, without establishing identical malformed-input behavior.
   - `XzStream` takes at most one delta or branch (BCJ) filter before LZMA2
     in a block. A block that chains several fails as unsupported where
     liblzma decodes it. (The ARM64 and RISC-V filters are supported.)
