@@ -389,7 +389,7 @@ Differences:
     the range coder's last bytes by decoding against zero padding. The
     current decoder tracks padding use and rejects an EOF finish that
     consumes it. `test_read_truncated_filter_lzma` passes; a focused check
-    of one-to-seven-byte cuts from a 17 KiB binary .lzma stream is rejected
+    of one-to-seven-byte cuts from a roughly 17 KiB binary payload compressed as .lzma is rejected
     by both Rust and pinned upstream `bsdcat`. This resolves the earlier
     padding claim, without establishing identical malformed-input behavior.
   - `XzStream` takes at most one delta or branch (BCJ) filter before LZMA2

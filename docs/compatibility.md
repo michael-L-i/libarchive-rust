@@ -62,7 +62,7 @@ The current
 [`LzmaStream` implementation](../vendor/lzma-rust2/src/lzma_reader.rs)
 tracks padding use and rejects an EOF finish that consumes synthetic padding.
 The upstream truncation regression test passes, and focused one-to-seven-byte
-cuts from a 17 KiB binary stream were rejected by both implementations.
+cuts from a roughly 17 KiB binary payload compressed as .lzma were rejected by both implementations.
 These checks resolve the old claim that the decoder cannot detect padding;
 they do not establish identical behavior for every malformed LZMA stream.
 
