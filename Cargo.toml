@@ -4,10 +4,14 @@ default-members = [".", "capi", "deflate", "tools/libarchive_fe", "tools/cat", "
 # The patched backends keep their own manifests and tests.
 exclude = ["vendor", "fuzz"]
 
+[workspace.package]
+rust-version = "1.95"
+
 [package]
 name = "libarchive-rust"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license = "BSD-2-Clause"
 
 [dependencies]

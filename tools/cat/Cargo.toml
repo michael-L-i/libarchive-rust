@@ -2,6 +2,7 @@
 name = "bsdcat"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license = "BSD-2-Clause"
 description = "bsdcat: expands compressed files to standard output (upstream's cat/)"
 

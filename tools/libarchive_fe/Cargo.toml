@@ -2,6 +2,7 @@
 name = "libarchive-fe"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 license = "BSD-2-Clause AND BSD-3-Clause AND ISC"
 description = "The helpers libarchive's front-ends share (upstream's libarchive_fe/)"
 
