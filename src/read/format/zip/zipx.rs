@@ -33,7 +33,7 @@
 use super::{BUFFER_SIZE, Out, Zip};
 use crate::archive::*;
 use crate::ppmd::ByteIn;
-use crate::ppmd8::Ppmd8;
+use crate::ppmd8::{PPMD8_MIN_ORDER, Ppmd8};
 use crate::read::filter::bzip2::Decoder as Bzip2Decoder;
 use crate::read::{ARCHIVE_ERRNO_FILE_FORMAT, ARCHIVE_ERRNO_PROGRAMMER, Reader};
 use crate::util::Error;
@@ -529,7 +529,7 @@ impl<const SEEKABLE: bool> Zip<SEEKABLE> {
         let mem = ((val >> 4) & 0xff) + 1;
         let restore_method = val >> 12;
 
-        if order < 2 || restore_method > 2 {
+        if order < PPMD8_MIN_ORDER || restore_method > 2 {
             return Err(Error::new(
                 ARCHIVE_FAILED,
                 ARCHIVE_ERRNO_FILE_FORMAT,

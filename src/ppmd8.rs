@@ -3,7 +3,6 @@
 This code is based on PPMd var.I (2002): Dmitry Shkarin : Public domain */
 
 // Ported from libarchive/archive_ppmd8.c (decoder side).
-#![allow(dead_code)] // the zip reader leaves some of the API unused
 
 //! PPMd var. I decoder, with its carryless range decoder.
 //!
@@ -19,9 +18,10 @@ use crate::ppmd::{
 
 pub const PPMD8_MIN_ORDER: u32 = 2;
 pub const PPMD8_MAX_ORDER: u32 = 16;
+pub const PPMD8_RESTORE_METHOD_RESTART: u32 = 0;
 /// The restore method that cuts the model off instead of restarting it.
 /// (Upstream's FREEZE method is not supported.)
-pub const PPMD8_RESTORE_METHOD_RESTART: u32 = 0;
+#[cfg(test)]
 pub const PPMD8_RESTORE_METHOD_CUT_OFF: u32 = 1;
 
 const K_TOP: u32 = 1 << 24;
@@ -153,6 +153,7 @@ impl Ppmd8 {
         self.size = 0;
     }
 
+    #[cfg(test)]
     pub fn was_allocated(&self) -> bool {
         self.a.is_allocated()
     }

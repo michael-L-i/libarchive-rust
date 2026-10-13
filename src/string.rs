@@ -58,11 +58,8 @@ const SCONV_FROM_UTF16LE: u32 = 1 << 13;
 const SCONV_TO_UTF16: u32 = SCONV_TO_UTF16BE | SCONV_TO_UTF16LE;
 const SCONV_FROM_UTF16: u32 = SCONV_FROM_UTF16BE | SCONV_FROM_UTF16LE;
 
-#[allow(dead_code)] // for `set_opt`'s callers, the tar reader (phase 4)
 pub(crate) const SCONV_SET_OPT_UTF8_LIBARCHIVE2X: i32 = 1;
-#[allow(dead_code)] // for `set_opt`'s callers, the tar reader (phase 4)
 pub(crate) const SCONV_SET_OPT_NORMALIZATION_C: i32 = 2;
-#[allow(dead_code)] // for `set_opt`'s callers, the tar reader (phase 4)
 pub(crate) const SCONV_SET_OPT_NORMALIZATION_D: i32 = 4;
 
 const UNICODE_MAX: u32 = 0x10FFFF;
@@ -115,7 +112,6 @@ fn skip(s: &[u8], n: i32) -> &[u8] {
 }
 
 /// Equivalent to dirname(3).
-#[allow(dead_code)] // used by the mtree reader (phase 3) and the disk code (phase 5)
 pub(crate) fn string_dirname(s: &mut Vec<u8>) {
     // strip trailing separators
     while s.len() > 1 && s.last() == Some(&b'/') {
@@ -1176,7 +1172,6 @@ impl StringConv {
     }
 
     /// Change the behavior of a string conversion.
-    #[allow(dead_code)] // used by the tar reader (phase 4)
     pub(crate) fn set_opt(&self, opt: i32) {
         let mut st = self.state();
         match opt {
@@ -1211,7 +1206,6 @@ impl StringConv {
 }
 
 /// The name of the charset a conversion goes to or from, for messages.
-#[allow(dead_code)] // used by the format readers and writers (phases 3-5)
 pub(crate) fn conversion_charset_name(sc: Option<&StringConv>) -> &[u8] {
     match sc {
         None => b"current locale",
@@ -1772,9 +1766,7 @@ impl MString {
 mod tests {
     use super::*;
     use crate::ffi::charset::{lock_locale, set_locale_all};
-    use std::io::Write;
     use std::path::PathBuf;
-    use std::process::{Command, Stdio};
 
     fn skipping(msg: &str) {
         eprintln!("SKIPPED: {msg}");
@@ -1864,47 +1856,19 @@ mod tests {
         Some(out)
     }
 
-    /// Decompress Unix `compress` (.Z) data. The LZW filter is not ported
-    /// yet (phase 2), so this borrows the system's `gzip -dc` (or
-    /// `uncompress -c`), which read .Z.
-    fn uncompress(data: &[u8]) -> Option<Vec<u8>> {
-        for (prog, args) in [("gzip", &["-dc"][..]), ("uncompress", &["-c"][..])] {
-            let Ok(mut child) = Command::new(prog)
-                .args(args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-            else {
-                continue;
-            };
-            let mut stdin = child.stdin.take()?;
-            let input = data.to_vec();
-            let writer = std::thread::spawn(move || stdin.write_all(&input));
-            let output = child.wait_with_output().ok()?;
-            let _ = writer.join();
-            if output.status.success() {
-                return Some(output.stdout);
-            }
-        }
-        None
-    }
-
     /// The NFC/NFD pattern file that upstream extracts from
     /// test_archive_string_conversion.txt.Z.uu.
     ///
-    /// Looked up in `$LIBARCHIVE_TEST_DIR`, else the checkout's submodule,
-    /// else (in a worktree under `.claude/worktrees/`) the main checkout's.
+    /// Looked up in `$LIBARCHIVE_TEST_DIR`, then `tests/fixtures`.
     fn load_normalization_data() -> String {
         const NAME: &str = "test_archive_string_conversion.txt.Z.uu";
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let rel = "upstream/libarchive/libarchive/test";
+        let rel = "tests/fixtures";
         let mut dirs: Vec<PathBuf> = std::env::var_os("LIBARCHIVE_TEST_DIR")
             .map(PathBuf::from)
             .into_iter()
             .collect();
         dirs.push(manifest.join(rel));
-        dirs.extend(manifest.ancestors().nth(3).map(|root| root.join(rel)));
         let uu = dirs
             .iter()
             .find_map(|d| std::fs::read(d.join(NAME)).ok())
@@ -1912,7 +1876,23 @@ mod tests {
                 panic!("fixture {NAME} not found in {dirs:?}; set LIBARCHIVE_TEST_DIR")
             });
         let z = uudecode(&uu).expect("fixture is not valid uuencode");
-        let text = uncompress(&z).expect("neither gzip nor uncompress could decompress the .Z");
+        let mut reader = crate::ArchiveRead::new();
+        assert_eq!(reader.support_filter_compress(), crate::Status::Ok);
+        assert_eq!(reader.support_format_raw(), crate::Status::Ok);
+        assert_eq!(reader.open_memory(z), crate::Status::Ok);
+        assert_eq!(reader.next_header(), crate::Status::Ok);
+        let mut text = Vec::new();
+        let mut block = [0; 8192];
+        loop {
+            let n = reader.data(&mut block).expect("invalid compressed fixture");
+            if n == 0 {
+                break;
+            }
+            text.extend_from_slice(&block[..n]);
+        }
+        // Check the pinned fixture's decoded bytes before using its patterns.
+        assert_eq!(text.len(), 363_470);
+        assert_eq!(crc32fast::hash(&text), 0x282e_2d69);
         String::from_utf8(text).expect("fixture is not UTF-8")
     }
 

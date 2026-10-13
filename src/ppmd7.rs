@@ -3,7 +3,6 @@
 This code is based on PPMd var.H (2001): Dmitry Shkarin : Public domain */
 
 // Ported from libarchive/archive_ppmd7.c.
-#![allow(dead_code)] // used by the 7zip and rar readers
 
 //! PPMd var. H model, encoder, and the 7z and RAR range decoders.
 //!
@@ -134,6 +133,7 @@ impl Ppmd7 {
         self.size = 0;
     }
 
+    #[cfg(test)]
     pub fn was_allocated(&self) -> bool {
         self.a.is_allocated()
     }
@@ -1069,6 +1069,7 @@ impl Ppmd7RangeDec {
     }
 
     /// `Ppmd7z_RangeDec_IsFinishedOK`.
+    #[cfg(test)]
     pub fn is_finished_ok(&self) -> bool {
         self.code == 0
     }
