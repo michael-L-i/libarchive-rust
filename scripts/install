@@ -80,12 +80,20 @@ def license_notices():
 
 
 def build(args, target_dir):
-    env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
+    rustc = os.environ.get("RUSTC", "rustc")
+    compiler = subprocess.check_output([rustc, "-vV"], cwd=ROOT, text=True)
+    host = re.search(r"^host: ([A-Za-z0-9_.-]+)$", compiler, re.MULTILINE)
+    if host is None:
+        raise RuntimeError("rustc did not report its host target")
+    host = host.group(1)
+    if os.environ.get("CARGO_BUILD_TARGET", host) != host:
+        raise RuntimeError("cross compilation is not supported by this installer")
+    env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir), RUSTC=rustc)
     cargo = os.environ.get("CARGO", "cargo")
     profile = "release" if args.profile == "release" else "dev"
-    output_dir = target_dir / ("release" if profile == "release" else "debug")
+    output_dir = target_dir / host / ("release" if profile == "release" else "debug")
     command = [cargo, "rustc", "--locked", "-p", "libarchive-capi", "--lib",
-               "--profile", profile, "--", "--print=native-static-libs"]
+               "--target", host, "--profile", profile, "--", "--print=native-static-libs"]
     output = run(command, env)
     archive = output_dir / "libarchive.a"
     report = output_dir / "libarchive-native-libs.json"
@@ -101,7 +109,7 @@ def build(args, target_dir):
         if native is None:
             # Cargo does not repeat rustc's native-library note for a cached build.
             # Only discard this package's products, retaining dependency caches.
-            run([cargo, "clean", "-p", "libarchive-capi", "--profile", profile], env)
+            run([cargo, "clean", "-p", "libarchive-capi", "--target", host, "--profile", profile], env)
             output = run(command, env)
             match = re.search(r"native-static-libs:\s*([^\n]+)", output)
             if not match:
@@ -109,7 +117,7 @@ def build(args, target_dir):
             native = shlex.split(match.group(1))
     report.write_text(json.dumps({"sha256": checksum(archive), "libs": native}) + "\n")
     if not args.without_tools:
-        run([cargo, "build", "--locked", "--profile", profile,
+        run([cargo, "build", "--locked", "--target", host, "--profile", profile,
              *[item for tool in TOOLS for item in ("-p", tool)]], env)
     return output_dir, native
 
@@ -253,8 +261,6 @@ def main():
     system = platform.system()
     if system not in ("Linux", "Darwin"):
         parser.error("installation is supported on Linux and macOS")
-    if os.environ.get("CARGO_BUILD_TARGET"):
-        parser.error("cross compilation is not supported by this installer")
     destination = args.destdir.resolve()
     if destination == Path("/") or destination == ROOT or destination in ROOT.parents:
         parser.error("--destdir must be a dedicated staging directory")

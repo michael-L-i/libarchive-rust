@@ -1,8 +1,10 @@
 """Installer path validation and confinement checks without a compiler build."""
 
 import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -102,6 +104,39 @@ class InstallerPaths(unittest.TestCase):
             self.stage(temporary)
             self.assertEqual(outside.read_bytes(), b"keep me")
             self.assertEqual((lib / "libarchive.a").read_bytes(), b"new static archive")
+
+    def test_configured_cargo_target_cannot_select_stale_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "src").mkdir()
+            (directory / "src/lib.rs").write_text(
+                '#[no_mangle]\npub extern "C" fn fixture() -> i32 { 42 }\n'
+            )
+            (directory / "Cargo.toml").write_text(
+                '[package]\nname="libarchive-capi"\nversion="0.1.0"\nedition="2021"\n'
+                '[lib]\nname="archive"\ncrate-type=["staticlib", "cdylib"]\n'
+            )
+            (directory / "Cargo.lock").write_text(
+                'version = 4\n[[package]]\nname = "libarchive-capi"\nversion = "0.1.0"\n'
+            )
+            (directory / ".cargo").mkdir()
+            (directory / ".cargo/config.toml").write_text(
+                '[build]\ntarget="wasm32-unknown-unknown"\n'
+            )
+            target = directory / "target"
+            stale = target / "debug/libarchive.a"
+            stale.parent.mkdir(parents=True)
+            stale.write_bytes(b"stale archive")
+            args = SimpleNamespace(profile="dev", without_tools=True)
+            env = dict(os.environ)
+            env.pop("CARGO_BUILD_TARGET", None)
+            with patch.object(INSTALL, "ROOT", directory), patch.dict(os.environ, env, clear=True):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    output, native = INSTALL.build(args, target)
+            self.assertNotEqual(output, stale.parent)
+            self.assertNotEqual((output / "libarchive.a").read_bytes(), stale.read_bytes())
+            self.assertEqual(stale.read_bytes(), b"stale archive")
+            self.assertTrue(native)
 
 
 if __name__ == "__main__":

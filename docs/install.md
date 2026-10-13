@@ -21,7 +21,10 @@ to the prefix. Library-directory components accept ASCII letters, digits,
 path is also embedded in pkg-config and CMake metadata. The prefix and staging
 directory may contain spaces. `--target-dir PATH` overrides the dedicated `build/install-target`
 Cargo cache. Ordinary Cargo environment variables, such as `CARGO_HOME`, are
-supported; cross compilation is not supported by this installer.
+supported. The installer selects the compiler named by `RUSTC` (default
+`rustc`) and explicitly builds for that compiler's host target, overriding
+Cargo's `build.target` configuration. Cross compilation is not supported;
+a differing `CARGO_BUILD_TARGET` environment variable is rejected.
 
 `--destdir` is required. The script stages files for a package manager or a
 separate deployment step; it does not modify the running system. The installed
