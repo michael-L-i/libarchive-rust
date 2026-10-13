@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Run real pacman transactions against an installed Linux library in Docker."""
+
+import argparse
+from pathlib import Path
+import subprocess
+import sys
+import uuid
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--library", type=Path, required=True,
+                        help="installed Linux libarchive.so.13 (must match the selected platform)")
+    parser.add_argument("--report-dir", type=Path, required=True)
+    parser.add_argument("--platform", choices=("linux/arm64", "linux/amd64"),
+                        help="Docker platform; omitted uses the Docker host architecture")
+    args = parser.parse_args()
+    library = args.library.resolve()
+    if not library.is_file():
+        parser.error("--library must be a built Linux ELF shared library")
+    with library.open("rb") as stream:
+        elf = stream.read(4) == b"\x7fELF"
+    if not elf:
+        parser.error("--library must be a built Linux ELF shared library")
+    report = args.report_dir.resolve()
+    report.mkdir(parents=True, exist_ok=True)
+    name = "la-adoption-pacman-" + uuid.uuid4().hex[:12]
+    image = name + ":local"
+    platform = ["--platform", args.platform] if args.platform else []
+    created = False
+    try:
+        print("Building disposable Debian pacman test image", flush=True)
+        with (report / "image-build.log").open("wb") as log:
+            subprocess.run(["docker", "build", *platform, "-t", image,
+                            str(ROOT / "tests/package-manager")], stdout=log,
+                           stderr=subprocess.STDOUT, timeout=600, check=True)
+        (report / "image.json").write_bytes(subprocess.check_output(["docker", "image", "inspect", image]))
+        subprocess.run(["docker", "create", *platform, "--name", name, "--network", "none", image],
+                       stdout=subprocess.DEVNULL, check=True)
+        created = True
+        subprocess.run(["docker", "cp", str(library), name + ":/opt/libarchive.so.13"], check=True)
+        subprocess.run(["docker", "start", name], stdout=subprocess.DEVNULL, check=True)
+        status = subprocess.check_output(["docker", "wait", name], text=True, timeout=600).strip()
+        logs = subprocess.check_output(["docker", "logs", name], stderr=subprocess.STDOUT)
+        (report / "container.log").write_bytes(logs)
+        sys.stdout.buffer.write(logs)
+        subprocess.run(["docker", "cp", name + ":/evidence/.", str(report)], check=True)
+        if status != "0":
+            raise RuntimeError(f"package transaction checks failed (container exit {status}); see {report}")
+    finally:
+        if created:
+            subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, check=False)
+        subprocess.run(["docker", "image", "rm", image], stdout=subprocess.DEVNULL, check=False)
+
+
+if __name__ == "__main__":
+    main()
