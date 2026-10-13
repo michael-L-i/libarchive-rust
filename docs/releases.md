@@ -3,7 +3,7 @@
 Builds require Rust 1.95 or newer, a platform linker, and a C compiler for
 the C interface's variadic formatting shim. Rust tools and the Rust library
 do not compile C. Installed applications require neither Cargo nor rustc.
-The minimum compiler is recorded in every first-party Cargo manifest and
+The minimum compiler is recorded in every workspace member manifest and
 tested in the installed-package CI matrix alongside the current stable
 compiler. Keeping this baseline avoids requiring a newer compiler solely
 to replace the small `archive_set_error` shim.
