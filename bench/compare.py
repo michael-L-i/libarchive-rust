@@ -55,10 +55,21 @@ def manifest(root):
             for p in sorted(Path(root).rglob('*')) if p.is_file()}
 
 
-def run(argv, cwd):
+def timed_command(argv, env=None):
+    command = list(map(str, argv))
+    loader = {key: value for key, value in (env or {}).items()
+              if key.startswith(('DYLD_', 'LD_'))}
+    if loader:
+        # macOS strips DYLD variables on launch of protected /usr/bin/time.
+        # Apply assignments in its child, after that protected launch.
+        command = ['/usr/bin/env', *[f'{key}={value}' for key, value in loader.items()], *command]
+    return ['/usr/bin/time', '-l', *command]
+
+
+def run(argv, cwd, env=None):
     """Run under /usr/bin/time -l; returns wall time, peak RSS and status."""
     start = time.perf_counter()
-    p = subprocess.Popen(['/usr/bin/time', '-l', *map(str, argv)], cwd=cwd, env=ENV,
+    p = subprocess.Popen(timed_command(argv, env), cwd=cwd, env=ENV if env is None else env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                          start_new_session=True)
     try:
@@ -74,15 +85,16 @@ def run(argv, cwd):
                 error=err[-500:] if p.returncode else '')
 
 
-def version(exe):
-    return subprocess.check_output([exe, '--version'], text=True, env=ENV).strip()
+def version(exe, env=None):
+    return subprocess.check_output([exe, '--version'], text=True, env=ENV if env is None else env).strip()
 
 
 def outcome(ratio):
     return 'win' if ratio < 1 - THRESHOLD else 'loss' if ratio > 1 + THRESHOLD else 'tie'
 
 
-def measure(tools, inputs, work, args, expected):
+def measure(tools, inputs, work, args, expected, environments=None):
+    environments = environments or {}
     rows, checks, failures = [], [], []
     names = list(tools)
     rotations = lambda r: names[r % len(names):] + names[:r % len(names)]
@@ -101,7 +113,7 @@ def measure(tools, inputs, work, args, expected):
                 for r in range(args.repeats):
                     for v in rotations(r):
                         # One shared output path: separate per-tool files showed allocation bias.
-                        res = run([tools[v], *FORMATS[fmt], *NO_METADATA, '-cf', out, '-C', inputs / d, '.'], work)
+                        res = run([tools[v], *FORMATS[fmt], *NO_METADATA, '-cf', out, '-C', inputs / d, '.'], work, environments.get(v))
                         if res['status'] != 'ok':
                             fail(f'{tag} create {v}: {res["status"]} {res["error"]}')
                             continue
@@ -117,7 +129,7 @@ def measure(tools, inputs, work, args, expected):
                 for r in range(args.repeats):
                     for v in rotations(r):
                         with tempfile.TemporaryDirectory(prefix='extract-', dir=work) as dest:
-                            res = run([tools[v], *NO_METADATA, '--no-same-owner', '-xf', archives['C'], '-C', dest], work)
+                            res = run([tools[v], *NO_METADATA, '--no-same-owner', '-xf', archives['C'], '-C', dest], work, environments.get(v))
                             res.update(dataset=d, format=fmt, operation='extract', variant=v, repeat=r)
                             if res['status'] != 'ok' or manifest(dest) != expected[d]:
                                 fail(f'{tag} extract {v}: {res["status"] or "content mismatch"} {res["error"]}')
@@ -128,7 +140,7 @@ def measure(tools, inputs, work, args, expected):
                     continue
                 for reader in dict.fromkeys(['C', names[-1]]):
                     with tempfile.TemporaryDirectory(prefix='cross-', dir=work) as dest:
-                        res = run([tools[reader], *NO_METADATA, '--no-same-owner', '-xf', archive, '-C', dest], work)
+                        res = run([tools[reader], *NO_METADATA, '--no-same-owner', '-xf', archive, '-C', dest], work, environments.get(reader))
                         ok = res['status'] == 'ok' and manifest(dest) == expected[d]
                         checks.append(dict(dataset=d, format=fmt, writer=writer, reader=reader, valid=ok))
                         if not ok:
