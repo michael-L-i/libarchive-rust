@@ -1,6 +1,6 @@
 //! libarchive's C ABI. The exported functions live in `libarchive_rust`'s
 //! `ffi` module; this crate links them into `libarchive.{so,dylib,a}` with
-//! `variadic.c`, the one function stable Rust can't define:
+//! `variadic.c`, a formatting shim retained for the minimum Rust 1.95 compiler:
 //! `archive_set_error`, which takes printf-style arguments. Rust programs
 //! use `libarchive_rust` directly and contain no C.
 

@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Package a committed source tree with locked dependencies for offline builds."""
+
+import argparse
+import gzip
+import io
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+import tempfile
+import tomllib
+
+
+ROOT = Path(__file__).resolve().parent.parent
+DIRECTORIES = {"src", "capi", "deflate", "tools", "vendor", "include", "scripts", "tests", "docs"}
+FILES = {"Cargo.toml", "Cargo.lock", "build.rs", "LICENSE", "COPYING", "README.md", "NOTES.md", "Makefile"}
+
+
+def git(*args):
+    return subprocess.check_output(["git", "-C", str(ROOT), *args])
+
+
+def package(args):
+    revision = git("rev-parse", "--verify", "--end-of-options", f"{args.revision}^{{commit}}").decode().strip()
+    manifest = tomllib.loads(git("show", f"{revision}:Cargo.toml").decode())
+    name = f"libarchive-rust-{manifest['package']['version']}"
+    epoch = int(os.environ.get("SOURCE_DATE_EPOCH", git("show", "-s", "--format=%ct", revision).decode().strip()))
+    if not 0 <= epoch <= 0xFFFFFFFF:
+        raise ValueError("SOURCE_DATE_EPOCH must fit an unsigned 32-bit timestamp")
+    output = args.output.absolute()
+    if output.exists():
+        raise ValueError(f"output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="libarchive-source-") as temporary:
+        tree = Path(temporary) / name
+        tree.mkdir()
+        # Exclude the oracle and development state; use committed regular files.
+        with tarfile.open(fileobj=io.BytesIO(git("archive", "--format=tar", revision))) as source:
+            for member in source:
+                path = Path(member.name)
+                if path.parts[0] not in DIRECTORIES and member.name not in FILES:
+                    continue
+                if member.isdir():
+                    continue
+                if not member.isfile() or path.is_absolute() or ".." in path.parts:
+                    raise ValueError(f"unsupported source archive entry: {member.name}")
+                destination = tree / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with source.extractfile(member) as contents:
+                    destination.write_bytes(contents.read())
+                destination.chmod(0o755 if member.mode & 0o111 else 0o644)
+        if not (tree / "include/archive.h").is_file():
+            raise ValueError("the selected commit does not contain standalone public headers")
+        result = subprocess.run(
+            ["cargo", "vendor", "--locked", "third-party"], cwd=tree,
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode:
+            raise ValueError(f"cargo vendor failed:\n{result.stderr.strip()}")
+        config = tree / ".cargo/config.toml"
+        config.parent.mkdir()
+        config.write_text(result.stdout + "\n[net]\noffline = true\n")
+        (tree / "SOURCE-REVISION").write_text(revision + "\n")
+        # Normalize ordering, modes, ownership, timestamps and gzip headers.
+        descriptor, pending = tempfile.mkstemp(prefix=".source-release-", dir=output.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as raw:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=epoch) as compressed:
+                    with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as target:
+                        for path in [tree, *sorted(tree.rglob("*"))]:
+                            info = target.gettarinfo(str(path), str(Path(name) / path.relative_to(tree)))
+                            if not info.isfile() and not info.isdir():
+                                raise ValueError(f"unsupported vendored entry: {path.relative_to(tree)}")
+                            info.uid = info.gid = 0
+                            info.uname = info.gname = ""
+                            info.mtime = epoch
+                            info.mode = 0o755 if info.isdir() or info.mode & 0o111 else 0o644
+                            if info.isfile():
+                                with path.open("rb") as contents:
+                                    target.addfile(info, contents)
+                            else:
+                                target.addfile(info)
+            # Publish atomically and refuse an output created during vendoring.
+            os.link(pending, output)
+        finally:
+            os.unlink(pending)
+    print(f"Source release: {output} (revision {revision[:12]})")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--revision", default="HEAD", help="committed revision (default: HEAD)")
+    parser.add_argument("--output", required=True, type=Path, help="new .tar.gz output path")
+    args = parser.parse_args()
+    try:
+        package(args)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"source-release: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
