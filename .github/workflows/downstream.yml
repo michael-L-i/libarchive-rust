@@ -1,0 +1,39 @@
+name: Downstream Linux applications
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  existing-binaries:
+    name: Existing applications (${{ matrix.os }}, x86_64)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - name: Install unchanged distribution consumers
+        run: |
+          test "$(uname -m)" = x86_64
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake pkg-config binutils libarchive-tools
+      - name: Stage libraries and tools
+        run: scripts/install --prefix /opt/libarchive-rust --destdir "$RUNNER_TEMP/package stage"
+      - name: Test installed C and C++ consumers
+        run: scripts/test-installed --prefix "$RUNNER_TEMP/package stage/opt/libarchive-rust" --tools
+      - name: Compare existing applications with C and Rust libraries
+        run: >-
+          python3 tests/downstream/existing-binaries.py
+          --library-dir "$RUNNER_TEMP/package stage/opt/libarchive-rust/lib"
+          --report-dir "$RUNNER_TEMP/downstream report"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: downstream-${{ matrix.os }}-x86_64
+          path: ${{ runner.temp }}/downstream report
+          if-no-files-found: ignore
