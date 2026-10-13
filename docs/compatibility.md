@@ -17,7 +17,8 @@ The supported installation path is macOS and Linux with glibc. Native ARM64
 builds, installed consumers and upstream suites have been exercised on both.
 Debian 12 x86_64 has also been exercised under Rosetta translation, with three
 development-test failures reproduced in standalone process-spawning programs.
-Native x86_64 CI is configured; hosted results are pending publication.
+Native x86_64 hosted results are recorded in
+[publication validation](publication-validation.md).
 
 Windows, musl, kernel use and cross compilation through `scripts/install`
 are unvalidated. The library uses `std` and platform system libraries. Build
@@ -93,5 +94,5 @@ does not establish Linux performance.
 
 The next compatibility work should reproduce specific documented differences
 with minimized valid and malformed fixtures, preserving both implementations'
-results. Native x86_64 execution and the intended distribution's actual
-downstream clients remain necessary before making broader replacement claims.
+results. Further testing with the intended distribution's downstream clients
+remains necessary before making broader replacement claims.

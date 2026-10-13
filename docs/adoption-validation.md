@@ -20,8 +20,9 @@ Unchanged distribution applications selected either their system C library or
 the staged Rust library through a child-process loader environment. Loader
 traces verified the selected provider. See [downstream testing](downstream-testing.md)
 for the x86 results, including three development-test failures reproduced by
-standalone Rust and C spawning under Rosetta. Native x86 CI is configured but
-has not run. Debian's older liblzma headers also caused one previously passing
+standalone Rust and C spawning under Rosetta. This round did not include
+native x86 CI; the subsequent [publication validation](publication-validation.md)
+records native hosted results. Debian's older liblzma headers also caused one previously passing
 RISC-V test to skip in both C and Rust; neither ratchet was relaxed.
 
 `scripts/test-package-manager` runs isolated pacman 6.0.2/libalpm 13.0.2

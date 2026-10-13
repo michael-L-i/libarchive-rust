@@ -14,8 +14,8 @@ Additional adoption validation exercised unchanged Linux applications and
 pacman transactions on native ARM64 and translated x86_64, extended all 39
 fuzz targets, and measured the installed shared library through one C client.
 The 96-case native macOS benchmark has 49 Rust wins, 45 ties and two losses,
-with geometric mean Rust/C elapsed time 0.910324. Native x86 validation remains
-outstanding; emulated development failures and a dependency-related skip are
+with geometric mean Rust/C elapsed time 0.910324. Native x86 validation was
+outstanding in that round; emulated development failures and a dependency-related skip are
 recorded in [adoption validation](docs/adoption-validation.md).
 
 A final performance screen tried four LZMA changes, two Zstd changes and
@@ -95,8 +95,12 @@ and a standalone source release with a fresh Cargo home and networking disabled.
 Local publication checks passed: 632 workspace tests (five ignored), strict
 Clippy, formatting, 20 Python tests and all 926 macOS oracle cases with zero
 ratchet regressions. These packaging changes do not alter runtime algorithms.
-Hosted Linux/macOS validation is tracked in the repository's Actions runs;
-configured jobs alone are not evidence of a passing native x86 campaign.
+Hosted Rust tests and strict lint checks passed on native Ubuntu x86_64
+and macOS ARM64. Installed consumers passed on both platforms with Rust 1.95
+and stable; Ubuntu 22.04 and 24.04 unchanged application checks also passed.
+The native Ubuntu upstream suite recorded 976 passes and 134 skips, with
+zero regressions. See [publication validation](docs/publication-validation.md)
+for the tested revisions and CI setup corrections.
 
 Generated dependency build metadata was removed from the unpublished history;
 [the revision map](docs/history.md) preserves older report provenance. Obsolete

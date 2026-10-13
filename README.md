@@ -109,8 +109,11 @@ installed consumers, package transactions and extended fuzz campaigns.
 Local x86_64 Linux testing used Rosetta translation: downstream checks passed,
 but three process-spawning development tests failed and were reproduced with
 standalone Rust and C programs. [The x86 report](docs/downstream-testing.md)
-records those results. Native x86_64 GitHub Actions jobs are configured; their
-first hosted results are pending publication. Windows and musl are unvalidated.
+records those results. Native x86_64 Ubuntu checks now pass, including 976
+upstream cases and installed consumers on Ubuntu 22.04 and 24.04. See
+[publication validation](docs/publication-validation.md) and
+[GitHub Actions](https://github.com/michael-L-i/libarchive-rust/actions) for
+results and environments. Windows and musl are unvalidated.
 
 Read [compatibility](docs/compatibility.md) before evaluating a replacement for
 an existing libarchive installation. [NOTES.md](NOTES.md) contains detailed

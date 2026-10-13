@@ -21,7 +21,8 @@ with Rust 1.97.1. Upstream-suite Linux validation used the existing Debian 13
 environment; installed-package and minimum-compiler tests used Debian 12,
 glibc 2.36, Rust 1.95, and an unprivileged user. macOS validation used the
 local Apple Silicon environment. Hosted x86_64 and current-stable CI jobs
-are configured but have not run locally or remotely in this pass.
+were configured but had not run locally or remotely in this pass. Subsequent
+native hosted results are in [publication validation](publication-validation.md).
 
 Installed consumers compile against the bundled pinned headers and verify
 the actual relocated library using `dladdr`, not merely a successful link.
