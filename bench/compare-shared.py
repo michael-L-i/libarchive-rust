@@ -61,12 +61,31 @@ def reject_truncated(binary, environments, work):
         archive = work / f'truncated.{name}'
         archive.write_bytes(content)
         for variant, env in environments.items():
-            result = subprocess.run([str(binary), '-tf', str(archive)], env=env,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            try:
+                result = subprocess.run([str(binary), '-tf', str(archive)], env=env,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            except subprocess.TimeoutExpired as error:
+                stderr = error.stderr or b''
+                checks.append(dict(check=f'reject truncated {name}', variant=variant,
+                                   valid=False, status='timeout', exit_status=None,
+                                   stderr=stderr.decode('utf-8', 'replace')))
+                continue
             checks.append(dict(check=f'reject truncated {name}', variant=variant,
-                               valid=result.returncode != 0, exit_status=result.returncode,
+                               valid=result.returncode > 0, exit_status=result.returncode,
                                stderr=result.stderr.decode('utf-8', 'replace')))
     return checks
+
+
+def summarize_startup(rows, variants):
+    summary = {}
+    for variant in variants:
+        successful = [row for row in rows if row['variant'] == variant and row['status'] == 'ok']
+        wall = [row['wall_s'] for row in successful]
+        rss = [row['peak_rss_bytes'] for row in successful if row.get('peak_rss_bytes') is not None]
+        summary[variant] = dict(median_s=statistics.median(wall) if wall else None,
+                                peak_mib=statistics.median(rss) / 1024 ** 2 if rss else None,
+                                successful_runs=len(successful))
+    return summary
 
 
 def main():
@@ -123,10 +142,7 @@ def main():
     score['geometric_mean_ratio'] = (math.exp(statistics.mean(math.log(case['ratio'])
                                                              for case in score['cases']))
                                      if score['cases'] else None)
-    startup_summary = {variant: dict(
-        median_s=statistics.median(row['wall_s'] for row in startup if row['variant'] == variant),
-        peak_mib=statistics.median(row['peak_rss_bytes'] or 0 for row in startup
-                                  if row['variant'] == variant) / 1024 ** 2) for variant in tools}
+    startup_summary = summarize_startup(startup, tools)
     meta = dict(platform=platform.platform(), machine=platform.machine(),
                 cpu=subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'], text=True).strip(),
                 versions={variant: detail['version'] for variant, detail in verification.items()},
@@ -150,11 +166,11 @@ def main():
     markdown += ('\nOne identical C client executable loaded each shared library. Public read, write, disk '
                  'and variadic error symbols resolved to the selected library before timing. '
                  f'Geometric mean Rust/C ratio: {score["geometric_mean_ratio"]}.\n\n'
-                 '| Startup (`--version`) | C | Rust |\n|---|---:|---:|\n'
-                 f'| Median ms | {startup_summary["C"]["median_s"] * 1000:.3f} | '
-                 f'{startup_summary["Rust"]["median_s"] * 1000:.3f} |\n'
-                 f'| Median peak MiB | {startup_summary["C"]["peak_mib"]:.2f} | '
-                 f'{startup_summary["Rust"]["peak_mib"]:.2f} |\n')
+                 '| Startup (`--version`) | C | Rust |\n|---|---:|---:|\n')
+    for label, key, scale in [('Median ms', 'median_s', 1000), ('Median peak MiB', 'peak_mib', 1)]:
+        values = [f'{metric * scale:.3f}' if (metric := startup_summary[variant][key]) is not None
+                  else 'unavailable' for variant in tools]
+        markdown += f'| {label} | ' + ' | '.join(values) + ' |\n'
     stem.with_suffix('.md').write_text(markdown)
     print(markdown)
     return int(bool(failures) or any(not check['valid'] for check in checks))
