@@ -169,7 +169,6 @@ pub struct Entry {
     encryption: u8,
     mac_metadata: Vec<u8>,
     /// Bitmap of the digests that are set, by `1 << (type - 1)`.
-    #[allow(dead_code)] // read by the mtree writer (phase 5)
     mset_digest: u32,
     digest: [[u8; 64]; 6],
 
@@ -257,7 +256,6 @@ macro_rules! text_field {
 
         /// The string in the charset of `sc`; false if it did not convert
         /// completely.
-        #[allow(dead_code)] // used by the format readers and writers (phases 3-4)
         pub fn $get_l(&mut self, sc: Option<&StringConv>) -> (Option<&[u8]>, bool) {
             let mut g = lock(&self.cache);
             self.$field.get_mbs_l(g.as_deref_mut(), sc)
@@ -284,7 +282,6 @@ macro_rules! text_field {
             self.$field.clear();
         }
 
-        #[allow(dead_code)] // used by the format readers (phases 3-4)
         pub fn $copy_l(&mut self, v: &[u8], sc: Option<&StringConv>) -> Result<(), ConvFailed> {
             self.$field.copy_mbs_len_l(v, sc)
         }
@@ -848,7 +845,6 @@ impl Entry {
         self.linkname.get_wcs_z(g.as_deref_mut()).ok().flatten()
     }
 
-    #[allow(dead_code)] // for the format writers
     pub fn hardlink_l(&mut self, sc: Option<&StringConv>) -> (Option<&[u8]>, bool) {
         if self.set & AE_SET_HARDLINK == 0 {
             return (None, true);
@@ -881,7 +877,6 @@ impl Entry {
         self.linkname.get_wcs_z(g.as_deref_mut()).ok().flatten()
     }
 
-    #[allow(dead_code)] // for the format writers
     pub fn symlink_l(&mut self, sc: Option<&StringConv>) -> (Option<&[u8]>, bool) {
         if self.set & AE_SET_SYMLINK == 0 {
             return (None, true);
@@ -923,7 +918,6 @@ impl Entry {
         update_utf8(&mut self.linkname, &self.cache, target)
     }
 
-    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn copy_hardlink_l(
         &mut self,
         target: &[u8],
@@ -966,7 +960,6 @@ impl Entry {
         update_utf8(&mut self.linkname, &self.cache, linkname)
     }
 
-    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn copy_symlink_l(
         &mut self,
         linkname: &[u8],
@@ -1025,7 +1018,6 @@ impl Entry {
         self.put_link(None);
     }
 
-    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn copy_link_l(
         &mut self,
         target: &[u8],
@@ -1149,11 +1141,6 @@ impl Entry {
 
     pub fn acl_from_text(&mut self, text: &[u8], ty: c_int) -> c_int {
         self.acl.parse_nl(text, ty, None)
-    }
-
-    #[allow(dead_code)] // for the format readers
-    pub fn acl_from_text_l(&mut self, text: &[u8], ty: c_int, sc: Option<&StringConv>) -> c_int {
-        self.acl.parse_nl(text, ty, sc)
     }
 }
 

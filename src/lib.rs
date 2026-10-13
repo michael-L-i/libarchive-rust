@@ -48,7 +48,6 @@ mod read_set_format;
 mod read_set_options;
 mod string;
 mod string_composition;
-#[allow(dead_code)] // used by the zip, 7zip, rar, rar5 and lha readers (phase 4)
 mod time;
 mod util;
 mod version_details;

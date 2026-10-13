@@ -33,8 +33,6 @@
 //! functions; here the RustCrypto crates are the only backend and the table
 //! is `Digest`.
 
-#![allow(dead_code)] // RIPEMD-160 and SHA-384, for the mtree writer (phase 5)
-
 use md5::Md5;
 use ripemd::Ripemd160;
 use sha1::Sha1;

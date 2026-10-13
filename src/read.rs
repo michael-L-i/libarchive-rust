@@ -143,7 +143,6 @@ impl Whence {
     }
 
     /// The origin for a C `whence`.
-    #[allow(dead_code)] // for the formats' seek_data (phase 4)
     pub fn from_c(whence: c_int) -> Option<Whence> {
         match whence {
             libc::SEEK_SET => Some(Whence::Set),
@@ -1058,38 +1057,6 @@ impl<'a> Reader<'a> {
         Ok(top.data(loc))
     }
 
-    /// Reads the next `n` bytes into a `Vec` and consumes them, or `None`
-    /// (nothing consumed) if the input ends first. For fixed-size fields a
-    /// format keeps, where a `read_ahead` slice would be in the way.
-    #[allow(dead_code)] // used by the format readers (phases 3-4)
-    pub fn read_exact_vec(&mut self, n: usize) -> Result<Option<Vec<u8>>, Error> {
-        let Some(data) = self.read_ahead(n)? else {
-            return Ok(None);
-        };
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(n)
-            .map_err(|_| Error::fatal(libc::ENOMEM, "No memory for archive input"))?;
-        bytes.extend_from_slice(data.get(..n).unwrap_or_default());
-        self.consume(n)?;
-        Ok(Some(bytes))
-    }
-
-    /// Consumes `n` bytes that a `read_ahead` (or `peek_available`) just
-    /// showed were there: `consume`, but running out is a bug in the caller,
-    /// which debug builds assert on, rather than a truncated input.
-    #[allow(dead_code)] // used by the format readers (phases 3-4)
-    pub fn consume_ahead(&mut self, n: usize) -> Result<(), Error> {
-        self.flush()?;
-        debug_assert!(
-            self.chain
-                .last()
-                .is_some_and(|s| s.avail + s.client_avail >= n),
-            "consume_ahead({n}) without that much read ahead"
-        );
-        self.consume(n)
-    }
-
     /// `__archive_read_consume`: moves the file pointer forward by `n`, which
     /// the reader should have looked at (or not) first. It is a fatal error
     /// for the stream to end first, or for `n` to be negative.
@@ -1200,7 +1167,6 @@ impl<'a> Reader<'a> {
 
     /// Whether `seek` can work. Seeking is only possible if the client seeks
     /// and no filter is in the way.
-    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn can_seek(&self) -> bool {
         self.chain.last().is_some_and(|s| s.can_seek)
     }
@@ -1225,21 +1191,18 @@ impl<'a> Reader<'a> {
 
     /// Records a warning; return the `Status` it gives to say so.
     #[must_use = "return the status so the warning reaches the caller"]
-    #[allow(dead_code)] // used by the format readers (phases 3-4)
     pub fn warn(&self, errno: c_int, msg: impl AsRef<[u8]>) -> Status {
         self.a.warn(errno, msg)
     }
 
     /// `__archive_read_reset_passphrase`: call when you start looking for a
     /// passphrase for an entry.
-    #[allow(dead_code)] // used by the zip, rar and 7zip readers (phase 4)
     pub fn reset_passphrase(&mut self) {
         self.passphrases.reset();
     }
 
     /// `__archive_read_next_passphrase`: the next passphrase to try, `None`
     /// when the candidates and the client's callback have run out.
-    #[allow(dead_code)] // used by the zip, rar and 7zip readers (phase 4)
     pub fn next_passphrase(&mut self) -> Option<Vec<u8>> {
         self.passphrases.next()
     }
@@ -1496,7 +1459,6 @@ pub enum Data<'r> {
     /// `Reader::warn`): there is no block this time, and the caller gets
     /// `ARCHIVE_WARN`. A later call may carry on. `offset` is what the
     /// caller gets as the block's offset.
-    #[allow(dead_code)] // returned by the zip and rar readers (phase 4)
     Warn { offset: i64 },
 }
 
@@ -3735,17 +3697,19 @@ mod tests {
     }
 
     #[test]
-    fn helpers_read_fixed_amounts() {
+    fn read_ahead_does_not_consume() {
         let (mem, _) = Mem::new(b"0123456789", 3);
         let (mut r, a) = setup(mem);
         let mut rd = r.reader(&a);
-        assert_eq!(rd.read_exact_vec(4).unwrap(), Some(b"0123".to_vec()));
+        assert_eq!(&rd.read_ahead(4).unwrap().unwrap()[..4], b"0123");
+        assert_eq!(rd.position(), 0);
+        rd.consume(4).unwrap();
         assert_eq!(rd.position(), 4);
         // Too little: nothing is consumed.
-        assert_eq!(rd.read_exact_vec(7).unwrap(), None);
+        assert_eq!(rd.read_ahead(7).unwrap(), None);
         assert_eq!(rd.position(), 4);
         assert!(rd.read_ahead(2).unwrap().is_some());
-        rd.consume_ahead(2).unwrap();
+        rd.consume(2).unwrap();
         assert_eq!(rd.peek_available(1).unwrap().first(), Some(&b'6'));
     }
 }
