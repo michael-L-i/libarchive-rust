@@ -29,14 +29,16 @@ def environment(library):
 
 
 def verify_provider(binary, probe, library, env):
-    provider = subprocess.check_output([str(probe)], env=env, text=True, timeout=30)
+    provider = subprocess.run(compare.timed_command([probe], env), env=env, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              check=True, timeout=30).stdout
     symbols = dict(line.split('\t', 1) for line in provider.splitlines()[1:])
     required = {'archive_read_new', 'archive_write_new', 'archive_read_disk_new',
                 'archive_set_error'}
     if set(symbols) != required or any(Path(path).resolve() != library for path in symbols.values()):
         raise RuntimeError(f'public functions did not bind to {library}: {symbols}')
     trace_env = dict(env, DYLD_PRINT_LIBRARIES='1', DYLD_PRINT_BINDINGS='1')
-    trace = subprocess.run([str(binary), '--version'], env=trace_env, text=True,
+    trace = subprocess.run(compare.timed_command([binary, '--version'], trace_env), env=trace_env, text=True,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30)
     loaded = [match.group(1) for line in trace.stderr.splitlines()
               if (match := re.search(r'dyld\[\d+\]: <[^>]+> (/.+libarchive[^/]*\.dylib)$', line))]
@@ -94,6 +96,8 @@ def main():
     libraries = {'C': args.c_library.resolve(), 'Rust': args.rust_library.resolve()}
     if not all(path.is_file() for path in (binary, probe, *libraries.values())):
         parser.error('binary, probe and both libraries must exist')
+    if libraries['C'] == libraries['Rust']:
+        parser.error('C and Rust library files must differ')
     environments = {variant: environment(library) for variant, library in libraries.items()}
     verification = {variant: verify_provider(binary, probe, library, environments[variant])
                     for variant, library in libraries.items()}

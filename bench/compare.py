@@ -55,10 +55,21 @@ def manifest(root):
             for p in sorted(Path(root).rglob('*')) if p.is_file()}
 
 
+def timed_command(argv, env=None):
+    command = list(map(str, argv))
+    loader = {key: value for key, value in (env or {}).items()
+              if key.startswith(('DYLD_', 'LD_'))}
+    if loader:
+        # macOS strips DYLD variables on launch of protected /usr/bin/time.
+        # Apply assignments in its child, after that protected launch.
+        command = ['/usr/bin/env', *[f'{key}={value}' for key, value in loader.items()], *command]
+    return ['/usr/bin/time', '-l', *command]
+
+
 def run(argv, cwd, env=None):
     """Run under /usr/bin/time -l; returns wall time, peak RSS and status."""
     start = time.perf_counter()
-    p = subprocess.Popen(['/usr/bin/time', '-l', *map(str, argv)], cwd=cwd, env=ENV if env is None else env,
+    p = subprocess.Popen(timed_command(argv, env), cwd=cwd, env=ENV if env is None else env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                          start_new_session=True)
     try:

@@ -68,6 +68,9 @@ rotations. Loader diagnostic variables are removed from the timed environment.
 JSON records client/library hashes, actual loaded library paths and symbol
 bindings, compiler identification, caller-supplied Rust build provenance, input
 digests and every timed run. Run with no competing builds or fuzzing.
+The preflight uses the exact timing wrapper. Loader assignments are passed to
+`env` inside `/usr/bin/time`, since macOS clears `DYLD_*` when launching the
+protected timing executable; both implementations use that same wrapper.
 
 The client links directly only to libarchive and the C runtime. C compression
 libraries remain dependencies of the C shared library, so their startup cost
