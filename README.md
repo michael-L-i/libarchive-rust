@@ -1,17 +1,31 @@
 # libarchive-rust
 
-A Rust implementation of [libarchive](https://github.com/libarchive/libarchive),
-with its archive library and four command-line tools: `bsdtar`, `bsdcpio`,
-`bsdcat` and `bsdunzip`.
+An experimental Rust port of [libarchive](https://github.com/libarchive/libarchive)
+and its command-line tools.
 
-The project provides a Rust API and a C-compatible shared/static library using
-the pinned upstream public headers. It aims to let existing applications use
-the Rust implementation without changing their source. Compatibility is tested
-against upstream and selected downstream applications; documented differences
-and platform limits still apply. This is an independent port, not affiliated
-with the libarchive project.
+The goal is to preserve libarchive's APIs and behavior while moving the archive
+library, compression backends and tools to Rust. The port includes:
 
-## Build and use
+- **A Rust API** with typed handles for reading, writing and extracting archives.
+- **A C interface** with shared and static libraries, the pinned upstream headers
+  and all 454 public functions implemented.
+- **Four Rust command-line tools:** `bsdtar`, `bsdcpio`, `bsdcat` and `bsdunzip`.
+- **Compatibility tests and benchmarks** against the pinned C implementation,
+  plus selected downstream applications and fuzz campaigns.
+
+**Status: experimental.** The port has been validated on the configurations
+documented below and is ready to try and evaluate. Matching the public API is
+the target; compatibility with every application, archive and platform is still
+an ongoing effort. Start with the [compatibility guide](docs/compatibility.md)
+and test your own workflows when considering adoption.
+
+This is an independent project, not affiliated with the libarchive project.
+
+[Quick start](#quick-start) · [Installation](docs/install.md) ·
+[Compatibility](docs/compatibility.md) · [Performance](#performance) ·
+[Contributing](CONTRIBUTING.md)
+
+## Quick start
 
 Builds support macOS and Linux with glibc, using Rust **1.95 or newer** and a
 platform linker. The C interface also requires a C compiler for a small
@@ -26,8 +40,14 @@ target/release/bsdtar --version
 ```
 
 This builds the library, C interface and all four tools. The upstream C
-submodule is unnecessary for this build. To build only the Rust library and
-tools, without compiling the C shim:
+submodule is unnecessary for this build. Try the Rust `bsdtar` directly:
+
+```sh
+target/release/bsdtar -cf archive.tar path/to/files
+target/release/bsdtar -tf archive.tar
+```
+
+To build only the Rust library and tools, without compiling the C shim:
 
 ```sh
 cargo build --release --locked \
@@ -35,7 +55,11 @@ cargo build --release --locked \
 ```
 
 The tools are in `target/release/`. The C build produces `libarchive.a` and
-`libarchive.so` or `libarchive.dylib`. Use the installer for versioned libraries,
+`libarchive.so` or `libarchive.dylib`.
+
+### Stage an installation
+
+Use the installer for versioned libraries,
 headers, pkg-config/CMake metadata and license notices:
 
 ```sh
@@ -44,9 +68,9 @@ scripts/install --prefix /usr --destdir "$PWD/build/package"
 
 The installer needs Python 3 and stages a package tree without changing the
 running system. See [installation](docs/install.md) for C/C++ consumers and
-[source releases](docs/releases.md) for offline builds. The Rust API is
-documented in [src/api/mod.rs](src/api/mod.rs); run
-`cargo doc --no-deps -p libarchive-rust --open` to browse it locally.
+[source releases](docs/releases.md) for offline builds.
+
+### Use from Rust
 
 Rust applications can depend on this repository through Cargo:
 
@@ -59,35 +83,12 @@ The crate is not published on crates.io yet. The repository dependency includes
 the patched codec sources; consumers do not need their own Cargo patches.
 Pin a reviewed commit with Cargo's `rev` option when deploying an application.
 
-## One repository, one Cargo workspace
+The Rust API is documented in [src/api/mod.rs](src/api/mod.rs). Browse the
+generated documentation locally with:
 
-The library and tools are separate Cargo crates sharing one Git history and
-lockfile. They do not need separate repositories.
-
-```text
-src/                    Archive library, Rust API and C ABI exports
-capi/                   Shared/static C library and variadic formatting shim
-deflate/                Rust port of the zlib compressor
-tools/libarchive_fe/    Shared command-line helpers
-tools/tar/              bsdtar
-tools/cpio/             bsdcpio
-tools/cat/              bsdcat
-tools/unzip/            bsdunzip
-include/                Pinned upstream public headers
-vendor/                 Patched Rust codec dependencies and provenance
-tests/                  Compatibility tests and platform baselines
-scripts/                Build, install, test and source-release helpers
-fuzz/                   Separate nightly-only fuzz package
-bench/                  Benchmark harnesses and reproducible data generator
-docs/                   Installation, compatibility and validation reports
-upstream/libarchive/    Read-only C reference submodule, for development tests
+```sh
+cargo doc --no-deps -p libarchive-rust --open
 ```
-
-The Rust library and tools compile no C codec code. They use the platform's
-libc and iconv where needed. Unsafe operations are confined to the library's
-C/system interface and shared tool system wrappers; the remaining project
-modules deny unsafe code. The only project C source compiled for distribution
-is `capi/variadic.c`, retained to support Rust 1.95.
 
 ## Compatibility and validation
 
@@ -138,6 +139,35 @@ other hardware, cold storage or concurrent applications. See the
 [benchmark method](bench/README.md),
 [shared-library report](docs/shared-library-performance.md) and
 [final optimization screen](docs/final-performance-screen.md).
+
+## Project layout
+
+The library, C interface and tools share one Cargo workspace and lockfile.
+
+```text
+src/                    Archive library, Rust API and C ABI exports
+capi/                   Shared/static C library and variadic formatting shim
+deflate/                Rust port of the zlib compressor
+tools/libarchive_fe/    Shared command-line helpers
+tools/tar/              bsdtar
+tools/cpio/             bsdcpio
+tools/cat/              bsdcat
+tools/unzip/            bsdunzip
+include/                Pinned upstream public headers
+vendor/                 Patched Rust codec dependencies and provenance
+tests/                  Compatibility tests and platform baselines
+scripts/                Build, install, test and source-release helpers
+fuzz/                   Separate nightly-only fuzz package
+bench/                  Benchmark harnesses and reproducible data generator
+docs/                   Installation, compatibility and validation reports
+upstream/libarchive/    Read-only C reference submodule, for development tests
+```
+
+The Rust library and tools compile no C codec code. They use the platform's
+libc and iconv where needed. Unsafe operations are confined to the library's
+C/system interface and shared tool system wrappers; the remaining project
+modules deny unsafe code. The only project C source compiled for distribution
+is `capi/variadic.c`, retained to support Rust 1.95.
 
 ## Contributing and license
 
